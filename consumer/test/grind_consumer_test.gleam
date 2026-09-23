@@ -50,6 +50,11 @@ pub fn queue_policy_is_checked_before_start_test() {
   |> queue.with_maximum_jobs_per_poll(-1)
   |> queue.validate_policy
   |> should.equal(Error(queue.MaximumJobsPerPollMustBePositive))
+
+  queue.default_policy()
+  |> queue.with_shutdown_grace(-1)
+  |> queue.validate_policy
+  |> should.equal(Error(queue.ShutdownGraceMustBeNonNegative))
 }
 
 pub fn public_consumer_executes_typed_workers_test() {
@@ -112,10 +117,14 @@ fn run_public_consumer_test(url: String) -> Nil {
   process.receive(payment_probe, within: 5000)
   |> should.equal(Ok(ChargeInvoked))
 
-  // This actor call is a synchronization barrier: the automatic poll that
-  // emitted the handler probes must finish committing all three outcomes first.
-  queue.process_available(consumer)
-  |> should.equal(queue.BatchCompleted(0))
+  // Handler probes arrive before their database acknowledgements. Wait for the
+  // committed job states themselves before reading typed outcomes.
+  await_state(database, payment_handle, job.Succeeded, 250)
+  |> should.equal(True)
+  await_state(database, report_handle, job.Succeeded, 250)
+  |> should.equal(True)
+  await_state(database, failure_handle, job.BusinessFailed, 250)
+  |> should.equal(True)
   synthetic_effect_count("payment/42") |> should.equal(1)
   postgres.outcome(database, payment_handle)
   |> should.equal(Ok(job.SucceededWith("synthetic-receipt/payment/42")))
@@ -124,6 +133,26 @@ fn run_public_consumer_test(url: String) -> Nil {
   postgres.outcome(database, failure_handle)
   |> should.equal(Ok(job.BusinessFailedWith(PaymentRejected("missing/99"))))
   mark("two-worker-consumer-passed")
+}
+
+fn await_state(
+  database: postgres.Database,
+  handle: job.JobHandle(input, output, error),
+  expected: job.State,
+  remaining_checks: Int,
+) -> Bool {
+  case postgres.state(database, handle) {
+    Ok(state) ->
+      case state == expected, remaining_checks > 0 {
+        True, _ -> True
+        False, True -> {
+          process.sleep(20)
+          await_state(database, handle, expected, remaining_checks - 1)
+        }
+        False, False -> False
+      }
+    Error(_) -> False
+  }
 }
 
 fn payment_worker(

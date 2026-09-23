@@ -30,6 +30,8 @@ createdb -h 127.0.0.1 -p "$port" -U grind grind_owner_b
 createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_bad
 createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v1
 createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v2
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v3
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v4_missing_receipt
 createdb -h 127.0.0.1 -p "$port" -U grind grind_resolution_route_a
 createdb -h 127.0.0.1 -p "$port" -U grind grind_resolution_route_b
 createdb -h 127.0.0.1 -p "$port" -U grind grind_consumer_test
@@ -42,11 +44,13 @@ GRIND_TEST_OWNER_B_URL="postgres://grind@127.0.0.1:$port/grind_owner_b?sslmode=d
 GRIND_TEST_SCHEMA_BAD_URL="postgres://grind@127.0.0.1:$port/grind_schema_bad?sslmode=disable" \
 GRIND_TEST_SCHEMA_V1_URL="postgres://grind@127.0.0.1:$port/grind_schema_v1?sslmode=disable" \
 GRIND_TEST_SCHEMA_V2_URL="postgres://grind@127.0.0.1:$port/grind_schema_v2?sslmode=disable" \
+GRIND_TEST_SCHEMA_V3_URL="postgres://grind@127.0.0.1:$port/grind_schema_v3?sslmode=disable" \
+GRIND_TEST_SCHEMA_V4_MISSING_RECEIPT_URL="postgres://grind@127.0.0.1:$port/grind_schema_v4_missing_receipt?sslmode=disable" \
 GRIND_TEST_RESOLUTION_ROUTE_A_URL="postgres://grind@127.0.0.1:$port/grind_resolution_route_a?sslmode=disable" \
 GRIND_TEST_RESOLUTION_ROUTE_B_URL="postgres://grind@127.0.0.1:$port/grind_resolution_route_b?sslmode=disable" \
 GRIND_TEST_MARKER="$root/database-test-ran" \
   gleam test
-for contract in admission-read-passed storage-owner-passed incompatible-schema-rejected v1-migration-preserved-data v2-legacy-resolution-preserved committed-success-passed codec-contract-rejected typed-business-failure-passed automatic-contract-skip-passed queue-batch-policy-passed scheduled-due-time-passed batch-partial-commit-count-passed expired-attempt-takeover-passed expired-attempt-quarantine-passed mixed-consumer-policy-rejected concurrent-policy-start-single-winner audited-uncertain-resolution-passed resolution-payload-bound resolution-rebind-owner-checked; do
+for contract in admission-read-passed storage-owner-passed incompatible-schema-rejected v1-migration-preserved-data v2-legacy-resolution-preserved v3-upgrade-created-ack-table v3-missing-attempt-sequence-rejected v4-missing-ack-table-rejected committed-success-passed codec-contract-rejected typed-business-failure-passed long-handler-wait-passed stale-consumer-handle-rejected supervised-owner-restart-resumed-polling foreign-consumer-stop-owner-preserved consumer-stop-timeout-owner-survived consumer-stop-drained-active-worker consumer-stop-forced-active-work-retained automatic-drain-paused-poll-and-renewed overlapping-claims-skip-locked lease-renewal-loss-fenced-passed renewal-storage-error-retried-passed closed-pool-renewal-recovered-passed unstarted-worker-claim-released-passed temporary-worker-death-quarantined-no-replay dead-idle-worker-claim-released independent-consumers-single-live-claim consumer-capacity-two-enforced automatic-consumer-capacity-two-enforced automatic-contract-skip-passed queue-batch-policy-passed scheduled-due-time-passed batch-partial-commit-count-passed expired-attempt-takeover-passed expired-attempt-quarantine-passed mixed-consumer-policy-rejected concurrent-policy-start-single-winner audited-uncertain-resolution-passed resolution-payload-bound resolution-rebind-owner-checked durable-ack-receipt-passed ack-commit-connection-loss-unknown-passed; do
   if ! grep -q "$contract" "$root/database-test-ran"; then
     echo "PostgreSQL integration contract did not execute: $contract" >&2
     exit 1

@@ -72,6 +72,22 @@ pub opaque type Database {
   )
 }
 
+// Pog 4.1 lets a pgo_pool checkout exit escape from execute/transaction when
+// the named pool disappears. Keep that failure at the storage boundary so a
+// queue actor can retain ownership and report an unavailable store instead of
+// crashing. These wrappers catch only the known checkout-exit shape.
+@external(erlang, "grind_postgres_ffi", "execute_safely")
+fn execute_safely(
+  query: pog.Query(a),
+  on connection: pog.Connection,
+) -> Result(pog.Returned(a), pog.QueryError)
+
+@external(erlang, "grind_postgres_ffi", "transaction_safely")
+fn transaction_safely(
+  connection: pog.Connection,
+  callback: fn(pog.Connection) -> Result(a, b),
+) -> Result(a, pog.TransactionError(b))
+
 pub type StartError {
   PoolStartFailed(actor.StartError)
 }
@@ -235,7 +251,7 @@ pub fn resolve_uncertain(
           failure_description:,
         )
       case
-        pog.transaction(connection, fn(transaction) {
+        transaction_safely(connection, fn(transaction) {
           reconcile_transaction(transaction, command)
         })
       {
@@ -373,7 +389,7 @@ fn find_resolution(
         payload_match,
       ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(ReconciliationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -456,7 +472,7 @@ fn apply_uncertain_resolution(
             stored_error_version,
           ))
         })
-      use stored <- result.try(case pog.execute(select, on: connection) {
+      use stored <- result.try(case execute_safely(select, on: connection) {
         Error(error) -> Error(ReconciliationQueryFailed(error))
         Ok(returned) ->
           case returned.rows {
@@ -581,7 +597,7 @@ fn write_resolution(
       use resolution_id <- decode.field(0, decode.string)
       decode.success(resolution_id)
     })
-  use _ <- result.try(case pog.execute(insert, on: connection) {
+  use _ <- result.try(case execute_safely(insert, on: connection) {
     Error(error) -> Error(ReconciliationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -611,7 +627,7 @@ fn write_resolution(
       use state <- decode.field(0, decode.string)
       decode.success(state)
     })
-  use state <- result.try(case pog.execute(update, on: connection) {
+  use state <- result.try(case execute_safely(update, on: connection) {
     Error(error) -> Error(ReconciliationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -645,7 +661,7 @@ pub fn configure_queue(
     |> pog.parameter(pog.text(storage_owner))
     |> pog.parameter(pog.text(queue))
     |> pog.parameter(pog.text(expected))
-  use _ <- result.try(case pog.execute(insert, on: connection) {
+  use _ <- result.try(case execute_safely(insert, on: connection) {
     Error(error) -> Error(QueuePolicyQueryFailed(error))
     Ok(_) -> Ok(Nil)
   })
@@ -659,7 +675,7 @@ pub fn configure_queue(
       use policy <- decode.field(0, decode.string)
       decode.success(policy)
     })
-  case pog.execute(read, on: connection) {
+  case execute_safely(read, on: connection) {
     Error(error) -> Error(QueuePolicyQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -677,7 +693,7 @@ pub fn configure_queue(
 pub fn migrate(database: Database) -> Result(Nil, StorageError) {
   let Database(connection:, ..) = database
   case
-    pog.transaction(connection, fn(transaction) {
+    transaction_safely(connection, fn(transaction) {
       migrate_transaction(transaction)
     })
   {
@@ -688,9 +704,153 @@ pub fn migrate(database: Database) -> Result(Nil, StorageError) {
   }
 }
 
+type SchemaGeneration {
+  FreshSchema
+  ExistingSchema(
+    version: Int,
+    has_jobs: Bool,
+    has_queue_policies: Bool,
+    has_resolutions: Bool,
+    has_acknowledgements: Bool,
+    has_attempt_sequence: Bool,
+  )
+}
+
+fn read_schema_generation(
+  connection: pog.Connection,
+) -> Result(SchemaGeneration, StorageError) {
+  let query =
+    pog.query(
+      "SELECT to_regclass(current_schema() || '.grind_schema_migrations') IS NOT NULL, to_regclass(current_schema() || '.grind_jobs') IS NOT NULL, to_regclass(current_schema() || '.grind_queue_policies') IS NOT NULL, to_regclass(current_schema() || '.grind_job_resolutions') IS NOT NULL, to_regclass(current_schema() || '.grind_job_acknowledgements') IS NOT NULL, to_regclass(current_schema() || '.grind_attempts_id_seq') IS NOT NULL",
+    )
+    |> pog.returning({
+      use has_migrations <- decode.field(0, decode.bool)
+      use has_jobs <- decode.field(1, decode.bool)
+      use has_queue_policies <- decode.field(2, decode.bool)
+      use has_resolutions <- decode.field(3, decode.bool)
+      use has_acknowledgements <- decode.field(4, decode.bool)
+      use has_attempt_sequence <- decode.field(5, decode.bool)
+      decode.success(#(
+        has_migrations,
+        has_jobs,
+        has_queue_policies,
+        has_resolutions,
+        has_acknowledgements,
+        has_attempt_sequence,
+      ))
+    })
+  use
+    #(
+      has_migrations,
+      has_jobs,
+      has_queue_policies,
+      has_resolutions,
+      has_acknowledgements,
+      has_attempt_sequence,
+    )
+  <- result.try(case execute_safely(query, on: connection) {
+    Error(error) -> Error(MigrationQueryFailed(error))
+    Ok(returned) ->
+      case returned.rows {
+        [schema] -> Ok(schema)
+        _ -> Error(IncompatibleSchema)
+      }
+  })
+  case has_migrations {
+    False ->
+      case
+        has_jobs
+        || has_queue_policies
+        || has_resolutions
+        || has_acknowledgements
+        || has_attempt_sequence
+      {
+        True -> Error(IncompatibleSchema)
+        False -> Ok(FreshSchema)
+      }
+    True ->
+      read_installed_schema_version(
+        connection,
+        has_jobs,
+        has_queue_policies,
+        has_resolutions,
+        has_acknowledgements,
+        has_attempt_sequence,
+      )
+  }
+}
+
+fn read_installed_schema_version(
+  connection: pog.Connection,
+  has_jobs: Bool,
+  has_queue_policies: Bool,
+  has_resolutions: Bool,
+  has_acknowledgements: Bool,
+  has_attempt_sequence: Bool,
+) -> Result(SchemaGeneration, StorageError) {
+  let query =
+    pog.query(
+      "SELECT count(*)::bigint, COALESCE(min(version), 0)::bigint, COALESCE(max(version), 0)::bigint FROM grind_schema_migrations",
+    )
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      use minimum <- decode.field(1, decode.int)
+      use maximum <- decode.field(2, decode.int)
+      decode.success(#(count, minimum, maximum))
+    })
+  use #(count, minimum, maximum) <- result.try(
+    case execute_safely(query, on: connection) {
+      Error(_) -> Error(IncompatibleSchema)
+      Ok(returned) ->
+        case returned.rows {
+          [version] -> Ok(version)
+          _ -> Error(IncompatibleSchema)
+        }
+    },
+  )
+  let v3_evidence_valid = case maximum >= 3 {
+    False -> True
+    True -> has_queue_policies && has_resolutions
+  }
+  let v4_evidence_valid = case maximum >= 4 {
+    False -> True
+    True -> has_acknowledgements && has_attempt_sequence
+  }
+  // Every installed generation uses attempt IDs as fencing identity. Recreating
+  // a missing sequence would risk reusing an ID that a live or historical
+  // attempt already owns.
+  let attempt_sequence_valid = has_attempt_sequence
+  case
+    has_jobs,
+    count == maximum && minimum == 1 && maximum > 0 && maximum <= 4,
+    v3_evidence_valid,
+    v4_evidence_valid,
+    attempt_sequence_valid
+  {
+    False, _, _, _, _ -> Error(IncompatibleSchema)
+    _, False, _, _, _ ->
+      case maximum > 4 {
+        True -> Error(UnsupportedSchemaVersion(maximum))
+        False -> Error(IncompatibleSchema)
+      }
+    _, _, False, _, _ | _, _, _, False, _ | _, _, _, _, False ->
+      Error(IncompatibleSchema)
+    _, _, True, True, True ->
+      Ok(ExistingSchema(
+        version: maximum,
+        has_jobs:,
+        has_queue_policies:,
+        has_resolutions:,
+        has_acknowledgements:,
+        has_attempt_sequence:,
+      ))
+  }
+}
+
 fn migrate_transaction(
   connection: pog.Connection,
 ) -> Result(Nil, StorageError) {
+  use _schema_generation <- result.try(read_schema_generation(connection))
   let migration_sql =
     "CREATE TABLE IF NOT EXISTS grind_schema_migrations (version integer PRIMARY KEY, installed_at timestamptz NOT NULL DEFAULT clock_timestamp())"
   let jobs_sql =
@@ -717,11 +877,22 @@ fn migrate_transaction(
     <> "payload_version text, payload jsonb, "
     <> "resolved_by text NOT NULL, details text NOT NULL, resolved_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
     <> "CONSTRAINT grind_job_resolutions_pkey PRIMARY KEY (storage_owner, resolution_id))"
+  let acknowledgements_sql =
+    "CREATE TABLE IF NOT EXISTS grind_job_acknowledgements ("
+    <> "storage_owner text NOT NULL, command_id text NOT NULL, queue text NOT NULL, job_id bigint NOT NULL, "
+    <> "worker_id text NOT NULL, worker_version text NOT NULL, attempt_id bigint NOT NULL, attempt_epoch bigint NOT NULL, "
+    <> "attempt_owner text NOT NULL, proposed_state text NOT NULL CONSTRAINT grind_job_acknowledgements_proposed_state_check CHECK (proposed_state IN ('succeeded', 'business_failed', 'runtime_failed')), "
+    <> "committed_state text NOT NULL CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'runtime_failed')), "
+    <> "output_version text, output jsonb, error_version text, error jsonb, failure_description text, "
+    <> "committed_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
+    <> "CONSTRAINT grind_job_acknowledgements_pkey PRIMARY KEY (storage_owner, command_id), "
+    <> "CONSTRAINT grind_job_acknowledgements_attempt_key UNIQUE (storage_owner, job_id, attempt_id, attempt_epoch))"
   let attempts_sql = "CREATE SEQUENCE IF NOT EXISTS grind_attempts_id_seq"
   use _ <- result.try(run_statement(connection, migration_sql))
   use _ <- result.try(run_statement(connection, jobs_sql))
   use _ <- result.try(run_statement(connection, queue_policies_sql))
   use _ <- result.try(run_statement(connection, resolutions_sql))
+  use _ <- result.try(run_statement(connection, acknowledgements_sql))
   use _ <- result.try(run_statement(connection, attempts_sql))
   use _ <- result.try(upgrade_schema_versions(connection))
   use #(migration_columns, migration_columns_valid) <- result.try(
@@ -759,7 +930,22 @@ fn migrate_transaction(
                 ),
               )
               case resolution_columns == 17 && resolution_columns_valid == 17 {
-                True -> validate_schema_contract(connection)
+                True -> {
+                  use #(acknowledgement_columns, acknowledgement_columns_valid) <- result.try(
+                    inspect_columns(
+                      connection,
+                      "grind_job_acknowledgements",
+                      "(column_name = 'storage_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'command_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'queue' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'job_id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'worker_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'worker_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'attempt_id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_epoch' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'proposed_state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'committed_state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'output_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'output' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'error_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'error' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'failure_description' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'committed_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'NO')",
+                    ),
+                  )
+                  case
+                    acknowledgement_columns == 17
+                    && acknowledgement_columns_valid == 17
+                  {
+                    True -> validate_schema_contract(connection)
+                    False -> Error(IncompatibleSchema)
+                  }
+                }
                 False -> Error(IncompatibleSchema)
               }
             }
@@ -785,7 +971,7 @@ fn upgrade_schema_versions(
       decode.success(#(count, minimum, maximum))
     })
   use #(count, minimum, maximum) <- result.try(
-    case pog.execute(query, on: connection) {
+    case execute_safely(query, on: connection) {
       Error(error) -> Error(MigrationQueryFailed(error))
       Ok(returned) ->
         case returned.rows {
@@ -798,14 +984,19 @@ fn upgrade_schema_versions(
     0, 0, 0 ->
       run_statement(
         connection,
-        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3)",
+        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3), (4)",
       )
     1, 1, 1 -> {
       use _ <- result.try(upgrade_schema_v1_to_v2(connection))
-      upgrade_schema_v2_to_v3(connection)
+      use _ <- result.try(upgrade_schema_v2_to_v3(connection))
+      upgrade_schema_v3_to_v4(connection)
     }
-    2, 1, 2 -> upgrade_schema_v2_to_v3(connection)
-    3, 1, 3 -> Ok(Nil)
+    2, 1, 2 -> {
+      use _ <- result.try(upgrade_schema_v2_to_v3(connection))
+      upgrade_schema_v3_to_v4(connection)
+    }
+    3, 1, 3 -> upgrade_schema_v3_to_v4(connection)
+    4, 1, 4 -> Ok(Nil)
     _, _, unsupported -> Error(UnsupportedSchemaVersion(unsupported))
   }
 }
@@ -855,6 +1046,15 @@ fn upgrade_schema_v2_to_v3(
   )
 }
 
+fn upgrade_schema_v3_to_v4(
+  connection: pog.Connection,
+) -> Result(Nil, StorageError) {
+  run_statement(
+    connection,
+    "INSERT INTO grind_schema_migrations (version) VALUES (4)",
+  )
+}
+
 fn upgrade_schema_v1_to_v2(
   connection: pog.Connection,
 ) -> Result(Nil, StorageError) {
@@ -870,7 +1070,7 @@ fn upgrade_schema_v1_to_v2(
       use state_check <- decode.field(1, decode.int)
       decode.success(#(columns, state_check))
     })
-  use _ <- result.try(case pog.execute(query, on: connection) {
+  use _ <- result.try(case execute_safely(query, on: connection) {
     Error(error) -> Error(MigrationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -900,7 +1100,7 @@ fn run_statement(
   connection: pog.Connection,
   sql: String,
 ) -> Result(Nil, StorageError) {
-  case pog.execute(pog.query(sql), on: connection) {
+  case execute_safely(pog.query(sql), on: connection) {
     Ok(_) -> Ok(Nil)
     Error(error) -> Error(MigrationQueryFailed(error))
   }
@@ -923,7 +1123,7 @@ fn inspect_columns(
       use valid <- decode.field(1, decode.int)
       decode.success(#(count, valid))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(MigrationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -947,7 +1147,7 @@ fn ensure_schema_version(
       decode.success(#(count, minimum, maximum))
     })
   use #(count, minimum, maximum) <- result.try(
-    case pog.execute(query, on: connection) {
+    case execute_safely(query, on: connection) {
       Error(error) -> Error(MigrationQueryFailed(error))
       Ok(returned) ->
         case returned.rows {
@@ -960,9 +1160,9 @@ fn ensure_schema_version(
     0, 0, 0 ->
       run_statement(
         connection,
-        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3)",
+        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3), (4)",
       )
-    3, 1, 3 -> Ok(Nil)
+    4, 1, 4 -> Ok(Nil)
     _, _, unsupported -> Error(UnsupportedSchemaVersion(unsupported))
   }
 }
@@ -978,11 +1178,27 @@ fn validate_schema_contract(
     "CHECK ((decision = ANY (ARRAY['confirm_success'::text, 'confirm_business_failure'::text, 'authorize_replay'::text])))"
   let expected_resolution_target_check =
     "CHECK ((target_state = ANY (ARRAY['queued'::text, 'succeeded'::text, 'business_failed'::text])))"
+  let expected_ack_state_check =
+    "CHECK ((proposed_state = ANY (ARRAY['succeeded'::text, 'business_failed'::text, 'runtime_failed'::text])))"
+  let expected_ack_committed_check =
+    "CHECK ((committed_state = ANY (ARRAY['succeeded'::text, 'business_failed'::text, 'runtime_failed'::text])))"
   use resolution_target_check <- result.try(exact_constraint_count(
     connection,
     "grind_job_resolutions",
     "grind_job_resolutions_target_state_check",
     expected_resolution_target_check,
+  ))
+  use acknowledgement_proposed_check <- result.try(exact_constraint_count(
+    connection,
+    "grind_job_acknowledgements",
+    "grind_job_acknowledgements_proposed_state_check",
+    expected_ack_state_check,
+  ))
+  use acknowledgement_committed_check <- result.try(exact_constraint_count(
+    connection,
+    "grind_job_acknowledgements",
+    "grind_job_acknowledgements_committed_state_check",
+    expected_ack_committed_check,
   ))
   let query =
     pog.query(
@@ -1021,15 +1237,45 @@ fn validate_schema_contract(
         resolution_constraints,
       ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(MigrationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
         [#(1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 3)] ->
           case resolution_target_check == 1 {
-            True -> ensure_schema_version(connection)
+            True ->
+              case
+                acknowledgement_proposed_check == 1
+                && acknowledgement_committed_check == 1
+              {
+                True -> validate_acknowledgement_constraints(connection)
+                False -> Error(IncompatibleSchema)
+              }
             False -> Error(IncompatibleSchema)
           }
+        _ -> Error(IncompatibleSchema)
+      }
+  }
+}
+
+fn validate_acknowledgement_constraints(
+  connection: pog.Connection,
+) -> Result(Nil, StorageError) {
+  let query =
+    pog.query(
+      "SELECT (SELECT count(*) FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema() AND t.relname = 'grind_job_acknowledgements' AND c.contype = 'p' AND pg_get_constraintdef(c.oid) = 'PRIMARY KEY (storage_owner, command_id)')::bigint, (SELECT count(*) FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema() AND t.relname = 'grind_job_acknowledgements' AND c.contype = 'u' AND pg_get_constraintdef(c.oid) = 'UNIQUE (storage_owner, job_id, attempt_id, attempt_epoch)')::bigint, (SELECT count(*) FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema() AND t.relname = 'grind_job_acknowledgements' AND c.contype IN ('p', 'u', 'c'))::bigint",
+    )
+    |> pog.returning({
+      use primary_key <- decode.field(0, decode.int)
+      use attempt_key <- decode.field(1, decode.int)
+      use constraints <- decode.field(2, decode.int)
+      decode.success(#(primary_key, attempt_key, constraints))
+    })
+  case execute_safely(query, on: connection) {
+    Error(error) -> Error(MigrationQueryFailed(error))
+    Ok(returned) ->
+      case returned.rows {
+        [#(1, 1, 4)] -> ensure_schema_version(connection)
         _ -> Error(IncompatibleSchema)
       }
   }
@@ -1052,7 +1298,7 @@ fn exact_constraint_count(
       use count <- decode.field(0, decode.int)
       decode.success(count)
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(MigrationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -1143,7 +1389,7 @@ fn submit_with_availability(
           use id <- decode.field(0, decode.int)
           decode.success(id)
         })
-      case pog.execute(query, on: connection) {
+      case execute_safely(query, on: connection) {
         Error(error) -> Error(SubmitQueryFailed(error))
         Ok(returned) ->
           case returned.rows {
@@ -1217,7 +1463,7 @@ pub fn bind_handle(
         stored_error_version,
       ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(HandleBindQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -1281,7 +1527,7 @@ pub fn arguments(
         stored_worker_version,
       ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(ArgumentQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -1342,9 +1588,57 @@ pub type StateError {
 /// to the batch caller but a committed job disposition.
 pub type QueueRunError {
   QueueClaimFailed(pog.QueryError)
+  QueueClaimReleaseFailed(pog.QueryError)
+  QueueClaimReleaseRejected
   QueueAckFailed(pog.QueryError)
+  /// The ACK transaction may have committed although its reply was lost.
+  /// Reconcile this stable command ID before considering any replay.
+  QueueAckUnknown(command_id: String, proposed: worker.Execution)
+  /// The exact worker proposal was not committed because the claim no longer
+  /// owned a live, executing row. The attached reason is a database snapshot.
+  QueueAckStale(proposed: worker.Execution, reason: AckRejection)
   QueueAckRejected
+  QueueAckCommandConflict
+  QueueAckProposalCodecMismatch(kind: String, expected: String, actual: String)
   QueueCodecMismatch(kind: String, expected: String, actual: String)
+}
+
+pub type AckRejection {
+  AckRecordMissing
+  AckLeaseExpired(attempt_id: Int, epoch: Int, owner: String)
+  AckOwnershipChanged(
+    state: String,
+    attempt_id: Option(Int),
+    epoch: Option(Int),
+    owner: Option(String),
+  )
+  AckStateChanged(state: String)
+  AckRecordChanged(
+    state: String,
+    attempt_id: Option(Int),
+    epoch: Option(Int),
+    owner: Option(String),
+  )
+}
+
+pub type AcknowledgementReceipt(output, error) {
+  AcknowledgementReceipt(
+    command_id: String,
+    attempt_id: Int,
+    attempt_epoch: Int,
+    outcome: job.Outcome(output, error),
+  )
+}
+
+pub type AckReconciliationError {
+  AckReceiptQueryFailed(pog.QueryError)
+  AckReceiptNotFound
+  AckReceiptStorageOwnerMismatch
+  AckReceiptRouteMismatch
+  AckReceiptWorkerContractMismatch
+  AckReceiptPayloadMismatch
+  AckReceiptCodecFailed(worker.StoredCodecError)
+  AckReceiptInvalidState(String)
 }
 
 type Claim {
@@ -1359,6 +1653,23 @@ type Claim {
     output_version: String,
     error_version: Option(String),
   )
+}
+
+type AckProposal {
+  AckProposal(
+    state: String,
+    output_version: Option(String),
+    output: Option(String),
+    error_version: Option(String),
+    error: Option(String),
+    failure_description: Option(String),
+  )
+}
+
+/// A claimed row bound to its registered typed execution closure.
+@internal
+pub opaque type ClaimedJob {
+  ClaimedJob(claim: Claim, run: fn() -> worker.Execution)
 }
 
 type ResolutionCommand {
@@ -1390,9 +1701,238 @@ pub fn storage_owner(database: Database) -> String {
   storage_owner
 }
 
-/// Atomically claims one due row, invokes its exact typed registration, then
-/// commits the outcome only while the attempt id, epoch, owner, and DB-time
-/// lease are still current.
+/// Atomically claims one due row without running its handler in the caller.
+/// The queue actor owns renewal and acknowledgement after this boundary.
+@internal
+pub fn claim_one(
+  database: Database,
+  queue: String,
+  workers: Registry,
+  attempt_owner: String,
+  replay_expired: Bool,
+  lease_duration_ms: Int,
+) -> Result(Option(ClaimedJob), QueueRunError) {
+  let identities = registry.identities(workers)
+  case replay_expired {
+    True ->
+      claim_registered_job(
+        database,
+        queue,
+        workers,
+        attempt_owner,
+        identities,
+        True,
+        lease_duration_ms,
+      )
+    False ->
+      case quarantine_expired(database, queue, identities) {
+        Error(error) -> Error(error)
+        Ok(Nil) ->
+          claim_registered_job(
+            database,
+            queue,
+            workers,
+            attempt_owner,
+            identities,
+            False,
+            lease_duration_ms,
+          )
+      }
+  }
+}
+
+/// Executes only the typed closure captured when a matching job was claimed.
+@internal
+pub fn execute_claim(claimed: ClaimedJob) -> worker.Execution {
+  let ClaimedJob(run:, ..) = claimed
+  run()
+}
+
+/// Returns stable fencing fields for the queue actor's private active entry.
+@internal
+pub fn claim_identity(claimed: ClaimedJob) -> #(Int, Int, Int) {
+  let ClaimedJob(claim: Claim(id:, attempt_id:, epoch:, ..), ..) = claimed
+  #(id, attempt_id, epoch)
+}
+
+/// Extends the current lease using PostgreSQL's clock and current row values.
+/// An expired or fenced claim cannot be renewed.
+@internal
+pub fn renew_claim(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  claimed: ClaimedJob,
+  lease_duration_ms: Int,
+) -> Result(Bool, QueueRunError) {
+  let Database(connection:, storage_owner:, ..) = database
+  let ClaimedJob(claim: Claim(id:, attempt_id:, epoch:, ..), ..) = claimed
+  let query =
+    pog.query(
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() + ($7::double precision * interval '1 millisecond') WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND lease_expires_at > clock_timestamp() RETURNING id",
+    )
+    |> pog.parameter(pog.int(id))
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.int(attempt_id))
+    |> pog.parameter(pog.int(epoch))
+    |> pog.parameter(pog.text(attempt_owner))
+    |> pog.parameter(pog.int(lease_duration_ms))
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+  case execute_safely(query, on: connection) {
+    Error(error) -> Error(QueueClaimFailed(error))
+    Ok(returned) ->
+      case returned.rows {
+        [_] -> Ok(True)
+        [] -> Ok(False)
+        _ -> Error(QueueAckRejected)
+      }
+  }
+}
+
+/// Releases a claim only when its exact attempt still owns the executing row.
+/// This is used only when the temporary worker child failed to start before
+/// receiving `StartAttempt`, so it is safe to refund the uninvoked attempt.
+@internal
+pub fn release_unstarted_claim(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  claimed: ClaimedJob,
+) -> Result(Bool, QueueRunError) {
+  let Database(connection:, storage_owner:, ..) = database
+  let ClaimedJob(claim: Claim(id:, attempt_id:, epoch:, ..), ..) = claimed
+  let query =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'queued', attempt_epoch = attempt_epoch + 1, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0) WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 RETURNING id",
+    )
+    |> pog.parameter(pog.int(id))
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.int(attempt_id))
+    |> pog.parameter(pog.int(epoch))
+    |> pog.parameter(pog.text(attempt_owner))
+    |> pog.returning({
+      use returned_id <- decode.field(0, decode.int)
+      decode.success(returned_id)
+    })
+  case execute_safely(query, on: connection) {
+    Error(error) -> Error(QueueClaimReleaseFailed(error))
+    Ok(returned) ->
+      case returned.rows {
+        [_] -> Ok(True)
+        [] -> Ok(False)
+        _ -> Error(QueueClaimReleaseRejected)
+      }
+  }
+}
+
+/// Commits the proposed worker outcome through the same attempt fence.
+@internal
+pub fn acknowledge_claim(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  claimed: ClaimedJob,
+  execution: worker.Execution,
+) -> Result(Bool, QueueRunError) {
+  acknowledge_claim_with_reply_mode(
+    database,
+    queue,
+    attempt_owner,
+    claimed,
+    execution,
+    False,
+  )
+}
+
+fn acknowledge_claim_with_reply_mode(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  claimed: ClaimedJob,
+  execution: worker.Execution,
+  simulate_lost_reply: Bool,
+) -> Result(Bool, QueueRunError) {
+  let ClaimedJob(claim:, ..) = claimed
+  let Claim(output_version:, error_version:, ..) = claim
+  case execution {
+    worker.ExecutedSuccess(actual_version, _) ->
+      case actual_version == output_version {
+        True ->
+          acknowledge(
+            database,
+            queue,
+            attempt_owner,
+            claim,
+            execution,
+            output_version,
+            simulate_lost_reply,
+          )
+        False ->
+          Error(QueueAckProposalCodecMismatch(
+            "output",
+            output_version,
+            actual_version,
+          ))
+      }
+    worker.ExecutedBusinessFailure(actual_version, _, _) ->
+      case actual_version == error_version {
+        True ->
+          acknowledge(
+            database,
+            queue,
+            attempt_owner,
+            claim,
+            execution,
+            output_version,
+            simulate_lost_reply,
+          )
+        False ->
+          Error(QueueAckProposalCodecMismatch(
+            "error",
+            option_version(error_version),
+            option_version(actual_version),
+          ))
+      }
+    worker.ExecutedInvalidInput(_) ->
+      acknowledge(
+        database,
+        queue,
+        attempt_owner,
+        claim,
+        execution,
+        output_version,
+        simulate_lost_reply,
+      )
+  }
+}
+
+/// Test seam that injects a lost transaction reply and unavailable immediate
+/// reconciliation at the production result boundary after PostgreSQL commits.
+@internal
+pub fn acknowledge_claim_with_lost_reply_after_commit(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  claimed: ClaimedJob,
+  execution: worker.Execution,
+) -> Result(Bool, QueueRunError) {
+  acknowledge_claim_with_reply_mode(
+    database,
+    queue,
+    attempt_owner,
+    claimed,
+    execution,
+    True,
+  )
+}
+
+/// Compatibility stepping API retained for internal tests while callers move
+/// to the queue-owned claim/run/renew/ack protocol.
 @internal
 pub fn process_one(
   database: Database,
@@ -1401,45 +1941,31 @@ pub fn process_one(
   attempt_owner: String,
   replay_expired: Bool,
 ) -> Result(Bool, QueueRunError) {
-  let identities = registry.identities(workers)
-  case replay_expired {
-    True ->
-      claim_and_run_one(
-        database,
-        queue,
-        workers,
-        attempt_owner,
-        identities,
-        True,
-      )
-    False ->
-      case quarantine_expired(database, queue, identities) {
-        Error(error) -> Error(error)
-        Ok(Nil) ->
-          claim_and_run_one(
-            database,
-            queue,
-            workers,
-            attempt_owner,
-            identities,
-            False,
-          )
-      }
+  case
+    claim_one(database, queue, workers, attempt_owner, replay_expired, 30_000)
+  {
+    Error(error) -> Error(error)
+    Ok(None) -> Ok(False)
+    Ok(Some(claimed)) -> {
+      let execution = execute_claim(claimed)
+      acknowledge_claim(database, queue, attempt_owner, claimed, execution)
+    }
   }
 }
 
-fn claim_and_run_one(
+fn claim_registered_job(
   database: Database,
   queue: String,
   workers: Registry,
   attempt_owner: String,
   identities: List(#(String, String)),
   replay_expired: Bool,
-) -> Result(Bool, QueueRunError) {
+  lease_duration_ms: Int,
+) -> Result(Option(ClaimedJob), QueueRunError) {
   let Database(connection:, storage_owner:, ..) = database
   let eligibility =
     list.index_map(identities, fn(_, index) {
-      let id_parameter = 4 + index * 2
+      let id_parameter = 5 + index * 2
       let version_parameter = id_parameter + 1
       "(worker_id = $"
       <> int.to_string(id_parameter)
@@ -1459,10 +1985,15 @@ fn claim_and_run_one(
     <> eligible_state
     <> " AND ("
     <> eligibility
-    <> ") ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $3, lease_expires_at = clock_timestamp() + interval '30 seconds', attempt_count = job.attempt_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version"
+    <> ") ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $3, lease_expires_at = clock_timestamp() + ($4::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version"
   let parameters =
     list.append(
-      [pog.text(storage_owner), pog.text(queue), pog.text(attempt_owner)],
+      [
+        pog.text(storage_owner),
+        pog.text(queue),
+        pog.text(attempt_owner),
+        pog.int(lease_duration_ms),
+      ],
       list.flat_map(identities, fn(identity) {
         let #(worker_id, worker_version) = identity
         [pog.text(worker_id), pog.text(worker_version)]
@@ -1494,11 +2025,11 @@ fn claim_and_run_one(
         error_version:,
       ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(QueueClaimFailed(error))
     Ok(returned) ->
       case returned.rows {
-        [] -> Ok(False)
+        [] -> Ok(None)
         [claim] -> {
           let Claim(
             input_version:,
@@ -1510,15 +2041,7 @@ fn claim_and_run_one(
             ..,
           ) = claim
           case registry.select(workers, queue, worker_id, worker_version) {
-            Error(error) ->
-              acknowledge(
-                database,
-                queue,
-                attempt_owner,
-                claim,
-                worker.ExecutedInvalidInput(string.inspect(error)),
-                output_version,
-              )
+            Error(_) -> Error(QueueAckRejected)
             Ok(#(registered_input, registered_output, registered_error, run)) ->
               case
                 codec_contract_mismatch(
@@ -1548,17 +2071,14 @@ fn claim_and_run_one(
                     Ok(False) -> Error(QueueAckRejected)
                   }
                 }
-                None -> {
-                  let execution = run(input_version, encoded_input)
-                  acknowledge(
-                    database,
-                    queue,
-                    attempt_owner,
-                    claim,
-                    execution,
-                    output_version,
+                None ->
+                  Ok(
+                    Some(
+                      ClaimedJob(claim:, run: fn() {
+                        run(input_version, encoded_input)
+                      }),
+                    ),
                   )
-                }
               }
           }
         }
@@ -1603,7 +2123,7 @@ fn quarantine_expired(
         list.fold(parameters, pog.query(sql), fn(query, parameter) {
           pog.parameter(query, parameter)
         })
-      case pog.execute(query, on: connection) {
+      case execute_safely(query, on: connection) {
         Error(error) -> Error(QueueClaimFailed(error))
         Ok(_) -> Ok(Nil)
       }
@@ -1678,7 +2198,7 @@ fn mark_contract_mismatch(
       use id <- decode.field(0, decode.int)
       decode.success(id)
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(QueueAckFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -1695,64 +2215,468 @@ fn acknowledge(
   claim: Claim,
   execution: worker.Execution,
   expected_output_version: String,
+  simulate_lost_reply: Bool,
 ) -> Result(Bool, QueueRunError) {
   let Database(connection:, storage_owner:, ..) = database
   let Claim(id:, attempt_id:, epoch:, ..) = claim
-  let #(sql, parameters) = case execution {
-    worker.ExecutedSuccess(output_version, encoded_output) -> #(
-      "UPDATE grind_jobs SET state = 'succeeded', output = $1::jsonb, output_version = $2, error = NULL, error_version = NULL, failure_description = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $3 AND storage_owner = $4 AND queue = $5 AND state = 'executing' AND attempt_id = $6 AND attempt_epoch = $7 AND attempt_owner = $8 AND output_version = $9 AND lease_expires_at > clock_timestamp() RETURNING id",
-      [
-        pog.text(encoded_output),
-        pog.text(output_version),
-        pog.int(id),
-        pog.text(storage_owner),
-        pog.text(queue),
-        pog.int(attempt_id),
-        pog.int(epoch),
-        pog.text(attempt_owner),
-        pog.text(expected_output_version),
-      ],
-    )
-    worker.ExecutedBusinessFailure(error_version, encoded_error, description) -> #(
-      "UPDATE grind_jobs SET state = 'business_failed', output = NULL, error = $1::jsonb, error_version = $2, failure_description = $3, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $4 AND storage_owner = $5 AND queue = $6 AND state = 'executing' AND attempt_id = $7 AND attempt_epoch = $8 AND attempt_owner = $9 AND lease_expires_at > clock_timestamp() RETURNING id",
-      [
-        pog.nullable(pog.text, encoded_error),
-        pog.nullable(pog.text, error_version),
-        pog.text(description),
-        pog.int(id),
-        pog.text(storage_owner),
-        pog.text(queue),
-        pog.int(attempt_id),
-        pog.int(epoch),
-        pog.text(attempt_owner),
-      ],
-    )
-    worker.ExecutedInvalidInput(description) -> #(
-      "UPDATE grind_jobs SET state = 'runtime_failed', output = NULL, error = NULL, error_version = NULL, failure_description = $1, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id",
-      [
-        pog.text(description),
-        pog.int(id),
-        pog.text(storage_owner),
-        pog.text(queue),
-        pog.int(attempt_id),
-        pog.int(epoch),
-        pog.text(attempt_owner),
-      ],
-    )
+  let proposal = case execution {
+    worker.ExecutedSuccess(version, encoded) ->
+      AckProposal(
+        state: "succeeded",
+        output_version: Some(version),
+        output: Some(encoded),
+        error_version: None,
+        error: None,
+        failure_description: None,
+      )
+    worker.ExecutedBusinessFailure(version, encoded, description) ->
+      AckProposal(
+        state: "business_failed",
+        output_version: None,
+        output: None,
+        error_version: version,
+        error: encoded,
+        failure_description: Some(description),
+      )
+    worker.ExecutedInvalidInput(description) ->
+      AckProposal(
+        state: "runtime_failed",
+        output_version: None,
+        output: None,
+        error_version: None,
+        error: None,
+        failure_description: Some(description),
+      )
   }
+  let command_id = acknowledgement_command_id(id, attempt_id, epoch)
+  let transaction_result =
+    transaction_safely(connection, fn(transaction) {
+      acknowledge_transaction(
+        transaction,
+        storage_owner,
+        queue,
+        attempt_owner,
+        claim,
+        command_id,
+        proposal,
+        execution,
+        expected_output_version,
+      )
+    })
+  resolve_ack_transaction_result(
+    connection,
+    storage_owner,
+    queue,
+    attempt_owner,
+    claim,
+    command_id,
+    proposal,
+    execution,
+    transaction_result,
+    simulate_lost_reply,
+  )
+}
+
+fn resolve_ack_transaction_result(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  attempt_owner: String,
+  claim: Claim,
+  command_id: String,
+  proposal: AckProposal,
+  execution: worker.Execution,
+  transaction_result: Result(Bool, pog.TransactionError(QueueRunError)),
+  simulate_lost_reply: Bool,
+) -> Result(Bool, QueueRunError) {
+  case transaction_result {
+    Ok(result) ->
+      case result, simulate_lost_reply {
+        True, True ->
+          reconcile_unknown_ack(
+            connection,
+            storage_owner,
+            queue,
+            attempt_owner,
+            claim,
+            command_id,
+            proposal,
+            execution,
+            False,
+          )
+        _, _ -> Ok(result)
+      }
+    Error(pog.TransactionRolledBack(error)) -> Error(error)
+    Error(pog.TransactionQueryError(_)) ->
+      reconcile_unknown_ack(
+        connection,
+        storage_owner,
+        queue,
+        attempt_owner,
+        claim,
+        command_id,
+        proposal,
+        execution,
+        True,
+      )
+  }
+}
+
+fn reconcile_unknown_ack(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  attempt_owner: String,
+  claim: Claim,
+  command_id: String,
+  proposal: AckProposal,
+  execution: worker.Execution,
+  receipt_lookup_available: Bool,
+) -> Result(Bool, QueueRunError) {
+  case receipt_lookup_available {
+    False -> Error(QueueAckUnknown(command_id, execution))
+    True ->
+      case
+        matching_acknowledgement(
+          connection,
+          storage_owner,
+          queue,
+          attempt_owner,
+          claim,
+          command_id,
+          proposal,
+        )
+      {
+        Ok(Some(True)) -> Ok(True)
+        Ok(Some(False)) -> Error(QueueAckCommandConflict)
+        Ok(None) | Error(_) -> Error(QueueAckUnknown(command_id, execution))
+      }
+  }
+}
+
+fn acknowledge_transaction(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  attempt_owner: String,
+  claim: Claim,
+  command_id: String,
+  proposal: AckProposal,
+  execution: worker.Execution,
+  expected_output_version: String,
+) -> Result(Bool, QueueRunError) {
+  case
+    matching_acknowledgement(
+      connection,
+      storage_owner,
+      queue,
+      attempt_owner,
+      claim,
+      command_id,
+      proposal,
+    )
+  {
+    Error(error) -> Error(error)
+    Ok(Some(True)) -> Ok(True)
+    Ok(Some(False)) -> Error(QueueAckCommandConflict)
+    Ok(None) -> {
+      let Claim(id:, attempt_id:, epoch:, error_version:, ..) = claim
+      let AckProposal(
+        state:,
+        output_version: _,
+        output:,
+        error_version: proposed_error_version,
+        error:,
+        failure_description:,
+      ) = proposal
+      let #(sql, parameters) = case state {
+        "succeeded" -> #(
+          "UPDATE grind_jobs SET state = 'succeeded', output = $1::jsonb, error = NULL, error_version = NULL, failure_description = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND output_version = $8 AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.text, output),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+            pog.text(expected_output_version),
+          ],
+        )
+        "business_failed" -> #(
+          "UPDATE grind_jobs SET state = 'business_failed', output = NULL, error = $1::jsonb, error_version = $2, failure_description = $3, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $4 AND storage_owner = $5 AND queue = $6 AND state = 'executing' AND attempt_id = $7 AND attempt_epoch = $8 AND attempt_owner = $9 AND error_version IS NOT DISTINCT FROM $10 AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.text, error),
+            pog.nullable(pog.text, proposed_error_version),
+            pog.nullable(pog.text, failure_description),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+            pog.nullable(pog.text, error_version),
+          ],
+        )
+        _ -> #(
+          "UPDATE grind_jobs SET state = 'runtime_failed', output = NULL, error = NULL, error_version = NULL, failure_description = $1, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.text, failure_description),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+          ],
+        )
+      }
+      let query =
+        list.fold(parameters, pog.query(sql), fn(query, parameter) {
+          pog.parameter(query, parameter)
+        })
+        |> pog.returning({
+          use updated_id <- decode.field(0, decode.int)
+          decode.success(updated_id)
+        })
+      case execute_safely(query, on: connection) {
+        Error(error) -> Error(QueueAckFailed(error))
+        Ok(returned) ->
+          case returned.rows {
+            [] ->
+              // A duplicate ACK can wait behind the first writer's row lock.
+              // Re-read its receipt after the UPDATE observes the committed
+              // state instead of misreporting that exact retry as stale.
+              case
+                matching_acknowledgement(
+                  connection,
+                  storage_owner,
+                  queue,
+                  attempt_owner,
+                  claim,
+                  command_id,
+                  proposal,
+                )
+              {
+                Ok(Some(True)) -> Ok(True)
+                Ok(Some(False)) -> Error(QueueAckCommandConflict)
+                Ok(None) ->
+                  current_ack_rejection(
+                    connection,
+                    storage_owner,
+                    queue,
+                    attempt_owner,
+                    claim,
+                    execution,
+                  )
+                Error(error) -> Error(error)
+              }
+            [_] ->
+              insert_acknowledgement(
+                connection,
+                storage_owner,
+                queue,
+                attempt_owner,
+                claim,
+                command_id,
+                proposal,
+              )
+            _ -> Error(QueueAckRejected)
+          }
+      }
+    }
+  }
+}
+
+fn current_ack_rejection(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  attempt_owner: String,
+  claim: Claim,
+  execution: worker.Execution,
+) -> Result(Bool, QueueRunError) {
+  let Claim(id:, attempt_id:, epoch:, ..) = claim
   let query =
-    list.fold(parameters, pog.query(sql), fn(query, parameter) {
-      pog.parameter(query, parameter)
-    })
+    pog.query(
+      "SELECT state, attempt_id, attempt_epoch, attempt_owner, lease_expires_at > clock_timestamp() FROM grind_jobs WHERE id = $1 AND storage_owner = $2 AND queue = $3",
+    )
+    |> pog.parameter(pog.int(id))
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(queue))
     |> pog.returning({
-      use id <- decode.field(0, decode.int)
-      decode.success(id)
+      use state <- decode.field(0, decode.string)
+      use current_attempt <- decode.field(1, decode.optional(decode.int))
+      use current_epoch <- decode.field(2, decode.optional(decode.int))
+      use current_owner <- decode.field(3, decode.optional(decode.string))
+      use lease_live <- decode.field(4, decode.bool)
+      decode.success(#(
+        state,
+        current_attempt,
+        current_epoch,
+        current_owner,
+        lease_live,
+      ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(QueueAckFailed(error))
     Ok(returned) ->
       case returned.rows {
-        [] -> Error(QueueAckRejected)
+        [] -> Error(QueueAckStale(execution, AckRecordMissing))
+        [#(state, current_attempt, current_epoch, current_owner, lease_live)] ->
+          case state {
+            "executing" ->
+              case
+                current_attempt == Some(attempt_id)
+                && current_epoch == Some(epoch)
+                && current_owner == Some(attempt_owner)
+              {
+                False ->
+                  Error(QueueAckStale(
+                    execution,
+                    AckOwnershipChanged(
+                      state:,
+                      attempt_id: current_attempt,
+                      epoch: current_epoch,
+                      owner: current_owner,
+                    ),
+                  ))
+                True ->
+                  case lease_live {
+                    False ->
+                      Error(QueueAckStale(
+                        execution,
+                        AckLeaseExpired(attempt_id, epoch, attempt_owner),
+                      ))
+                    True ->
+                      Error(QueueAckStale(
+                        execution,
+                        AckRecordChanged(
+                          state:,
+                          attempt_id: current_attempt,
+                          epoch: current_epoch,
+                          owner: current_owner,
+                        ),
+                      ))
+                  }
+              }
+            _ -> Error(QueueAckStale(execution, AckStateChanged(state)))
+          }
+        _ -> Error(QueueAckRejected)
+      }
+  }
+}
+
+fn acknowledgement_command_id(
+  job_id: Int,
+  attempt_id: Int,
+  epoch: Int,
+) -> String {
+  "grind-ack:"
+  <> int.to_string(job_id)
+  <> ":"
+  <> int.to_string(attempt_id)
+  <> ":"
+  <> int.to_string(epoch)
+}
+
+fn matching_acknowledgement(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  attempt_owner: String,
+  claim: Claim,
+  command_id: String,
+  proposal: AckProposal,
+) -> Result(Option(Bool), QueueRunError) {
+  let Claim(id:, attempt_id:, epoch:, worker_id:, worker_version:, ..) = claim
+  let AckProposal(
+    state:,
+    output_version:,
+    output:,
+    error_version:,
+    error:,
+    failure_description:,
+  ) = proposal
+  let query =
+    pog.query(
+      "SELECT storage_owner = $1 AND command_id = $2 AND queue = $3 AND job_id = $4 AND worker_id = $5 AND worker_version = $6 AND attempt_id = $7 AND attempt_epoch = $8 AND attempt_owner = $9 AND proposed_state = $10 AND committed_state = $10 AND output_version IS NOT DISTINCT FROM $11 AND output IS NOT DISTINCT FROM $12::jsonb AND error_version IS NOT DISTINCT FROM $13 AND error IS NOT DISTINCT FROM $14::jsonb AND failure_description IS NOT DISTINCT FROM $15 FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(command_id))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.int(id))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(worker_version))
+    |> pog.parameter(pog.int(attempt_id))
+    |> pog.parameter(pog.int(epoch))
+    |> pog.parameter(pog.text(attempt_owner))
+    |> pog.parameter(pog.text(state))
+    |> pog.parameter(pog.nullable(pog.text, output_version))
+    |> pog.parameter(pog.nullable(pog.text, output))
+    |> pog.parameter(pog.nullable(pog.text, error_version))
+    |> pog.parameter(pog.nullable(pog.text, error))
+    |> pog.parameter(pog.nullable(pog.text, failure_description))
+    |> pog.returning({
+      use matches <- decode.field(0, decode.bool)
+      decode.success(matches)
+    })
+  case execute_safely(query, on: connection) {
+    Error(error) -> Error(QueueAckFailed(error))
+    Ok(returned) ->
+      case returned.rows {
+        [] -> Ok(None)
+        [matches] -> Ok(Some(matches))
+        _ -> Error(QueueAckRejected)
+      }
+  }
+}
+
+fn insert_acknowledgement(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  attempt_owner: String,
+  claim: Claim,
+  command_id: String,
+  proposal: AckProposal,
+) -> Result(Bool, QueueRunError) {
+  let Claim(id:, attempt_id:, epoch:, worker_id:, worker_version:, ..) = claim
+  let AckProposal(
+    state:,
+    output_version:,
+    output:,
+    error_version:,
+    error:,
+    failure_description:,
+  ) = proposal
+  let query =
+    pog.query(
+      "INSERT INTO grind_job_acknowledgements (storage_owner, command_id, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, attempt_owner, proposed_state, committed_state, output_version, output, error_version, error, failure_description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12::jsonb, $13, $14::jsonb, $15) RETURNING command_id",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(command_id))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.int(id))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(worker_version))
+    |> pog.parameter(pog.int(attempt_id))
+    |> pog.parameter(pog.int(epoch))
+    |> pog.parameter(pog.text(attempt_owner))
+    |> pog.parameter(pog.text(state))
+    |> pog.parameter(pog.nullable(pog.text, output_version))
+    |> pog.parameter(pog.nullable(pog.text, output))
+    |> pog.parameter(pog.nullable(pog.text, error_version))
+    |> pog.parameter(pog.nullable(pog.text, error))
+    |> pog.parameter(pog.nullable(pog.text, failure_description))
+    |> pog.returning({
+      use inserted_command_id <- decode.field(0, decode.string)
+      decode.success(inserted_command_id)
+    })
+  case execute_safely(query, on: connection) {
+    Error(error) -> Error(QueueAckFailed(error))
+    Ok(returned) ->
+      case returned.rows {
         [_] -> Ok(True)
         _ -> Error(QueueAckRejected)
       }
@@ -1786,7 +2710,7 @@ pub fn state(
         state,
       ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(StateQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -1887,7 +2811,7 @@ pub fn outcome(
         failure_description,
       ))
     })
-  case pog.execute(query, on: connection) {
+  case execute_safely(query, on: connection) {
     Error(error) -> Error(OutcomeQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
@@ -1905,6 +2829,137 @@ pub fn outcome(
           )
         _ -> Error(OutcomeJobNotFound)
       }
+  }
+}
+
+/// Reads an acknowledgement receipt by its stable command ID and decodes the
+/// committed result with the codecs retained by this typed handle.
+pub fn reconcile_acknowledgement(
+  database: Database,
+  handle: JobHandle(input, output, error),
+  command_id: String,
+) -> Result(AcknowledgementReceipt(output, error), AckReconciliationError) {
+  let Database(connection:, storage_owner: database_owner, ..) = database
+  let #(id, handle_owner, queue, worker_id, worker_version, _) =
+    job.storage_fields(handle)
+  let #(_, _, _, _, _, output_codec, error_codec) = job.result_fields(handle)
+  case handle_owner == database_owner {
+    False -> Error(AckReceiptStorageOwnerMismatch)
+    True -> {
+      let query =
+        pog.query(
+          "SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, proposed_state, committed_state, output::text, output_version, error::text, error_version, failure_description FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2",
+        )
+        |> pog.parameter(pog.text(database_owner))
+        |> pog.parameter(pog.text(command_id))
+        |> pog.returning({
+          use stored_owner <- decode.field(0, decode.string)
+          use stored_queue <- decode.field(1, decode.string)
+          use stored_id <- decode.field(2, decode.int)
+          use stored_worker <- decode.field(3, decode.string)
+          use stored_worker_version <- decode.field(4, decode.string)
+          use attempt_id <- decode.field(5, decode.int)
+          use attempt_epoch <- decode.field(6, decode.int)
+          use proposed_state <- decode.field(7, decode.string)
+          use committed_state <- decode.field(8, decode.string)
+          use encoded_output <- decode.field(9, decode.optional(decode.string))
+          use output_version <- decode.field(10, decode.optional(decode.string))
+          use encoded_error <- decode.field(11, decode.optional(decode.string))
+          use error_version <- decode.field(12, decode.optional(decode.string))
+          use failure_description <- decode.field(
+            13,
+            decode.optional(decode.string),
+          )
+          decode.success(#(
+            stored_owner,
+            stored_queue,
+            stored_id,
+            stored_worker,
+            stored_worker_version,
+            attempt_id,
+            attempt_epoch,
+            proposed_state,
+            committed_state,
+            encoded_output,
+            output_version,
+            encoded_error,
+            error_version,
+            failure_description,
+          ))
+        })
+      case execute_safely(query, on: connection) {
+        Error(error) -> Error(AckReceiptQueryFailed(error))
+        Ok(returned) ->
+          case returned.rows {
+            [] -> Error(AckReceiptNotFound)
+            [receipt] -> {
+              let #(
+                stored_owner,
+                stored_queue,
+                stored_id,
+                stored_worker,
+                stored_worker_version,
+                attempt_id,
+                attempt_epoch,
+                proposed_state,
+                committed_state,
+                encoded_output,
+                output_version,
+                encoded_error,
+                error_version,
+                failure_description,
+              ) = receipt
+              case stored_owner == database_owner && stored_id == id {
+                False -> Error(AckReceiptStorageOwnerMismatch)
+                True ->
+                  case stored_queue == queue {
+                    False -> Error(AckReceiptRouteMismatch)
+                    True ->
+                      case
+                        stored_worker == worker_id
+                        && stored_worker_version == worker_version
+                      {
+                        False -> Error(AckReceiptWorkerContractMismatch)
+                        True ->
+                          case proposed_state == committed_state {
+                            False -> Error(AckReceiptPayloadMismatch)
+                            True -> {
+                              let result =
+                                outcome_value(
+                                  committed_state,
+                                  output_codec,
+                                  error_codec,
+                                  encoded_output,
+                                  output_version |> option.unwrap(""),
+                                  encoded_error,
+                                  error_version,
+                                  failure_description,
+                                )
+                              case result {
+                                Ok(outcome) ->
+                                  Ok(AcknowledgementReceipt(
+                                    command_id:,
+                                    attempt_id:,
+                                    attempt_epoch:,
+                                    outcome:,
+                                  ))
+                                Error(OutcomeCodecFailed(error)) ->
+                                  Error(AckReceiptCodecFailed(error))
+                                Error(InvalidOutcomeState(state)) ->
+                                  Error(AckReceiptInvalidState(state))
+                                Error(_) ->
+                                  Error(AckReceiptInvalidState(committed_state))
+                              }
+                            }
+                          }
+                      }
+                  }
+              }
+            }
+            _ -> Error(AckReceiptNotFound)
+          }
+      }
+    }
   }
 }
 
