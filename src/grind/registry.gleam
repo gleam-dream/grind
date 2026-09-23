@@ -14,7 +14,7 @@ type Selection {
     input_version: String,
     output_version: String,
     error_version: Option(String),
-    run: fn(String, String) -> worker.Execution,
+    run: fn(String, String, worker.RetryContext) -> worker.Execution,
   )
 }
 
@@ -43,6 +43,7 @@ pub fn register(
     input_version:,
     output_version:,
     error_version:,
+    ..,
   ) = metadata
   case
     list.any(workers, fn(selection) {
@@ -61,8 +62,13 @@ pub fn register(
             input_version:,
             output_version:,
             error_version:,
-            run: fn(input_version, encoded_input) {
-              worker.execute_encoded(worker, input_version, encoded_input)
+            run: fn(input_version, encoded_input, context) {
+              worker.execute_encoded(
+                worker,
+                input_version,
+                encoded_input,
+                context,
+              )
             },
           ),
           ..workers
@@ -98,7 +104,12 @@ pub fn select(
   id: String,
   version: String,
 ) -> Result(
-  #(String, String, Option(String), fn(String, String) -> worker.Execution),
+  #(
+    String,
+    String,
+    Option(String),
+    fn(String, String, worker.RetryContext) -> worker.Execution,
+  ),
   SelectionError,
 ) {
   let Registry(queue: registered_queue, workers: workers) = registry

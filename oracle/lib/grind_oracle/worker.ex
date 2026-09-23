@@ -4,4 +4,5 @@ defmodule GrindOracle.Worker do
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "success", "value" => value}}), do: {:ok, value + 1}
   def perform(%Oban.Job{args: %{"mode" => "failure"}}), do: {:error, "business failure"}
+  def perform(%Oban.Job{args: %{"mode" => "snooze"}}), do: {:snooze, 60}
 end

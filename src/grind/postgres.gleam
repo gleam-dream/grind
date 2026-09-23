@@ -822,14 +822,14 @@ fn read_installed_schema_version(
   let attempt_sequence_valid = has_attempt_sequence
   case
     has_jobs,
-    count == maximum && minimum == 1 && maximum > 0 && maximum <= 4,
+    count == maximum && minimum == 1 && maximum > 0 && maximum <= 6,
     v3_evidence_valid,
     v4_evidence_valid,
     attempt_sequence_valid
   {
     False, _, _, _, _ -> Error(IncompatibleSchema)
     _, False, _, _, _ ->
-      case maximum > 4 {
+      case maximum > 6 {
         True -> Error(UnsupportedSchemaVersion(maximum))
         False -> Error(IncompatibleSchema)
       }
@@ -858,10 +858,10 @@ fn migrate_transaction(
     <> "id bigserial PRIMARY KEY, storage_owner text NOT NULL, queue text NOT NULL, "
     <> "worker_id text NOT NULL, worker_version text NOT NULL, input_version text NOT NULL, input jsonb NOT NULL, "
     <> "output_version text NOT NULL, output jsonb, error_version text, error jsonb, "
-    <> "state text NOT NULL CONSTRAINT grind_jobs_state_check CHECK (state IN ('queued', 'scheduled', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled')), "
+    <> "state text NOT NULL CONSTRAINT grind_jobs_state_check CHECK (state IN ('queued', 'scheduled', 'retryable', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled')), "
     <> "available_at timestamptz NOT NULL, inserted_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
     <> "attempt_id bigint, attempt_epoch bigint NOT NULL DEFAULT 0, attempt_owner text, "
-    <> "lease_expires_at timestamptz, attempt_count bigint NOT NULL DEFAULT 0, failure_description text, uncertain_at timestamptz)"
+    <> "lease_expires_at timestamptz, attempt_count bigint NOT NULL DEFAULT 0, max_attempts bigint NOT NULL DEFAULT 20, delivery_count bigint NOT NULL DEFAULT 0, snooze_count bigint NOT NULL DEFAULT 0, failure_description text, failure_cause text, uncertain_at timestamptz, CONSTRAINT grind_jobs_max_attempts_check CHECK (max_attempts > 0))"
   let queue_policies_sql =
     "CREATE TABLE IF NOT EXISTS grind_queue_policies ("
     <> "storage_owner text NOT NULL, queue text NOT NULL, "
@@ -881,9 +881,9 @@ fn migrate_transaction(
     "CREATE TABLE IF NOT EXISTS grind_job_acknowledgements ("
     <> "storage_owner text NOT NULL, command_id text NOT NULL, queue text NOT NULL, job_id bigint NOT NULL, "
     <> "worker_id text NOT NULL, worker_version text NOT NULL, attempt_id bigint NOT NULL, attempt_epoch bigint NOT NULL, "
-    <> "attempt_owner text NOT NULL, proposed_state text NOT NULL CONSTRAINT grind_job_acknowledgements_proposed_state_check CHECK (proposed_state IN ('succeeded', 'business_failed', 'runtime_failed')), "
-    <> "committed_state text NOT NULL CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'runtime_failed')), "
-    <> "output_version text, output jsonb, error_version text, error jsonb, failure_description text, "
+    <> "attempt_owner text NOT NULL, proposed_state text NOT NULL CONSTRAINT grind_job_acknowledgements_proposed_state_check CHECK (proposed_state IN ('succeeded', 'business_failed', 'retryable', 'runtime_failed', 'snoozed', 'discarded', 'cancelled', 'uncertain')), "
+    <> "committed_state text NOT NULL CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'retryable', 'runtime_failed', 'scheduled', 'discarded', 'cancelled', 'uncertain')), "
+    <> "output_version text, output jsonb, error_version text, error jsonb, failure_description text, requested_delay_ms bigint, failure_cause text, "
     <> "committed_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
     <> "CONSTRAINT grind_job_acknowledgements_pkey PRIMARY KEY (storage_owner, command_id), "
     <> "CONSTRAINT grind_job_acknowledgements_attempt_key UNIQUE (storage_owner, job_id, attempt_id, attempt_epoch))"
@@ -908,11 +908,12 @@ fn migrate_transaction(
       use #(job_columns, job_columns_valid) <- result.try(inspect_columns(
         connection,
         "grind_jobs",
-        "(column_name = 'id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'storage_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'queue' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'worker_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'worker_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'input_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'input' AND data_type = 'jsonb' AND is_nullable = 'NO') OR (column_name = 'output_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'output' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'error_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'error' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'available_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'NO') OR (column_name = 'inserted_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'NO') OR (column_name = 'attempt_id' AND data_type = 'bigint' AND is_nullable = 'YES') OR (column_name = 'attempt_epoch' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_owner' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'lease_expires_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'YES') OR (column_name = 'attempt_count' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'failure_description' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'uncertain_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'YES')",
+        "(column_name = 'id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'storage_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'queue' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'worker_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'worker_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'input_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'input' AND data_type = 'jsonb' AND is_nullable = 'NO') OR (column_name = 'output_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'output' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'error_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'error' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'available_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'NO') OR (column_name = 'inserted_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'NO') OR (column_name = 'attempt_id' AND data_type = 'bigint' AND is_nullable = 'YES') OR (column_name = 'attempt_epoch' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_owner' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'lease_expires_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'YES') OR (column_name = 'attempt_count' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'snooze_count' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'failure_description' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'uncertain_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'YES')",
       ))
-      case job_columns == 21 && job_columns_valid == 21 {
+      case job_columns == 25 && job_columns_valid == 22 {
         False -> Error(IncompatibleSchema)
         True -> {
+          use _ <- result.try(validate_v6_job_columns(connection))
           use #(queue_columns, queue_columns_valid) <- result.try(
             inspect_columns(
               connection,
@@ -935,14 +936,17 @@ fn migrate_transaction(
                     inspect_columns(
                       connection,
                       "grind_job_acknowledgements",
-                      "(column_name = 'storage_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'command_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'queue' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'job_id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'worker_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'worker_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'attempt_id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_epoch' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'proposed_state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'committed_state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'output_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'output' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'error_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'error' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'failure_description' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'committed_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'NO')",
+                      "(column_name = 'storage_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'command_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'queue' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'job_id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'worker_id' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'worker_version' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'attempt_id' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_epoch' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'attempt_owner' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'proposed_state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'committed_state' AND data_type = 'text' AND is_nullable = 'NO') OR (column_name = 'output_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'output' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'error_version' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'error' AND data_type = 'jsonb' AND is_nullable = 'YES') OR (column_name = 'failure_description' AND data_type = 'text' AND is_nullable = 'YES') OR (column_name = 'requested_delay_ms' AND data_type = 'bigint' AND is_nullable = 'YES') OR (column_name = 'committed_at' AND data_type = 'timestamp with time zone' AND is_nullable = 'NO')",
                     ),
                   )
                   case
-                    acknowledgement_columns == 17
-                    && acknowledgement_columns_valid == 17
+                    acknowledgement_columns == 19
+                    && acknowledgement_columns_valid == 18
                   {
-                    True -> validate_schema_contract(connection)
+                    True -> {
+                      use _ <- result.try(validate_v6_ack_columns(connection))
+                      validate_schema_contract(connection)
+                    }
                     False -> Error(IncompatibleSchema)
                   }
                 }
@@ -984,21 +988,207 @@ fn upgrade_schema_versions(
     0, 0, 0 ->
       run_statement(
         connection,
-        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3), (4)",
+        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3), (4), (5), (6)",
       )
     1, 1, 1 -> {
       use _ <- result.try(upgrade_schema_v1_to_v2(connection))
       use _ <- result.try(upgrade_schema_v2_to_v3(connection))
-      upgrade_schema_v3_to_v4(connection)
+      use _ <- result.try(upgrade_schema_v3_to_v4(connection))
+      use _ <- result.try(upgrade_schema_v4_to_v5(connection))
+      upgrade_schema_v5_to_v6(connection)
     }
     2, 1, 2 -> {
       use _ <- result.try(upgrade_schema_v2_to_v3(connection))
-      upgrade_schema_v3_to_v4(connection)
+      use _ <- result.try(upgrade_schema_v3_to_v4(connection))
+      use _ <- result.try(upgrade_schema_v4_to_v5(connection))
+      upgrade_schema_v5_to_v6(connection)
     }
-    3, 1, 3 -> upgrade_schema_v3_to_v4(connection)
-    4, 1, 4 -> Ok(Nil)
+    3, 1, 3 -> {
+      use _ <- result.try(upgrade_schema_v3_to_v4(connection))
+      use _ <- result.try(upgrade_schema_v4_to_v5(connection))
+      upgrade_schema_v5_to_v6(connection)
+    }
+    4, 1, 4 -> {
+      use _ <- result.try(upgrade_schema_v4_to_v5(connection))
+      upgrade_schema_v5_to_v6(connection)
+    }
+    5, 1, 5 -> upgrade_schema_v5_to_v6(connection)
+    6, 1, 6 -> Ok(Nil)
     _, _, unsupported -> Error(UnsupportedSchemaVersion(unsupported))
   }
+}
+
+fn upgrade_schema_v4_to_v5(
+  connection: pog.Connection,
+) -> Result(Nil, StorageError) {
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs ADD COLUMN IF NOT EXISTS snooze_count bigint NOT NULL DEFAULT 0",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements ADD COLUMN IF NOT EXISTS requested_delay_ms bigint",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_proposed_state_check",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_committed_state_check",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_proposed_state_check CHECK (proposed_state IN ('succeeded', 'business_failed', 'runtime_failed', 'snoozed', 'discarded', 'cancelled', 'uncertain'))",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'runtime_failed', 'scheduled', 'discarded', 'cancelled', 'uncertain'))",
+  ))
+  run_statement(
+    connection,
+    "INSERT INTO grind_schema_migrations (version) VALUES (5)",
+  )
+}
+
+fn validate_v6_job_columns(
+  connection: pog.Connection,
+) -> Result(Nil, StorageError) {
+  use #(columns, valid) <- result.try(inspect_columns(
+    connection,
+    "grind_jobs",
+    "(column_name = 'max_attempts' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'delivery_count' AND data_type = 'bigint' AND is_nullable = 'NO') OR (column_name = 'failure_cause' AND data_type = 'text' AND is_nullable = 'YES')",
+  ))
+  use limit_check <- result.try(exact_constraint_count(
+    connection,
+    "grind_jobs",
+    "grind_jobs_max_attempts_check",
+    "CHECK ((max_attempts > 0))",
+  ))
+  use max_attempts_default <- result.try(exact_column_default_count(
+    connection,
+    "grind_jobs",
+    "max_attempts",
+    "20",
+  ))
+  use delivery_count_default <- result.try(exact_column_default_count(
+    connection,
+    "grind_jobs",
+    "delivery_count",
+    "0",
+  ))
+  case
+    columns == 25
+    && valid == 3
+    && limit_check == 1
+    && max_attempts_default == 1
+    && delivery_count_default == 1
+  {
+    True -> Ok(Nil)
+    False -> Error(IncompatibleSchema)
+  }
+}
+
+fn exact_column_default_count(
+  connection: pog.Connection,
+  table: String,
+  column: String,
+  expression: String,
+) -> Result(Int, StorageError) {
+  let query =
+    pog.query(
+      "SELECT count(*)::bigint FROM pg_attribute a JOIN pg_class t ON t.oid = a.attrelid JOIN pg_namespace n ON n.oid = t.relnamespace JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum WHERE n.nspname = current_schema() AND t.relname = $1 AND a.attname = $2 AND NOT a.attisdropped AND pg_get_expr(d.adbin, d.adrelid) = $3",
+    )
+    |> pog.parameter(pog.text(table))
+    |> pog.parameter(pog.text(column))
+    |> pog.parameter(pog.text(expression))
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+  case execute_safely(query, on: connection) {
+    Error(error) -> Error(MigrationQueryFailed(error))
+    Ok(returned) ->
+      case returned.rows {
+        [count] -> Ok(count)
+        _ -> Error(IncompatibleSchema)
+      }
+  }
+}
+
+fn validate_v6_ack_columns(
+  connection: pog.Connection,
+) -> Result(Nil, StorageError) {
+  use #(columns, valid) <- result.try(inspect_columns(
+    connection,
+    "grind_job_acknowledgements",
+    "column_name = 'failure_cause' AND data_type = 'text' AND is_nullable = 'YES'",
+  ))
+  case columns == 19 && valid == 1 {
+    True -> Ok(Nil)
+    False -> Error(IncompatibleSchema)
+  }
+}
+
+fn upgrade_schema_v5_to_v6(
+  connection: pog.Connection,
+) -> Result(Nil, StorageError) {
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs ADD COLUMN IF NOT EXISTS max_attempts bigint NOT NULL DEFAULT 20",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs ADD COLUMN IF NOT EXISTS delivery_count bigint NOT NULL DEFAULT 0",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs ADD COLUMN IF NOT EXISTS failure_cause text",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs DROP CONSTRAINT IF EXISTS grind_jobs_max_attempts_check",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_max_attempts_check CHECK (max_attempts > 0)",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "UPDATE grind_jobs SET delivery_count = attempt_count WHERE delivery_count = 0 AND attempt_count > 0",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs DROP CONSTRAINT IF EXISTS grind_jobs_state_check",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_state_check CHECK (state IN ('queued', 'scheduled', 'retryable', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled'))",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements ADD COLUMN IF NOT EXISTS failure_cause text",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT IF EXISTS grind_job_acknowledgements_proposed_state_check",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT IF EXISTS grind_job_acknowledgements_committed_state_check",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_proposed_state_check CHECK (proposed_state IN ('succeeded', 'business_failed', 'retryable', 'runtime_failed', 'snoozed', 'discarded', 'cancelled', 'uncertain'))",
+  ))
+  use _ <- result.try(run_statement(
+    connection,
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'retryable', 'runtime_failed', 'scheduled', 'discarded', 'cancelled', 'uncertain'))",
+  ))
+  run_statement(
+    connection,
+    "INSERT INTO grind_schema_migrations (version) VALUES (6)",
+  )
 }
 
 fn upgrade_schema_v2_to_v3(
@@ -1160,9 +1350,9 @@ fn ensure_schema_version(
     0, 0, 0 ->
       run_statement(
         connection,
-        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3), (4)",
+        "INSERT INTO grind_schema_migrations (version) VALUES (1), (2), (3), (4), (5), (6)",
       )
-    4, 1, 4 -> Ok(Nil)
+    6, 1, 6 -> Ok(Nil)
     _, _, unsupported -> Error(UnsupportedSchemaVersion(unsupported))
   }
 }
@@ -1171,7 +1361,7 @@ fn validate_schema_contract(
   connection: pog.Connection,
 ) -> Result(Nil, StorageError) {
   let expected_state_check =
-    "CHECK ((state = ANY (ARRAY['queued'::text, 'scheduled'::text, 'executing'::text, 'succeeded'::text, 'business_failed'::text, 'runtime_failed'::text, 'contract_mismatch'::text, 'uncertain'::text, 'discarded'::text, 'cancelled'::text])))"
+    "CHECK ((state = ANY (ARRAY['queued'::text, 'scheduled'::text, 'retryable'::text, 'executing'::text, 'succeeded'::text, 'business_failed'::text, 'runtime_failed'::text, 'contract_mismatch'::text, 'uncertain'::text, 'discarded'::text, 'cancelled'::text])))"
   let expected_queue_policy_check =
     "CHECK ((expired_attempt_policy = ANY (ARRAY['require_reconciliation'::text, 'replay_at_least_once'::text])))"
   let expected_resolution_check =
@@ -1179,9 +1369,9 @@ fn validate_schema_contract(
   let expected_resolution_target_check =
     "CHECK ((target_state = ANY (ARRAY['queued'::text, 'succeeded'::text, 'business_failed'::text])))"
   let expected_ack_state_check =
-    "CHECK ((proposed_state = ANY (ARRAY['succeeded'::text, 'business_failed'::text, 'runtime_failed'::text])))"
+    "CHECK ((proposed_state = ANY (ARRAY['succeeded'::text, 'business_failed'::text, 'retryable'::text, 'runtime_failed'::text, 'snoozed'::text, 'discarded'::text, 'cancelled'::text, 'uncertain'::text])))"
   let expected_ack_committed_check =
-    "CHECK ((committed_state = ANY (ARRAY['succeeded'::text, 'business_failed'::text, 'runtime_failed'::text])))"
+    "CHECK ((committed_state = ANY (ARRAY['succeeded'::text, 'business_failed'::text, 'retryable'::text, 'runtime_failed'::text, 'scheduled'::text, 'discarded'::text, 'cancelled'::text, 'uncertain'::text])))"
   use resolution_target_check <- result.try(exact_constraint_count(
     connection,
     "grind_job_resolutions",
@@ -1241,7 +1431,7 @@ fn validate_schema_contract(
     Error(error) -> Error(MigrationQueryFailed(error))
     Ok(returned) ->
       case returned.rows {
-        [#(1, 1, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 3)] ->
+        [#(1, 1, 1, 1, 1, 3, 1, 1, 1, 2, 1, 1, 3)] ->
           case resolution_target_check == 1 {
             True ->
               case
@@ -1360,6 +1550,7 @@ fn submit_with_availability(
         input_version:,
         output_version:,
         error_version:,
+        max_attempts:,
       ) = worker.metadata(worker)
       let error_parameter = case error_version {
         Some(version) -> pog.text(version)
@@ -1370,10 +1561,10 @@ fn submit_with_availability(
         None -> pog.null()
       }
       let sql =
-        "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, error_version, state, available_at) "
-        <> "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, "
-        <> "CASE WHEN $9::bigint IS NULL OR $9::bigint <= (extract(epoch FROM clock_timestamp()) * 1000)::bigint THEN 'queued' ELSE 'scheduled' END, "
-        <> "CASE WHEN $9::bigint IS NULL THEN clock_timestamp() ELSE to_timestamp($9::double precision / 1000.0) END) RETURNING id"
+        "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at) "
+        <> "VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, "
+        <> "CASE WHEN $10::bigint IS NULL OR $10::bigint <= (extract(epoch FROM clock_timestamp()) * 1000)::bigint THEN 'queued' ELSE 'scheduled' END, "
+        <> "CASE WHEN $10::bigint IS NULL THEN clock_timestamp() ELSE to_timestamp($10::double precision / 1000.0) END) RETURNING id"
       let query =
         pog.query(sql)
         |> pog.parameter(pog.text(storage_owner))
@@ -1384,6 +1575,7 @@ fn submit_with_availability(
         |> pog.parameter(pog.text(worker.encode_input(worker, input)))
         |> pog.parameter(pog.text(output_version))
         |> pog.parameter(error_parameter)
+        |> pog.parameter(pog.int(max_attempts))
         |> pog.parameter(availability_parameter)
         |> pog.returning({
           use id <- decode.field(0, decode.int)
@@ -1437,6 +1629,7 @@ pub fn bind_handle(
     input_version: expected_input_version,
     output_version: expected_output_version,
     error_version: expected_error_version,
+    ..,
   ) = worker.metadata(worker)
   let query =
     pog.query(
@@ -1652,12 +1845,21 @@ type Claim {
     worker_version: String,
     output_version: String,
     error_version: Option(String),
+    current_attempt: Int,
+    max_attempts: Int,
+    snooze_count: Int,
+    delivery_count: Int,
+    business_attempt_charged: Bool,
+    previous_state: String,
   )
 }
 
 type AckProposal {
   AckProposal(
-    state: String,
+    proposed_state: String,
+    committed_state: String,
+    failure_cause: Option(String),
+    requested_delay_ms: Option(Int),
     output_version: Option(String),
     output: Option(String),
     error_version: Option(String),
@@ -1751,8 +1953,19 @@ pub fn execute_claim(claimed: ClaimedJob) -> worker.Execution {
 /// Returns stable fencing fields for the queue actor's private active entry.
 @internal
 pub fn claim_identity(claimed: ClaimedJob) -> #(Int, Int, Int) {
-  let ClaimedJob(claim: Claim(id:, attempt_id:, epoch:, ..), ..) = claimed
+  let ClaimedJob(claim: claim, ..) = claimed
+  let Claim(id:, attempt_id:, epoch:, ..) = claim
   #(id, attempt_id, epoch)
+}
+
+fn claim_business_attempt_charged(claim: Claim) -> Bool {
+  let Claim(business_attempt_charged:, ..) = claim
+  business_attempt_charged
+}
+
+fn claim_previous_state(claim: Claim) -> String {
+  let Claim(previous_state:, ..) = claim
+  previous_state
 }
 
 /// Extends the current lease using PostgreSQL's clock and current row values.
@@ -1766,7 +1979,8 @@ pub fn renew_claim(
   lease_duration_ms: Int,
 ) -> Result(Bool, QueueRunError) {
   let Database(connection:, storage_owner:, ..) = database
-  let ClaimedJob(claim: Claim(id:, attempt_id:, epoch:, ..), ..) = claimed
+  let ClaimedJob(claim: claim, ..) = claimed
+  let Claim(id:, attempt_id:, epoch:, ..) = claim
   let query =
     pog.query(
       "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() + ($7::double precision * interval '1 millisecond') WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND lease_expires_at > clock_timestamp() RETURNING id",
@@ -1796,6 +2010,10 @@ pub fn renew_claim(
 /// Releases a claim only when its exact attempt still owns the executing row.
 /// This is used only when the temporary worker child failed to start before
 /// receiving `StartAttempt`, so it is safe to refund the uninvoked attempt.
+/// An unstarted replay of an expired executing row keeps its new fenced owner
+/// and records that the earlier external effect remains unconfirmed. The
+/// expired row can then be quarantined and audited instead of becoming an
+/// ownerless reconciliation sink.
 @internal
 pub fn release_unstarted_claim(
   database: Database,
@@ -1804,10 +2022,11 @@ pub fn release_unstarted_claim(
   claimed: ClaimedJob,
 ) -> Result(Bool, QueueRunError) {
   let Database(connection:, storage_owner:, ..) = database
-  let ClaimedJob(claim: Claim(id:, attempt_id:, epoch:, ..), ..) = claimed
+  let ClaimedJob(claim: claim, ..) = claimed
+  let Claim(id:, attempt_id:, epoch:, ..) = claim
   let query =
     pog.query(
-      "UPDATE grind_jobs SET state = 'queued', attempt_epoch = attempt_epoch + 1, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0) WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 RETURNING id",
+      "UPDATE grind_jobs SET state = CASE WHEN $7 = 'executing' THEN 'executing' ELSE $7 END, attempt_epoch = attempt_epoch + 1, attempt_owner = CASE WHEN $7 = 'executing' THEN $6 ELSE NULL END, lease_expires_at = CASE WHEN $7 = 'executing' THEN clock_timestamp() ELSE NULL END, failure_description = CASE WHEN $7 = 'executing' THEN 'Unstarted replay claim; prior effect remains unconfirmed' ELSE failure_description END, attempt_count = CASE WHEN $8 THEN GREATEST(attempt_count - 1, 0) ELSE attempt_count END WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 RETURNING id",
     )
     |> pog.parameter(pog.int(id))
     |> pog.parameter(pog.text(storage_owner))
@@ -1815,6 +2034,8 @@ pub fn release_unstarted_claim(
     |> pog.parameter(pog.int(attempt_id))
     |> pog.parameter(pog.int(epoch))
     |> pog.parameter(pog.text(attempt_owner))
+    |> pog.parameter(pog.text(claim_previous_state(claim)))
+    |> pog.parameter(pog.bool(claim_business_attempt_charged(claim)))
     |> pog.returning({
       use returned_id <- decode.field(0, decode.int)
       decode.success(returned_id)
@@ -1879,7 +2100,26 @@ fn acknowledge_claim_with_reply_mode(
             actual_version,
           ))
       }
-    worker.ExecutedBusinessFailure(actual_version, _, _) ->
+    worker.ExecutedBusinessFailure(actual_version, _, _, _) ->
+      case actual_version == error_version {
+        True ->
+          acknowledge(
+            database,
+            queue,
+            attempt_owner,
+            claim,
+            execution,
+            output_version,
+            simulate_lost_reply,
+          )
+        False ->
+          Error(QueueAckProposalCodecMismatch(
+            "error",
+            option_version(error_version),
+            option_version(actual_version),
+          ))
+      }
+    worker.ExecutedRetryable(actual_version, _, _, _) ->
       case actual_version == error_version {
         True ->
           acknowledge(
@@ -1899,6 +2139,19 @@ fn acknowledge_claim_with_reply_mode(
           ))
       }
     worker.ExecutedInvalidInput(_) ->
+      acknowledge(
+        database,
+        queue,
+        attempt_owner,
+        claim,
+        execution,
+        output_version,
+        simulate_lost_reply,
+      )
+    worker.ExecutedSnoozed(_, _)
+    | worker.ExecutedDiscarded(_)
+    | worker.ExecutedCancelled(_)
+    | worker.ExecutedUncertain(_) ->
       acknowledge(
         database,
         queue,
@@ -1976,16 +2229,16 @@ fn claim_registered_job(
     |> string.join(" OR ")
   let eligible_state = case replay_expired {
     True ->
-      "((state IN ('queued', 'scheduled') AND available_at <= clock_timestamp()) OR (state = 'executing' AND lease_expires_at <= clock_timestamp()))"
+      "((state IN ('queued', 'scheduled', 'retryable') AND available_at <= clock_timestamp()) OR (state = 'executing' AND lease_expires_at <= clock_timestamp()))"
     False ->
-      "(state IN ('queued', 'scheduled') AND available_at <= clock_timestamp())"
+      "(state IN ('queued', 'scheduled', 'retryable') AND available_at <= clock_timestamp())"
   }
   let sql =
-    "WITH candidate AS (SELECT id FROM grind_jobs WHERE storage_owner = $1 AND queue = $2 AND "
+    "WITH candidate AS (SELECT id, state AS previous_state FROM grind_jobs WHERE storage_owner = $1 AND queue = $2 AND "
     <> eligible_state
     <> " AND ("
     <> eligibility
-    <> ") ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $3, lease_expires_at = clock_timestamp() + ($4::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version"
+    <> ") ORDER BY available_at, id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $3, lease_expires_at = clock_timestamp() + ($4::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + CASE WHEN candidate.previous_state IN ('queued', 'scheduled', 'retryable') THEN 1 ELSE 0 END, delivery_count = job.delivery_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version, job.attempt_count, job.max_attempts, job.snooze_count, job.delivery_count, candidate.previous_state IN ('queued', 'scheduled', 'retryable'), candidate.previous_state"
   let parameters =
     list.append(
       [
@@ -2013,6 +2266,12 @@ fn claim_registered_job(
       use worker_version <- decode.field(6, decode.string)
       use output_version <- decode.field(7, decode.string)
       use error_version <- decode.field(8, decode.optional(decode.string))
+      use current_attempt <- decode.field(9, decode.int)
+      use max_attempts <- decode.field(10, decode.int)
+      use snooze_count <- decode.field(11, decode.int)
+      use delivery_count <- decode.field(12, decode.int)
+      use business_attempt_charged <- decode.field(13, decode.bool)
+      use previous_state <- decode.field(14, decode.string)
       decode.success(Claim(
         id:,
         attempt_id:,
@@ -2023,6 +2282,12 @@ fn claim_registered_job(
         worker_version:,
         output_version:,
         error_version:,
+        current_attempt:,
+        max_attempts:,
+        snooze_count:,
+        delivery_count:,
+        business_attempt_charged:,
+        previous_state:,
       ))
     })
   case execute_safely(query, on: connection) {
@@ -2038,6 +2303,9 @@ fn claim_registered_job(
             worker_version:,
             output_version:,
             error_version:,
+            current_attempt:,
+            max_attempts:,
+            snooze_count:,
             ..,
           ) = claim
           case registry.select(workers, queue, worker_id, worker_version) {
@@ -2075,7 +2343,15 @@ fn claim_registered_job(
                   Ok(
                     Some(
                       ClaimedJob(claim:, run: fn() {
-                        run(input_version, encoded_input)
+                        run(
+                          input_version,
+                          encoded_input,
+                          worker.RetryContext(
+                            current_attempt:,
+                            max_attempts:,
+                            snooze_count:,
+                          ),
+                        )
                       }),
                     ),
                   )
@@ -2110,7 +2386,7 @@ fn quarantine_expired(
       let sql =
         "WITH candidate AS (SELECT id FROM grind_jobs WHERE storage_owner = $1 AND queue = $2 AND state = 'executing' AND lease_expires_at <= clock_timestamp() AND ("
         <> eligibility
-        <> ") ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'uncertain', failure_description = 'expired attempt requires outcome reconciliation', uncertain_at = clock_timestamp() FROM candidate WHERE job.id = candidate.id"
+        <> ") ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'uncertain', failure_description = CASE WHEN job.failure_description IS NULL THEN 'expired attempt requires outcome reconciliation' ELSE job.failure_description || '; expired attempt requires outcome reconciliation' END, uncertain_at = clock_timestamp() FROM candidate WHERE job.id = candidate.id"
       let parameters =
         list.append(
           [pog.text(storage_owner), pog.text(queue)],
@@ -2178,7 +2454,7 @@ fn mark_contract_mismatch(
   let Claim(id:, attempt_id:, epoch:, ..) = claim
   let query =
     pog.query(
-      "UPDATE grind_jobs SET state = 'contract_mismatch', failure_description = $7, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0) WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND lease_expires_at > clock_timestamp() RETURNING id",
+      "UPDATE grind_jobs SET state = 'contract_mismatch', failure_description = $7, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = CASE WHEN $8 THEN GREATEST(attempt_count - 1, 0) ELSE attempt_count END WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND lease_expires_at > clock_timestamp() RETURNING id",
     )
     |> pog.parameter(pog.int(id))
     |> pog.parameter(pog.text(storage_owner))
@@ -2194,6 +2470,7 @@ fn mark_contract_mismatch(
       <> " does not match registered version "
       <> actual,
     ))
+    |> pog.parameter(pog.bool(claim_business_attempt_charged(claim)))
     |> pog.returning({
       use id <- decode.field(0, decode.int)
       decode.success(id)
@@ -2222,16 +2499,34 @@ fn acknowledge(
   let proposal = case execution {
     worker.ExecutedSuccess(version, encoded) ->
       AckProposal(
-        state: "succeeded",
+        proposed_state: "succeeded",
+        committed_state: "succeeded",
+        failure_cause: None,
+        requested_delay_ms: None,
         output_version: Some(version),
         output: Some(encoded),
         error_version: None,
         error: None,
         failure_description: None,
       )
-    worker.ExecutedBusinessFailure(version, encoded, description) ->
+    worker.ExecutedBusinessFailure(version, encoded, description, cause) ->
       AckProposal(
-        state: "business_failed",
+        proposed_state: "business_failed",
+        committed_state: "business_failed",
+        failure_cause: Some(cause),
+        requested_delay_ms: None,
+        output_version: None,
+        output: None,
+        error_version: version,
+        error: encoded,
+        failure_description: Some(description),
+      )
+    worker.ExecutedRetryable(version, encoded, description, delay_ms) ->
+      AckProposal(
+        proposed_state: "retryable",
+        committed_state: "retryable",
+        failure_cause: None,
+        requested_delay_ms: Some(delay_ms),
         output_version: None,
         output: None,
         error_version: version,
@@ -2240,12 +2535,63 @@ fn acknowledge(
       )
     worker.ExecutedInvalidInput(description) ->
       AckProposal(
-        state: "runtime_failed",
+        proposed_state: "runtime_failed",
+        committed_state: "runtime_failed",
+        failure_cause: None,
+        requested_delay_ms: None,
         output_version: None,
         output: None,
         error_version: None,
         error: None,
         failure_description: Some(description),
+      )
+    worker.ExecutedSnoozed(delay_ms, reason) ->
+      AckProposal(
+        proposed_state: "snoozed",
+        committed_state: "scheduled",
+        failure_cause: None,
+        requested_delay_ms: Some(delay_ms),
+        output_version: None,
+        output: None,
+        error_version: None,
+        error: None,
+        failure_description: Some(reason),
+      )
+    worker.ExecutedDiscarded(reason) ->
+      AckProposal(
+        proposed_state: "discarded",
+        committed_state: "discarded",
+        failure_cause: None,
+        requested_delay_ms: None,
+        output_version: None,
+        output: None,
+        error_version: None,
+        error: None,
+        failure_description: Some(reason),
+      )
+    worker.ExecutedCancelled(reason) ->
+      AckProposal(
+        proposed_state: "cancelled",
+        committed_state: "cancelled",
+        failure_cause: None,
+        requested_delay_ms: None,
+        output_version: None,
+        output: None,
+        error_version: None,
+        error: None,
+        failure_description: Some(reason),
+      )
+    worker.ExecutedUncertain(reason) ->
+      AckProposal(
+        proposed_state: "uncertain",
+        committed_state: "uncertain",
+        failure_cause: None,
+        requested_delay_ms: None,
+        output_version: None,
+        output: None,
+        error_version: None,
+        error: None,
+        failure_description: Some(reason),
       )
   }
   let command_id = acknowledgement_command_id(id, attempt_id, epoch)
@@ -2380,18 +2726,28 @@ fn acknowledge_transaction(
     Ok(Some(True)) -> Ok(True)
     Ok(Some(False)) -> Error(QueueAckCommandConflict)
     Ok(None) -> {
-      let Claim(id:, attempt_id:, epoch:, error_version:, ..) = claim
+      let Claim(
+        id:,
+        attempt_id:,
+        epoch:,
+        error_version:,
+        business_attempt_charged:,
+        ..,
+      ) = claim
       let AckProposal(
-        state:,
+        proposed_state:,
+        committed_state: _,
+        failure_cause:,
         output_version: _,
+        requested_delay_ms:,
         output:,
         error_version: proposed_error_version,
         error:,
         failure_description:,
       ) = proposal
-      let #(sql, parameters) = case state {
+      let #(sql, parameters) = case proposed_state {
         "succeeded" -> #(
-          "UPDATE grind_jobs SET state = 'succeeded', output = $1::jsonb, error = NULL, error_version = NULL, failure_description = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND output_version = $8 AND lease_expires_at > clock_timestamp() RETURNING id",
+          "UPDATE grind_jobs SET state = 'succeeded', output = $1::jsonb, error = NULL, error_version = NULL, failure_description = NULL, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND output_version = $8 AND lease_expires_at > clock_timestamp() RETURNING id",
           [
             pog.nullable(pog.text, output),
             pog.int(id),
@@ -2404,8 +2760,25 @@ fn acknowledge_transaction(
           ],
         )
         "business_failed" -> #(
-          "UPDATE grind_jobs SET state = 'business_failed', output = NULL, error = $1::jsonb, error_version = $2, failure_description = $3, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $4 AND storage_owner = $5 AND queue = $6 AND state = 'executing' AND attempt_id = $7 AND attempt_epoch = $8 AND attempt_owner = $9 AND error_version IS NOT DISTINCT FROM $10 AND lease_expires_at > clock_timestamp() RETURNING id",
+          "UPDATE grind_jobs SET state = 'business_failed', output = NULL, error = $1::jsonb, error_version = $2, failure_description = $3, failure_cause = $4, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $5 AND storage_owner = $6 AND queue = $7 AND state = 'executing' AND attempt_id = $8 AND attempt_epoch = $9 AND attempt_owner = $10 AND error_version IS NOT DISTINCT FROM $11 AND lease_expires_at > clock_timestamp() AND (($4 = 'budget_exhausted' AND attempt_count >= max_attempts) OR ($4 = 'retry_declined' AND attempt_count < max_attempts)) RETURNING id",
           [
+            pog.nullable(pog.text, error),
+            pog.nullable(pog.text, proposed_error_version),
+            pog.nullable(pog.text, failure_description),
+            pog.nullable(pog.text, failure_cause),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+            pog.nullable(pog.text, error_version),
+          ],
+        )
+        "retryable" -> #(
+          "UPDATE grind_jobs SET state = 'retryable', available_at = clock_timestamp() + ($1::double precision * interval '1 millisecond'), output = NULL, error = $2::jsonb, error_version = $3, failure_description = $4, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $5 AND storage_owner = $6 AND queue = $7 AND state = 'executing' AND attempt_id = $8 AND attempt_epoch = $9 AND attempt_owner = $10 AND error_version IS NOT DISTINCT FROM $11 AND attempt_count < max_attempts AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.int, requested_delay_ms),
             pog.nullable(pog.text, error),
             pog.nullable(pog.text, proposed_error_version),
             pog.nullable(pog.text, failure_description),
@@ -2418,8 +2791,22 @@ fn acknowledge_transaction(
             pog.nullable(pog.text, error_version),
           ],
         )
-        _ -> #(
-          "UPDATE grind_jobs SET state = 'runtime_failed', output = NULL, error = NULL, error_version = NULL, failure_description = $1, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id",
+        "snoozed" -> #(
+          "UPDATE grind_jobs SET state = 'scheduled', available_at = clock_timestamp() + ($1::double precision * interval '1 millisecond'), snooze_count = snooze_count + 1, attempt_count = CASE WHEN $9 THEN GREATEST(attempt_count - 1, 0) ELSE attempt_count END, output = NULL, error = NULL, error_version = NULL, failure_description = $2, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $3 AND storage_owner = $4 AND queue = $5 AND state = 'executing' AND attempt_id = $6 AND attempt_epoch = $7 AND attempt_owner = $8 AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.int, requested_delay_ms),
+            pog.nullable(pog.text, failure_description),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+            pog.bool(business_attempt_charged),
+          ],
+        )
+        "discarded" -> #(
+          "UPDATE grind_jobs SET state = 'discarded', output = NULL, error = NULL, error_version = NULL, failure_description = $1, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id",
           [
             pog.nullable(pog.text, failure_description),
             pog.int(id),
@@ -2430,6 +2817,43 @@ fn acknowledge_transaction(
             pog.text(attempt_owner),
           ],
         )
+        "cancelled" -> #(
+          "UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, error_version = NULL, failure_description = $1, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.text, failure_description),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+          ],
+        )
+        "uncertain" -> #(
+          "UPDATE grind_jobs SET state = 'uncertain', failure_description = $1, uncertain_at = clock_timestamp() WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.text, failure_description),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+          ],
+        )
+        "runtime_failed" -> #(
+          "UPDATE grind_jobs SET state = 'runtime_failed', output = NULL, error = NULL, error_version = NULL, failure_description = $1, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id",
+          [
+            pog.nullable(pog.text, failure_description),
+            pog.int(id),
+            pog.text(storage_owner),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+          ],
+        )
+        _ -> #("SELECT 1 WHERE FALSE", [])
       }
       let query =
         list.fold(parameters, pog.query(sql), fn(query, parameter) {
@@ -2591,7 +3015,10 @@ fn matching_acknowledgement(
 ) -> Result(Option(Bool), QueueRunError) {
   let Claim(id:, attempt_id:, epoch:, worker_id:, worker_version:, ..) = claim
   let AckProposal(
-    state:,
+    proposed_state:,
+    committed_state:,
+    failure_cause:,
+    requested_delay_ms:,
     output_version:,
     output:,
     error_version:,
@@ -2600,7 +3027,7 @@ fn matching_acknowledgement(
   ) = proposal
   let query =
     pog.query(
-      "SELECT storage_owner = $1 AND command_id = $2 AND queue = $3 AND job_id = $4 AND worker_id = $5 AND worker_version = $6 AND attempt_id = $7 AND attempt_epoch = $8 AND attempt_owner = $9 AND proposed_state = $10 AND committed_state = $10 AND output_version IS NOT DISTINCT FROM $11 AND output IS NOT DISTINCT FROM $12::jsonb AND error_version IS NOT DISTINCT FROM $13 AND error IS NOT DISTINCT FROM $14::jsonb AND failure_description IS NOT DISTINCT FROM $15 FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2",
+      "SELECT storage_owner = $1 AND command_id = $2 AND queue = $3 AND job_id = $4 AND worker_id = $5 AND worker_version = $6 AND attempt_id = $7 AND attempt_epoch = $8 AND attempt_owner = $9 AND proposed_state = $10 AND committed_state = $11 AND requested_delay_ms IS NOT DISTINCT FROM $12 AND output_version IS NOT DISTINCT FROM $13 AND output IS NOT DISTINCT FROM $14::jsonb AND error_version IS NOT DISTINCT FROM $15 AND error IS NOT DISTINCT FROM $16::jsonb AND failure_description IS NOT DISTINCT FROM $17 AND failure_cause IS NOT DISTINCT FROM $18 FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2",
     )
     |> pog.parameter(pog.text(storage_owner))
     |> pog.parameter(pog.text(command_id))
@@ -2611,12 +3038,15 @@ fn matching_acknowledgement(
     |> pog.parameter(pog.int(attempt_id))
     |> pog.parameter(pog.int(epoch))
     |> pog.parameter(pog.text(attempt_owner))
-    |> pog.parameter(pog.text(state))
+    |> pog.parameter(pog.text(proposed_state))
+    |> pog.parameter(pog.text(committed_state))
+    |> pog.parameter(pog.nullable(pog.int, requested_delay_ms))
     |> pog.parameter(pog.nullable(pog.text, output_version))
     |> pog.parameter(pog.nullable(pog.text, output))
     |> pog.parameter(pog.nullable(pog.text, error_version))
     |> pog.parameter(pog.nullable(pog.text, error))
     |> pog.parameter(pog.nullable(pog.text, failure_description))
+    |> pog.parameter(pog.nullable(pog.text, failure_cause))
     |> pog.returning({
       use matches <- decode.field(0, decode.bool)
       decode.success(matches)
@@ -2643,7 +3073,10 @@ fn insert_acknowledgement(
 ) -> Result(Bool, QueueRunError) {
   let Claim(id:, attempt_id:, epoch:, worker_id:, worker_version:, ..) = claim
   let AckProposal(
-    state:,
+    proposed_state:,
+    committed_state:,
+    failure_cause:,
+    requested_delay_ms:,
     output_version:,
     output:,
     error_version:,
@@ -2652,7 +3085,7 @@ fn insert_acknowledgement(
   ) = proposal
   let query =
     pog.query(
-      "INSERT INTO grind_job_acknowledgements (storage_owner, command_id, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, attempt_owner, proposed_state, committed_state, output_version, output, error_version, error, failure_description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $11, $12::jsonb, $13, $14::jsonb, $15) RETURNING command_id",
+      "INSERT INTO grind_job_acknowledgements (storage_owner, command_id, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, attempt_owner, proposed_state, committed_state, output_version, output, error_version, error, failure_description, requested_delay_ms, failure_cause) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15::jsonb, $16, $17, $18) RETURNING command_id",
     )
     |> pog.parameter(pog.text(storage_owner))
     |> pog.parameter(pog.text(command_id))
@@ -2663,12 +3096,15 @@ fn insert_acknowledgement(
     |> pog.parameter(pog.int(attempt_id))
     |> pog.parameter(pog.int(epoch))
     |> pog.parameter(pog.text(attempt_owner))
-    |> pog.parameter(pog.text(state))
+    |> pog.parameter(pog.text(proposed_state))
+    |> pog.parameter(pog.text(committed_state))
     |> pog.parameter(pog.nullable(pog.text, output_version))
     |> pog.parameter(pog.nullable(pog.text, output))
     |> pog.parameter(pog.nullable(pog.text, error_version))
     |> pog.parameter(pog.nullable(pog.text, error))
     |> pog.parameter(pog.nullable(pog.text, failure_description))
+    |> pog.parameter(pog.nullable(pog.int, requested_delay_ms))
+    |> pog.parameter(pog.nullable(pog.text, failure_cause))
     |> pog.returning({
       use inserted_command_id <- decode.field(0, decode.string)
       decode.success(inserted_command_id)
@@ -2739,6 +3175,7 @@ pub fn state(
                       case state {
                         "queued" -> Ok(Queued)
                         "scheduled" -> Ok(Scheduled)
+                        "retryable" -> Ok(job.Retryable)
                         "executing" -> Ok(job.Executing)
                         "succeeded" -> Ok(job.Succeeded)
                         "business_failed" -> Ok(job.BusinessFailed)
@@ -2784,7 +3221,7 @@ pub fn outcome(
   ) = job.result_fields(handle)
   let query =
     pog.query(
-      "SELECT storage_owner, queue, worker_id, worker_version, state, output::text, output_version, error::text, error_version, failure_description FROM grind_jobs WHERE id = $1",
+      "SELECT storage_owner, queue, worker_id, worker_version, state, output::text, output_version, error::text, error_version, failure_description, failure_cause FROM grind_jobs WHERE id = $1",
     )
     |> pog.parameter(pog.int(id))
     |> pog.returning({
@@ -2798,6 +3235,7 @@ pub fn outcome(
       use encoded_error <- decode.field(7, decode.optional(decode.string))
       use error_version <- decode.field(8, decode.optional(decode.string))
       use failure_description <- decode.field(9, decode.optional(decode.string))
+      use failure_cause <- decode.field(10, decode.optional(decode.string))
       decode.success(#(
         stored_owner,
         stored_queue,
@@ -2809,6 +3247,7 @@ pub fn outcome(
         encoded_error,
         error_version,
         failure_description,
+        failure_cause,
       ))
     })
   case execute_safely(query, on: connection) {
@@ -2848,7 +3287,7 @@ pub fn reconcile_acknowledgement(
     True -> {
       let query =
         pog.query(
-          "SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, proposed_state, committed_state, output::text, output_version, error::text, error_version, failure_description FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2",
+          "SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, proposed_state, committed_state, output::text, output_version, error::text, error_version, failure_description, failure_cause FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2",
         )
         |> pog.parameter(pog.text(database_owner))
         |> pog.parameter(pog.text(command_id))
@@ -2870,6 +3309,7 @@ pub fn reconcile_acknowledgement(
             13,
             decode.optional(decode.string),
           )
+          use failure_cause <- decode.field(14, decode.optional(decode.string))
           decode.success(#(
             stored_owner,
             stored_queue,
@@ -2885,6 +3325,7 @@ pub fn reconcile_acknowledgement(
             encoded_error,
             error_version,
             failure_description,
+            failure_cause,
           ))
         })
       case execute_safely(query, on: connection) {
@@ -2901,13 +3342,14 @@ pub fn reconcile_acknowledgement(
                 stored_worker_version,
                 attempt_id,
                 attempt_epoch,
-                proposed_state,
+                _proposed_state,
                 committed_state,
                 encoded_output,
                 output_version,
                 encoded_error,
                 error_version,
                 failure_description,
+                failure_cause,
               ) = receipt
               case stored_owner == database_owner && stored_id == id {
                 False -> Error(AckReceiptStorageOwnerMismatch)
@@ -2920,38 +3362,35 @@ pub fn reconcile_acknowledgement(
                         && stored_worker_version == worker_version
                       {
                         False -> Error(AckReceiptWorkerContractMismatch)
-                        True ->
-                          case proposed_state == committed_state {
-                            False -> Error(AckReceiptPayloadMismatch)
-                            True -> {
-                              let result =
-                                outcome_value(
-                                  committed_state,
-                                  output_codec,
-                                  error_codec,
-                                  encoded_output,
-                                  output_version |> option.unwrap(""),
-                                  encoded_error,
-                                  error_version,
-                                  failure_description,
-                                )
-                              case result {
-                                Ok(outcome) ->
-                                  Ok(AcknowledgementReceipt(
-                                    command_id:,
-                                    attempt_id:,
-                                    attempt_epoch:,
-                                    outcome:,
-                                  ))
-                                Error(OutcomeCodecFailed(error)) ->
-                                  Error(AckReceiptCodecFailed(error))
-                                Error(InvalidOutcomeState(state)) ->
-                                  Error(AckReceiptInvalidState(state))
-                                Error(_) ->
-                                  Error(AckReceiptInvalidState(committed_state))
-                              }
-                            }
+                        True -> {
+                          let result =
+                            outcome_value(
+                              committed_state,
+                              output_codec,
+                              error_codec,
+                              encoded_output,
+                              output_version |> option.unwrap(""),
+                              encoded_error,
+                              error_version,
+                              failure_description,
+                              failure_cause,
+                            )
+                          case result {
+                            Ok(outcome) ->
+                              Ok(AcknowledgementReceipt(
+                                command_id:,
+                                attempt_id:,
+                                attempt_epoch:,
+                                outcome:,
+                              ))
+                            Error(OutcomeCodecFailed(error)) ->
+                              Error(AckReceiptCodecFailed(error))
+                            Error(InvalidOutcomeState(state)) ->
+                              Error(AckReceiptInvalidState(state))
+                            Error(_) ->
+                              Error(AckReceiptInvalidState(committed_state))
                           }
+                        }
                       }
                   }
               }
@@ -2982,6 +3421,7 @@ fn outcome_from_row(
     Option(String),
     Option(String),
     Option(String),
+    Option(String),
   ),
 ) -> Result(job.Outcome(output, error), OutcomeError) {
   let #(
@@ -2995,6 +3435,7 @@ fn outcome_from_row(
     encoded_error,
     error_version,
     failure_description,
+    failure_cause,
   ) = stored
   case stored_owner == database_owner && handle_owner == database_owner {
     False -> Error(OutcomeStorageOwnerMismatch)
@@ -3017,6 +3458,7 @@ fn outcome_from_row(
                 encoded_error,
                 error_version,
                 failure_description,
+                failure_cause,
               )
           }
       }
@@ -3032,10 +3474,12 @@ fn outcome_value(
   encoded_error: Option(String),
   error_version: Option(String),
   failure_description: Option(String),
+  failure_cause: Option(String),
 ) -> Result(job.Outcome(output, error), OutcomeError) {
   case state {
     "queued" -> Ok(job.Pending(Queued))
     "scheduled" -> Ok(job.Pending(Scheduled))
+    "retryable" -> Ok(job.Pending(job.Retryable))
     "executing" -> Ok(job.Pending(job.Executing))
     "succeeded" ->
       case encoded_output {
@@ -3045,18 +3489,39 @@ fn outcome_value(
           |> result.map_error(OutcomeCodecFailed)
         None -> Error(InvalidOutcomeState("successful row has no output"))
       }
-    "business_failed" ->
+    "business_failed" -> {
+      let cause = case failure_cause {
+        Some("budget_exhausted") -> Some(job.BudgetExhausted)
+        Some("retry_declined") -> Some(job.RetryDeclined)
+        _ -> None
+      }
       case error_codec, encoded_error, error_version {
         Some(codec), Some(encoded), Some(version) ->
           worker.decode_codec(codec, version, encoded)
-          |> result.map(job.BusinessFailedWith)
+          |> result.map(fn(error) {
+            case cause {
+              Some(terminal_cause) ->
+                job.BusinessFailedWithCause(error, terminal_cause)
+              None -> job.BusinessFailedWith(error)
+            }
+          })
           |> result.map_error(OutcomeCodecFailed)
         _, _, _ ->
-          Ok(job.FailedOperationally(
-            failure_description
-            |> unwrap("worker returned an application error"),
-          ))
+          case cause {
+            Some(terminal_cause) ->
+              Ok(job.FailedOperationallyWithCause(
+                failure_description
+                  |> unwrap("worker returned an application error"),
+                terminal_cause,
+              ))
+            None ->
+              Ok(job.FailedOperationally(
+                failure_description
+                |> unwrap("worker returned an application error"),
+              ))
+          }
       }
+    }
     "runtime_failed" ->
       Ok(job.FailedOperationally(
         failure_description |> unwrap("worker runtime failed"),

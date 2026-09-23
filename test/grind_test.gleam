@@ -4,7 +4,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleeunit
@@ -33,6 +33,10 @@ pub type LookupFailure {
 type WorkerProbe {
   WorkerInvoked
   LaterWorkerInvoked
+}
+
+type RetryPolicyProbe {
+  RetryPolicyInvoked(Int, Int)
 }
 
 type LeaseCommand {
@@ -100,6 +104,78 @@ pub fn invocation_preserves_the_application_error_test() {
   |> should.equal(Error(AccountMissing(42)))
 }
 
+pub fn queue_response_adapter_keeps_the_ordinary_worker_result_test() {
+  let assert Ok(input_codec) =
+    worker.codec("queue-adapter-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("queue-adapter-output-v1", json.string, decode.string)
+  let assert Ok(delay) = worker.retry_delay(0)
+  let probe = process.new_subject()
+  let assert Ok(lookup) =
+    worker.define(
+      "accounts.queue-adapter",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(account_id) {
+        case account_id > 0 {
+          True -> Ok("ordinary result")
+          False -> Error(AccountMissing(account_id))
+        }
+      },
+    )
+  let queue_lookup =
+    worker.with_queue_handler(lookup, fn(_) {
+      process.send(probe, WorkerInvoked)
+      worker.WorkerSnoozed(delay, "wait for account")
+    })
+
+  worker.invoke(queue_lookup, 42)
+  |> should.equal(Ok("ordinary result"))
+  worker.respond(queue_lookup, 42)
+  |> should.equal(worker.WorkerSnoozed(delay, "wait for account"))
+  process.receive(probe, within: 1000) |> should.equal(Ok(WorkerInvoked))
+  worker.respond(lookup, 42)
+  |> should.equal(worker.WorkerSucceeded("ordinary result"))
+}
+
+pub fn deterministic_default_retry_backoff_is_bounded_test() {
+  worker.default_retry_delay_milliseconds(1) |> should.equal(15_000)
+  worker.default_retry_delay_milliseconds(2) |> should.equal(30_000)
+  worker.default_retry_delay_milliseconds(13) |> should.equal(61_440_000)
+  worker.default_retry_delay_milliseconds(14) |> should.equal(86_400_000)
+  worker.default_retry_delay_milliseconds(100) |> should.equal(86_400_000)
+}
+
+pub fn retry_settings_reject_invalid_values_before_resources_test() {
+  let assert Ok(input_codec) =
+    worker.codec("retry-validation-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("retry-validation-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("retry.validation", "v1", input_codec, output_codec, fn(v) {
+      Ok(int.to_string(v))
+    })
+
+  worker.with_max_attempts(definition, 0)
+  |> should.equal(Error(worker.AttemptLimitMustBePositive))
+  let maximum_attempts = worker.max_attempts_supported_maximum()
+  let assert Ok(_) = worker.with_max_attempts(definition, maximum_attempts)
+  worker.with_max_attempts(definition, maximum_attempts + 1)
+  |> should.equal(Error(worker.AttemptLimitExceedsSupportedMaximum))
+  worker.retry_delay(-1)
+  |> should.equal(Error(worker.RetryDelayMustNotBeNegative))
+}
+
+pub fn retry_delay_rejects_values_above_supported_precision_bound_test() {
+  let maximum = worker.retry_delay_maximum_milliseconds()
+  worker.retry_delay(maximum)
+  |> result.map(worker.retry_delay_milliseconds)
+  |> should.equal(Ok(maximum))
+  worker.retry_delay(maximum + 1)
+  |> should.equal(Error(worker.RetryDelayExceedsSupportedMaximum))
+}
+
 pub fn renewal_ticks_are_scoped_to_the_active_attempt_test() {
   queue.renewal_is_current(10, 2, 10, 2) |> should.equal(True)
   queue.renewal_is_current(10, 2, 11, 3) |> should.equal(False)
@@ -108,6 +184,118 @@ pub fn renewal_ticks_are_scoped_to_the_active_attempt_test() {
 pub fn pending_shutdown_waiters_keep_the_original_deadline_test() {
   queue.next_shutdown_generation(7, True) |> should.equal(7)
   queue.next_shutdown_generation(7, False) |> should.equal(8)
+}
+
+pub fn attempt_resolution_exhausts_before_consulting_retry_policy_test() {
+  let assert Ok(delay) = worker.retry_delay(500)
+  let probe = process.new_subject()
+  let definition = resolver_test_worker(probe, delay)
+  let context = worker.RetryContext(2, 2, 3)
+
+  worker.resolve_response(
+    definition,
+    worker.WorkerFailed(AccountMissing(42)),
+    context,
+  )
+  |> should.equal(worker.ResolvedBusinessFailure(
+    AccountMissing(42),
+    worker.BudgetExhausted,
+  ))
+  process.receive(probe, within: 0) |> should.equal(Error(Nil))
+}
+
+pub fn snooze_is_not_a_retry_policy_decision_test() {
+  let assert Ok(delay) = worker.retry_delay(250)
+  let probe = process.new_subject()
+  let definition = resolver_test_worker(probe, delay)
+  let context = worker.RetryContext(2, 2, 3)
+
+  worker.resolve_response(
+    definition,
+    worker.WorkerSnoozed(delay, "wait for account"),
+    context,
+  )
+  |> should.equal(worker.ResolvedSnoozed(delay, "wait for account"))
+  process.receive(probe, within: 0) |> should.equal(Error(Nil))
+}
+
+pub fn retry_policy_is_called_once_only_for_nonexhausted_business_failure_test() {
+  let assert Ok(delay) = worker.retry_delay(500)
+  let probe = process.new_subject()
+  let definition = resolver_test_worker(probe, delay)
+  let active_attempt = worker.RetryContext(1, 2, 0)
+  let exhausted_attempt = worker.RetryContext(2, 2, 0)
+
+  worker.resolve_response(
+    definition,
+    worker.WorkerSucceeded("ok"),
+    active_attempt,
+  )
+  |> should.equal(worker.ResolvedSucceeded("ok"))
+  worker.resolve_response(
+    definition,
+    worker.WorkerDiscarded("skip"),
+    active_attempt,
+  )
+  |> should.equal(worker.ResolvedDiscarded("skip"))
+  worker.resolve_response(
+    definition,
+    worker.WorkerCancelled("cancelled by worker"),
+    active_attempt,
+  )
+  |> should.equal(worker.ResolvedCancelled("cancelled by worker"))
+  worker.resolve_response(
+    definition,
+    worker.WorkerUncertain("effect may have happened"),
+    active_attempt,
+  )
+  |> should.equal(worker.ResolvedUncertain("effect may have happened"))
+  worker.resolve_response(
+    definition,
+    worker.WorkerFailed(AccountMissing(42)),
+    exhausted_attempt,
+  )
+  |> should.equal(worker.ResolvedBusinessFailure(
+    AccountMissing(42),
+    worker.BudgetExhausted,
+  ))
+  process.receive(probe, within: 0) |> should.equal(Error(Nil))
+
+  worker.resolve_response(
+    definition,
+    worker.WorkerFailed(AccountMissing(43)),
+    active_attempt,
+  )
+  |> should.equal(worker.ResolvedRetryable(AccountMissing(43), delay))
+  process.receive(probe, within: 0)
+  |> should.equal(Ok(RetryPolicyInvoked(1, 43)))
+  process.receive(probe, within: 0) |> should.equal(Error(Nil))
+}
+
+fn resolver_test_worker(
+  probe: process.Subject(RetryPolicyProbe),
+  delay: worker.RetryDelay,
+) -> worker.Worker(Int, String, LookupFailure) {
+  let assert Ok(input_codec) =
+    worker.codec("resolver-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("resolver-output-v1", json.string, decode.string)
+  let assert Ok(base) =
+    worker.define("worker.resolver", "v1", input_codec, output_codec, fn(_) {
+      Error(AccountMissing(0))
+    })
+  let assert Ok(limited) = worker.with_max_attempts(base, 2)
+  let policy =
+    worker.retry_policy(fn(failure, context) {
+      case failure {
+        worker.BusinessFailure(AccountMissing(account_id)) -> {
+          let worker.RetryContext(current_attempt:, ..) = context
+          process.send(probe, RetryPolicyInvoked(current_attempt, account_id))
+        }
+      }
+      worker.RetryAfter(delay)
+    })
+  worker.with_retry_policy(limited, policy)
 }
 
 pub fn postgres_stopped_consumer_handle_does_not_retarget_after_restart_test() {
@@ -733,6 +921,12 @@ fn schema_v2_url() -> Result(String, Nil)
 @external(erlang, "grind_test_env", "schema_v3_url")
 fn schema_v3_url() -> Result(String, Nil)
 
+@external(erlang, "grind_test_env", "schema_v4_url")
+fn schema_v4_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "schema_v5_url")
+fn schema_v5_url() -> Result(String, Nil)
+
 @external(erlang, "grind_test_env", "schema_v4_missing_receipt_url")
 fn schema_v4_missing_receipt_url() -> Result(String, Nil)
 
@@ -910,6 +1104,12 @@ fn run_v3_upgrade_ack_table_test(database_url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
   let connection = pog.named_connection(pool_name)
   let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 6")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 5")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations WHERE version = 4")
     |> pog.execute(on: connection)
   let assert Ok(_) =
@@ -918,7 +1118,7 @@ fn run_v3_upgrade_ack_table_test(database_url: String) -> Nil {
   postgres.migrate(database) |> should.equal(Ok(Nil))
   let assert Ok(upgraded) =
     pog.query(
-      "SELECT (SELECT count(*) = 4 FROM grind_schema_migrations), to_regclass(current_schema() || '.grind_job_acknowledgements') IS NOT NULL",
+      "SELECT (SELECT count(*) = 6 FROM grind_schema_migrations), to_regclass(current_schema() || '.grind_job_acknowledgements') IS NOT NULL",
     )
     |> pog.returning({
       use all_versions <- decode.field(0, decode.bool)
@@ -927,6 +1127,12 @@ fn run_v3_upgrade_ack_table_test(database_url: String) -> Nil {
     })
     |> pog.execute(on: connection)
   let assert [#(True, True)] = upgraded.rows
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 6")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 5")
+    |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations WHERE version = 4")
     |> pog.execute(on: connection)
@@ -956,6 +1162,373 @@ pub fn postgres_v4_migration_rejects_missing_ack_receipt_table_test() {
     Error(Nil) -> Nil
     Ok(database_url) -> run_missing_v4_ack_table_test(database_url)
   }
+}
+
+pub fn postgres_v4_to_v5_migration_preserves_ack_receipt_test() {
+  case schema_v4_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_v4_to_v5_migration_test(database_url)
+  }
+}
+
+pub fn postgres_v5_to_v6_migration_preserves_ack_receipt_test() {
+  case schema_v5_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_v5_to_v6_migration_test(database_url)
+  }
+}
+
+fn run_v5_to_v6_migration_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_schema_v5")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(input_codec) =
+    worker.codec("v5-migration-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("v5-migration-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("schema.v5.receipt", "v1", input_codec, output_codec, fn(_) {
+      Ok("retained-v5-output")
+    })
+  let assert Ok(workers) = registry.new("schema-v5")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) = postgres.submit(database, "schema-v5", definition, 5)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  let durable_id = job.id_value(handle)
+  let assert Ok(v5_receipt) =
+    pog.query(
+      "SELECT command_id, attempt_id, attempt_epoch, proposed_state, committed_state, output::text, output_version FROM grind_job_acknowledgements WHERE job_id = $1",
+    )
+    |> pog.parameter(pog.int(durable_id))
+    |> pog.returning({
+      use command_id <- decode.field(0, decode.string)
+      use attempt_id <- decode.field(1, decode.int)
+      use attempt_epoch <- decode.field(2, decode.int)
+      use proposed <- decode.field(3, decode.string)
+      use committed <- decode.field(4, decode.string)
+      use output <- decode.field(5, decode.string)
+      use output_version <- decode.field(6, decode.string)
+      decode.success(#(
+        command_id,
+        attempt_id,
+        attempt_epoch,
+        proposed,
+        committed,
+        output,
+        output_version,
+      ))
+    })
+    |> pog.execute(on: connection)
+  let assert [
+    #(
+      command_id,
+      attempt_id,
+      attempt_epoch,
+      "succeeded",
+      "succeeded",
+      "\"retained-v5-output\"",
+      "v5-migration-output-v1",
+    ),
+  ] = v5_receipt.rows
+
+  // Restore the v5 shape: keep snooze fields, but remove retry accounting and
+  // the retryable state vocabulary introduced by v6.
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_jobs DROP CONSTRAINT grind_jobs_max_attempts_check, DROP COLUMN max_attempts, DROP COLUMN delivery_count, DROP COLUMN failure_cause",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements DROP COLUMN failure_cause",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("ALTER TABLE grind_jobs DROP CONSTRAINT grind_jobs_state_check")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_state_check CHECK (state IN ('queued', 'scheduled', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled'))",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_proposed_state_check, DROP CONSTRAINT grind_job_acknowledgements_committed_state_check",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_proposed_state_check CHECK (proposed_state IN ('succeeded', 'business_failed', 'runtime_failed', 'snoozed', 'discarded', 'cancelled', 'uncertain'))",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'runtime_failed', 'scheduled', 'discarded', 'cancelled', 'uncertain'))",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 6")
+    |> pog.execute(on: connection)
+
+  postgres.migrate(database) |> should.equal(Ok(Nil))
+  postgres.migrate(database) |> should.equal(Ok(Nil))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.SucceededWith("retained-v5-output")))
+  let assert Ok(migrated) =
+    pog.query(
+      "SELECT max_attempts, delivery_count, attempt_count, snooze_count, failure_cause IS NULL, (SELECT count(*) = 6 FROM grind_schema_migrations) FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(durable_id))
+    |> pog.returning({
+      use max_attempts <- decode.field(0, decode.int)
+      use delivery_count <- decode.field(1, decode.int)
+      use attempt_count <- decode.field(2, decode.int)
+      use snooze_count <- decode.field(3, decode.int)
+      use no_failure_cause <- decode.field(4, decode.bool)
+      use all_versions <- decode.field(5, decode.bool)
+      decode.success(#(
+        max_attempts,
+        delivery_count,
+        attempt_count,
+        snooze_count,
+        no_failure_cause,
+        all_versions,
+      ))
+    })
+    |> pog.execute(on: connection)
+  migrated.rows |> should.equal([#(20, 1, 1, 0, True, True)])
+  let assert Ok(preserved) =
+    pog.query(
+      "SELECT command_id, attempt_id, attempt_epoch, proposed_state, committed_state, requested_delay_ms IS NULL, failure_cause IS NULL, output::text, output_version FROM grind_job_acknowledgements WHERE job_id = $1",
+    )
+    |> pog.parameter(pog.int(durable_id))
+    |> pog.returning({
+      use stored_command_id <- decode.field(0, decode.string)
+      use stored_attempt_id <- decode.field(1, decode.int)
+      use stored_epoch <- decode.field(2, decode.int)
+      use proposed <- decode.field(3, decode.string)
+      use committed <- decode.field(4, decode.string)
+      use delay_absent <- decode.field(5, decode.bool)
+      use cause_absent <- decode.field(6, decode.bool)
+      use output <- decode.field(7, decode.string)
+      use output_version <- decode.field(8, decode.string)
+      decode.success(#(
+        stored_command_id,
+        stored_attempt_id,
+        stored_epoch,
+        proposed,
+        committed,
+        delay_absent,
+        cause_absent,
+        output,
+        output_version,
+      ))
+    })
+    |> pog.execute(on: connection)
+  preserved.rows
+  |> should.equal([
+    #(
+      command_id,
+      attempt_id,
+      attempt_epoch,
+      "succeeded",
+      "succeeded",
+      True,
+      True,
+      "\"retained-v5-output\"",
+      "v5-migration-output-v1",
+    ),
+  ])
+  postgres.reconcile_acknowledgement(database, handle, command_id)
+  |> should.equal(
+    Ok(postgres.AcknowledgementReceipt(
+      command_id:,
+      attempt_id:,
+      attempt_epoch:,
+      outcome: job.SucceededWith("retained-v5-output"),
+    )),
+  )
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_jobs ALTER COLUMN delivery_count SET DEFAULT 7",
+    )
+    |> pog.execute(on: connection)
+  postgres.migrate(database) |> should.equal(Error(postgres.IncompatibleSchema))
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_jobs ALTER COLUMN delivery_count SET DEFAULT 0",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("ALTER TABLE grind_jobs ALTER COLUMN max_attempts SET DEFAULT 7")
+    |> pog.execute(on: connection)
+  postgres.migrate(database) |> should.equal(Error(postgres.IncompatibleSchema))
+  mark_database_test_executed("v5-migration-preserved-ack-receipt")
+  mark_database_test_executed("v6-invalid-default-rejected")
+}
+
+fn run_v4_to_v5_migration_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_schema_v4")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(input_codec) =
+    worker.codec("v4-migration-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("v4-migration-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("schema.v4.receipt", "v1", input_codec, output_codec, fn(_) {
+      Ok("retained-v4-output")
+    })
+  let assert Ok(workers) = registry.new("schema-v4")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) = postgres.submit(database, "schema-v4", definition, 4)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  let durable_id = job.id_value(handle)
+  let assert Ok(existing_receipt) =
+    pog.query(
+      "SELECT command_id, attempt_id, attempt_epoch, proposed_state, committed_state, output::text, output_version FROM grind_job_acknowledgements WHERE job_id = $1",
+    )
+    |> pog.parameter(pog.int(durable_id))
+    |> pog.returning({
+      use command_id <- decode.field(0, decode.string)
+      use attempt_id <- decode.field(1, decode.int)
+      use attempt_epoch <- decode.field(2, decode.int)
+      use proposed_state <- decode.field(3, decode.string)
+      use committed_state <- decode.field(4, decode.string)
+      use output <- decode.field(5, decode.string)
+      use output_version <- decode.field(6, decode.string)
+      decode.success(#(
+        command_id,
+        attempt_id,
+        attempt_epoch,
+        proposed_state,
+        committed_state,
+        output,
+        output_version,
+      ))
+    })
+    |> pog.execute(on: connection)
+  let assert [#(command_id, attempt_id, attempt_epoch, _, _, _, _)] =
+    existing_receipt.rows
+
+  // This fixture restores the v4 shape from the accepted pre-v5 schema
+  // (ecb121f): no snooze_count/requested_delay_ms and both ACK state checks
+  // allow only succeeded, business_failed, or runtime_failed.
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_jobs DROP CONSTRAINT grind_jobs_max_attempts_check, DROP COLUMN max_attempts, DROP COLUMN delivery_count, DROP COLUMN failure_cause",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("ALTER TABLE grind_jobs DROP COLUMN snooze_count")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_proposed_state_check, DROP CONSTRAINT grind_job_acknowledgements_committed_state_check, DROP COLUMN requested_delay_ms",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements DROP COLUMN failure_cause",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("ALTER TABLE grind_jobs DROP CONSTRAINT grind_jobs_state_check")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_state_check CHECK (state IN ('queued', 'scheduled', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled'))",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_proposed_state_check CHECK (proposed_state IN ('succeeded', 'business_failed', 'runtime_failed'))",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'runtime_failed'))",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 6")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 5")
+    |> pog.execute(on: connection)
+
+  postgres.migrate(database) |> should.equal(Ok(Nil))
+  postgres.migrate(database) |> should.equal(Ok(Nil))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.SucceededWith("retained-v4-output")))
+  let assert Ok(migrated_receipt) =
+    pog.query(
+      "SELECT proposed_state, committed_state, requested_delay_ms IS NULL, output::text, output_version, attempt_id, attempt_epoch, (SELECT count(*) = 6 FROM grind_schema_migrations), (SELECT snooze_count = 0 FROM grind_jobs WHERE id = $1) FROM grind_job_acknowledgements WHERE command_id = $2",
+    )
+    |> pog.parameter(pog.int(durable_id))
+    |> pog.parameter(pog.text(command_id))
+    |> pog.returning({
+      use proposed_state <- decode.field(0, decode.string)
+      use committed_state <- decode.field(1, decode.string)
+      use delay_is_null <- decode.field(2, decode.bool)
+      use output <- decode.field(3, decode.string)
+      use output_version <- decode.field(4, decode.string)
+      use stored_attempt_id <- decode.field(5, decode.int)
+      use stored_epoch <- decode.field(6, decode.int)
+      use all_versions <- decode.field(7, decode.bool)
+      use snooze_default <- decode.field(8, decode.bool)
+      decode.success(#(
+        proposed_state,
+        committed_state,
+        delay_is_null,
+        output,
+        output_version,
+        stored_attempt_id,
+        stored_epoch,
+        all_versions,
+        snooze_default,
+      ))
+    })
+    |> pog.execute(on: connection)
+  let assert [
+    #(
+      "succeeded",
+      "succeeded",
+      True,
+      "\"retained-v4-output\"",
+      "v4-migration-output-v1",
+      preserved_attempt_id,
+      preserved_epoch,
+      True,
+      True,
+    ),
+  ] = migrated_receipt.rows
+  preserved_attempt_id |> should.equal(attempt_id)
+  preserved_epoch |> should.equal(attempt_epoch)
+  postgres.reconcile_acknowledgement(database, handle, command_id)
+  |> should.equal(
+    Ok(postgres.AcknowledgementReceipt(
+      command_id:,
+      attempt_id:,
+      attempt_epoch:,
+      outcome: job.SucceededWith("retained-v4-output"),
+    )),
+  )
+  mark_database_test_executed("v4-migration-preserved-ack-receipt")
 }
 
 fn run_missing_v4_ack_table_test(database_url: String) -> Nil {
@@ -1014,23 +1587,35 @@ fn run_v1_migration_test(database_url: String) -> Nil {
     worker.define("legacy.echo", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
     })
-  let assert Ok(handle) = postgres.submit(database, "legacy", legacy_worker, 73)
+  let assert Ok(legacy_job) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, error_version, state, available_at) VALUES ($1, 'legacy', 'legacy.echo', 'v1', 'legacy-input-v1', '73'::jsonb, 'legacy-output-v1', NULL, 'queued', clock_timestamp()) RETURNING id",
+    )
+    |> pog.parameter(pog.text(postgres.storage_owner(database)))
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+    |> pog.execute(on: connection)
+  let assert [legacy_id] = legacy_job.rows
   let assert Ok(_) =
     pog.query(
       "UPDATE grind_jobs SET state = 'executing', attempt_id = 77, attempt_epoch = 4, attempt_owner = 'legacy-consumer', lease_expires_at = clock_timestamp() + interval '30 seconds', attempt_count = 2 WHERE id = $1",
     )
-    |> pog.parameter(pog.int(1))
+    |> pog.parameter(pog.int(legacy_id))
     |> pog.execute(on: connection)
 
   postgres.migrate(database) |> should.equal(Ok(Nil))
   postgres.migrate(database) |> should.equal(Ok(Nil))
+  let assert Ok(handle) =
+    postgres.bind_handle(database, legacy_worker, legacy_id)
   postgres.arguments(database, handle) |> should.equal(Ok(73))
   postgres.state(database, handle) |> should.equal(Ok(job.Executing))
   let assert Ok(migrated_attempt) =
     pog.query(
-      "SELECT attempt_id, attempt_epoch, attempt_owner, lease_expires_at > clock_timestamp(), uncertain_at IS NULL, (SELECT count(*) = 4 FROM grind_schema_migrations) FROM grind_jobs WHERE id = $1",
+      "SELECT attempt_id, attempt_epoch, attempt_owner, lease_expires_at > clock_timestamp(), uncertain_at IS NULL, (SELECT count(*) = 6 FROM grind_schema_migrations) FROM grind_jobs WHERE id = $1",
     )
-    |> pog.parameter(pog.int(1))
+    |> pog.parameter(pog.int(legacy_id))
     |> pog.returning({
       use attempt_id <- decode.field(0, decode.int)
       use attempt_epoch <- decode.field(1, decode.int)
@@ -1106,10 +1691,16 @@ fn run_v2_migration_test(database_url: String) -> Nil {
     )
     |> pog.execute(on: connection)
   let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 6")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations WHERE version = 3")
     |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations WHERE version = 4")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations WHERE version = 5")
     |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query(
@@ -1123,7 +1714,7 @@ fn run_v2_migration_test(database_url: String) -> Nil {
   postgres.migrate(database) |> should.equal(Ok(Nil))
   let assert Ok(legacy_receipt) =
     pog.query(
-      "SELECT target_state, payload_version IS NULL, payload IS NULL, (SELECT count(*) = 4 FROM grind_schema_migrations), decision, details, worker_id, worker_version FROM grind_job_resolutions WHERE resolution_id = 'legacy-resolution'",
+      "SELECT target_state, payload_version IS NULL, payload IS NULL, (SELECT count(*) = 6 FROM grind_schema_migrations), decision, details, worker_id, worker_version FROM grind_job_resolutions WHERE resolution_id = 'legacy-resolution'",
     )
     |> pog.returning({
       use target_state <- decode.field(0, decode.string)
@@ -1199,6 +1790,13 @@ pub fn postgres_queue_persists_typed_business_failure_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
     Ok(database_url) -> run_business_failure_test(database_url)
+  }
+}
+
+pub fn postgres_worker_snooze_commits_scheduled_state_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_worker_snooze_test(database_url)
   }
 }
 
@@ -2450,6 +3048,12 @@ fn run_worker_start_failure_test(database_url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, definition)
   let assert Ok(handle) =
     postgres.submit(database, "start-failure", definition, 15)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'scheduled', available_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.execute(on: pog.named_connection(pool_name))
   let assert Ok(consumer) = queue.start_manual(database, workers)
   use <- exception.defer(fn() { queue.stop(consumer) })
   queue.fail_next_worker_start(consumer) |> should.equal(Ok(Nil))
@@ -2459,7 +3063,7 @@ fn run_worker_start_failure_test(database_url: String) -> Nil {
       queue.QueueWorkerStartFailed(actor.InitFailed("injected start failure")),
     ),
   )
-  postgres.state(database, handle) |> should.equal(Ok(job.Queued))
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
   let connection = pog.named_connection(pool_name)
   attempt_count_for(connection, job.id_value(handle))
   |> should.equal(Ok(0))
@@ -2827,6 +3431,75 @@ fn run_takeover_fencing_test(database_url: String) -> Nil {
     |> pog.parameter(pog.text("takeover-fence"))
     |> pog.execute(on: connection)
 
+  queue.fail_next_worker_start(takeover_consumer) |> should.equal(Ok(Nil))
+  queue.process_one(takeover_consumer)
+  |> should.equal(
+    Error(
+      queue.QueueWorkerStartFailed(actor.InitFailed("injected start failure")),
+    ),
+  )
+  let assert Ok(unstarted_replay) =
+    pog.query(
+      "SELECT attempt_id, attempt_epoch, attempt_owner, attempt_count, delivery_count, lease_expires_at <= clock_timestamp(), failure_description FROM grind_jobs WHERE worker_id = $1 AND queue = $2",
+    )
+    |> pog.parameter(pog.text("takeover.echo"))
+    |> pog.parameter(pog.text("takeover-fence"))
+    |> pog.returning({
+      use attempt_id <- decode.field(0, decode.int)
+      use attempt_epoch <- decode.field(1, decode.int)
+      use attempt_owner <- decode.field(2, decode.optional(decode.string))
+      use attempt_count <- decode.field(3, decode.int)
+      use delivery_count <- decode.field(4, decode.int)
+      use lease_expired <- decode.field(5, decode.bool)
+      use failure_description <- decode.field(6, decode.optional(decode.string))
+      decode.success(#(
+        attempt_id,
+        attempt_epoch,
+        attempt_owner,
+        attempt_count,
+        delivery_count,
+        lease_expired,
+        failure_description,
+      ))
+    })
+    |> pog.execute(on: connection)
+  let assert [
+    #(
+      unstarted_attempt_id,
+      unstarted_epoch,
+      Some(unstarted_owner),
+      1,
+      2,
+      True,
+      Some(unstarted_description),
+    ),
+  ] = unstarted_replay.rows
+  unstarted_attempt_id |> should.not_equal(first_attempt_id)
+  unstarted_epoch |> should.equal(first_epoch + 2)
+  unstarted_owner |> should.not_equal(first_owner)
+  unstarted_description
+  |> should.equal("Unstarted replay claim; prior effect remains unconfirmed")
+  process.receive(signals, within: 0) |> should.equal(Error(Nil))
+
+  process.send(first_release, ReleaseAttempt)
+  process.receive(first_reply, within: 5000)
+  |> should.equal(
+    Ok(
+      Error(
+        queue.QueueProcessFailed(postgres.QueueAckStale(
+          worker.ExecutedSuccess("takeover-output-v1", "\"obsolete-7\""),
+          postgres.AckOwnershipChanged(
+            state: "executing",
+            attempt_id: Some(unstarted_attempt_id),
+            epoch: Some(unstarted_epoch),
+            owner: Some(unstarted_owner),
+          ),
+        )),
+      ),
+    ),
+  )
+  process.send(first_finished, Nil)
+
   let takeover_reply = process.new_subject()
   let takeover_finished = process.new_subject()
   let _ =
@@ -2854,29 +3527,11 @@ fn run_takeover_fencing_test(database_url: String) -> Nil {
   let assert [#(takeover_attempt_id, takeover_epoch, takeover_owner)] =
     takeover_claim.rows
   takeover_attempt_id |> should.not_equal(first_attempt_id)
-  takeover_epoch |> should.equal(first_epoch + 1)
+  takeover_attempt_id |> should.not_equal(unstarted_attempt_id)
+  takeover_epoch |> should.equal(unstarted_epoch + 1)
   takeover_owner |> should.not_equal(first_owner)
   queue.process_one(competing_consumer) |> should.equal(Ok(False))
 
-  process.send(first_release, ReleaseAttempt)
-  let first_ack = process.receive(first_reply, within: 5000)
-  process.send(first_finished, Nil)
-  first_ack
-  |> should.equal(
-    Ok(
-      Error(
-        queue.QueueProcessFailed(postgres.QueueAckStale(
-          worker.ExecutedSuccess("takeover-output-v1", "\"obsolete-7\""),
-          postgres.AckOwnershipChanged(
-            state: "executing",
-            attempt_id: Some(takeover_attempt_id),
-            epoch: Some(takeover_epoch),
-            owner: Some(takeover_owner),
-          ),
-        )),
-      ),
-    ),
-  )
   postgres.state(database, handle) |> should.equal(Ok(job.Executing))
 
   process.send(takeover_release, ReleaseAttempt)
@@ -3649,6 +4304,7 @@ fn run_business_failure_test(database_url: String) -> Nil {
       error_codec,
       fn(account_id) { Error(AccountMissing(account_id)) },
     )
+  let assert Ok(lookup) = worker.with_max_attempts(lookup, 1)
   let assert Ok(workers) = registry.new("business-failures")
   let assert Ok(workers) = registry.register(workers, lookup)
   let assert Ok(handle) =
@@ -3659,10 +4315,837 @@ fn run_business_failure_test(database_url: String) -> Nil {
   queue.process_one(consumer)
   |> should.equal(Ok(True))
   postgres.outcome(database, handle)
-  |> should.equal(Ok(job.BusinessFailedWith(AccountMissing(42))))
+  |> should.equal(
+    Ok(job.BusinessFailedWithCause(AccountMissing(42), job.BudgetExhausted)),
+  )
   postgres.state(database, handle)
   |> should.equal(Ok(job.BusinessFailed))
   mark_database_test_executed("typed-business-failure-passed")
+}
+
+fn run_worker_snooze_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_worker_snooze")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("snooze-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("snooze-output-v1", json.string, decode.string)
+  let assert Ok(delay) = worker.retry_delay(60_000)
+  let ordinary_probe = process.new_subject()
+  let assert Ok(ordinary) =
+    worker.define("worker.snooze", "v1", input_codec, output_codec, fn(_) {
+      process.send(ordinary_probe, WorkerInvoked)
+      Error(AccountMissing(1))
+    })
+  let queue_probe = process.new_subject()
+  let snoozing =
+    worker.with_queue_handler(ordinary, fn(_) {
+      process.send(queue_probe, LaterWorkerInvoked)
+      worker.WorkerSnoozed(delay, "awaiting external account")
+    })
+  let assert Ok(workers) = registry.new("snoozes")
+  let assert Ok(workers) = registry.register(workers, snoozing)
+  let assert Ok(handle) = postgres.submit(database, "snoozes", snoozing, 1)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let before_ack_ms =
+    database_time_milliseconds(pog.named_connection(pool_name))
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  let after_ack_ms = database_time_milliseconds(pog.named_connection(pool_name))
+  process.receive(queue_probe, within: 0)
+  |> should.equal(Ok(LaterWorkerInvoked))
+  process.receive(queue_probe, within: 0) |> should.equal(Error(Nil))
+  process.receive(ordinary_probe, within: 0) |> should.equal(Error(Nil))
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.Pending(job.Scheduled)))
+  let assert Ok(snooze_evidence) =
+    pog.query(
+      "SELECT job.attempt_count, job.snooze_count, floor(extract(epoch FROM job.available_at) * 1000)::bigint, floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint, receipt.proposed_state, receipt.committed_state, receipt.requested_delay_ms FROM grind_jobs AS job JOIN grind_job_acknowledgements AS receipt ON receipt.job_id = job.id WHERE job.id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use attempt_count <- decode.field(0, decode.int)
+      use snooze_count <- decode.field(1, decode.int)
+      use available_at_ms <- decode.field(2, decode.int)
+      use sampled_now_ms <- decode.field(3, decode.int)
+      use proposed_state <- decode.field(4, decode.string)
+      use committed_state <- decode.field(5, decode.string)
+      use requested_delay_ms <- decode.field(6, decode.optional(decode.int))
+      decode.success(#(
+        attempt_count,
+        snooze_count,
+        available_at_ms,
+        sampled_now_ms,
+        proposed_state,
+        committed_state,
+        requested_delay_ms,
+      ))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  let assert [
+    #(
+      attempt_count,
+      snooze_count,
+      available_at_ms,
+      sampled_now_ms,
+      "snoozed",
+      "scheduled",
+      Some(60_000),
+    ),
+  ] = snooze_evidence.rows
+  attempt_count |> should.equal(0)
+  snooze_count |> should.equal(1)
+  should.be_true(available_at_ms >= before_ack_ms + 60_000)
+  should.be_true(available_at_ms <= after_ack_ms + 60_000)
+  should.be_true(sampled_now_ms >= after_ack_ms)
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  mark_database_test_executed("worker-snooze-scheduled-passed")
+}
+
+fn database_time_milliseconds(connection: pog.Connection) -> Int {
+  let assert Ok(sample) =
+    pog.query(
+      "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+    )
+    |> pog.returning({
+      use milliseconds <- decode.field(0, decode.int)
+      decode.success(milliseconds)
+    })
+    |> pog.execute(on: connection)
+  let assert [milliseconds] = sample.rows
+  milliseconds
+}
+
+pub fn postgres_worker_snooze_receipt_write_failure_rolls_back_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_snooze_receipt_rollback_test(database_url)
+  }
+}
+
+fn run_snooze_receipt_rollback_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_snooze_rollback")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  let connection = pog.named_connection(pool_name)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS grind_test_reject_snooze_receipt ON grind_job_acknowledgements",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS grind_test_reject_snooze_receipt()")
+      |> pog.execute(on: connection)
+    postgres.close(database)
+  })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("snooze-rollback-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("snooze-rollback-output-v1", json.string, decode.string)
+  let assert Ok(delay) = worker.retry_delay(60_000)
+  let assert Ok(ordinary) =
+    worker.define(
+      "worker.snooze.rollback",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let snoozing =
+    worker.with_queue_handler(ordinary, fn(_) {
+      worker.WorkerSnoozed(delay, "rollback receipt test")
+    })
+  let assert Ok(workers) = registry.new("snooze-rollback")
+  let assert Ok(workers) = registry.register(workers, snoozing)
+  let assert Ok(handle) =
+    postgres.submit(database, "snooze-rollback", snoozing, 8)
+  let attempt_owner = "snooze-rollback-owner"
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "snooze-rollback",
+      workers,
+      attempt_owner,
+      False,
+      30_000,
+    )
+  let proposed = postgres.execute_claim(claimed)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION grind_test_reject_snooze_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.proposed_state = 'snoozed' THEN RAISE EXCEPTION 'injected snooze receipt failure'; END IF; RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER grind_test_reject_snooze_receipt BEFORE INSERT ON grind_job_acknowledgements FOR EACH ROW EXECUTE FUNCTION grind_test_reject_snooze_receipt()",
+    )
+    |> pog.execute(on: connection)
+  let acknowledgement_failed = case
+    postgres.acknowledge_claim(
+      database,
+      "snooze-rollback",
+      attempt_owner,
+      claimed,
+      proposed,
+    )
+  {
+    Error(_) -> True
+    Ok(_) -> False
+  }
+  acknowledgement_failed |> should.equal(True)
+  let assert Ok(state_after_rollback) =
+    pog.query(
+      "SELECT state, attempt_count, snooze_count, (SELECT count(*) = 0 FROM grind_job_acknowledgements WHERE job_id = $1) FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use state <- decode.field(0, decode.string)
+      use attempt_count <- decode.field(1, decode.int)
+      use snooze_count <- decode.field(2, decode.int)
+      use no_receipt <- decode.field(3, decode.bool)
+      decode.success(#(state, attempt_count, snooze_count, no_receipt))
+    })
+    |> pog.execute(on: connection)
+  let assert [#("executing", 1, 0, True)] = state_after_rollback.rows
+  mark_database_test_executed("worker-snooze-receipt-rollback-passed")
+}
+
+pub fn postgres_worker_snooze_ack_receipt_binds_delay_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_snooze_delay_receipt_test(database_url)
+  }
+}
+
+pub fn postgres_snooze_after_uncharged_replay_preserves_business_attempt_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_snooze_after_replay_test(database_url)
+  }
+}
+
+fn run_snooze_after_replay_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_snooze_replay")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("snooze-replay-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("snooze-replay-output-v1", json.string, decode.string)
+  let assert Ok(delay) = worker.retry_delay(0)
+  let ordinary_probe = process.new_subject()
+  let queue_probe = process.new_subject()
+  let assert Ok(ordinary) =
+    worker.define(
+      "worker.snooze.replay",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        process.send(ordinary_probe, value)
+        Ok(int.to_string(value))
+      },
+    )
+  let snoozing =
+    worker.with_queue_handler(ordinary, fn(_) {
+      process.send(queue_probe, WorkerInvoked)
+      worker.WorkerSnoozed(delay, "replay snooze")
+    })
+  let assert Ok(workers) = registry.new("snooze-replay")
+  let assert Ok(workers) = registry.register(workers, snoozing)
+  let assert Ok(handle) =
+    postgres.submit(database, "snooze-replay", snoozing, 8)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = 9, attempt_owner = 'expired-snooze-owner', lease_expires_at = clock_timestamp(), attempt_count = 1, delivery_count = 1 WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.execute(on: connection)
+  let assert Ok(replay_policy) =
+    queue.default_policy()
+    |> queue.with_expired_attempt_policy(queue.ReplayAtLeastOnce)
+    |> queue.validate_policy
+  let assert Ok(consumer) =
+    queue.start_manual_with_policy(database, workers, replay_policy)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  process.receive(queue_probe, within: 0) |> should.equal(Ok(WorkerInvoked))
+  process.receive(queue_probe, within: 0) |> should.equal(Error(Nil))
+  process.receive(ordinary_probe, within: 0) |> should.equal(Error(Nil))
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.Pending(job.Scheduled)))
+  let assert Ok(evidence) =
+    pog.query(
+      "SELECT attempt_count, max_attempts, delivery_count, snooze_count, receipt.proposed_state, receipt.committed_state, receipt.requested_delay_ms FROM grind_jobs AS job JOIN grind_job_acknowledgements AS receipt ON receipt.job_id = job.id WHERE job.id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use attempt_count <- decode.field(0, decode.int)
+      use max_attempts <- decode.field(1, decode.int)
+      use delivery_count <- decode.field(2, decode.int)
+      use snooze_count <- decode.field(3, decode.int)
+      use proposed <- decode.field(4, decode.string)
+      use committed <- decode.field(5, decode.string)
+      use requested_delay <- decode.field(6, decode.optional(decode.int))
+      decode.success(#(
+        attempt_count,
+        max_attempts,
+        delivery_count,
+        snooze_count,
+        proposed,
+        committed,
+        requested_delay,
+      ))
+    })
+    |> pog.execute(on: connection)
+  evidence.rows
+  |> should.equal([#(1, 20, 2, 1, "snoozed", "scheduled", Some(0))])
+  mark_database_test_executed("worker-snooze-uncharged-replay-preserved")
+}
+
+pub fn postgres_business_failure_is_scheduled_before_retry_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_business_retry_test(database_url)
+  }
+}
+
+pub fn postgres_default_retry_backoff_is_persisted_at_database_time_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_default_retry_backoff_test(database_url)
+  }
+}
+
+pub fn postgres_retry_delay_maximum_commits_without_precision_loss_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_retry_delay_maximum_test(database_url)
+  }
+}
+
+fn run_default_retry_backoff_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_default_retry")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("default-retry-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("default-retry-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "worker.default.retry",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(_) { Error(AccountMissing(71)) },
+    )
+  let assert Ok(handle) =
+    postgres.submit(database, "default-retry", definition, 1)
+  let assert Ok(workers) = registry.new("default-retry")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  let connection = pog.named_connection(pool_name)
+  let before_ack_us = database_time_microseconds(connection)
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  let after_ack_us = database_time_microseconds(connection)
+  postgres.state(database, handle) |> should.equal(Ok(job.Retryable))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.Pending(job.Retryable)))
+  let assert Ok(evidence) =
+    pog.query(
+      "SELECT state, attempt_count, max_attempts, delivery_count, floor(extract(epoch FROM available_at) * 1000000)::bigint, receipt.proposed_state, receipt.committed_state, receipt.requested_delay_ms FROM grind_jobs AS job JOIN grind_job_acknowledgements AS receipt ON receipt.job_id = job.id WHERE job.id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use state <- decode.field(0, decode.string)
+      use attempt_count <- decode.field(1, decode.int)
+      use max_attempts <- decode.field(2, decode.int)
+      use delivery_count <- decode.field(3, decode.int)
+      use available_at_us <- decode.field(4, decode.int)
+      use proposed <- decode.field(5, decode.string)
+      use committed <- decode.field(6, decode.string)
+      use requested_delay_ms <- decode.field(7, decode.optional(decode.int))
+      decode.success(#(
+        state,
+        attempt_count,
+        max_attempts,
+        delivery_count,
+        available_at_us,
+        proposed,
+        committed,
+        requested_delay_ms,
+      ))
+    })
+    |> pog.execute(on: connection)
+  let assert [
+    #(
+      "retryable",
+      1,
+      20,
+      1,
+      available_at_us,
+      "retryable",
+      "retryable",
+      Some(15_000),
+    ),
+  ] = evidence.rows
+  should.be_true(available_at_us >= before_ack_us + 15_000_000)
+  should.be_true(available_at_us <= after_ack_us + 15_000_000)
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  mark_database_test_executed("default-retry-backoff-database-time-passed")
+}
+
+fn run_retry_delay_maximum_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_retry_delay_maximum")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("maximum-delay-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("maximum-delay-output-v1", json.string, decode.string)
+  let maximum_delay_ms = worker.retry_delay_maximum_milliseconds()
+  let assert Ok(delay) = worker.retry_delay(maximum_delay_ms)
+  let assert Ok(ordinary) =
+    worker.define(
+      "worker.maximum.delay",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(_) { Ok("ordinary path unused") },
+    )
+  let definition =
+    worker.with_queue_handler(ordinary, fn(_) {
+      worker.WorkerSnoozed(delay, "maximum supported delay")
+    })
+  let assert Ok(handle) =
+    postgres.submit(database, "maximum-delay", definition, 1)
+  let assert Ok(workers) = registry.new("maximum-delay")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  let connection = pog.named_connection(pool_name)
+  let before_ack_us = database_time_microseconds(connection)
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  let after_ack_us = database_time_microseconds(connection)
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  let assert Ok(evidence) =
+    pog.query(
+      "SELECT floor(extract(epoch FROM job.available_at) * 1000000)::bigint, receipt.proposed_state, receipt.committed_state, receipt.requested_delay_ms FROM grind_jobs AS job JOIN grind_job_acknowledgements AS receipt ON receipt.job_id = job.id WHERE job.id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use available_at_us <- decode.field(0, decode.int)
+      use proposed <- decode.field(1, decode.string)
+      use committed <- decode.field(2, decode.string)
+      use requested_delay_ms <- decode.field(3, decode.optional(decode.int))
+      decode.success(#(available_at_us, proposed, committed, requested_delay_ms))
+    })
+    |> pog.execute(on: connection)
+  let assert [#(available_at_us, "snoozed", "scheduled", Some(stored_delay_ms))] =
+    evidence.rows
+  stored_delay_ms |> should.equal(maximum_delay_ms)
+  let delay_us = maximum_delay_ms * 1000
+  should.be_true(available_at_us >= before_ack_us + delay_us)
+  should.be_true(available_at_us <= after_ack_us + delay_us)
+  mark_database_test_executed("retry-delay-maximum-postgres-ack-passed")
+}
+
+fn database_time_microseconds(connection: pog.Connection) -> Int {
+  let assert Ok(sample) =
+    pog.query(
+      "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000000)::bigint",
+    )
+    |> pog.returning({
+      use microseconds <- decode.field(0, decode.int)
+      decode.success(microseconds)
+    })
+    |> pog.execute(on: connection)
+  let assert [microseconds] = sample.rows
+  microseconds
+}
+
+pub fn postgres_retry_policy_can_decline_without_an_error_codec_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_retry_declined_without_error_codec_test(database_url)
+  }
+}
+
+fn run_retry_declined_without_error_codec_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_retry_declined")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("retry-declined-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("retry-declined-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "worker.retry.declined",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(_) { Error(AccountMissing(91)) },
+    )
+  let policy_calls = process.new_subject()
+  let policy =
+    worker.retry_policy(fn(failure, _) {
+      case failure {
+        worker.BusinessFailure(AccountMissing(account_id)) ->
+          process.send(policy_calls, account_id)
+      }
+      worker.DoNotRetry
+    })
+  let assert Ok(limited) = worker.with_max_attempts(definition, 2)
+  let limited = worker.with_retry_policy(limited, policy)
+  let assert Ok(error_codec) =
+    worker.codec(
+      "retry-declined-error-v1",
+      encode_lookup_failure,
+      decode_lookup_failure(),
+    )
+  let assert Ok(typed_definition) =
+    worker.define_with_error_codec(
+      "worker.retry.declined.typed",
+      "v1",
+      input_codec,
+      output_codec,
+      error_codec,
+      fn(_) { Error(AccountMissing(92)) },
+    )
+  let assert Ok(typed_limited) = worker.with_max_attempts(typed_definition, 2)
+  let typed_limited = worker.with_retry_policy(typed_limited, policy)
+  let assert Ok(workers) = registry.new("retry-declined")
+  let assert Ok(workers) = registry.register(workers, limited)
+  let assert Ok(workers) = registry.register(workers, typed_limited)
+  let assert Ok(handle) =
+    postgres.submit(database, "retry-declined", limited, 3)
+  let assert Ok(typed_handle) =
+    postgres.submit(database, "retry-declined", typed_limited, 4)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  process.receive(policy_calls, within: 0) |> should.equal(Ok(91))
+  postgres.state(database, handle) |> should.equal(Ok(job.BusinessFailed))
+  postgres.outcome(database, handle)
+  |> should.equal(
+    Ok(job.FailedOperationallyWithCause(
+      "worker returned an application error",
+      job.RetryDeclined,
+    )),
+  )
+  process.receive(policy_calls, within: 0) |> should.equal(Error(Nil))
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  process.receive(policy_calls, within: 0) |> should.equal(Ok(92))
+  postgres.outcome(database, typed_handle)
+  |> should.equal(
+    Ok(job.BusinessFailedWithCause(AccountMissing(92), job.RetryDeclined)),
+  )
+  process.receive(policy_calls, within: 0) |> should.equal(Error(Nil))
+  let assert Ok(committed_failure) =
+    pog.query(
+      "SELECT attempt_count, max_attempts, delivery_count, failure_cause, error IS NULL, error_version IS NULL FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use attempt_count <- decode.field(0, decode.int)
+      use max_attempts <- decode.field(1, decode.int)
+      use delivery_count <- decode.field(2, decode.int)
+      use cause <- decode.field(3, decode.optional(decode.string))
+      use no_error <- decode.field(4, decode.bool)
+      use no_error_version <- decode.field(5, decode.bool)
+      decode.success(#(
+        attempt_count,
+        max_attempts,
+        delivery_count,
+        cause,
+        no_error,
+        no_error_version,
+      ))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  committed_failure.rows
+  |> should.equal([#(1, 2, 1, Some("retry_declined"), True, True)])
+  let assert Ok(typed_failure) =
+    pog.query(
+      "SELECT failure_cause, error IS NOT NULL, error_version FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(typed_handle)))
+    |> pog.returning({
+      use cause <- decode.field(0, decode.optional(decode.string))
+      use has_error <- decode.field(1, decode.bool)
+      use error_version <- decode.field(2, decode.optional(decode.string))
+      decode.success(#(cause, has_error, error_version))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  typed_failure.rows
+  |> should.equal([
+    #(Some("retry_declined"), True, Some("retry-declined-error-v1")),
+  ])
+  mark_database_test_executed("worker-retry-declined-without-error-codec")
+}
+
+fn run_business_retry_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_business_retry")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("business-retry-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("business-retry-output-v1", json.string, decode.string)
+  let assert Ok(error_codec) =
+    worker.codec(
+      "business-retry-error-v1",
+      encode_lookup_failure,
+      decode_lookup_failure(),
+    )
+  let assert Ok(delay) = worker.retry_delay(60_000)
+  let assert Ok(definition) =
+    worker.define_with_error_codec(
+      "worker.business.retry",
+      "v1",
+      input_codec,
+      output_codec,
+      error_codec,
+      fn(_) { Error(AccountMissing(42)) },
+    )
+  let retry_probe = process.new_subject()
+  let policy =
+    worker.retry_policy(fn(failure, context) {
+      case failure {
+        worker.BusinessFailure(AccountMissing(account_id)) -> {
+          let worker.RetryContext(current_attempt:, ..) = context
+          process.send(
+            retry_probe,
+            RetryPolicyInvoked(current_attempt, account_id),
+          )
+          worker.RetryAfter(delay)
+        }
+      }
+    })
+  let assert Ok(retrying) = worker.with_max_attempts(definition, 2)
+  let retrying = worker.with_retry_policy(retrying, policy)
+  let assert Ok(workers) = registry.new("business-retry")
+  let assert Ok(workers) = registry.register(workers, retrying)
+  let assert Ok(handle) =
+    postgres.submit(database, "business-retry", retrying, 17)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.Retryable))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.Pending(job.Retryable)))
+  process.receive(retry_probe, within: 0)
+  |> should.equal(Ok(RetryPolicyInvoked(1, 42)))
+  let assert Ok(first_attempt) =
+    pog.query(
+      "SELECT state, attempt_count, max_attempts, delivery_count FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use state <- decode.field(0, decode.string)
+      use attempt_count <- decode.field(1, decode.int)
+      use max_attempts <- decode.field(2, decode.int)
+      use delivery_count <- decode.field(3, decode.int)
+      decode.success(#(state, attempt_count, max_attempts, delivery_count))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  let assert [#("retryable", 1, 2, 1)] = first_attempt.rows
+  let before_due = database_time_milliseconds(pog.named_connection(pool_name))
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  process.receive(retry_probe, within: 0) |> should.equal(Error(Nil))
+
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET available_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.execute(on: pog.named_connection(pool_name))
+  queue.fail_next_worker_start(consumer) |> should.equal(Ok(Nil))
+  queue.process_one(consumer)
+  |> should.equal(
+    Error(
+      queue.QueueWorkerStartFailed(actor.InitFailed("injected start failure")),
+    ),
+  )
+  postgres.state(database, handle) |> should.equal(Ok(job.Retryable))
+  let assert Ok(after_unstarted_retry) =
+    pog.query(
+      "SELECT attempt_count, delivery_count FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use attempt_count <- decode.field(0, decode.int)
+      use delivery_count <- decode.field(1, decode.int)
+      decode.success(#(attempt_count, delivery_count))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  after_unstarted_retry.rows |> should.equal([#(1, 2)])
+  process.receive(retry_probe, within: 0) |> should.equal(Error(Nil))
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.BusinessFailed))
+  postgres.outcome(database, handle)
+  |> should.equal(
+    Ok(job.BusinessFailedWithCause(AccountMissing(42), job.BudgetExhausted)),
+  )
+  process.receive(retry_probe, within: 0) |> should.equal(Error(Nil))
+  let assert Ok(attempt_receipts) =
+    pog.query(
+      "SELECT attempt_id, proposed_state, committed_state, requested_delay_ms, failure_cause, error IS NOT NULL FROM grind_job_acknowledgements WHERE job_id = $1 ORDER BY attempt_id",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use attempt_id <- decode.field(0, decode.int)
+      use proposed <- decode.field(1, decode.string)
+      use committed <- decode.field(2, decode.string)
+      use delay_ms <- decode.field(3, decode.optional(decode.int))
+      use failure_cause <- decode.field(4, decode.optional(decode.string))
+      use has_typed_error <- decode.field(5, decode.bool)
+      decode.success(#(
+        attempt_id,
+        proposed,
+        committed,
+        delay_ms,
+        failure_cause,
+        has_typed_error,
+      ))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  let assert [
+    #(first_attempt, "retryable", "retryable", Some(60_000), None, True),
+    #(
+      second_attempt,
+      "business_failed",
+      "business_failed",
+      None,
+      Some("budget_exhausted"),
+      True,
+    ),
+  ] = attempt_receipts.rows
+  should.be_true(first_attempt < second_attempt)
+  let assert Ok(counters) =
+    pog.query(
+      "SELECT attempt_count, max_attempts, delivery_count FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use attempt_count <- decode.field(0, decode.int)
+      use max_attempts <- decode.field(1, decode.int)
+      use delivery_count <- decode.field(2, decode.int)
+      decode.success(#(attempt_count, max_attempts, delivery_count))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  let assert [#(2, 2, 3)] = counters.rows
+  should.be_true(before_due > 0)
+  mark_database_test_executed("worker-retry-first-attempt-scheduled")
+}
+
+fn run_snooze_delay_receipt_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_snooze_delay_receipt")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("snooze-delay-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("snooze-delay-output-v1", json.string, decode.string)
+  let assert Ok(delay) = worker.retry_delay(60_000)
+  let assert Ok(ordinary) =
+    worker.define(
+      "worker.snooze.delay.receipt",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let snoozing =
+    worker.with_queue_handler(ordinary, fn(_) {
+      worker.WorkerSnoozed(delay, "receipt payload conflict")
+    })
+  let assert Ok(workers) = registry.new("snooze-delay-receipt")
+  let assert Ok(workers) = registry.register(workers, snoozing)
+  let assert Ok(handle) =
+    postgres.submit(database, "snooze-delay-receipt", snoozing, 9)
+  let attempt_owner = "snooze-delay-owner"
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "snooze-delay-receipt",
+      workers,
+      attempt_owner,
+      False,
+      30_000,
+    )
+  let proposal = worker.ExecutedSnoozed(60_000, "receipt payload conflict")
+  postgres.acknowledge_claim(
+    database,
+    "snooze-delay-receipt",
+    attempt_owner,
+    claimed,
+    proposal,
+  )
+  |> should.equal(Ok(True))
+  postgres.acknowledge_claim(
+    database,
+    "snooze-delay-receipt",
+    attempt_owner,
+    claimed,
+    worker.ExecutedSnoozed(70_000, "receipt payload conflict"),
+  )
+  |> should.equal(Error(postgres.QueueAckCommandConflict))
+  let assert Ok(receipt) =
+    pog.query(
+      "SELECT state, attempt_count, snooze_count, requested_delay_ms FROM grind_jobs AS job JOIN grind_job_acknowledgements AS receipt ON receipt.job_id = job.id WHERE job.id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.returning({
+      use state <- decode.field(0, decode.string)
+      use attempt_count <- decode.field(1, decode.int)
+      use snooze_count <- decode.field(2, decode.int)
+      use requested_delay <- decode.field(3, decode.int)
+      decode.success(#(state, attempt_count, snooze_count, requested_delay))
+    })
+    |> pog.execute(on: pog.named_connection(pool_name))
+  let assert [#("scheduled", 0, 1, 60_000)] = receipt.rows
+  mark_database_test_executed("worker-snooze-delay-receipt-conflict-passed")
 }
 
 fn encode_lookup_failure(error: LookupFailure) -> json.Json {

@@ -46,6 +46,7 @@ pub fn available_at_unix_milliseconds(available_at: AvailableAt) -> Int {
 pub type State {
   Queued
   Scheduled
+  Retryable
   Executing
   Succeeded
   BusinessFailed
@@ -60,9 +61,16 @@ pub type Outcome(output, error) {
   Pending(State)
   SucceededWith(output)
   BusinessFailedWith(error)
+  BusinessFailedWithCause(error, BusinessFailureCause)
   FailedOperationally(String)
+  FailedOperationallyWithCause(String, BusinessFailureCause)
   /// An expired execution needs an explicit audited outcome resolution.
   ReconciliationRequired(String)
+}
+
+pub type BusinessFailureCause {
+  BudgetExhausted
+  RetryDeclined
 }
 
 pub fn id(handle: JobHandle(input, output, error)) -> JobId {

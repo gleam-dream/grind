@@ -67,5 +67,87 @@ for {mode, args, expected_event_state, expected_database_state} <- [
   end
 end
 
+# The first Oban instance polls `default` automatically. Stop it before the
+# manual drain observations so it cannot claim those jobs from the same Repo.
 if Process.alive?(oban_pid), do: Supervisor.stop(oban_pid)
+
+{:ok, manual_pid} =
+  Oban.start_link(
+    name: GrindOracle.ManualOban,
+    repo: Repo,
+    engine: Oban.Engines.Basic,
+    queues: [],
+    plugins: [],
+    testing: :manual
+  )
+
+{:ok, retry_job} =
+  Oban.insert(
+    GrindOracle.ManualOban,
+    Worker.new(%{"mode" => "failure"}, max_attempts: 2)
+  )
+
+first_retry_drain = Oban.drain_queue(GrindOracle.ManualOban, queue: :default)
+1 = Map.fetch!(first_retry_drain, :failure)
+retryable = Repo.get!(Oban.Job, retry_job.id)
+true = retryable.state == "retryable"
+1 = retryable.attempt
+2 = retryable.max_attempts
+:gt = DateTime.compare(retryable.scheduled_at, DateTime.utc_now())
+
+IO.inspect(
+  %{
+    trigger: "first failure with max_attempts 2",
+    committed_state: retryable.state,
+    attempt: retryable.attempt,
+    max_attempts: retryable.max_attempts,
+    scheduled_at: retryable.scheduled_at
+  },
+  label: "Oban v2.24.1 retry observation"
+)
+
+second_retry_drain =
+  Oban.drain_queue(GrindOracle.ManualOban, queue: :default, with_scheduled: true)
+
+1 = Map.fetch!(second_retry_drain, :discard)
+exhausted = Repo.get!(Oban.Job, retry_job.id)
+true = exhausted.state == "discarded"
+2 = exhausted.attempt
+
+IO.inspect(
+  %{
+    trigger: "second failure at max_attempts 2",
+    committed_state: exhausted.state,
+    attempt: exhausted.attempt,
+    max_attempts: exhausted.max_attempts
+  },
+  label: "Oban v2.24.1 exhaustion observation"
+)
+
+{:ok, snooze_job} =
+  Oban.insert(
+    GrindOracle.ManualOban,
+    Worker.new(%{"mode" => "snooze"})
+  )
+
+snooze_drain = Oban.drain_queue(GrindOracle.ManualOban, queue: :default)
+1 = Map.fetch!(snooze_drain, :snoozed)
+snoozed = Repo.get!(Oban.Job, snooze_job.id)
+true = snoozed.state == "scheduled"
+0 = snoozed.attempt
+1 = snoozed.meta["snoozed"]
+:gt = DateTime.compare(snoozed.scheduled_at, DateTime.utc_now())
+
+IO.inspect(
+  %{
+    trigger: "worker snoozes for 60 seconds",
+    committed_state: snoozed.state,
+    attempt: snoozed.attempt,
+    snoozed_count: snoozed.meta["snoozed"],
+    scheduled_at: snoozed.scheduled_at
+  },
+  label: "Oban v2.24.1 snooze observation"
+)
+
+if Process.alive?(manual_pid), do: Supervisor.stop(manual_pid)
 File.write!(System.fetch_env!("GRIND_ORACLE_MARKER"), "oban-oracle-passed\n", [:append])

@@ -131,7 +131,12 @@ fn run_public_consumer_test(url: String) -> Nil {
   postgres.outcome(database, report_handle)
   |> should.equal(Ok(job.SucceededWith(16)))
   postgres.outcome(database, failure_handle)
-  |> should.equal(Ok(job.BusinessFailedWith(PaymentRejected("missing/99"))))
+  |> should.equal(
+    Ok(job.BusinessFailedWithCause(
+      PaymentRejected("missing/99"),
+      job.BudgetExhausted,
+    )),
+  )
   mark("two-worker-consumer-passed")
 }
 
@@ -190,7 +195,8 @@ fn payment_worker(
         }
       },
     )
-  definition
+  let assert Ok(single_attempt) = worker.with_max_attempts(definition, 1)
+  single_attempt
 }
 
 fn encode_payment_request(request: PaymentRequest) -> json.Json {

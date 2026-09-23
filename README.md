@@ -7,9 +7,14 @@ Hex.
 
 The current runnable slice includes typed, versioned worker definitions,
 heterogeneous registration, PostgreSQL admission and typed result reads,
-absolute one-time scheduling, and a supervised serial queue consumer. A queue
-policy validates its polling interval and maximum jobs per poll. That batch cap
-is a throughput setting; it does not raise the consumer's concurrency above one.
+absolute one-time scheduling, and a supervised queue consumer with bounded
+per-consumer concurrency. Its validated policy separates local worker capacity
+from the maximum jobs claimed per poll. Attempts use database-time leases,
+fenced acknowledgement receipts, and conservative uncertainty recovery.
+Business failures support a persisted attempt limit, deterministic default or
+definition-bound retry policy, and typed terminal causes; queue handlers can
+also snooze with a checked delay. Explicit discard, cancellation arbitration,
+uniqueness, and lifecycle observations remain in the retained backlog.
 See [implementation scope](docs/IMPLEMENTATION-SCOPE.md) for the delivered
 boundary and complete retained backlog.
 
