@@ -1,4 +1,4 @@
-import gleam/option.{type Option}
+import gleam/option.{type Option, None, Some}
 import grind/worker.{type Codec, type Worker}
 
 /// A typed reference to a persisted job. Codecs are retained from its definition.
@@ -51,6 +51,7 @@ pub type State {
   BusinessFailed
   RuntimeFailed
   ContractMismatch
+  Uncertain
   Discarded
   Cancelled
 }
@@ -60,11 +61,19 @@ pub type Outcome(output, error) {
   SucceededWith(output)
   BusinessFailedWith(error)
   FailedOperationally(String)
+  /// An expired execution needs an explicit audited outcome resolution.
+  ReconciliationRequired(String)
 }
 
 pub fn id(handle: JobHandle(input, output, error)) -> JobId {
   let JobHandle(id:, ..) = handle
   JobId(id)
+}
+
+/// Returns the durable PostgreSQL integer so applications can persist and rebind it.
+pub fn id_value(handle: JobHandle(input, output, error)) -> Int {
+  let JobHandle(id:, ..) = handle
+  id
 }
 
 pub fn queue(handle: JobHandle(input, output, error)) -> String {
@@ -127,4 +136,58 @@ pub fn result_fields(
     ..,
   ) = handle
   #(id, storage_owner, queue, worker_id, worker_version, output, error)
+}
+
+/// Internal identity and persisted codec contract used to resolve an
+/// uncertain attempt without repeating worker metadata at the call site.
+@internal
+pub fn reconciliation_fields(
+  handle: JobHandle(input, output, error),
+) -> #(Int, String, String, String, String, String, Option(String)) {
+  let JobHandle(
+    id:,
+    storage_owner:,
+    queue:,
+    worker_id:,
+    worker_version:,
+    output:,
+    error:,
+    ..,
+  ) = handle
+  let error_version = case error {
+    Some(codec) -> Some(worker.codec_version(codec))
+    None -> None
+  }
+  #(
+    id,
+    storage_owner,
+    queue,
+    worker_id,
+    worker_version,
+    worker.codec_version(output),
+    error_version,
+  )
+}
+
+/// Encodes a caller-confirmed output using the admitted job's bound codec.
+@internal
+pub fn encode_reconciled_success(
+  handle: JobHandle(input, output, error),
+  value: output,
+) -> #(String, String) {
+  let JobHandle(output:, ..) = handle
+  worker.encode_value(output, value)
+}
+
+/// Encodes a caller-confirmed business error when the worker retained a codec.
+@internal
+pub fn encode_reconciled_error(
+  handle: JobHandle(input, output, error),
+  value: error,
+) -> Option(#(String, String)) {
+  let JobHandle(error:, ..) = handle
+  case error {
+    Some(codec) -> Some(worker.encode_value(codec, value))
+    None -> None
+  }
 }

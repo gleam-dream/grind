@@ -15,11 +15,25 @@ pub opaque type Consumer {
 /// Queue-local polling settings. Jobs execute serially within this consumer;
 /// `maximum_jobs_per_poll` controls how many it drains in one poll tick.
 pub type QueuePolicy {
-  QueuePolicy(poll_interval_ms: Int, maximum_jobs_per_poll: Int)
+  QueuePolicy(
+    poll_interval_ms: Int,
+    maximum_jobs_per_poll: Int,
+    expired_attempt_policy: ExpiredAttemptPolicy,
+  )
+}
+
+/// Controls whether an expired execution can invoke its handler again.
+pub type ExpiredAttemptPolicy {
+  RequireReconciliation
+  ReplayAtLeastOnce
 }
 
 pub fn default_policy() -> QueuePolicy {
-  QueuePolicy(poll_interval_ms: 250, maximum_jobs_per_poll: 1)
+  QueuePolicy(
+    poll_interval_ms: 250,
+    maximum_jobs_per_poll: 1,
+    expired_attempt_policy: RequireReconciliation,
+  )
 }
 
 pub fn with_poll_interval(
@@ -36,26 +50,46 @@ pub fn with_maximum_jobs_per_poll(
   QueuePolicy(..policy, maximum_jobs_per_poll:)
 }
 
+pub fn with_expired_attempt_policy(
+  policy: QueuePolicy,
+  expired_attempt_policy: ExpiredAttemptPolicy,
+) -> QueuePolicy {
+  QueuePolicy(..policy, expired_attempt_policy:)
+}
+
 pub type PolicyError {
   PollIntervalMustBePositive
   MaximumJobsPerPollMustBePositive
 }
 
 pub opaque type ValidatedPolicy {
-  ValidatedPolicy(poll_interval_ms: Int, maximum_jobs_per_poll: Int)
+  ValidatedPolicy(
+    poll_interval_ms: Int,
+    maximum_jobs_per_poll: Int,
+    expired_attempt_policy: ExpiredAttemptPolicy,
+  )
 }
 
 /// Validates the policy before a queue actor is started.
 pub fn validate_policy(
   policy: QueuePolicy,
 ) -> Result(ValidatedPolicy, PolicyError) {
-  let QueuePolicy(poll_interval_ms:, maximum_jobs_per_poll:) = policy
+  let QueuePolicy(
+    poll_interval_ms:,
+    maximum_jobs_per_poll:,
+    expired_attempt_policy:,
+  ) = policy
   case poll_interval_ms > 0 {
     False -> Error(PollIntervalMustBePositive)
     True ->
       case maximum_jobs_per_poll > 0 {
         False -> Error(MaximumJobsPerPollMustBePositive)
-        True -> Ok(ValidatedPolicy(poll_interval_ms:, maximum_jobs_per_poll:))
+        True ->
+          Ok(ValidatedPolicy(
+            poll_interval_ms:,
+            maximum_jobs_per_poll:,
+            expired_attempt_policy:,
+          ))
       }
   }
 }
@@ -63,6 +97,7 @@ pub fn validate_policy(
 pub type StartError {
   RegistryQueueMismatch
   NoRegisteredWorkers
+  QueueConfigurationFailed(postgres.QueueConfigurationError)
   QueueActorStartFailed(actor.StartError)
   QueueSupervisorStartFailed(actor.StartError)
 }
@@ -95,6 +130,7 @@ type ConsumerState {
     processed: Int,
     auto_poll: Bool,
     policy: ValidatedPolicy,
+    expired_attempt_policy: ExpiredAttemptPolicy,
   )
 }
 
@@ -147,39 +183,73 @@ fn start_consumer(
     True, _ -> Error(RegistryQueueMismatch)
     False, [] -> Error(NoRegisteredWorkers)
     False, _ -> {
-      let attempt_owner = "grind-consumer-" <> int.to_string(unique_integer())
-      let ValidatedPolicy(poll_interval_ms:, maximum_jobs_per_poll:) = policy
-      let actor_name = process.new_name("grind_queue_consumer")
-      let builder =
-        actor.new_with_initialiser(1000, fn(subject) {
-          start_polling(subject, auto_poll)
-          Ok(
-            actor.initialised(ConsumerState(
-              database:,
-              workers:,
-              queue: queue_name,
-              attempt_owner:,
-              subject:,
-              processed: 0,
-              auto_poll:,
-              policy: ValidatedPolicy(poll_interval_ms:, maximum_jobs_per_poll:),
-            ))
-            |> actor.returning(subject),
-          )
-        })
-        |> actor.on_message(handle_message)
-        |> actor.named(actor_name)
-      let child = supervision.worker(fn() { actor.start(builder) })
-      let supervisor =
-        static_supervisor.new(static_supervisor.OneForOne)
-        |> static_supervisor.add(child)
-      case static_supervisor.start(supervisor) {
-        Error(error) -> Error(QueueSupervisorStartFailed(error))
-        Ok(started) -> {
-          process.unlink(started.pid)
-          Ok(Consumer(process.named_subject(actor_name), started.pid))
-        }
+      let ValidatedPolicy(expired_attempt_policy:, ..) = policy
+      let replay_expired = case expired_attempt_policy {
+        RequireReconciliation -> False
+        ReplayAtLeastOnce -> True
       }
+      case postgres.configure_queue(database, queue_name, replay_expired) {
+        Error(error) -> Error(QueueConfigurationFailed(error))
+        Ok(Nil) ->
+          start_configured_consumer(
+            database,
+            workers,
+            queue_name,
+            policy,
+            auto_poll,
+          )
+      }
+    }
+  }
+}
+
+fn start_configured_consumer(
+  database: Database,
+  workers: Registry,
+  queue_name: String,
+  policy: ValidatedPolicy,
+  auto_poll: Bool,
+) -> Result(Consumer, StartError) {
+  let attempt_owner = "grind-consumer-" <> int.to_string(unique_integer())
+  let ValidatedPolicy(
+    poll_interval_ms:,
+    maximum_jobs_per_poll:,
+    expired_attempt_policy:,
+  ) = policy
+  let actor_name = process.new_name("grind_queue_consumer")
+  let builder =
+    actor.new_with_initialiser(1000, fn(subject) {
+      start_polling(subject, auto_poll)
+      Ok(
+        actor.initialised(ConsumerState(
+          database:,
+          workers:,
+          queue: queue_name,
+          attempt_owner:,
+          subject:,
+          processed: 0,
+          auto_poll:,
+          policy: ValidatedPolicy(
+            poll_interval_ms:,
+            maximum_jobs_per_poll:,
+            expired_attempt_policy:,
+          ),
+          expired_attempt_policy:,
+        ))
+        |> actor.returning(subject),
+      )
+    })
+    |> actor.on_message(handle_message)
+    |> actor.named(actor_name)
+  let child = supervision.worker(fn() { actor.start(builder) })
+  let supervisor =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(child)
+  case static_supervisor.start(supervisor) {
+    Error(error) -> Error(QueueSupervisorStartFailed(error))
+    Ok(started) -> {
+      process.unlink(started.pid)
+      Ok(Consumer(process.named_subject(actor_name), started.pid))
     }
   }
 }
@@ -225,7 +295,7 @@ fn handle_message(
 ) -> actor.Next(ConsumerState, Message) {
   case message {
     Poll -> {
-      let ValidatedPolicy(poll_interval_ms:, maximum_jobs_per_poll:) =
+      let ValidatedPolicy(poll_interval_ms:, maximum_jobs_per_poll:, ..) =
         state.policy
       let _ = run_batch(state, maximum_jobs_per_poll)
       schedule_poll(state.subject, state.auto_poll, poll_interval_ms)
@@ -281,7 +351,18 @@ fn run_batch_from(
 }
 
 fn run_one(state: ConsumerState) -> Result(Bool, ProcessError) {
-  let ConsumerState(database:, workers:, queue:, attempt_owner:, ..) = state
-  postgres.process_one(database, queue, workers, attempt_owner)
+  let ConsumerState(
+    database:,
+    workers:,
+    queue:,
+    attempt_owner:,
+    expired_attempt_policy:,
+    ..,
+  ) = state
+  let replay_expired = case expired_attempt_policy {
+    RequireReconciliation -> False
+    ReplayAtLeastOnce -> True
+  }
+  postgres.process_one(database, queue, workers, attempt_owner, replay_expired)
   |> result.map_error(QueueProcessFailed)
 }

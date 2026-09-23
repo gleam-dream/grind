@@ -159,6 +159,19 @@ pub fn decode_codec(
   }
 }
 
+/// Internal version and JSON encoding view used by audited typed outcomes.
+@internal
+pub fn encode_value(codec: Codec(value), value: value) -> #(String, String) {
+  let Codec(version:, encode:, ..) = codec
+  #(version, json.to_string(encode(value)))
+}
+
+@internal
+pub fn codec_version(codec: Codec(value)) -> String {
+  let Codec(version:, ..) = codec
+  version
+}
+
 pub type StoredCodecError {
   CodecVersionMismatch(expected: String, got: String)
   InvalidStoredJson(json.DecodeError)
