@@ -62,9 +62,12 @@ pub type Outcome(output, error) {
   SucceededWith(output)
   BusinessFailedWith(error)
   BusinessFailedWithCause(error, BusinessFailureCause)
+  DiscardedWithReason(String)
+  CancelledWithReason(String)
   FailedOperationally(String)
   FailedOperationallyWithCause(String, BusinessFailureCause)
-  /// An expired execution needs an explicit audited outcome resolution.
+  /// A worker declared or recovery detected an uncertain outcome needing an
+  /// explicit audited resolution.
   ReconciliationRequired(String)
 }
 

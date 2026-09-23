@@ -32,14 +32,7 @@ pub type QueuePolicy {
     maximum_concurrency: Int,
     lease_duration_ms: Int,
     shutdown_grace_ms: Int,
-    expired_attempt_policy: ExpiredAttemptPolicy,
   )
-}
-
-/// Controls whether an expired execution can invoke its handler again.
-pub type ExpiredAttemptPolicy {
-  RequireReconciliation
-  ReplayAtLeastOnce
 }
 
 pub fn default_policy() -> QueuePolicy {
@@ -49,7 +42,6 @@ pub fn default_policy() -> QueuePolicy {
     maximum_concurrency: 1,
     lease_duration_ms: 30_000,
     shutdown_grace_ms: 5000,
-    expired_attempt_policy: RequireReconciliation,
   )
 }
 
@@ -118,13 +110,6 @@ pub fn with_shutdown_grace(
   QueuePolicy(..policy, shutdown_grace_ms:)
 }
 
-pub fn with_expired_attempt_policy(
-  policy: QueuePolicy,
-  expired_attempt_policy: ExpiredAttemptPolicy,
-) -> QueuePolicy {
-  QueuePolicy(..policy, expired_attempt_policy:)
-}
-
 pub type PolicyError {
   PollIntervalMustBePositive
   MaximumJobsPerPollMustBePositive
@@ -140,7 +125,6 @@ pub opaque type ValidatedPolicy {
     maximum_concurrency: Int,
     lease_duration_ms: Int,
     shutdown_grace_ms: Int,
-    expired_attempt_policy: ExpiredAttemptPolicy,
   )
 }
 
@@ -154,7 +138,6 @@ pub fn validate_policy(
     maximum_concurrency:,
     lease_duration_ms:,
     shutdown_grace_ms:,
-    expired_attempt_policy:,
   ) = policy
   case poll_interval_ms > 0 {
     False -> Error(PollIntervalMustBePositive)
@@ -177,7 +160,6 @@ pub fn validate_policy(
                         maximum_concurrency:,
                         lease_duration_ms:,
                         shutdown_grace_ms:,
-                        expired_attempt_policy:,
                       ))
                   }
               }
@@ -189,7 +171,6 @@ pub fn validate_policy(
 pub type StartError {
   RegistryQueueMismatch
   NoRegisteredWorkers
-  QueueConfigurationFailed(postgres.QueueConfigurationError)
   QueueActorStartFailed(actor.StartError)
   QueueSupervisorStartFailed(actor.StartError)
   QueueActorHandoffFailed
@@ -368,24 +349,14 @@ fn start_consumer(
   case queue_name == "", registry.identities(workers) {
     True, _ -> Error(RegistryQueueMismatch)
     False, [] -> Error(NoRegisteredWorkers)
-    False, _ -> {
-      let ValidatedPolicy(expired_attempt_policy:, ..) = policy
-      let replay_expired = case expired_attempt_policy {
-        RequireReconciliation -> False
-        ReplayAtLeastOnce -> True
-      }
-      case postgres.configure_queue(database, queue_name, replay_expired) {
-        Error(error) -> Error(QueueConfigurationFailed(error))
-        Ok(Nil) ->
-          start_configured_consumer(
-            database,
-            workers,
-            queue_name,
-            policy,
-            auto_poll,
-          )
-      }
-    }
+    False, _ ->
+      start_configured_consumer(
+        database,
+        workers,
+        queue_name,
+        policy,
+        auto_poll,
+      )
   }
 }
 
@@ -442,7 +413,6 @@ fn start_configured_consumer_with_handoff(
     maximum_concurrency: _,
     lease_duration_ms:,
     shutdown_grace_ms:,
-    ..,
   ) = policy
   let renewal_interval_ms = case lease_duration_ms / 3 > 0 {
     True -> lease_duration_ms / 3
@@ -925,23 +895,16 @@ fn start_attempt(
     subject:,
     lease_duration_ms:,
     renewal_interval_ms:,
-    policy:,
     fail_next_worker_start:,
     kill_next_worker_before_monitor:,
     ..,
   ) = state
-  let ValidatedPolicy(expired_attempt_policy:, ..) = policy
-  let replay_expired = case expired_attempt_policy {
-    RequireReconciliation -> False
-    ReplayAtLeastOnce -> True
-  }
   case
     postgres.claim_one(
       database,
       queue,
       workers,
       attempt_owner,
-      replay_expired,
       lease_duration_ms,
     )
   {

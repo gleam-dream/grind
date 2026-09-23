@@ -28,12 +28,14 @@ createdb -h 127.0.0.1 -p "$port" -U grind oban_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_owner_a
 createdb -h 127.0.0.1 -p "$port" -U grind grind_owner_b
 createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_bad
-createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v1
-createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v2
-createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v3
-createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v4
-createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v5
-createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_v4_missing_receipt
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_fresh
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_markers
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_missing_jobs
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_missing_migrations
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_missing_resolutions
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_missing_ack
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_missing_attempt_sequence
+createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_atomic
 createdb -h 127.0.0.1 -p "$port" -U grind grind_resolution_route_a
 createdb -h 127.0.0.1 -p "$port" -U grind grind_resolution_route_b
 createdb -h 127.0.0.1 -p "$port" -U grind grind_consumer_test
@@ -44,24 +46,32 @@ GRIND_TEST_QUEUE_DATABASE_URL="postgres://grind@127.0.0.1:$port/grind_queue_test
 GRIND_TEST_OWNER_A_URL="postgres://grind@127.0.0.1:$port/grind_owner_a?sslmode=disable" \
 GRIND_TEST_OWNER_B_URL="postgres://grind@127.0.0.1:$port/grind_owner_b?sslmode=disable" \
 GRIND_TEST_SCHEMA_BAD_URL="postgres://grind@127.0.0.1:$port/grind_schema_bad?sslmode=disable" \
-GRIND_TEST_SCHEMA_V1_URL="postgres://grind@127.0.0.1:$port/grind_schema_v1?sslmode=disable" \
-GRIND_TEST_SCHEMA_V2_URL="postgres://grind@127.0.0.1:$port/grind_schema_v2?sslmode=disable" \
-GRIND_TEST_SCHEMA_V3_URL="postgres://grind@127.0.0.1:$port/grind_schema_v3?sslmode=disable" \
-GRIND_TEST_SCHEMA_V4_URL="postgres://grind@127.0.0.1:$port/grind_schema_v4?sslmode=disable" \
-GRIND_TEST_SCHEMA_V5_URL="postgres://grind@127.0.0.1:$port/grind_schema_v5?sslmode=disable" \
-GRIND_TEST_SCHEMA_V4_MISSING_RECEIPT_URL="postgres://grind@127.0.0.1:$port/grind_schema_v4_missing_receipt?sslmode=disable" \
+GRIND_TEST_SCHEMA_FRESH_URL="postgres://grind@127.0.0.1:$port/grind_schema_fresh?sslmode=disable" \
+GRIND_TEST_SCHEMA_MARKERS_URL="postgres://grind@127.0.0.1:$port/grind_schema_markers?sslmode=disable" \
+GRIND_TEST_SCHEMA_MISSING_JOBS_URL="postgres://grind@127.0.0.1:$port/grind_schema_missing_jobs?sslmode=disable" \
+GRIND_TEST_SCHEMA_MISSING_MIGRATIONS_URL="postgres://grind@127.0.0.1:$port/grind_schema_missing_migrations?sslmode=disable" \
+GRIND_TEST_SCHEMA_MISSING_RESOLUTIONS_URL="postgres://grind@127.0.0.1:$port/grind_schema_missing_resolutions?sslmode=disable" \
+GRIND_TEST_SCHEMA_MISSING_ACK_URL="postgres://grind@127.0.0.1:$port/grind_schema_missing_ack?sslmode=disable" \
+GRIND_TEST_SCHEMA_MISSING_ATTEMPT_SEQUENCE_URL="postgres://grind@127.0.0.1:$port/grind_schema_missing_attempt_sequence?sslmode=disable" \
+GRIND_TEST_SCHEMA_ATOMIC_URL="postgres://grind@127.0.0.1:$port/grind_schema_atomic?sslmode=disable" \
 GRIND_TEST_RESOLUTION_ROUTE_A_URL="postgres://grind@127.0.0.1:$port/grind_resolution_route_a?sslmode=disable" \
 GRIND_TEST_RESOLUTION_ROUTE_B_URL="postgres://grind@127.0.0.1:$port/grind_resolution_route_b?sslmode=disable" \
 GRIND_TEST_MARKER="$root/database-test-ran" \
   gleam test
-for contract in admission-read-passed storage-owner-passed incompatible-schema-rejected v1-migration-preserved-data v2-legacy-resolution-preserved v3-upgrade-created-ack-table v3-missing-attempt-sequence-rejected v4-migration-preserved-ack-receipt v5-migration-preserved-ack-receipt v6-invalid-default-rejected v4-missing-ack-table-rejected committed-success-passed codec-contract-rejected typed-business-failure-passed worker-snooze-scheduled-passed worker-snooze-receipt-rollback-passed worker-snooze-delay-receipt-conflict-passed worker-snooze-uncharged-replay-preserved default-retry-backoff-database-time-passed retry-delay-maximum-postgres-ack-passed worker-retry-first-attempt-scheduled worker-retry-declined-without-error-codec long-handler-wait-passed stale-consumer-handle-rejected supervised-owner-restart-resumed-polling foreign-consumer-stop-owner-preserved consumer-stop-timeout-owner-survived consumer-stop-drained-active-worker consumer-stop-forced-active-work-retained automatic-drain-paused-poll-and-renewed overlapping-claims-skip-locked lease-renewal-loss-fenced-passed renewal-storage-error-retried-passed closed-pool-renewal-recovered-passed unstarted-worker-claim-released-passed temporary-worker-death-quarantined-no-replay dead-idle-worker-claim-released independent-consumers-single-live-claim consumer-capacity-two-enforced automatic-consumer-capacity-two-enforced automatic-contract-skip-passed queue-batch-policy-passed scheduled-due-time-passed batch-partial-commit-count-passed expired-attempt-takeover-passed expired-attempt-quarantine-passed mixed-consumer-policy-rejected concurrent-policy-start-single-winner audited-uncertain-resolution-passed resolution-payload-bound resolution-rebind-owner-checked durable-ack-receipt-passed ack-commit-connection-loss-unknown-passed; do
+for contract in admission-read-passed storage-owner-passed incompatible-schema-rejected schema-v10-conservative-recovery-installed-and-idempotent legacy-future-schema-markers-rejected missing-schema-artifacts-not-repaired failed-fresh-install-rolled-back committed-success-passed codec-contract-rejected typed-business-failure-passed worker-discard-distinct-outcome-passed worker-cancel-distinct-outcome-passed worker-uncertainty-reconciliable-no-retry cancel-before-run-committed worker-snooze-scheduled-passed worker-snooze-receipt-rollback-passed worker-snooze-delay-receipt-conflict-passed worker-snooze-audited-replay-refunds-current-attempt default-retry-backoff-database-time-passed retry-delay-maximum-postgres-ack-passed worker-retry-first-attempt-scheduled worker-retry-declined-without-error-codec long-handler-wait-passed stale-consumer-handle-rejected supervised-owner-restart-resumed-polling foreign-consumer-stop-owner-preserved consumer-stop-timeout-owner-survived consumer-stop-drained-active-worker consumer-stop-forced-active-work-retained automatic-drain-paused-poll-and-renewed overlapping-claims-skip-locked lease-renewal-loss-fenced-passed renewal-storage-error-retried-passed closed-pool-renewal-recovered-passed unstarted-worker-claim-released-passed temporary-worker-death-quarantined-no-replay dead-idle-worker-claim-released independent-consumers-single-live-claim consumer-capacity-two-enforced automatic-consumer-capacity-two-enforced automatic-contract-skip-passed queue-batch-policy-passed scheduled-due-time-passed batch-partial-commit-count-passed expired-attempt-audited-replay-passed expired-attempt-quarantine-passed quarantine-bounded-passed audited-uncertain-resolution-passed resolution-payload-bound resolution-rebind-owner-checked durable-ack-receipt-passed ack-commit-connection-loss-unknown-passed; do
   if ! grep -q "$contract" "$root/database-test-ran"; then
     echo "PostgreSQL integration contract did not execute: $contract" >&2
     exit 1
   fi
-done
+  done
+  for contract in cancel-running-ack-wins cancel-after-completion-preserved cancel-running-uncertain-compact-receipt cancel-running-worker-cancel-compact-receipt cancel-pending-expiry-quarantined; do
+    if ! grep -q "$contract" "$root/database-test-ran"; then
+      echo "PostgreSQL integration contract did not execute: $contract" >&2
+      exit 1
+    fi
+  done
 
-(
+  (
   cd "$repo_root/oracle"
   mix deps.get --check-locked
   GRIND_OBAN_TEST_DATABASE_URL="postgres://grind@127.0.0.1:$port/oban_test?sslmode=disable" \

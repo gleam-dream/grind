@@ -13,8 +13,14 @@ from the maximum jobs claimed per poll. Attempts use database-time leases,
 fenced acknowledgement receipts, and conservative uncertainty recovery.
 Business failures support a persisted attempt limit, deterministic default or
 definition-bound retry policy, and typed terminal causes; queue handlers can
-also snooze with a checked delay. Explicit discard, cancellation arbitration,
-uniqueness, and lifecycle observations remain in the retained backlog.
+also snooze with a checked delay. Explicit discard, worker uncertainty, and
+cooperative cancellation are implemented; uniqueness and lifecycle observations
+remain in the retained backlog. The experimental v10 schema installs only into
+an empty schema; earlier
+experimental markers and partial Grind schemas fail closed without repair.
+Acknowledgement receipts retain committed attribution and a proposal fingerprint,
+not typed historical proposals. Typed outcome reads return the job's current
+result.
 See [implementation scope](docs/IMPLEMENTATION-SCOPE.md) for the delivered
 boundary and complete retained backlog.
 
