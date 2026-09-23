@@ -1,0 +1,16 @@
+name = "grind_consumer"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.18.0"
+licenses = ["Apache-2.0"]
+description = "External package that consumes Grind through its public modules."
+
+[dependencies]
+grind = { path = ".." }
+gleam_stdlib = ">= 0.70.0 and < 1.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_json = ">= 3.1.0 and < 4.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
+exception = ">= 2.1.1 and < 3.0.0"

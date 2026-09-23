@@ -19,6 +19,7 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        elixirPackage = pkgs.beam28Packages.elixir_1_18;
 
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
@@ -27,6 +28,8 @@
             ".render/**"
           ];
           programs.gleam.enable = true;
+          programs.mix-format.enable = true;
+          programs.mix-format.package = elixirPackage;
           programs.nixfmt.enable = true;
           programs.prettier.enable = true;
         };
@@ -35,8 +38,11 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             lefthook
+            git
             gleam
             beam28Packages.erlang
+            elixirPackage
+            postgresql_16
             rebar3
           ];
         };

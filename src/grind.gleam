@@ -1,7 +1,8 @@
-/// A strongly-typed Oban for Gleam: durable, typed background jobs on OTP + Postgres.
+/// Typed background jobs for Gleam on PostgreSQL and Erlang/OTP.
 ///
-/// Status: design-stage skeleton. See the design doc in gleam-dream/oversight
-/// (grind-design.md) for the intended public API.
+/// The package currently provides an experimental typed admission and serial
+/// consumer slice. See `docs/IMPLEMENTATION-SCOPE.md` for its boundary and the
+/// capabilities still retained as backlog.
 pub fn version() -> String {
   "0.1.0"
 }
