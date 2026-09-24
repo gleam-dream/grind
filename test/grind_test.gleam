@@ -4,7 +4,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
 import gleeunit
@@ -78,6 +78,19 @@ type ConsumerOwnerStart {
   ConsumerOwnerStarted(process.Pid, queue.Consumer, process.Subject(Nil))
   ConsumerOwnerStopCompleted(Result(queue.StopOutcome, queue.StopError))
   ConsumerOwnerFailed(queue.StartError)
+}
+
+type CoordinatorLossSignal {
+  CoordinatorLossStarted(process.Pid, process.Subject(LeaseCommand))
+}
+
+type OwnerPoolLossSignal {
+  OwnerPoolLossStarted(process.Pid, process.Subject(LeaseCommand))
+}
+
+type OwnerPoolLossOwnerEvent {
+  OwnerPoolLossOwnerReady(process.Pid, queue.Consumer)
+  OwnerPoolLossOwnerFailed(queue.StartError)
 }
 
 pub fn invocation_preserves_the_application_error_test() {
@@ -299,6 +312,13 @@ pub fn postgres_stopped_consumer_handle_does_not_retarget_after_restart_test() {
   }
 }
 
+pub fn postgres_repeated_stop_after_coordinator_gone_reports_without_drain_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_stop_without_drain_test(database_url)
+  }
+}
+
 pub fn postgres_supervised_owner_restart_resumes_automatic_polling_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
@@ -334,10 +354,39 @@ pub fn postgres_consumer_stop_reports_active_work_after_grace_test() {
   }
 }
 
+pub fn postgres_forced_stop_releases_worker_and_pool_then_recovers_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_forced_stop_pool_cleanup_test(database_url)
+  }
+}
+
 pub fn postgres_automatic_poll_pauses_and_renews_during_drain_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
     Ok(database_url) -> run_automatic_drain_test(database_url)
+  }
+}
+
+pub fn postgres_coordinator_loss_with_active_work_quarantines_without_replay_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_coordinator_loss_test(database_url)
+  }
+}
+
+pub fn postgres_owner_loss_recovers_on_fresh_consumer_after_pool_restart_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_owner_loss_recovers_after_pool_restart_test(database_url)
+  }
+}
+
+pub fn postgres_stale_shutdown_grace_timer_does_not_end_a_later_drain_early_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_stale_shutdown_grace_timer_test(database_url)
   }
 }
 
@@ -564,6 +613,169 @@ fn run_consumer_forced_stop_test(database_url: String) -> Nil {
   mark_database_test_executed("consumer-stop-forced-active-work-retained")
 }
 
+/// Polls (bounded, never a fixed sleep used as the assertion) for backends
+/// belonging to Grind's own pool that are still visible in
+/// `pg_stat_activity` after `postgres.close`. Grind never sets
+/// `application_name` on its connections, so leftover backends are found by
+/// exclusion instead: the observer's own backend (`pg_backend_pid()`) and
+/// any non-client backend (autovacuum, walsender, background workers) are
+/// excluded, leaving only ordinary client connections against this
+/// database and user — which, in the disposable test cluster, are only ever
+/// Grind's own pool connections plus this one observer. Returns `Ok(0)`
+/// once none remain, or `Ok(leftover_count)` if bounded checks are
+/// exhausted first — a nonzero result here is a real finding, not
+/// something this test papers over.
+fn poll_leftover_grind_backends(
+  connection: pog.Connection,
+  checks_remaining: Int,
+) -> Result(Int, Nil) {
+  let query =
+    pog.query(
+      "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND pid <> pg_backend_pid() AND backend_type = 'client backend'",
+    )
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+  case pog.execute(query, on: connection) {
+    Error(_) -> Error(Nil)
+    Ok(returned) ->
+      case returned.rows {
+        [0] -> Ok(0)
+        [count] ->
+          case checks_remaining > 0 {
+            True -> {
+              process.sleep(20)
+              poll_leftover_grind_backends(connection, checks_remaining - 1)
+            }
+            False -> Ok(count)
+          }
+        _ -> Error(Nil)
+      }
+  }
+}
+
+/// Forced shutdown (grace 0) releases both the worker process and Grind's
+/// own connection pool, and a fresh pool/consumer on the same pool name
+/// recovers the orphaned attempt as `Uncertain` with no second invocation —
+/// the same no-replay contract as every other owner-loss recovery path,
+/// now exercised across a real pool close/reopen rather than only a killed
+/// owner process.
+fn run_forced_stop_pool_cleanup_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_forced_stop_cleanup")
+  let settings = postgres.settings(database_url, pool_name)
+  let assert Ok(validated) = postgres.validate(settings)
+  let assert Ok(database) = postgres.start(validated)
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let observer_pool_name =
+    process.new_name("grind_forced_stop_cleanup_observer")
+  let observer_settings =
+    postgres.settings(database_url, observer_pool_name)
+    |> postgres.pool_size(1)
+  let assert Ok(observer_validated) = postgres.validate(observer_settings)
+  let assert Ok(observer) = postgres.start(observer_validated)
+  use <- exception.defer(fn() { postgres.close(observer) })
+  let observer_connection = pog.named_connection(observer_pool_name)
+
+  let assert Ok(input_codec) =
+    worker.codec("forced-stop-cleanup-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("forced-stop-cleanup-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let invocations = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "forced.stop.cleanup",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        process.send(invocations, WorkerInvoked)
+        let release = process.new_subject()
+        process.send(started, ShutdownWorkerStarted(process.self(), release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("cleanup-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("forced-stop-cleanup")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "forced-stop-cleanup", definition, 44)
+  let job_id = job.id_value(handle)
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_shutdown_grace(0)
+    |> queue.validate_policy
+  let assert Ok(consumer) =
+    queue.start_manual_with_policy(database, workers, policy)
+  let process_reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(process_reply, queue.process_one(consumer))
+    })
+  let assert Ok(ShutdownWorkerStarted(worker_pid, _release)) =
+    process.receive(started, within: 5000)
+  process.receive(invocations, within: 1000) |> should.equal(Ok(WorkerInvoked))
+  let worker_monitor = process.monitor(worker_pid)
+
+  queue.stop(consumer)
+  |> should.equal(Ok(queue.StoppedWithActiveWork(1)))
+  postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(worker_monitor, fn(down) { down })
+  let assert Ok(process.ProcessDown(..)) =
+    process.selector_receive(down_selector, within: 5000)
+  process.receive(process_reply, within: 1000)
+  |> should.equal(Ok(Error(queue.QueueActorExited)))
+
+  // Sanity-checks that the leftover-backend query below is not vacuously
+  // always 0: with Grind's own pool still open (migrate/submit/state have
+  // all just run queries through it), at least one client backend other
+  // than the observer's own must be visible right now. A single check
+  // (`checks_remaining: 0`) reuses the same query as the bounded poll below
+  // instead of a bespoke one-off.
+  let assert Ok(leftover_before_close) =
+    poll_leftover_grind_backends(observer_connection, 0)
+  should.be_true(leftover_before_close >= 1)
+
+  // No ack ever ran (the worker died mid-attempt), so there is nothing to
+  // reconcile against yet; the row is still `executing` with a live lease.
+  postgres.close(database)
+
+  let assert Ok(leftover) =
+    poll_leftover_grind_backends(observer_connection, 300)
+  leftover |> should.equal(0)
+
+  let assert Ok(reopened) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(reopened) })
+  postgres.state(reopened, handle) |> should.equal(Ok(job.Executing))
+
+  let assert Ok(new_consumer) = queue.start_manual(reopened, workers)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(new_consumer)
+    Nil
+  })
+  // Drives expiry at the database boundary rather than sleeping past the
+  // original lease duration.
+  let assert Ok(forced_expiry) =
+    pog.query(
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() - interval '1 millisecond' WHERE id = $1 AND state = 'executing'",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: observer_connection)
+  forced_expiry.count |> should.equal(1)
+
+  queue.process_one(new_consumer) |> should.equal(Ok(False))
+  postgres.state(reopened, handle) |> should.equal(Ok(job.Uncertain))
+  process.receive(invocations, within: 0) |> should.equal(Error(Nil))
+  mark_database_test_executed("forced-stop-pool-cleanup-recovered")
+}
+
 fn run_automatic_drain_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_auto_drain")
   let assert Ok(validated) =
@@ -764,8 +976,13 @@ fn run_owner_restart_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { queue.stop(consumer) })
   let assert Ok(first_coordinator) = queue.coordinator_pid(consumer)
   process.kill(first_coordinator)
-  queue.process_one(consumer)
-  |> should.equal(Error(queue.QueueActorExited))
+  // `Consumer.subject` is named, so it retargets to whichever coordinator
+  // incarnation is currently registered: wait for the restart to land, then
+  // `process_one` should reach the new, idle incarnation and report no due
+  // work, rather than racing an immediate call against however far the
+  // restart has progressed.
+  let assert Ok(_) = await_new_coordinator_pid(consumer, first_coordinator, 500)
+  queue.process_one(consumer) |> should.equal(Ok(False))
 
   let assert Ok(handle) =
     postgres.submit(database, "owner-restart", definition, 12)
@@ -773,7 +990,7 @@ fn run_owner_restart_test(database_url: String) -> Nil {
   postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
 
   let root_supervisor = queue.supervisor_pid(consumer)
-  let _ = queue.stop(consumer)
+  queue.stop(consumer) |> should.equal(Ok(queue.StoppedCleanly))
   process.is_alive(root_supervisor) |> should.equal(False)
   mark_database_test_executed("supervised-owner-restart-resumed-polling")
 }
@@ -794,6 +1011,393 @@ fn wait_for_succeeded(
         }
       }
   }
+}
+
+fn attempt_snapshot(
+  connection: pog.Connection,
+  id: Int,
+) -> Result(#(Int, Int, Int, Option(String)), Nil) {
+  pog.query(
+    "SELECT attempt_id, attempt_epoch, (extract(epoch FROM lease_expires_at) * 1000)::bigint, attempt_owner FROM grind_jobs WHERE id = $1",
+  )
+  |> pog.parameter(pog.int(id))
+  |> pog.returning({
+    use attempt_id <- decode.field(0, decode.int)
+    use attempt_epoch <- decode.field(1, decode.int)
+    use lease_expires_at <- decode.field(2, decode.int)
+    use attempt_owner <- decode.field(3, decode.optional(decode.string))
+    decode.success(#(attempt_id, attempt_epoch, lease_expires_at, attempt_owner))
+  })
+  |> pog.execute(on: connection)
+  |> result.map_error(fn(_) { Nil })
+  |> result.try(fn(returned) {
+    case returned.rows {
+      [snapshot] -> Ok(snapshot)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+fn database_time_ms(connection: pog.Connection) -> Result(Int, Nil) {
+  pog.query("SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint")
+  |> pog.returning({
+    use now <- decode.field(0, decode.int)
+    decode.success(now)
+  })
+  |> pog.execute(on: connection)
+  |> result.map_error(fn(_) { Nil })
+  |> result.try(fn(returned) {
+    case returned.rows {
+      [now] -> Ok(now)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// Polls the database clock (never local wall-clock time) until it passes
+/// `target_unix_ms`, bounded by `checks_remaining` 10ms polls.
+fn await_database_time_past(
+  connection: pog.Connection,
+  target_unix_ms: Int,
+  checks_remaining: Int,
+) -> Bool {
+  case database_time_ms(connection) {
+    Ok(now) if now >= target_unix_ms -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(10)
+          await_database_time_past(
+            connection,
+            target_unix_ms,
+            checks_remaining - 1,
+          )
+        }
+        False -> False
+      }
+  }
+}
+
+fn attempt_accounting(
+  connection: pog.Connection,
+  id: Int,
+) -> Result(#(Int, Int), Nil) {
+  pog.query(
+    "SELECT attempt_count, delivery_count FROM grind_jobs WHERE id = $1",
+  )
+  |> pog.parameter(pog.int(id))
+  |> pog.returning({
+    use attempt_count <- decode.field(0, decode.int)
+    use delivery_count <- decode.field(1, decode.int)
+    decode.success(#(attempt_count, delivery_count))
+  })
+  |> pog.execute(on: connection)
+  |> result.map_error(fn(_) { Nil })
+  |> result.try(fn(returned) {
+    case returned.rows {
+      [accounting] -> Ok(accounting)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+fn await_new_coordinator_pid(
+  consumer: queue.Consumer,
+  previous: process.Pid,
+  checks_remaining: Int,
+) -> Result(process.Pid, Nil) {
+  case queue.coordinator_pid(consumer) {
+    Ok(pid) if pid != previous -> Ok(pid)
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(10)
+          await_new_coordinator_pid(consumer, previous, checks_remaining - 1)
+        }
+        False -> Error(Nil)
+      }
+  }
+}
+
+fn run_coordinator_loss_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_coordinator_loss")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("coordinator-loss-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("coordinator-loss-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "coordinator.loss",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(invoked, WorkerInvoked)
+        process.send(started, CoordinatorLossStarted(process.self(), release))
+        case process.receive(release, within: 20_000) {
+          Ok(ReleaseAttempt) -> Ok("coordinator-loss-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("coordinator-loss")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "coordinator-loss", definition, 91)
+  let lease_duration_ms = 2000
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_poll_interval(20)
+    |> queue.with_maximum_concurrency(1)
+    |> queue.with_lease_duration(lease_duration_ms)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+
+  let assert Ok(CoordinatorLossStarted(worker_pid, _first_release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 0) |> should.equal(Ok(WorkerInvoked))
+
+  let connection = pog.named_connection(pool_name)
+  let job_id = job.id_value(handle)
+
+  let worker_monitor = process.monitor(worker_pid)
+  let assert Ok(first_coordinator) = queue.coordinator_pid(consumer)
+  process.kill(first_coordinator)
+
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(worker_monitor, fn(down) { down })
+  let assert Ok(process.ProcessDown(..)) =
+    process.selector_receive(down_selector, within: 5000)
+
+  // Snapshotted only after the worker-DOWN barrier confirms the old
+  // incarnation is gone, closing the window where a renewal from that
+  // incarnation landing between an earlier snapshot and the kill would make
+  // this snapshot's lease stale before it is ever compared against.
+  let assert Ok(#(first_attempt_id, first_epoch, first_lease, _)) =
+    attempt_snapshot(connection, job_id)
+
+  let assert Ok(second_coordinator) =
+    await_new_coordinator_pid(consumer, first_coordinator, 500)
+  second_coordinator |> should.not_equal(first_coordinator)
+
+  postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+  let assert Ok(#(still_attempt_id, still_epoch, _, _)) =
+    attempt_snapshot(connection, job_id)
+  still_attempt_id |> should.equal(first_attempt_id)
+  still_epoch |> should.equal(first_epoch)
+
+  // The restarted incarnation starts with no active attempts, so any stale
+  // renewal timer the dead incarnation already scheduled lands on a
+  // coordinator that has nothing to renew, and the orphaned lease is left
+  // untouched. `first_lease = claim_time + lease_duration_ms`, so waiting
+  // (via a database-time barrier, not a fixed sleep) until the database
+  // clock passes `first_lease - lease_duration_ms + 2 * renewal_interval_ms`
+  // is a wait past at least one full renewal tick and comfortably short of
+  // the lease's own natural expiry.
+  let renewal_interval_ms = lease_duration_ms / 3
+  let past_one_renewal_tick =
+    first_lease - lease_duration_ms + 2 * renewal_interval_ms
+  await_database_time_past(connection, past_one_renewal_tick, 400)
+  |> should.equal(True)
+  let assert Ok(#(_, _, after_wait_lease, _)) =
+    attempt_snapshot(connection, job_id)
+  after_wait_lease |> should.equal(first_lease)
+
+  let assert Ok(forced_expiry) =
+    pog.query(
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() WHERE id = $1 AND state = 'executing'",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  forced_expiry.count |> should.equal(1)
+
+  wait_for_job_state(database, handle, job.Uncertain, 250)
+  |> should.equal(True)
+  process.receive(invoked, within: 200) |> should.equal(Error(Nil))
+
+  let assert Ok(rebound) = postgres.bind_handle(database, definition, job_id)
+  postgres.resolve_uncertain(
+    database,
+    rebound,
+    "coordinator-loss-authorized-replay",
+    "on-call",
+    "inspect the external effect before authorizing a new delivery",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+
+  let assert Ok(CoordinatorLossStarted(_, second_release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 0) |> should.equal(Ok(WorkerInvoked))
+  process.send(second_release, ReleaseAttempt)
+
+  wait_for_job_state(database, handle, job.Succeeded, 250)
+  |> should.equal(True)
+  process.receive(invoked, within: 0) |> should.equal(Error(Nil))
+  let assert Ok(#(final_attempt_count, final_delivery_count)) =
+    attempt_accounting(connection, job_id)
+  final_attempt_count |> should.equal(2)
+  final_delivery_count |> should.equal(2)
+
+  queue.stop(consumer) |> should.equal(Ok(queue.StoppedCleanly))
+  mark_database_test_executed("coordinator-loss-quarantined-no-replay")
+}
+
+fn run_stop_without_drain_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_stop_without_drain")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("stop-without-drain-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("stop-without-drain-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "stop.without-drain",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("stop-without-drain")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+
+  // First call: a genuine clean stop with no active work. `stop`'s own
+  // `stop_consumer_supervisor` blocks until the supervisor (and therefore
+  // the coordinator, its child) is actually terminated before returning, so
+  // by the time the second call runs there is no race about whether the
+  // coordinator's name is still registered.
+  queue.stop(consumer) |> should.equal(Ok(queue.StoppedCleanly))
+
+  // Second call: the same owner, the same handle, but the coordinator this
+  // consumer named is now fully gone. This must not panic (a named subject
+  // send with nobody registered panics) and must not be reported as an
+  // ordinary clean drain, since nothing was actually drained.
+  queue.stop(consumer) |> should.equal(Ok(queue.StoppedWithoutDrain))
+  mark_database_test_executed("stop-after-coordinator-gone-without-drain")
+}
+
+fn run_stale_shutdown_grace_timer_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_stale_shutdown_grace")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("stale-grace-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("stale-grace-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define("stale.grace", "v1", input_codec, output_codec, fn(value) {
+      let release = process.new_subject()
+      process.send(started, CoordinatorLossStarted(process.self(), release))
+      case process.receive(release, within: 30_000) {
+        Ok(ReleaseAttempt) -> Ok("stale-grace-" <> int.to_string(value))
+        Error(Nil) -> Error(AccountMissing(value))
+      }
+    })
+  let assert Ok(workers) = registry.new("stale-grace")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(first_handle) =
+    postgres.submit(database, "stale-grace", definition, 71)
+  let shutdown_grace_ms = 4000
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_poll_interval(20)
+    |> queue.with_maximum_concurrency(1)
+    |> queue.with_lease_duration(15_000)
+    |> queue.with_shutdown_grace(shutdown_grace_ms)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+
+  let assert Ok(CoordinatorLossStarted(_first_worker_pid, _first_release)) =
+    process.receive(started, within: 5000)
+
+  // Put the first incarnation into "draining with active work" so it
+  // schedules a generation-1 grace timer, then kill it before that timer
+  // ever fires: the timer is a plain `erlang:send_after`, unaffected by the
+  // death of the process that scheduled it, so it keeps ticking regardless.
+  let assert Ok(first_coordinator) = queue.coordinator_pid(consumer)
+  let stale_reply = process.new_subject()
+  queue.begin_shutdown_for_test(consumer, stale_reply)
+  |> should.equal(Ok(Nil))
+  wait_for_shutdown_state(consumer, 200) |> should.equal(True)
+  process.kill(first_coordinator)
+
+  let assert Ok(second_coordinator) =
+    await_new_coordinator_pid(consumer, first_coordinator, 500)
+  second_coordinator |> should.not_equal(first_coordinator)
+
+  let assert Ok(second_handle) =
+    postgres.submit(database, "stale-grace", definition, 72)
+  let assert Ok(CoordinatorLossStarted(_second_worker_pid, _second_release)) =
+    process.receive(started, within: 5000)
+
+  // Wait well clear of the restart-and-reclaim overhead above before
+  // starting the new incarnation's own drain, so its generation-1 deadline
+  // sits comfortably later than the first incarnation's orphaned one. Both
+  // incarnations reach shutdown generation 1 on this, their first-ever
+  // drain with active work, so if the stale timer is not properly scoped to
+  // its own incarnation, it will match this one's generation too.
+  process.sleep(1000)
+  let begin_at = monotonic_ms()
+  let fresh_reply = process.new_subject()
+  queue.begin_shutdown_for_test(consumer, fresh_reply)
+  |> should.equal(Ok(Nil))
+
+  let outcome = process.receive(fresh_reply, within: shutdown_grace_ms + 3000)
+  let elapsed_ms = monotonic_ms() - begin_at
+
+  outcome |> should.equal(Ok(queue.ShutdownForced(1)))
+  // A correct implementation cannot report forced before its own
+  // `shutdown_grace_ms` has elapsed since `begin_at`, so its `elapsed_ms` is
+  // always close to `shutdown_grace_ms` (only ordinary scheduling/delivery
+  // jitter below it). Under the pre-fix bug, the first incarnation's
+  // orphaned generation-1 timer fires at a fixed point in time set long
+  // before `begin_at` (when that incarnation's own drain began), so its
+  // contribution to `elapsed_ms` is `shutdown_grace_ms - (time already
+  // spent on the kill, restart, and resubmit above, plus the 1000ms sleep)`
+  // — structurally at most `shutdown_grace_ms - 1000`, however fast that
+  // setup runs, since the 1000ms sleep alone already accounts for that much
+  // of the gap. The threshold below sits with an ordinary jitter margin
+  // under the correct value and a hard structural margin (not a jitter
+  // margin) above the bug's own ceiling: it can only fail to catch the bug
+  // if that setup work took under 400ms, which it does not in practice.
+  { elapsed_ms >= shutdown_grace_ms - 600 } |> should.equal(True)
+
+  postgres.state(database, first_handle) |> should.equal(Ok(job.Executing))
+  postgres.state(database, second_handle) |> should.equal(Ok(job.Executing))
+  // Clears the way for `stop`'s own final drain (in the deferred cleanup
+  // above) to reach a fresh, idle third incarnation and return promptly
+  // instead of waiting out another full grace period for the still-blocked
+  // second worker.
+  process.kill(second_coordinator)
+  mark_database_test_executed(
+    "stale-shutdown-grace-timer-scoped-to-incarnation",
+  )
 }
 
 fn run_stale_consumer_handle_test(database_url: String) -> Nil {
@@ -938,6 +1542,9 @@ fn resolution_route_b_url() -> Result(String, Nil)
 
 @external(erlang, "grind_test_env", "mark_database_test_executed")
 fn mark_database_test_executed(contract: String) -> Nil
+
+@external(erlang, "grind_test_env", "monotonic_ms")
+fn monotonic_ms() -> Int
 
 pub fn postgres_admission_round_trips_typed_arguments_test() {
   case database_url() {
@@ -1469,6 +2076,13 @@ pub fn postgres_scheduled_jobs_observe_database_due_time_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
     Ok(database_url) -> run_scheduled_due_time_test(database_url)
+  }
+}
+
+pub fn postgres_automatic_consumer_wakes_for_database_deadline_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_automatic_wakeup_test(database_url)
   }
 }
 
@@ -2131,20 +2745,7 @@ fn run_ack_commit_connection_loss_test(database_url: String) -> Nil {
 
   process.send(release, ReleaseAttempt)
   let assert Ok(backend_pid) = wait_for_commit_trigger_backend(connection, 100)
-  let assert Ok(True) =
-    pog.query("SELECT pg_terminate_backend($1)")
-    |> pog.parameter(pog.int(backend_pid))
-    |> pog.returning({
-      use terminated <- decode.field(0, decode.bool)
-      decode.success(terminated)
-    })
-    |> pog.execute(on: connection)
-    |> result.map(fn(returned) {
-      case returned.rows {
-        [terminated] -> terminated
-        _ -> False
-      }
-    })
+  terminate_backend(connection, backend_pid) |> should.equal(True)
   let assert Ok(Error(queue.QueueProcessFailed(postgres.QueueAckUnknown(
     command_id,
     proposed,
@@ -2211,6 +2812,438 @@ fn backend_pid_is_alive(connection: pog.Connection, pid: Int) -> Bool {
   }
 }
 
+fn terminate_backend(connection: pog.Connection, pid: Int) -> Bool {
+  pog.query("SELECT pg_terminate_backend($1)")
+  |> pog.parameter(pog.int(pid))
+  |> pog.returning({
+    use terminated <- decode.field(0, decode.bool)
+    decode.success(terminated)
+  })
+  |> pog.execute(on: connection)
+  |> result.map(fn(returned) {
+    case returned.rows {
+      [terminated] -> terminated
+      _ -> False
+    }
+  })
+  |> result.unwrap(False)
+}
+
+/// Blocks (bounded) until `pid` no longer appears in `pg_stat_activity`.
+/// `pg_terminate_backend` only sends the termination signal and returns
+/// immediately; it does not wait for the target to actually finish
+/// committing and exit. Callers that need PostgreSQL's own commit-visibility
+/// side effects (ProcArray removal) to have happened before they proceed —
+/// rather than relying on incidentally observing the same backend's own
+/// socket close, as the reconciling-from-receipt test does — must wait for
+/// this instead of proceeding immediately after termination.
+fn wait_for_backend_gone(
+  connection: pog.Connection,
+  pid: Int,
+  checks_remaining: Int,
+) -> Result(Nil, Nil) {
+  case backend_pid_is_alive(connection, pid) {
+    False -> Ok(Nil)
+    True ->
+      case checks_remaining > 0 {
+        False -> Error(Nil)
+        True -> {
+          process.sleep(10)
+          wait_for_backend_gone(connection, pid, checks_remaining - 1)
+        }
+      }
+  }
+}
+
+fn wait_for_syncrep_trigger_backend(
+  connection: pog.Connection,
+  checks_remaining: Int,
+) -> Result(Int, Nil) {
+  let query =
+    pog.query(
+      "SELECT pid FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND pid <> pg_backend_pid() AND wait_event = 'SyncRep' ORDER BY query_start DESC LIMIT 1",
+    )
+    |> pog.returning({
+      use pid <- decode.field(0, decode.int)
+      decode.success(pid)
+    })
+  case pog.execute(query, on: connection) {
+    Error(_) -> Error(Nil)
+    Ok(returned) ->
+      case returned.rows {
+        [pid] -> Ok(pid)
+        [] ->
+          case checks_remaining > 0 {
+            False -> Error(Nil)
+            True -> {
+              process.sleep(10)
+              wait_for_syncrep_trigger_backend(connection, checks_remaining - 1)
+            }
+          }
+        _ -> Error(Nil)
+      }
+  }
+}
+
+/// Fails clearly, instead of an opaque `let assert` mismatch far from the
+/// real cause, when the disposable cluster was not started the way the
+/// Increment 2 lost-reply tests require it. Without
+/// `synchronous_standby_names=grind_never_standby`, a transaction that
+/// raises its own `synchronous_commit` to `on` would either commit
+/// immediately (a real standby present) or never proceed past `SyncRep` at
+/// all in a way these tests can distinguish from a hang.
+fn require_syncrep_cluster_configured(connection: pog.Connection) -> Nil {
+  let assert Ok(returned) =
+    pog.query("SHOW synchronous_standby_names")
+    |> pog.returning({
+      use value <- decode.field(0, decode.string)
+      decode.success(value)
+    })
+    |> pog.execute(on: connection)
+  case returned.rows {
+    ["grind_never_standby"] -> Nil
+    [other] -> {
+      let message =
+        "scripts/test-postgres.sh must start PostgreSQL with -c synchronous_standby_names=grind_never_standby -c synchronous_commit=local for the SyncRep-based lost-reply tests to be meaningful; synchronous_standby_names was \""
+        <> other
+        <> "\" instead"
+      panic as message
+    }
+    _ ->
+      panic as "could not read synchronous_standby_names from the test cluster; scripts/test-postgres.sh must start PostgreSQL with -c synchronous_standby_names=grind_never_standby -c synchronous_commit=local"
+  }
+}
+
+/// Installs a deferred constraint trigger on `grind_job_acknowledgements`,
+/// scoped to `job_id`, whose function raises only that one ack transaction's
+/// `synchronous_commit` to `on` — see the Increment 2 tests below. Returns a
+/// cleanup thunk for the caller to register with `exception.defer`, which
+/// first terminates any backend this same trigger still has parked in
+/// `SyncRep` (so a failing assertion earlier in the test cannot hang the
+/// whole gate run waiting on a standby that will never connect) and caps the
+/// DROP itself with a lock timeout before dropping the trigger and function.
+fn install_syncrep_reply_trigger(
+  connection: pog.Connection,
+  name: String,
+  job_id: Int,
+) -> fn() -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_id <> "
+      <> int.to_string(job_id)
+      <> " THEN RETURN NEW; END IF; PERFORM set_config('synchronous_commit', 'on', true); RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER "
+      <> name
+      <> " AFTER INSERT ON grind_job_acknowledgements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+      <> name
+      <> "()",
+    )
+    |> pog.execute(on: connection)
+  fn() {
+    let _ = case wait_for_syncrep_trigger_backend(connection, 0) {
+      Ok(stuck_pid) -> terminate_backend(connection, stuck_pid)
+      Error(Nil) -> True
+    }
+    let _ = pog.query("SET lock_timeout = '2s'") |> pog.execute(on: connection)
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS " <> name <> " ON grind_job_acknowledgements",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> name <> "()")
+      |> pog.execute(on: connection)
+    Nil
+  }
+}
+
+fn stored_attempt_identity(
+  connection: pog.Connection,
+  job_id: Int,
+) -> Result(#(Int, Int), Nil) {
+  pog.query("SELECT attempt_id, attempt_epoch FROM grind_jobs WHERE id = $1")
+  |> pog.parameter(pog.int(job_id))
+  |> pog.returning({
+    use attempt_id <- decode.field(0, decode.int)
+    use epoch <- decode.field(1, decode.int)
+    decode.success(#(attempt_id, epoch))
+  })
+  |> pog.execute(on: connection)
+  |> result.replace_error(Nil)
+  |> result.try(fn(returned) {
+    case returned.rows {
+      [row] -> Ok(row)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// Increment 2: a genuinely successful ack whose reply is lost after
+/// PostgreSQL has already committed locally. The disposable cluster is
+/// started with `synchronous_standby_names=grind_never_standby` and
+/// `synchronous_commit=local` (scripts/test-postgres.sh), so an ordinary
+/// commit stays local, but a deferred constraint trigger scoped to this
+/// job's acknowledgement row raises this one transaction's own
+/// `synchronous_commit` to `on` (session-local, `set_config(..., true)`)
+/// just before COMMIT. Because the configured standby name never connects,
+/// that COMMIT parks in PostgreSQL's `SyncRep` wait *after* its WAL record is
+/// already locally flushed — genuinely committed, reply not yet sent.
+/// Terminating that backend at that exact moment (observed by polling
+/// `pg_stat_activity` for `wait_event = 'SyncRep'`) reproduces "PostgreSQL
+/// committed, but the client's connection closed before it saw the reply"
+/// without a TCP proxy or any production test hook: the client observes a
+/// closed connection during COMMIT, exactly like the existing aborted-commit
+/// test, but this time a receipt genuinely exists to reconcile from.
+pub fn postgres_ack_committed_reply_lost_reconciles_from_receipt_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_ack_committed_reply_lost_reconciles_test(database_url)
+  }
+}
+
+fn run_ack_committed_reply_lost_reconciles_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_ack_reply_lost")
+  let settings = postgres.settings(database_url, pool_name)
+  let assert Ok(validated) = postgres.validate(settings)
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  require_syncrep_cluster_configured(connection)
+  let assert Ok(input_codec) =
+    worker.codec("ack-reply-lost-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("ack-reply-lost-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(definition) =
+    worker.define("ack.reply.lost", "v1", input_codec, output_codec, fn(value) {
+      let release = process.new_subject()
+      process.send(started, FirstAttemptStarted(release))
+      process.send(invoked, WorkerInvoked)
+      case process.receive(release, within: 10_000) {
+        Ok(ReleaseAttempt) -> Ok("reply-lost-" <> int.to_string(value))
+        Error(Nil) -> Error(AccountMissing(value))
+      }
+    })
+  let assert Ok(workers) = registry.new("ack-reply-lost")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "ack-reply-lost", definition, 33)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
+
+  let job_id = job.id_value(handle)
+  use <- exception.defer(install_syncrep_reply_trigger(
+    connection,
+    "grind_test_syncrep_reply_lost",
+    job_id,
+  ))
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(backend_pid) = wait_for_syncrep_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  process.receive(reply, within: 10_000) |> should.equal(Ok(Ok(True)))
+  backend_pid_is_alive(connection, backend_pid) |> should.equal(False)
+  postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.SucceededWith("reply-lost-33")))
+  let assert Ok(#(attempt_id, epoch)) =
+    stored_attempt_identity(connection, job_id)
+  let command_id =
+    postgres.acknowledgement_command_id(job_id, attempt_id, epoch)
+  let assert Ok(postgres.AcknowledgementReceipt(committed_state:, ..)) =
+    postgres.reconcile_acknowledgement(database, handle, command_id)
+  committed_state |> should.equal(job.Succeeded)
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  process.receive(invoked, within: 0) |> should.equal(Error(Nil))
+  mark_database_test_executed("ack-committed-reply-lost-reconciled-passed")
+}
+
+/// Same fault as above, but Grind's own pool is closed (not the PostgreSQL
+/// backend) while the ack's COMMIT is still parked in `SyncRep`, so the
+/// receipt lookup that would otherwise reconcile the lost reply cannot run
+/// either. A separate observer pool (independent of Grind's pool) is used to
+/// poll for the SyncRep wait, read the committed attempt identity, and later
+/// terminate the stuck backend once the store-unavailable assertion has been
+/// made, exactly as prescribed.
+pub fn postgres_ack_committed_reply_lost_with_store_unavailable_is_unknown_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_ack_committed_reply_lost_with_store_unavailable_test(database_url)
+  }
+}
+
+fn run_ack_committed_reply_lost_with_store_unavailable_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_reply_lost_unavailable")
+  let settings = postgres.settings(database_url, pool_name)
+  let assert Ok(validated) = postgres.validate(settings)
+  let assert Ok(database) = postgres.start(validated)
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let observer_pool_name =
+    process.new_name("grind_ack_reply_lost_unavailable_observer")
+  let observer_settings =
+    postgres.settings(database_url, observer_pool_name)
+    |> postgres.pool_size(1)
+  let assert Ok(observer_validated) = postgres.validate(observer_settings)
+  let assert Ok(observer) = postgres.start(observer_validated)
+  use <- exception.defer(fn() { postgres.close(observer) })
+  let observer_connection = pog.named_connection(observer_pool_name)
+  require_syncrep_cluster_configured(observer_connection)
+
+  let assert Ok(input_codec) =
+    worker.codec("ack-reply-lost-unavailable-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "ack-reply-lost-unavailable-output-v1",
+      json.string,
+      decode.string,
+    )
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "ack.reply.lost.unavailable",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        process.send(invoked, WorkerInvoked)
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("unavailable-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("ack-reply-lost-unavailable")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "ack-reply-lost-unavailable", definition, 34)
+  let attempt_owner = "ack-reply-lost-unavailable-owner"
+  // Claimed directly through the postgres-level API (not `queue`), so the
+  // opaque `ClaimedJob`/`Execution` values stay in scope for the same-command
+  // retry through `postgres.acknowledge_claim` after the pool is reopened,
+  // below. `claim_one` itself does not block; only the worker's own handler
+  // (invoked by `execute_claim`, in the spawned process) does.
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "ack-reply-lost-unavailable",
+      workers,
+      attempt_owner,
+      30_000,
+    )
+  let #(claimed_id, attempt_id, epoch) = postgres.claim_identity(claimed)
+  let command_id =
+    postgres.acknowledgement_command_id(claimed_id, attempt_id, epoch)
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      let execution = postgres.execute_claim(claimed)
+      let ack_result =
+        postgres.acknowledge_claim(
+          database,
+          "ack-reply-lost-unavailable",
+          attempt_owner,
+          claimed,
+          execution,
+        )
+      process.send(reply, #(execution, ack_result))
+    })
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
+
+  let job_id = job.id_value(handle)
+  use <- exception.defer(install_syncrep_reply_trigger(
+    observer_connection,
+    "grind_test_syncrep_reply_lost_unavailable",
+    job_id,
+  ))
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(backend_pid) =
+    wait_for_syncrep_trigger_backend(observer_connection, 300)
+
+  postgres.close(database)
+
+  let assert Ok(#(execution, ack_result)) =
+    process.receive(reply, within: 10_000)
+  execution
+  |> should.equal(worker.ExecutedSuccess(
+    "ack-reply-lost-unavailable-output-v1",
+    "\"unavailable-34\"",
+  ))
+  ack_result
+  |> should.equal(Error(postgres.QueueAckUnknown(command_id, execution)))
+
+  terminate_backend(observer_connection, backend_pid) |> should.equal(True)
+  // `pg_terminate_backend` only signals the backend; it returns before the
+  // target has actually finished `ProcArrayEndTransaction` and exited. Unlike
+  // the reconciles-from-receipt test (where the coordinator's own blocked
+  // read on that same backend already orders its lookup after that step),
+  // here Grind's pool was closed client-side, so nothing else orders "reopen
+  // and query" after "the backend actually finished committing." Wait for it
+  // explicitly instead of assuming it.
+  let assert Ok(Nil) =
+    wait_for_backend_gone(observer_connection, backend_pid, 300)
+
+  let assert Ok(reopened) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(reopened) })
+  let assert Ok(postgres.AcknowledgementReceipt(committed_state:, ..)) =
+    postgres.reconcile_acknowledgement(reopened, handle, command_id)
+  committed_state |> should.equal(job.Succeeded)
+  postgres.outcome(reopened, handle)
+  |> should.equal(Ok(job.SucceededWith("unavailable-34")))
+
+  // The same command, retried end to end through the reopened store: proves
+  // idempotent replay, not just that the receipt can be read back.
+  postgres.acknowledge_claim(
+    reopened,
+    "ack-reply-lost-unavailable",
+    attempt_owner,
+    claimed,
+    execution,
+  )
+  |> should.equal(Ok(True))
+
+  let assert Ok(fresh_consumer) = queue.start_manual(reopened, workers)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(fresh_consumer)
+    Nil
+  })
+  queue.process_one(fresh_consumer) |> should.equal(Ok(False))
+  process.receive(invoked, within: 0) |> should.equal(Error(Nil))
+  mark_database_test_executed(
+    "ack-committed-reply-lost-store-unavailable-unknown-passed",
+  )
+}
+
 fn run_ack_receipt_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_ack_receipt")
   let assert Ok(validated) =
@@ -2261,12 +3294,7 @@ fn run_ack_receipt_test(database_url: String) -> Nil {
   )
   let #(claimed_id, attempt_id, epoch) = postgres.claim_identity(claimed)
   let command_id =
-    "grind-ack:"
-    <> int.to_string(claimed_id)
-    <> ":"
-    <> int.to_string(attempt_id)
-    <> ":"
-    <> int.to_string(epoch)
+    postgres.acknowledgement_command_id(claimed_id, attempt_id, epoch)
   let connection = pog.named_connection(pool_name)
   let assert Ok(_) =
     pog.query(
@@ -2305,14 +3333,14 @@ fn run_ack_receipt_test(database_url: String) -> Nil {
       "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_test_reject_ack",
     )
     |> pog.execute(on: connection)
-  postgres.acknowledge_claim_with_lost_reply_after_commit(
+  postgres.acknowledge_claim(
     database,
     "ack-receipt",
     "ack-receipt-owner",
     claimed,
     execution,
   )
-  |> should.equal(Error(postgres.QueueAckUnknown(command_id, execution)))
+  |> should.equal(Ok(True))
   // A retry with the same stable command and exact proposal is idempotent.
   postgres.acknowledge_claim(
     database,
@@ -2684,6 +3712,155 @@ fn run_closed_pool_renewal_test(database_url: String) -> Nil {
   mark_database_test_executed("closed-pool-renewal-recovered-passed")
 }
 
+/// The owner and pool losses here are sequential, not concurrent: the pool is
+/// only closed and reopened after the owner and its cascaded worker are both
+/// confirmed dead, as recovery plumbing following that death, not as a second
+/// failure landing during active work.
+fn run_owner_loss_recovers_after_pool_restart_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_owner_pool_loss")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("owner-pool-loss-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("owner-pool-loss-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(definition) =
+    worker.define("owner.pool.loss", "v1", input_codec, output_codec, fn(value) {
+      let release = process.new_subject()
+      process.send(invoked, WorkerInvoked)
+      process.send(started, OwnerPoolLossStarted(process.self(), release))
+      case process.receive(release, within: 20_000) {
+        Ok(ReleaseAttempt) -> Ok("owner-pool-loss-" <> int.to_string(value))
+        Error(Nil) -> Error(AccountMissing(value))
+      }
+    })
+  let assert Ok(workers) = registry.new("owner-pool-loss")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "owner-pool-loss", definition, 61)
+  let job_id = job.id_value(handle)
+
+  let owner_ready = process.new_subject()
+  let owner =
+    process.spawn_unlinked(fn() {
+      let assert Ok(policy) =
+        queue.default_policy()
+        |> queue.with_poll_interval(20)
+        |> queue.with_maximum_concurrency(1)
+        |> queue.with_lease_duration(5000)
+        |> queue.validate_policy
+      case queue.start_with_policy(database, workers, policy) {
+        Error(error) ->
+          process.send(owner_ready, OwnerPoolLossOwnerFailed(error))
+        Ok(consumer) -> {
+          process.send(
+            owner_ready,
+            OwnerPoolLossOwnerReady(process.self(), consumer),
+          )
+          process.sleep(60_000)
+        }
+      }
+    })
+  let owner_monitor = process.monitor(owner)
+  let assert Ok(OwnerPoolLossOwnerReady(started_owner, _consumer)) =
+    process.receive(owner_ready, within: 5000)
+  started_owner |> should.equal(owner)
+
+  let assert Ok(OwnerPoolLossStarted(worker_pid, _release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 0) |> should.equal(Ok(WorkerInvoked))
+  let worker_monitor = process.monitor(worker_pid)
+
+  // The owner is not part of this test process's own supervision tree, so
+  // killing it must be observed rather than assumed: the consumer's
+  // top-level supervisor is linked to whichever process called
+  // `queue.start_with_policy`, so the owner's death cascades down through
+  // that supervisor, the coordinator, and the coordinator's own linked
+  // worker factory, ending in the blocked worker's death too.
+  process.kill(owner)
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(owner_monitor, fn(down) {
+      #("owner", down)
+    })
+    |> process.select_specific_monitor(worker_monitor, fn(down) {
+      #("worker", down)
+    })
+  // Collected order-independently: the owner's death and the worker's death
+  // are two separate cascading events from this test's observation point,
+  // and only their causal order (owner, then worker) is guaranteed, not the
+  // order in which their DOWN messages are scheduled into this mailbox.
+  let assert Ok(#(first_down_tag, _)) =
+    process.selector_receive(down_selector, within: 5000)
+  let assert Ok(#(second_down_tag, _)) =
+    process.selector_receive(down_selector, within: 5000)
+  { first_down_tag != second_down_tag } |> should.equal(True)
+  { first_down_tag == "owner" || first_down_tag == "worker" }
+  |> should.equal(True)
+  { second_down_tag == "owner" || second_down_tag == "worker" }
+  |> should.equal(True)
+
+  postgres.close(database)
+  let assert Ok(reopened) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(reopened) })
+
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(forced_expiry) =
+    pog.query(
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() WHERE id = $1 AND state = 'executing'",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  forced_expiry.count |> should.equal(1)
+
+  let assert Ok(fresh_consumer) = queue.start_manual(reopened, workers)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(fresh_consumer)
+    Nil
+  })
+
+  queue.process_one(fresh_consumer) |> should.equal(Ok(False))
+  postgres.state(reopened, handle) |> should.equal(Ok(job.Uncertain))
+  process.receive(invoked, within: 0) |> should.equal(Error(Nil))
+
+  let assert Ok(rebound) = postgres.bind_handle(reopened, definition, job_id)
+  postgres.resolve_uncertain(
+    reopened,
+    rebound,
+    "owner-pool-loss-authorized-replay",
+    "on-call",
+    "inspect the external effect before authorizing a new delivery",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+
+  let replay_reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(replay_reply, queue.process_one(fresh_consumer))
+    })
+  let assert Ok(OwnerPoolLossStarted(_, replay_release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 0) |> should.equal(Ok(WorkerInvoked))
+  process.send(replay_release, ReleaseAttempt)
+  process.receive(replay_reply, within: 5000) |> should.equal(Ok(Ok(True)))
+  postgres.state(reopened, handle) |> should.equal(Ok(job.Succeeded))
+  process.receive(invoked, within: 0) |> should.equal(Error(Nil))
+  let assert Ok(#(final_attempt_count, final_delivery_count)) =
+    attempt_accounting(connection, job_id)
+  final_attempt_count |> should.equal(2)
+  final_delivery_count |> should.equal(2)
+  let _ = process.demonitor_process(owner_monitor)
+  mark_database_test_executed("owner-loss-pool-restart-quarantined-no-replay")
+}
+
 fn run_worker_start_failure_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_worker_start_failure")
   let assert Ok(validated) =
@@ -2906,6 +4083,104 @@ fn run_scheduled_due_time_test(database_url: String) -> Nil {
   process.receive(probe, within: 0) |> should.equal(Ok(WorkerInvoked))
   postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
   mark_database_test_executed("scheduled-due-time-passed")
+}
+
+/// Proves the automatic consumer actually waits for the database's own
+/// clock to reach `available_at` before claiming, rather than merely being
+/// eligible to run afterward. Honest limit: Grind has no LISTEN/NOTIFY
+/// wakeup path (confirmed by reading the source — `claim_registered_job`
+/// and the coordinator's self-scheduled `Poll` timer are the only ways a
+/// row ever gets claimed; no PostgreSQL channel is ever subscribed to);
+/// this proves wakeup via polling after the deadline elapses, not a
+/// notification-driven wakeup. Two independent database-time observations
+/// back this claim: (1) immediately after the consumer starts, the job is
+/// still `Scheduled` and the database clock is still before `available_at`
+/// — proving at least one pre-deadline poll tick genuinely skipped the row
+/// (this assertion is not retried, so a too-slow environment fails it
+/// honestly instead of silently passing); (2) the handler itself, at the
+/// moment it actually runs, compares `available_at` against the row's own
+/// recorded *claim* time (`lease_expires_at - lease_duration`) rather than
+/// its own later `clock_timestamp()` call, so the observation is pinned to
+/// when the claim SQL actually admitted the row, not to whatever moment the
+/// handler happens to be scheduled afterward.
+fn run_automatic_wakeup_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_automatic_wakeup")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("auto-wakeup-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("auto-wakeup-output-v1", json.bool, decode.bool)
+  let connection = pog.named_connection(pool_name)
+  let observed = process.new_subject()
+  let lease_duration_ms = 5000
+  let assert Ok(auto_worker) =
+    worker.define("auto.wakeup", "v1", input_codec, output_codec, fn(_value) {
+      let assert Ok(returned) =
+        pog.query(
+          "SELECT (lease_expires_at - ($1::double precision * interval '1 millisecond')) >= available_at FROM grind_jobs WHERE worker_id = 'auto.wakeup' AND queue = 'auto-wakeup'",
+        )
+        |> pog.parameter(pog.int(lease_duration_ms))
+        |> pog.returning({
+          use due <- decode.field(0, decode.bool)
+          decode.success(due)
+        })
+        |> pog.execute(on: connection)
+      let assert [due] = returned.rows
+      process.send(observed, due)
+      Ok(due)
+    })
+  let assert Ok(workers) = registry.new("auto-wakeup")
+  let assert Ok(workers) = registry.register(workers, auto_worker)
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint + 300",
+    )
+    |> pog.returning({
+      use value <- decode.field(0, decode.int)
+      decode.success(value)
+    })
+    |> pog.execute(on: connection)
+  let assert [future_unix_ms] = returned.rows
+  let assert Ok(available_at) = job.available_at(future_unix_ms)
+  let assert Ok(handle) =
+    postgres.submit_at(database, "auto-wakeup", auto_worker, 1, available_at)
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_poll_interval(20)
+    |> queue.with_lease_duration(lease_duration_ms)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+
+  // Not retried: this proves a pre-deadline poll tick genuinely observed
+  // the row as not-yet-due. A too-slow environment (already past the
+  // ~300ms deadline by the time this runs) fails this assertion honestly
+  // rather than the test silently skipping the proof.
+  let assert Ok(pre_deadline) =
+    pog.query(
+      "SELECT clock_timestamp() < available_at FROM grind_jobs WHERE worker_id = 'auto.wakeup' AND queue = 'auto-wakeup'",
+    )
+    |> pog.returning({
+      use before_deadline <- decode.field(0, decode.bool)
+      decode.success(before_deadline)
+    })
+    |> pog.execute(on: connection)
+  let assert [before_deadline] = pre_deadline.rows
+  before_deadline |> should.equal(True)
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+
+  process.receive(observed, within: 5000) |> should.equal(Ok(True))
+  wait_for_job_state(database, handle, job.Succeeded, 250)
+  |> should.equal(True)
+  mark_database_test_executed("automatic-wakeup-database-deadline-passed")
 }
 
 pub fn postgres_manual_batch_reports_acknowledged_prefix_test() {
@@ -3202,6 +4477,13 @@ pub fn postgres_acknowledgement_rejects_exact_database_expiry_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
     Ok(database_url) -> run_exact_expiry_test(database_url)
+  }
+}
+
+pub fn postgres_ack_after_database_expiry_is_stale_without_receipt_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_ack_after_database_expiry_test(database_url)
   }
 }
 
@@ -3522,19 +4804,161 @@ fn run_exact_expiry_test(database_url: String) -> Nil {
   let connection = pog.named_connection(pool_name)
   let assert Ok(boundary) =
     pog.query(
-      "WITH database_time AS MATERIALIZED (SELECT clock_timestamp() AS instant), boundary AS MATERIALIZED (UPDATE grind_jobs AS job SET lease_expires_at = database_time.instant FROM database_time WHERE job.id = $1 RETURNING job.lease_expires_at, database_time.instant) SELECT lease_expires_at = instant, lease_expires_at > instant FROM boundary",
+      "WITH database_time AS MATERIALIZED (SELECT clock_timestamp() AS instant), boundary AS MATERIALIZED (UPDATE grind_jobs AS job SET lease_expires_at = database_time.instant FROM database_time WHERE job.id = $1 RETURNING job.lease_expires_at, database_time.instant) SELECT lease_expires_at = instant, "
+      <> postgres.live_lease_predicate("instant")
+      <> ", "
+      <> postgres.expired_lease_predicate("instant")
+      <> " FROM boundary",
     )
     |> pog.parameter(pog.int(id))
     |> pog.returning({
       use exact <- decode.field(0, decode.bool)
       use acknowledgement_allowed <- decode.field(1, decode.bool)
-      decode.success(#(exact, acknowledgement_allowed))
+      use quarantine_eligible <- decode.field(2, decode.bool)
+      decode.success(#(exact, acknowledgement_allowed, quarantine_eligible))
     })
     |> pog.execute(on: connection)
-  let assert [#(exact, acknowledgement_allowed)] = boundary.rows
+  let assert [#(exact, acknowledgement_allowed, quarantine_eligible)] =
+    boundary.rows
   exact |> should.equal(True)
   acknowledgement_allowed |> should.equal(False)
+  // At the exact boundary, `expired_lease_predicate` must be the complement
+  // of `live_lease_predicate` (a strict `<=` and a strict `>` on the same
+  // pair can never both be true or both be false), proving the quarantine
+  // scan's own fragment agrees with the acknowledgement fragment on exactly
+  // this tie instead of merely happening not to disagree elsewhere.
+  quarantine_eligible |> should.equal(!acknowledgement_allowed)
+  quarantine_eligible |> should.equal(True)
   mark_database_test_executed("exact-expiry-rejected")
+}
+
+/// Proves the same fenced-lease predicate rejects acknowledgement once the
+/// lease has already expired by database time, on the *production*
+/// acknowledgement path (the test above only exercises the SQL predicate
+/// directly). The lease is deliberately much longer than this test's whole
+/// run so no automatic renewal tick can fire and confuse the result with a
+/// renewal-detected loss instead of the forced write below. Honest wording:
+/// this proves the "lease already expired" side of the boundary on the real
+/// `acknowledge_claim` path, not exact-instant equality — real time elapses
+/// between the forced write below and the ack transaction's own later
+/// `clock_timestamp()` call, so by the time production code evaluates the
+/// predicate the lease is already in the past, not tied to it. Exact
+/// equality at a single instant is what the predicate-only test above
+/// proves, against this same shared fragment.
+fn run_ack_after_database_expiry_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_ack_after_expiry")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("ack-after-expiry-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("ack-after-expiry-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(slow_worker) =
+    worker.define(
+      "ack.after.expiry",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        process.send(invoked, WorkerInvoked)
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("after-expiry-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("ack-after-expiry")
+  let assert Ok(workers) = registry.register(workers, slow_worker)
+  let assert Ok(handle) =
+    postgres.submit(database, "ack-after-expiry", slow_worker, 9)
+  let job_id = job.id_value(handle)
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_lease_duration(30_000)
+    |> queue.validate_policy
+  let assert Ok(consumer) =
+    queue.start_manual_with_policy(database, workers, policy)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+  let reply = process.new_subject()
+  let _ =
+    process.spawn(fn() { process.send(reply, queue.process_one(consumer)) })
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
+
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(#(attempt_id, epoch, _, Some(attempt_owner))) =
+    attempt_snapshot(connection, job_id)
+
+  // Tightest reachable forced expiry: the row's lease is set to the
+  // database's own "now" rather than a value already further in the past.
+  // The elapsed time between this UPDATE committing and the ack
+  // transaction's own later clock_timestamp() call is what pushes the
+  // lease into the past by the time production code evaluates it.
+  let assert Ok(forced_expiry) =
+    pog.query(
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() WHERE id = $1 AND state = 'executing'",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  forced_expiry.count |> should.equal(1)
+
+  // No renewal tick has fired yet (lease_duration_ms / 3 is far outside this
+  // test's whole run), so the coordinator's own renewal status is still
+  // whatever the claim left it at. This confirms the ack rejection below
+  // comes from the forced write, not from a renewal loss the coordinator
+  // already detected on its own.
+  queue.renewal_status(consumer)
+  |> should.equal(Ok(Some(queue.LeaseRenewalConfirmed)))
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(Error(queue.QueueProcessFailed(postgres.QueueAckStale(
+    proposed,
+    postgres.AckLeaseExpired(stale_attempt_id, stale_epoch, stale_owner),
+  )))) = process.receive(reply, within: 5000)
+  proposed
+  |> should.equal(worker.ExecutedSuccess(
+    "ack-after-expiry-output-v1",
+    "\"after-expiry-9\"",
+  ))
+  stale_attempt_id |> should.equal(attempt_id)
+  stale_epoch |> should.equal(epoch)
+  stale_owner |> should.equal(attempt_owner)
+
+  let command_id =
+    postgres.acknowledgement_command_id(job_id, attempt_id, epoch)
+  let assert Ok(receipt_rows) =
+    pog.query(
+      "SELECT count(*) FROM grind_job_acknowledgements WHERE command_id = $1",
+    )
+    |> pog.parameter(pog.text(command_id))
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+    |> pog.execute(on: connection)
+  let assert [0] = receipt_rows.rows
+
+  postgres.reconcile_acknowledgement(database, handle, command_id)
+  |> should.equal(Error(postgres.AckReceiptNotFound))
+  postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
+  process.receive(invoked, within: 0) |> should.equal(Error(Nil))
+  mark_database_test_executed(
+    "ack-after-database-expiry-stale-no-receipt-passed",
+  )
 }
 
 fn run_bounded_quarantine_test(database_url: String) -> Nil {

@@ -1,6 +1,7 @@
 import exception
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/int
 import gleam/json
 import gleeunit
 import gleeunit/should
@@ -22,6 +23,16 @@ type Probe {
   ReportInvoked
 }
 
+/// A running handler's own barrier: it reports it has started (handing back
+/// a release subject) and then blocks until the test releases it.
+type Barrier {
+  BarrierStarted(process.Subject(BarrierRelease))
+}
+
+type BarrierRelease {
+  BarrierRelease
+}
+
 @external(erlang, "consumer_test_env", "database_url")
 fn database_url() -> Result(String, Nil)
 
@@ -39,6 +50,32 @@ fn apply_synthetic_effect(key: String, amount: Int) -> #(String, Int)
 
 @external(erlang, "consumer_effect", "count")
 fn synthetic_effect_count(key: String) -> Int
+
+/// Reads the application's own dedup record for a key without applying
+/// anything: this is how the app inspects its own table during an audited
+/// resolution, as opposed to calling `apply_synthetic_effect` again.
+@external(erlang, "consumer_effect", "receipt")
+fn synthetic_effect_receipt(key: String) -> Result(String, Nil)
+
+/// Arms a one-shot crash: the next `apply_synthetic_effect` call for this
+/// exact key applies (and retains) its effect first, then raises, killing
+/// the calling worker process before Grind can acknowledge anything.
+@external(erlang, "consumer_effect", "arm_crash_after_effect")
+fn arm_crash_after_effect(key: String) -> Nil
+
+/// Reports whether a crash was still armed for this key, consuming it if
+/// so. Used here only to prove the fault is genuinely one-shot.
+@external(erlang, "consumer_effect", "take_fault")
+fn take_effect_fault(key: String) -> Bool
+
+@external(erlang, "consumer_counter", "reset")
+fn reset_counter(key: String) -> Nil
+
+@external(erlang, "consumer_counter", "next")
+fn next_counter(key: String) -> Int
+
+@external(erlang, "consumer_counter", "value")
+fn counter_value(key: String) -> Int
 
 pub fn queue_policy_is_checked_before_start_test() {
   queue.default_policy()
@@ -68,7 +105,7 @@ fn run_public_consumer_test(url: String) -> Nil {
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_poll_interval(60_000)
-    |> queue.with_maximum_jobs_per_poll(3)
+    |> queue.with_maximum_jobs_per_poll(4)
     |> queue.validate_policy
   let assert Ok(settings) =
     postgres.settings(url, process.new_name("external_consumer_pool"))
@@ -86,11 +123,19 @@ fn run_public_consumer_test(url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, payment_worker)
   let assert Ok(workers) = registry.register(workers, report_worker)
 
-  let #(seed_receipt, seed_count) = apply_synthetic_effect("payment/42", 500)
-  seed_receipt |> should.equal("synthetic-receipt/payment/42")
-  seed_count |> should.equal(1)
-
   let assert Ok(payment_handle) =
+    postgres.submit(
+      database,
+      "external-consumer",
+      payment_worker,
+      PaymentRequest("payment/42", 500),
+    )
+  // A second, independently admitted job reuses the same application
+  // idempotency key as `payment_handle`. Nothing is preseeded: this is what
+  // actually exercises the app's own dedup table, because the worker's own
+  // effect application for this second job is the one that must observe the
+  // key already taken by the first job's own execution.
+  let assert Ok(dedup_handle) =
     postgres.submit(
       database,
       "external-consumer",
@@ -112,6 +157,8 @@ fn run_public_consumer_test(url: String) -> Nil {
 
   process.receive(payment_probe, within: 5000)
   |> should.equal(Ok(ChargeInvoked))
+  process.receive(payment_probe, within: 5000)
+  |> should.equal(Ok(ChargeInvoked))
   process.receive(report_probe, within: 5000)
   |> should.equal(Ok(ReportInvoked))
   process.receive(payment_probe, within: 5000)
@@ -121,13 +168,25 @@ fn run_public_consumer_test(url: String) -> Nil {
   // committed job states themselves before reading typed outcomes.
   await_state(database, payment_handle, job.Succeeded, 250)
   |> should.equal(True)
+  await_state(database, dedup_handle, job.Succeeded, 250)
+  |> should.equal(True)
   await_state(database, report_handle, job.Succeeded, 250)
   |> should.equal(True)
   await_state(database, failure_handle, job.BusinessFailed, 250)
   |> should.equal(True)
+  // Both payment jobs called into the same synthetic effect for the same
+  // key, yet the key was only ever actually applied once.
   synthetic_effect_count("payment/42") |> should.equal(1)
+  // The receipt carries a unique token minted only inside the app's own
+  // table (consumer_effect.erl), so reading it back here and asserting both
+  // jobs' committed outcomes equal it proves the outcome's value actually
+  // came from that table -- not merely a value this test could have
+  // predicted as a pure function of the key.
+  let assert Ok(payment_receipt) = synthetic_effect_receipt("payment/42")
   postgres.outcome(database, payment_handle)
-  |> should.equal(Ok(job.SucceededWith("synthetic-receipt/payment/42")))
+  |> should.equal(Ok(job.SucceededWith(payment_receipt)))
+  postgres.outcome(database, dedup_handle)
+  |> should.equal(Ok(job.SucceededWith(payment_receipt)))
   postgres.outcome(database, report_handle)
   |> should.equal(Ok(job.SucceededWith(16)))
   postgres.outcome(database, failure_handle)
@@ -138,6 +197,243 @@ fn run_public_consumer_test(url: String) -> Nil {
     )),
   )
   mark("two-worker-consumer-passed")
+}
+
+pub fn public_consumer_retry_and_running_cancellation_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> run_retry_and_cancellation_test(url)
+  }
+}
+
+fn run_retry_and_cancellation_test(url: String) -> Nil {
+  let assert Ok(settings) =
+    postgres.settings(url, process.new_name("consumer_retry_cancel_pool"))
+    |> postgres.validate
+  let assert Ok(database) = postgres.start(settings)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  reset_effects()
+  reset_counter("consumer-retry-attempt")
+
+  let attempt_probe = process.new_subject()
+  let retry_context_probe = process.new_subject()
+  let started = process.new_subject()
+  let retry_worker =
+    retry_then_succeed_worker(attempt_probe, retry_context_probe)
+  let cancel_worker = cancel_while_running_worker(started)
+  let assert Ok(workers) = registry.new("consumer-retry-cancel")
+  let assert Ok(workers) = registry.register(workers, retry_worker)
+  let assert Ok(workers) = registry.register(workers, cancel_worker)
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  // --- Job 1: a definition-bound retry policy retries once, then succeeds.
+  let assert Ok(retry_handle) =
+    postgres.submit(database, "consumer-retry-cancel", retry_worker, 21)
+
+  await_claim(consumer, 0) |> should.equal(Ok(True))
+  // The bound retry policy callback receives Grind's own persisted
+  // `RetryContext` directly and reports it here: the first failed delivery's
+  // `current_attempt` is genuinely 1, observed through this public callback.
+  process.receive(retry_context_probe, within: 2000) |> should.equal(Ok(1))
+  // The `perform` handler itself has no such access -- only a bound retry
+  // policy callback ever receives a `RetryContext` (see
+  // docs/IMPLEMENTATION-SCOPE.md, "Job lifecycle and attempt history") -- so
+  // it tracks its own invocation count instead, which in this single-worker,
+  // no-concurrent-claims scenario advances in lockstep with Grind's
+  // persisted attempt count.
+  process.receive(attempt_probe, within: 2000) |> should.equal(Ok(1))
+  postgres.state(database, retry_handle) |> should.equal(Ok(job.Retryable))
+
+  // The retry delay is a real 50ms wall-clock wait; bounded polling waits
+  // for it to become due rather than sleeping a fixed duration as the
+  // assertion itself.
+  await_claim(consumer, 250) |> should.equal(Ok(True))
+  process.receive(attempt_probe, within: 2000) |> should.equal(Ok(2))
+  await_state(database, retry_handle, job.Succeeded, 250)
+  |> should.equal(True)
+  postgres.outcome(database, retry_handle)
+  |> should.equal(Ok(job.SucceededWith("retry-succeeded-21")))
+
+  // --- Job 2: cancellation requested against a running attempt. Grind
+  // commits Cancelled at acknowledgement regardless of the worker's own
+  // return value; it never undoes whatever the handler already did.
+  let assert Ok(cancel_handle) =
+    postgres.submit(
+      database,
+      "consumer-retry-cancel",
+      cancel_worker,
+      PaymentRequest("consumer-cancel/1", 250),
+    )
+
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(BarrierStarted(release)) =
+    process.receive(started, within: 5000)
+  use <- exception.defer(fn() { process.send(release, BarrierRelease) })
+
+  postgres.state(database, cancel_handle) |> should.equal(Ok(job.Executing))
+  postgres.cancel(database, cancel_handle)
+  |> should.equal(Ok(postgres.CancellationRequested))
+
+  process.send(release, BarrierRelease)
+  process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
+
+  postgres.state(database, cancel_handle) |> should.equal(Ok(job.Cancelled))
+  postgres.outcome(database, cancel_handle)
+  |> should.equal(Ok(job.CancelledWithReason("cancelled by caller")))
+
+  // The application's own effect record proves the handler's synthetic
+  // effect actually ran and was retained: Grind's cancellation does not, and
+  // cannot, undo it.
+  synthetic_effect_count("consumer-cancel/1") |> should.equal(1)
+
+  mark("consumer-retry-and-cancellation-passed")
+}
+
+pub fn public_consumer_effect_crash_uncertainty_audited_recovery_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> run_effect_crash_uncertainty_test(url)
+  }
+}
+
+fn run_effect_crash_uncertainty_test(url: String) -> Nil {
+  let assert Ok(settings) =
+    postgres.settings(url, process.new_name("consumer_uncertain_pool"))
+    |> postgres.validate
+  let assert Ok(database) = postgres.start(settings)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  reset_effects()
+
+  let job1_key = "consumer-uncertain/1"
+  let job2_key = "consumer-uncertain/2"
+  reset_counter(job1_key)
+  reset_counter(job2_key)
+  // A one-shot fault plan owned by the test application, not by Grind: the
+  // very next effect application for each key applies (and retains) its
+  // effect, then crashes the worker before any acknowledgement can commit.
+  arm_crash_after_effect(job1_key)
+  arm_crash_after_effect(job2_key)
+
+  let fault_worker = fault_prone_payment_worker()
+  let assert Ok(workers) = registry.new("consumer-uncertain")
+  let assert Ok(workers) = registry.register(workers, fault_worker)
+
+  let assert Ok(job1_handle) =
+    postgres.submit(
+      database,
+      "consumer-uncertain",
+      fault_worker,
+      PaymentRequest(job1_key, 100),
+    )
+  let assert Ok(job2_handle) =
+    postgres.submit(
+      database,
+      "consumer-uncertain",
+      fault_worker,
+      PaymentRequest(job2_key, 100),
+    )
+
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_poll_interval(20)
+    |> queue.with_maximum_jobs_per_poll(2)
+    |> queue.with_maximum_concurrency(2)
+    |> queue.with_lease_duration(500)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  // Each worker crashes (a genuine Erlang runtime error, not a typed business
+  // failure) right after applying its effect. That kills the Temporary
+  // worker child before it can return anything to Grind, so no
+  // acknowledgement is ever attempted for that attempt. Only the short
+  // lease's expiry, found by the automatic poller's own quarantine scan on a
+  // later tick, moves each row to Uncertain.
+  await_state(database, job1_handle, job.Uncertain, 250)
+  |> should.equal(True)
+  await_state(database, job2_handle, job.Uncertain, 250)
+  |> should.equal(True)
+  // The crash surfaced as worker death and conservative recovery -- never as
+  // an invalid-input or business-failure outcome.
+  postgres.outcome(database, job1_handle)
+  |> should.equal(
+    Ok(job.ReconciliationRequired(
+      "expired attempt requires outcome reconciliation",
+    )),
+  )
+  postgres.outcome(database, job2_handle)
+  |> should.equal(
+    Ok(job.ReconciliationRequired(
+      "expired attempt requires outcome reconciliation",
+    )),
+  )
+  synthetic_effect_count(job1_key) |> should.equal(1)
+  synthetic_effect_count(job2_key) |> should.equal(1)
+  counter_value(job1_key) |> should.equal(1)
+  counter_value(job2_key) |> should.equal(1)
+  // The one-shot fault plan is already consumed by the crashing call.
+  take_effect_fault(job1_key) |> should.equal(False)
+  take_effect_fault(job2_key) |> should.equal(False)
+
+  // The application inspects its own dedup table -- not a Grind API -- to
+  // decide each resolution.
+  let assert Ok(receipt1) = synthetic_effect_receipt(job1_key)
+  let assert Ok(receipt2) = synthetic_effect_receipt(job2_key)
+
+  // Job 1: confirmed successful from the application's own record. No rerun.
+  let assert Ok(rebound1) =
+    postgres.bind_handle(database, fault_worker, job.id_value(job1_handle))
+  postgres.resolve_uncertain(
+    database,
+    rebound1,
+    "consumer-uncertain-resolution-1",
+    "operator@example.test",
+    "confirmed from the application's own dedup record",
+    postgres.ConfirmSuccess(receipt1),
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Succeeded)))
+  postgres.state(database, rebound1) |> should.equal(Ok(job.Succeeded))
+  postgres.outcome(database, rebound1)
+  |> should.equal(Ok(job.SucceededWith(receipt1)))
+
+  // Job 2: authorized replay. The automatic consumer picks the requeued row
+  // back up on its own next poll tick; the rerun calls apply with the same
+  // key and receives the original receipt, so the synthetic effect count
+  // for that key stays 1.
+  let assert Ok(rebound2) =
+    postgres.bind_handle(database, fault_worker, job.id_value(job2_handle))
+  postgres.resolve_uncertain(
+    database,
+    rebound2,
+    "consumer-uncertain-resolution-2",
+    "operator@example.test",
+    "authorized replay after audited review",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+
+  await_state(database, rebound2, job.Succeeded, 250)
+  |> should.equal(True)
+  postgres.outcome(database, rebound2)
+  |> should.equal(Ok(job.SucceededWith(receipt2)))
+
+  // Job 1's handler ran exactly once (the crashing attempt); job 2's ran
+  // twice (the crashing attempt, then the authorized rerun). Neither key's
+  // synthetic effect was ever applied more than once.
+  counter_value(job1_key) |> should.equal(1)
+  counter_value(job2_key) |> should.equal(2)
+  synthetic_effect_count(job1_key) |> should.equal(1)
+  synthetic_effect_count(job2_key) |> should.equal(1)
+
+  mark("consumer-uncertainty-audited-recovery-passed")
 }
 
 fn await_state(
@@ -157,6 +453,27 @@ fn await_state(
         False, False -> False
       }
     Error(_) -> False
+  }
+}
+
+/// Bounded polling for a manual consumer's next claimable job. Used to wait
+/// for a real retry delay to become due without sleeping as the assertion
+/// itself.
+fn await_claim(
+  consumer: queue.Consumer,
+  remaining_checks: Int,
+) -> Result(Bool, queue.ProcessError) {
+  case queue.process_one(consumer) {
+    Ok(True) -> Ok(True)
+    Ok(False) ->
+      case remaining_checks > 0 {
+        True -> {
+          process.sleep(20)
+          await_claim(consumer, remaining_checks - 1)
+        }
+        False -> Ok(False)
+      }
+    Error(error) -> Error(error)
   }
 }
 
@@ -245,6 +562,104 @@ fn decode_payment_error() -> decode.Decoder(PaymentError) {
     "payment_rejected" -> decode.success(PaymentRejected(key))
     _ -> decode.failure(PaymentRejected(key), "known payment error kind")
   }
+}
+
+/// A worker whose bound retry policy retries exactly once (a short real
+/// delay) and then succeeds. The bound retry policy callback receives
+/// Grind's own `RetryContext` and reports its `current_attempt` on
+/// `retry_context_probe`. The `perform` handler itself has no such access
+/// (see docs/IMPLEMENTATION-SCOPE.md, "Job lifecycle and attempt history"),
+/// so it tracks its own invocation count on `attempt_probe` instead, which
+/// in this single-worker, no-concurrent-claims scenario advances in
+/// lockstep with Grind's persisted attempt count.
+fn retry_then_succeed_worker(
+  attempt_probe: process.Subject(Int),
+  retry_context_probe: process.Subject(Int),
+) -> worker.Worker(Int, String, Nil) {
+  let assert Ok(input) = worker.codec("retry-input-v1", json.int, decode.int)
+  let assert Ok(output) =
+    worker.codec("retry-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("consumer.retry_then_succeed", "v1", input, output, fn(value) {
+      let attempt = next_counter("consumer-retry-attempt")
+      process.send(attempt_probe, attempt)
+      case attempt {
+        1 -> Error(Nil)
+        _ -> Ok("retry-succeeded-" <> int.to_string(value))
+      }
+    })
+  let assert Ok(short_delay) = worker.retry_delay(50)
+  let policy =
+    worker.retry_policy(fn(_failure, context) {
+      process.send(retry_context_probe, context.current_attempt)
+      worker.RetryAfter(short_delay)
+    })
+  worker.with_retry_policy(definition, policy)
+}
+
+/// A worker that reports it has started, blocks on a barrier, and only then
+/// performs its (synthetic, idempotent) effect. Used to hold a job in
+/// `Executing` state long enough for the test to request cancellation.
+fn cancel_while_running_worker(
+  started: process.Subject(Barrier),
+) -> worker.Worker(PaymentRequest, String, Nil) {
+  let assert Ok(input) =
+    worker.codec(
+      "cancel-running-request-v1",
+      encode_payment_request,
+      decode_payment_request(),
+    )
+  let assert Ok(output) =
+    worker.codec("cancel-running-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "consumer.cancel_while_running",
+      "v1",
+      input,
+      output,
+      fn(request) {
+        let release = process.new_subject()
+        process.send(started, BarrierStarted(release))
+        let PaymentRequest(key, amount) = request
+        case process.receive(release, within: 10_000) {
+          Ok(BarrierRelease) -> {
+            let #(receipt, _) = apply_synthetic_effect(key, amount)
+            Ok(receipt)
+          }
+          Error(Nil) -> Ok("released-by-timeout")
+        }
+      },
+    )
+  definition
+}
+
+/// A worker whose effect application may have been armed to crash right
+/// after applying (see `arm_crash_after_effect`). Tracks its own invocation
+/// count per key so the test can distinguish the crashing attempt from a
+/// later authorized replay.
+fn fault_prone_payment_worker() -> worker.Worker(PaymentRequest, String, Nil) {
+  let assert Ok(input) =
+    worker.codec(
+      "fault-prone-request-v1",
+      encode_payment_request,
+      decode_payment_request(),
+    )
+  let assert Ok(output) =
+    worker.codec("fault-prone-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "consumer.fault_prone_payment",
+      "v1",
+      input,
+      output,
+      fn(request) {
+        let PaymentRequest(key, amount) = request
+        let _ = next_counter(key)
+        let #(receipt, _) = apply_synthetic_effect(key, amount)
+        Ok(receipt)
+      },
+    )
+  definition
 }
 
 pub fn storage_start_failure_is_reported_test() {

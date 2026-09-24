@@ -1,3 +1,4 @@
+import exception
 import gleam/erlang/process
 import gleam/int
 import gleam/list
@@ -184,8 +185,28 @@ pub type StopError {
 }
 
 pub type StopOutcome {
+  /// The coordinator this call reached drained cleanly with no active work.
+  /// This describes only the incarnation `stop` actually talked to: it does
+  /// not mean no attempt was ever abandoned by an earlier incarnation that
+  /// crashed before this call — an abandoned attempt is recovered only
+  /// through lease expiry moving it to `Uncertain` and an audited
+  /// resolution, independent of what any later `stop` call reports.
   StoppedCleanly
   StoppedWithActiveWork(Int)
+  /// No coordinator was reachable under this consumer's name at all — for
+  /// example a repeated `stop` on an already-stopped consumer, or a
+  /// coordinator that crashed and was not, or not yet, restarted. The
+  /// consumer's supervisor tree is stopped regardless. Any work an earlier
+  /// incarnation had claimed is not drained or observed by this call; it is
+  /// recovered only through lease expiry and an audited resolution, exactly
+  /// as if this `stop` had never been called. This can also happen when the
+  /// top-level supervisor restarts a coordinator during this very call: a
+  /// freshly restarted incarnation auto-polls immediately and may claim a
+  /// job before this call's own supervisor teardown kills it moments later.
+  /// That job is left `Executing` with nothing left to renew it, and is
+  /// recovered the same way — lease expiry to `Uncertain`, then an audited
+  /// resolution — as any other abandoned attempt.
+  StoppedWithoutDrain
 }
 
 pub type ProcessError {
@@ -228,7 +249,11 @@ type Message {
   WorkerDown(process.Down)
 }
 
-type ShutdownReply {
+/// Exposed `@internal` only so `begin_shutdown_for_test` can hand its reply
+/// subject's type to a caller outside this module; not part of the stable
+/// public API.
+@internal
+pub type ShutdownReply {
   ShutdownDrained
   ShutdownForced(Int)
 }
@@ -287,6 +312,24 @@ type ConsumerState {
     queue: String,
     attempt_owner: String,
     subject: process.Subject(Message),
+    /// A plain (unregistered, pid-bound) subject created fresh by this
+    /// incarnation's own initialiser, used for every message that is
+    /// internal to this incarnation: the timers it schedules for its own
+    /// future self (`Poll`, `Renew`, `ShutdownGraceExpired`) and the
+    /// `AttemptReturned` reply a worker this incarnation started sends back
+    /// once it finishes. Unlike `subject`, which is named and therefore
+    /// reaches whichever incarnation is *currently* registered,
+    /// `erlang:send_after` targeting a plain subject's pid keeps targeting
+    /// that exact pid even after it dies, so a timer an incarnation
+    /// scheduled and never got to cancel becomes an inert send to a dead
+    /// pid instead of landing in a later incarnation's mailbox. A worker
+    /// cannot actually outlive its own incarnation's coordinator (its
+    /// factory_supervisor is linked to, and dies with, that coordinator),
+    /// so `AttemptReturned` could not have leaked across incarnations
+    /// either way; routing it through this same incarnation-scoped subject
+    /// keeps every internal channel consistent rather than relying on that
+    /// cascade as the only reason it would have been safe.
+    incarnation_subject: process.Subject(Message),
     auto_poll: Bool,
     policy: ValidatedPolicy,
     lease_duration_ms: Int,
@@ -303,6 +346,9 @@ type ConsumerState {
 
 /// Starts a supervised, serial consumer. Serial execution is its concurrency
 /// bound, and an OTP child owns the process until `stop` is called.
+/// Allocates one atom-backed coordinator name (see `process.new_name`);
+/// bounded per call, reused rather than recreated across any internal
+/// restart.
 pub fn start(
   database: Database,
   workers: Registry,
@@ -312,6 +358,9 @@ pub fn start(
 }
 
 /// Starts an automatically polling queue with a validated local policy.
+/// Allocates one atom-backed coordinator name (see `process.new_name`);
+/// bounded per call, reused rather than recreated across any internal
+/// restart.
 pub fn start_with_policy(
   database: Database,
   workers: Registry,
@@ -321,7 +370,10 @@ pub fn start_with_policy(
 }
 
 /// Starts a supervised consumer without a timer; callers drive each attempt
-/// through `process_one`. This is useful for deterministic operations and tests.
+/// through `process_one`. This is useful for deterministic operations and
+/// tests. Allocates one atom-backed coordinator name (see
+/// `process.new_name`); bounded per call, reused rather than recreated
+/// across any internal restart.
 pub fn start_manual(
   database: Database,
   workers: Registry,
@@ -330,7 +382,9 @@ pub fn start_manual(
   start_consumer(database, workers, policy, False)
 }
 
-/// Starts a manually polled queue with a validated local policy.
+/// Starts a manually polled queue with a validated local policy. Allocates
+/// one atom-backed coordinator name (see `process.new_name`); bounded per
+/// call, reused rather than recreated across any internal restart.
 pub fn start_manual_with_policy(
   database: Database,
   workers: Registry,
@@ -367,7 +421,12 @@ fn start_configured_consumer(
   policy: ValidatedPolicy,
   auto_poll: Bool,
 ) -> Result(Consumer, StartError) {
-  let attempt_owner = "grind-consumer-" <> int.to_string(unique_integer())
+  // Created once per consumer, never inside the child start function: a
+  // restarted coordinator incarnation re-registers this same name (the prior
+  // registration is cleared by OTP when its owner dies), so `Consumer.subject`
+  // keeps routing to whichever incarnation is currently alive. This bounds
+  // atom creation to one name per `Consumer` value, not one per restart.
+  let coordinator_name = process.new_name("grind_queue_coordinator")
   let handoff_reply = process.new_subject()
   let handoff_pid = start_queue_actor_handoff(handoff_reply, process.self())
   case process.receive(handoff_reply, within: 5000) {
@@ -382,7 +441,7 @@ fn start_configured_consumer(
         queue_name,
         policy,
         auto_poll,
-        attempt_owner,
+        coordinator_name,
         handoff_reply,
         handoff_pid,
         actor_ready,
@@ -401,7 +460,7 @@ fn start_configured_consumer_with_handoff(
   queue_name: String,
   policy: ValidatedPolicy,
   auto_poll: Bool,
-  attempt_owner: String,
+  coordinator_name: process.Name(Message),
   handoff_reply: process.Subject(QueueActorHandoffMessage),
   handoff_pid: process.Pid,
   actor_ready: process.Subject(process.Subject(Message)),
@@ -425,13 +484,31 @@ fn start_configured_consumer_with_handoff(
     |> factory_supervisor.restart_strategy(supervision.Temporary)
   let builder =
     actor.new_with_initialiser(1000, fn(subject) {
-      start_polling(subject, auto_poll)
+      // Computed fresh on every incarnation (initial start and every
+      // supervised restart both run this closure), so each incarnation has
+      // its own distinct owner label. attempt_owner is itself part of the
+      // SQL fence checked alongside attempt_id and epoch on renewal,
+      // release, and resolution (postgres.gleam's `renew_claim`,
+      // `release_unstarted_claim`, `acknowledge`, and the resolution
+      // route); attempt_id is already globally unique on its own (a
+      // noncycling sequence), so this label does not change which row a
+      // correct claim can match, but a distinct label per incarnation means
+      // a coordinator that somehow still held stale in-memory claim state
+      // from a previous incarnation could never accidentally satisfy a
+      // fence it does not legitimately own.
+      let attempt_owner = "grind-consumer-" <> int.to_string(unique_integer())
+      // Fresh per incarnation, unlike `subject`: see the field's doc
+      // comment on `ConsumerState` for why every self-scheduled timer uses
+      // this instead of the named `subject`.
+      let incarnation_subject = process.new_subject()
+      start_polling(incarnation_subject, auto_poll)
       case factory_supervisor.start(worker_factory_builder) {
         Error(error) -> Error(string.inspect(error))
         Ok(started_factory) -> {
           let selector =
             process.new_selector()
             |> process.select(for: subject)
+            |> process.select(for: incarnation_subject)
             |> process.select_monitors(fn(down) { WorkerDown(down) })
           Ok(
             actor.initialised(
@@ -442,6 +519,7 @@ fn start_configured_consumer_with_handoff(
                 queue: queue_name,
                 attempt_owner:,
                 subject:,
+                incarnation_subject:,
                 auto_poll:,
                 policy:,
                 lease_duration_ms:,
@@ -462,6 +540,7 @@ fn start_configured_consumer_with_handoff(
       }
     })
     |> actor.on_message(handle_message)
+    |> actor.named(coordinator_name)
   let child =
     supervision.worker(fn() {
       case actor.start(builder) {
@@ -567,10 +646,56 @@ fn start_polling(subject: process.Subject(Message), auto_poll: Bool) -> Nil {
   }
 }
 
+/// Sends through a consumer's named coordinator subject. That name is a
+/// fixed identity, not one incarnation's pid, so a send normally reaches
+/// whichever incarnation the top-level supervisor currently has registered
+/// under that name, including one restarted after the original crashed.
+/// `process.send` panics if it resolves a named subject with nobody
+/// currently registered (this consumer's coordinator has fully exited, for
+/// example a repeated `stop` on an already-stopped consumer, or the rare
+/// window where a crash lands between a caller's own liveness check and this
+/// send); that panic is caught here and reported as an ordinary delivery
+/// failure instead of propagating into the caller.
+fn send_to_coordinator(
+  consumer: Consumer,
+  message: Message,
+) -> Result(Nil, Nil) {
+  let Consumer(subject:, ..) = consumer
+  exception.rescue(fn() { process.send(subject, message) })
+  |> result.map_error(fn(_) { Nil })
+}
+
+/// Sends a message built around a fresh reply subject and waits up to one
+/// second for the answer, sharing the send/timeout/error shape used by every
+/// `@internal` coordinator-introspection hook.
+fn call_coordinator(
+  consumer: Consumer,
+  build_message: fn(process.Subject(reply)) -> Message,
+) -> Result(reply, ProcessError) {
+  let reply = process.new_subject()
+  case send_to_coordinator(consumer, build_message(reply)) {
+    Error(Nil) -> Error(QueueActorExited)
+    Ok(Nil) ->
+      process.receive(reply, within: 1000)
+      |> result.map_error(fn(_) { QueueActorExited })
+  }
+}
+
 /// Deterministically asks the queue actor to claim one due job now and waits
 /// without an implicit deadline. A valid worker can run longer than the
 /// polling interval; callers needing a deadline should run this operation in
 /// their own process and define their timeout and reconciliation behavior.
+///
+/// The liveness check below resolves and monitors a specific coordinator
+/// pid; the later send resolves the (possibly different, if a restart lands
+/// in between) pid currently registered under this consumer's name. If a
+/// restart wins that narrow race, this call reports `QueueActorExited` for
+/// the pid it was actually watching even though a new incarnation may have
+/// gone on to claim and run a job — there is no lost or duplicated delivery
+/// from Grind's perspective (nothing was acknowledged twice), only a result
+/// that undercounts what the fresh incarnation did. A caller that needs to
+/// know whether work actually happened after such a result should re-check
+/// job state rather than treat `QueueActorExited` as proof nothing ran.
 pub fn process_one(consumer: Consumer) -> Result(Bool, ProcessError) {
   let Consumer(subject:, ..) = consumer
   case process.subject_owner(subject) {
@@ -589,18 +714,23 @@ pub fn process_one(consumer: Consumer) -> Result(Bool, ProcessError) {
             }
             True -> {
               let reply = process.new_subject()
-              // `subject` is the unregistered subject from this exact actor
-              // incarnation. It cannot retarget a restarted coordinator.
-              process.send(subject, ProcessOne(reply))
-              let selector =
-                process.new_selector()
-                |> process.select_map(reply, fn(result) {
-                  ProcessOneResult(result)
-                })
-                |> process.select_specific_monitor(monitor, fn(down) {
-                  ProcessOneActorDown(down)
-                })
-              wait_for_process_one(actor_pid, monitor, selector)
+              case send_to_coordinator(consumer, ProcessOne(reply)) {
+                Error(Nil) -> {
+                  let _ = process.demonitor_process(monitor)
+                  Error(QueueActorExited)
+                }
+                Ok(Nil) -> {
+                  let selector =
+                    process.new_selector()
+                    |> process.select_map(reply, fn(result) {
+                      ProcessOneResult(result)
+                    })
+                    |> process.select_specific_monitor(monitor, fn(down) {
+                      ProcessOneActorDown(down)
+                    })
+                  wait_for_process_one(actor_pid, monitor, selector)
+                }
+              }
             }
           }
         }
@@ -654,27 +784,71 @@ fn run_batch_from(
   }
 }
 
+type ShutdownOutcome {
+  ShutdownReceived(ShutdownReply)
+  /// Nobody is registered under this consumer's coordinator name at all, so
+  /// there is nothing to ask to drain and no reply will ever come; reported
+  /// to the caller as `StoppedWithoutDrain`, not as a clean stop.
+  ShutdownAbsent
+  ShutdownTimedOut
+}
+
 /// Stops the queue supervisor from the process that started it. The queue
 /// pauses new claims and waits up to its configured grace for active workers.
 pub fn stop(consumer: Consumer) -> Result(StopOutcome, StopError) {
-  let Consumer(subject:, supervisor_pid:, shutdown_grace_ms:, owner_pid:, ..) =
-    consumer
+  let Consumer(supervisor_pid:, shutdown_grace_ms:, owner_pid:, ..) = consumer
   case process.self() == owner_pid {
     False -> Error(ConsumerOwnedByAnotherProcess)
     True -> {
-      let reply = process.new_subject()
-      process.send(subject, BeginShutdown(reply))
-      let shutdown = process.receive(reply, within: shutdown_grace_ms + 1000)
+      let shutdown = request_shutdown(consumer, shutdown_grace_ms)
       case stop_consumer_supervisor(supervisor_pid) {
         Error(Nil) -> Error(ConsumerStopTimedOut)
         Ok(Nil) ->
           case shutdown {
-            Ok(ShutdownDrained) -> Ok(StoppedCleanly)
-            Ok(ShutdownForced(active)) -> Ok(StoppedWithActiveWork(active))
-            Error(Nil) -> Error(ConsumerDrainTimedOut)
+            ShutdownReceived(ShutdownDrained) -> Ok(StoppedCleanly)
+            ShutdownReceived(ShutdownForced(active)) ->
+              Ok(StoppedWithActiveWork(active))
+            ShutdownAbsent -> Ok(StoppedWithoutDrain)
+            ShutdownTimedOut -> Error(ConsumerDrainTimedOut)
           }
       }
     }
+  }
+}
+
+fn request_shutdown(
+  consumer: Consumer,
+  shutdown_grace_ms: Int,
+) -> ShutdownOutcome {
+  let reply = process.new_subject()
+  // Reaches whichever coordinator incarnation is currently registered under
+  // this consumer's name, even if the original one has since crashed and
+  // been restarted by the top-level supervisor.
+  case send_to_coordinator(consumer, BeginShutdown(reply)) {
+    Error(Nil) -> ShutdownAbsent
+    Ok(Nil) ->
+      case process.receive(reply, within: shutdown_grace_ms + 1000) {
+        Ok(shutdown_reply) -> ShutdownReceived(shutdown_reply)
+        Error(Nil) -> ShutdownTimedOut
+      }
+  }
+}
+
+/// Test hook that begins the coordinator's shutdown transition the same way
+/// `stop` does, but without `stop`'s single-owner check or its subsequent
+/// supervisor teardown, and with the reply subject supplied by the caller
+/// instead of consumed internally. This lets a test drive a coordinator
+/// through "draining with active work" (and therefore through scheduling its
+/// grace timer) from any process, independent of the one owner process that
+/// may legitimately call the public, blocking `stop`.
+@internal
+pub fn begin_shutdown_for_test(
+  consumer: Consumer,
+  reply: process.Subject(ShutdownReply),
+) -> Result(Nil, ProcessError) {
+  case send_to_coordinator(consumer, BeginShutdown(reply)) {
+    Error(Nil) -> Error(QueueActorExited)
+    Ok(Nil) -> Ok(Nil)
   }
 }
 
@@ -682,31 +856,19 @@ pub fn stop(consumer: Consumer) -> Result(StopOutcome, StopError) {
 /// This internal observation supports deterministic lifecycle synchronization.
 @internal
 pub fn shutdown_state(consumer: Consumer) -> Result(Bool, ProcessError) {
-  let Consumer(subject:, ..) = consumer
-  let reply = process.new_subject()
-  process.send(subject, ReadShutdownState(reply))
-  process.receive(reply, within: 1000)
-  |> result.map_error(fn(_) { QueueActorExited })
+  call_coordinator(consumer, ReadShutdownState)
 }
 
 @internal
 pub fn renewal_status(
   consumer: Consumer,
 ) -> Result(Option(RenewalStatus), ProcessError) {
-  let Consumer(subject:, ..) = consumer
-  let reply = process.new_subject()
-  process.send(subject, ReadRenewalStatus(reply))
-  process.receive(reply, within: 1000)
-  |> result.map_error(fn(_) { QueueActorExited })
+  call_coordinator(consumer, ReadRenewalStatus)
 }
 
 @internal
 pub fn fail_next_worker_start(consumer: Consumer) -> Result(Nil, ProcessError) {
-  let Consumer(subject:, ..) = consumer
-  let reply = process.new_subject()
-  process.send(subject, InjectWorkerStartFailure(reply))
-  process.receive(reply, within: 1000)
-  |> result.map_error(fn(_) { QueueActorExited })
+  call_coordinator(consumer, InjectWorkerStartFailure)
 }
 
 /// Test hook that kills the next idle worker after start_child but before its
@@ -715,11 +877,7 @@ pub fn fail_next_worker_start(consumer: Consumer) -> Result(Nil, ProcessError) {
 pub fn kill_next_worker_before_monitor(
   consumer: Consumer,
 ) -> Result(Nil, ProcessError) {
-  let Consumer(subject:, ..) = consumer
-  let reply = process.new_subject()
-  process.send(subject, KillNextWorkerBeforeMonitor(reply))
-  process.receive(reply, within: 1000)
-  |> result.map_error(fn(_) { QueueActorExited })
+  call_coordinator(consumer, KillNextWorkerBeforeMonitor)
 }
 
 /// Returns the coordinator incarnation owned by this consumer handle.
@@ -851,7 +1009,7 @@ fn begin_shutdown(
             next_shutdown_generation(state.shutdown_generation, False)
           let _ =
             process.send_after(
-              state.subject,
+              state.incarnation_subject,
               shutdown_grace_ms,
               ShutdownGraceExpired(generation),
             )
@@ -892,7 +1050,7 @@ fn start_attempt(
     worker_factory:,
     queue:,
     attempt_owner:,
-    subject:,
+    incarnation_subject:,
     lease_duration_ms:,
     renewal_interval_ms:,
     fail_next_worker_start:,
@@ -913,7 +1071,7 @@ fn start_attempt(
     Ok(None) -> finish_without_claim(state, completion, Ok(False))
     Ok(Some(claimed)) -> {
       let #(id, attempt_id, epoch) = postgres.claim_identity(claimed)
-      let request = WorkerRequest(subject, claimed)
+      let request = WorkerRequest(incarnation_subject, claimed)
       let state =
         ConsumerState(
           ..state,
@@ -957,7 +1115,7 @@ fn start_attempt(
                 )
               let _ =
                 process.send_after(
-                  subject,
+                  incarnation_subject,
                   renewal_interval_ms,
                   Renew(attempt_id, epoch),
                 )
@@ -1263,7 +1421,7 @@ fn renew_active_attempt(
                 )
               let _ =
                 process.send_after(
-                  state.subject,
+                  state.incarnation_subject,
                   state.renewal_interval_ms,
                   Renew(attempt_id, epoch),
                 )
@@ -1286,7 +1444,7 @@ fn renew_active_attempt(
                 )
               let _ =
                 process.send_after(
-                  state.subject,
+                  state.incarnation_subject,
                   state.renewal_interval_ms,
                   Renew(attempt_id, epoch),
                 )
@@ -1366,7 +1524,7 @@ fn handle_worker_down(
 
 fn schedule_next_poll(state: ConsumerState) -> Nil {
   let ValidatedPolicy(poll_interval_ms:, ..) = state.policy
-  schedule_poll(state.subject, state.auto_poll, poll_interval_ms)
+  schedule_poll(state.incarnation_subject, state.auto_poll, poll_interval_ms)
 }
 
 type WorkerState {

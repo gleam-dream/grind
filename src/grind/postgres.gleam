@@ -1400,6 +1400,33 @@ fn claim_previous_state(claim: Claim) -> String {
   previous_state
 }
 
+/// Renders the fenced "the lease is still live" predicate, comparing
+/// `lease_expires_at` against the given SQL time expression (in production,
+/// always `clock_timestamp()`). Renewal, contract-mismatch release, every
+/// acknowledgement disposition, and the ack-rejection reader all gate on
+/// this exact fragment; a test can render the identical production text
+/// against a fixed instant instead of duplicating the comparison by hand.
+/// `now_expression` is spliced into the query text verbatim, not bound as a
+/// parameter — it must be trusted SQL supplied by this module or a test
+/// (a literal function call or column reference such as `clock_timestamp()`
+/// or `instant`), never untrusted or caller-supplied input.
+@internal
+pub fn live_lease_predicate(now_expression: String) -> String {
+  "lease_expires_at > " <> now_expression
+}
+
+/// The complement of `live_lease_predicate`: true once the lease has
+/// already expired at the given time expression. Used by the quarantine
+/// scan that looks for abandoned attempts. Kept as its own mirrored
+/// fragment (rather than `NOT (` <> live_lease_predicate <> `)`) so the
+/// production SQL text is unchanged by this extraction. Same trust
+/// requirement as `live_lease_predicate`: `now_expression` is spliced in
+/// verbatim and must be trusted SQL, never user input.
+@internal
+pub fn expired_lease_predicate(now_expression: String) -> String {
+  "lease_expires_at <= " <> now_expression
+}
+
 /// Extends the current lease using PostgreSQL's clock and current row values.
 /// An expired or fenced claim cannot be renewed.
 @internal
@@ -1415,7 +1442,9 @@ pub fn renew_claim(
   let Claim(id:, attempt_id:, epoch:, ..) = claim
   let query =
     pog.query(
-      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() + ($7::double precision * interval '1 millisecond') WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND lease_expires_at > clock_timestamp() RETURNING id",
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() + ($7::double precision * interval '1 millisecond') WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
+      <> live_lease_predicate("clock_timestamp()")
+      <> " RETURNING id",
     )
     |> pog.parameter(pog.int(id))
     |> pog.parameter(pog.text(storage_owner))
@@ -1487,24 +1516,6 @@ pub fn acknowledge_claim(
   claimed: ClaimedJob,
   execution: worker.Execution,
 ) -> Result(Bool, QueueRunError) {
-  acknowledge_claim_with_reply_mode(
-    database,
-    queue,
-    attempt_owner,
-    claimed,
-    execution,
-    False,
-  )
-}
-
-fn acknowledge_claim_with_reply_mode(
-  database: Database,
-  queue: String,
-  attempt_owner: String,
-  claimed: ClaimedJob,
-  execution: worker.Execution,
-  simulate_lost_reply: Bool,
-) -> Result(Bool, QueueRunError) {
   let ClaimedJob(claim:, ..) = claimed
   let Claim(output_version:, error_version:, ..) = claim
   case execution {
@@ -1518,7 +1529,6 @@ fn acknowledge_claim_with_reply_mode(
             claim,
             execution,
             output_version,
-            simulate_lost_reply,
           )
         False ->
           Error(QueueAckProposalCodecMismatch(
@@ -1537,7 +1547,6 @@ fn acknowledge_claim_with_reply_mode(
             claim,
             execution,
             output_version,
-            simulate_lost_reply,
           )
         False ->
           Error(QueueAckProposalCodecMismatch(
@@ -1556,7 +1565,6 @@ fn acknowledge_claim_with_reply_mode(
             claim,
             execution,
             output_version,
-            simulate_lost_reply,
           )
         False ->
           Error(QueueAckProposalCodecMismatch(
@@ -1573,7 +1581,6 @@ fn acknowledge_claim_with_reply_mode(
         claim,
         execution,
         output_version,
-        simulate_lost_reply,
       )
     worker.ExecutedSnoozed(_, _)
     | worker.ExecutedDiscarded(_)
@@ -1586,29 +1593,8 @@ fn acknowledge_claim_with_reply_mode(
         claim,
         execution,
         output_version,
-        simulate_lost_reply,
       )
   }
-}
-
-/// Test seam that injects a lost transaction reply and unavailable immediate
-/// reconciliation at the production result boundary after PostgreSQL commits.
-@internal
-pub fn acknowledge_claim_with_lost_reply_after_commit(
-  database: Database,
-  queue: String,
-  attempt_owner: String,
-  claimed: ClaimedJob,
-  execution: worker.Execution,
-) -> Result(Bool, QueueRunError) {
-  acknowledge_claim_with_reply_mode(
-    database,
-    queue,
-    attempt_owner,
-    claimed,
-    execution,
-    True,
-  )
 }
 
 /// Compatibility stepping API retained for internal tests while callers move
@@ -1801,7 +1787,9 @@ fn quarantine_expired(
         })
         |> string.join(" OR ")
       let sql =
-        "WITH candidate AS (SELECT id FROM grind_jobs WHERE storage_owner = $1 AND queue = $2 AND state = 'executing' AND lease_expires_at <= clock_timestamp() AND ("
+        "WITH candidate AS (SELECT id FROM grind_jobs WHERE storage_owner = $1 AND queue = $2 AND state = 'executing' AND "
+        <> expired_lease_predicate("clock_timestamp()")
+        <> " AND ("
         <> eligibility
         <> ") ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'uncertain', failure_description = CASE WHEN job.cancel_requested_at IS NOT NULL THEN 'expired after cancellation request; prior effect unknown' WHEN job.failure_description IS NULL THEN 'expired attempt requires outcome reconciliation' ELSE job.failure_description || '; expired attempt requires outcome reconciliation' END, uncertain_at = clock_timestamp() FROM candidate WHERE job.id = candidate.id"
       let parameters =
@@ -1871,7 +1859,9 @@ fn mark_contract_mismatch(
   let Claim(id:, attempt_id:, epoch:, ..) = claim
   let query =
     pog.query(
-      "UPDATE grind_jobs SET state = 'contract_mismatch', failure_description = $7, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0) WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND lease_expires_at > clock_timestamp() RETURNING id",
+      "UPDATE grind_jobs SET state = 'contract_mismatch', failure_description = $7, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0) WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
+      <> live_lease_predicate("clock_timestamp()")
+      <> " RETURNING id",
     )
     |> pog.parameter(pog.int(id))
     |> pog.parameter(pog.text(storage_owner))
@@ -1908,7 +1898,6 @@ fn acknowledge(
   claim: Claim,
   execution: worker.Execution,
   expected_output_version: String,
-  simulate_lost_reply: Bool,
 ) -> Result(Bool, QueueRunError) {
   let Database(connection:, storage_owner:, ..) = database
   let Claim(id:, attempt_id:, epoch:, ..) = claim
@@ -2027,7 +2016,6 @@ fn acknowledge(
     proposal,
     execution,
     transaction_result,
-    simulate_lost_reply,
   )
 }
 
@@ -2041,25 +2029,9 @@ fn resolve_ack_transaction_result(
   proposal: AckProposal,
   execution: worker.Execution,
   transaction_result: Result(Bool, pog.TransactionError(QueueRunError)),
-  simulate_lost_reply: Bool,
 ) -> Result(Bool, QueueRunError) {
   case transaction_result {
-    Ok(result) ->
-      case result, simulate_lost_reply {
-        True, True ->
-          reconcile_unknown_ack(
-            connection,
-            storage_owner,
-            queue,
-            attempt_owner,
-            claim,
-            command_id,
-            proposal,
-            execution,
-            False,
-          )
-        _, _ -> Ok(result)
-      }
+    Ok(result) -> Ok(result)
     Error(pog.TransactionRolledBack(error)) -> Error(error)
     Error(pog.TransactionQueryError(_)) ->
       reconcile_unknown_ack(
@@ -2071,7 +2043,6 @@ fn resolve_ack_transaction_result(
         command_id,
         proposal,
         execution,
-        True,
       )
   }
 }
@@ -2085,26 +2056,21 @@ fn reconcile_unknown_ack(
   command_id: String,
   proposal: AckProposal,
   execution: worker.Execution,
-  receipt_lookup_available: Bool,
 ) -> Result(Bool, QueueRunError) {
-  case receipt_lookup_available {
-    False -> Error(QueueAckUnknown(command_id, execution))
-    True ->
-      case
-        matching_acknowledgement(
-          connection,
-          storage_owner,
-          queue,
-          attempt_owner,
-          claim,
-          command_id,
-          proposal,
-        )
-      {
-        Ok(Some(True)) -> Ok(True)
-        Ok(Some(False)) -> Error(QueueAckCommandConflict)
-        Ok(None) | Error(_) -> Error(QueueAckUnknown(command_id, execution))
-      }
+  case
+    matching_acknowledgement(
+      connection,
+      storage_owner,
+      queue,
+      attempt_owner,
+      claim,
+      command_id,
+      proposal,
+    )
+  {
+    Ok(Some(True)) -> Ok(True)
+    Ok(Some(False)) -> Error(QueueAckCommandConflict)
+    Ok(None) | Error(_) -> Error(QueueAckUnknown(command_id, execution))
   }
 }
 
@@ -2147,7 +2113,9 @@ fn acknowledge_transaction(
       ) = proposal
       let #(sql, parameters) = case proposed_state {
         "succeeded" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'succeeded' END, output = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $1::jsonb END, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE NULL END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND output_version = $8 AND lease_expires_at > clock_timestamp() RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'succeeded' END, output = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $1::jsonb END, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE NULL END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND output_version = $8 AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description",
           [
             pog.nullable(pog.text, output),
             pog.int(id),
@@ -2160,7 +2128,9 @@ fn acknowledge_transaction(
           ],
         )
         "business_failed" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'business_failed' END, output = NULL, error = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $1::jsonb END, error_version = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $2 END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $3 END, failure_cause = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $4 END, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $5 AND storage_owner = $6 AND queue = $7 AND state = 'executing' AND attempt_id = $8 AND attempt_epoch = $9 AND attempt_owner = $10 AND error_version IS NOT DISTINCT FROM $11 AND lease_expires_at > clock_timestamp() AND (cancel_requested_at IS NOT NULL OR (($4 = 'budget_exhausted' AND attempt_count >= max_attempts) OR ($4 = 'retry_declined' AND attempt_count < max_attempts))) RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'business_failed' END, output = NULL, error = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $1::jsonb END, error_version = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $2 END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $3 END, failure_cause = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $4 END, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $5 AND storage_owner = $6 AND queue = $7 AND state = 'executing' AND attempt_id = $8 AND attempt_epoch = $9 AND attempt_owner = $10 AND error_version IS NOT DISTINCT FROM $11 AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " AND (cancel_requested_at IS NOT NULL OR (($4 = 'budget_exhausted' AND attempt_count >= max_attempts) OR ($4 = 'retry_declined' AND attempt_count < max_attempts))) RETURNING id, state, failure_description",
           [
             pog.nullable(pog.text, error),
             pog.nullable(pog.text, proposed_error_version),
@@ -2176,7 +2146,9 @@ fn acknowledge_transaction(
           ],
         )
         "retryable" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'retryable' END, available_at = CASE WHEN cancel_requested_at IS NOT NULL THEN available_at ELSE clock_timestamp() + ($1::double precision * interval '1 millisecond') END, output = NULL, error = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $2::jsonb END, error_version = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $3 END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $4 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $5 AND storage_owner = $6 AND queue = $7 AND state = 'executing' AND attempt_id = $8 AND attempt_epoch = $9 AND attempt_owner = $10 AND error_version IS NOT DISTINCT FROM $11 AND (attempt_count < max_attempts OR cancel_requested_at IS NOT NULL) AND lease_expires_at > clock_timestamp() RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'retryable' END, available_at = CASE WHEN cancel_requested_at IS NOT NULL THEN available_at ELSE clock_timestamp() + ($1::double precision * interval '1 millisecond') END, output = NULL, error = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $2::jsonb END, error_version = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $3 END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $4 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $5 AND storage_owner = $6 AND queue = $7 AND state = 'executing' AND attempt_id = $8 AND attempt_epoch = $9 AND attempt_owner = $10 AND error_version IS NOT DISTINCT FROM $11 AND (attempt_count < max_attempts OR cancel_requested_at IS NOT NULL) AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description",
           [
             pog.nullable(pog.int, requested_delay_ms),
             pog.nullable(pog.text, error),
@@ -2192,7 +2164,9 @@ fn acknowledge_transaction(
           ],
         )
         "snoozed" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'scheduled' END, available_at = CASE WHEN cancel_requested_at IS NOT NULL THEN available_at ELSE clock_timestamp() + ($1::double precision * interval '1 millisecond') END, snooze_count = CASE WHEN cancel_requested_at IS NOT NULL THEN snooze_count ELSE snooze_count + 1 END, attempt_count = CASE WHEN cancel_requested_at IS NOT NULL THEN attempt_count ELSE GREATEST(attempt_count - 1, 0) END, output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $2 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $3 AND storage_owner = $4 AND queue = $5 AND state = 'executing' AND attempt_id = $6 AND attempt_epoch = $7 AND attempt_owner = $8 AND lease_expires_at > clock_timestamp() RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'scheduled' END, available_at = CASE WHEN cancel_requested_at IS NOT NULL THEN available_at ELSE clock_timestamp() + ($1::double precision * interval '1 millisecond') END, snooze_count = CASE WHEN cancel_requested_at IS NOT NULL THEN snooze_count ELSE snooze_count + 1 END, attempt_count = CASE WHEN cancel_requested_at IS NOT NULL THEN attempt_count ELSE GREATEST(attempt_count - 1, 0) END, output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $2 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $3 AND storage_owner = $4 AND queue = $5 AND state = 'executing' AND attempt_id = $6 AND attempt_epoch = $7 AND attempt_owner = $8 AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description",
           [
             pog.nullable(pog.int, requested_delay_ms),
             pog.nullable(pog.text, failure_description),
@@ -2205,7 +2179,9 @@ fn acknowledge_transaction(
           ],
         )
         "discarded" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'discarded' END, output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'discarded' END, output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description",
           [
             pog.nullable(pog.text, failure_description),
             pog.int(id),
@@ -2217,7 +2193,9 @@ fn acknowledge_transaction(
           ],
         )
         "cancelled" -> #(
-          "UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description",
           [
             pog.nullable(pog.text, failure_description),
             pog.int(id),
@@ -2229,7 +2207,9 @@ fn acknowledge_transaction(
           ],
         )
         "uncertain" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'uncertain' END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, uncertain_at = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE clock_timestamp() END, attempt_owner = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE attempt_owner END, lease_expires_at = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE lease_expires_at END, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'uncertain' END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, uncertain_at = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE clock_timestamp() END, attempt_owner = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE attempt_owner END, lease_expires_at = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE lease_expires_at END, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description",
           [
             pog.nullable(pog.text, failure_description),
             pog.int(id),
@@ -2241,7 +2221,9 @@ fn acknowledge_transaction(
           ],
         )
         "runtime_failed" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'runtime_failed' END, output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND lease_expires_at > clock_timestamp() RETURNING id, state, failure_description",
+          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'runtime_failed' END, output = NULL, error = NULL, error_version = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL WHERE id = $2 AND storage_owner = $3 AND queue = $4 AND state = 'executing' AND attempt_id = $5 AND attempt_epoch = $6 AND attempt_owner = $7 AND "
+            <> live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description",
           [
             pog.nullable(pog.text, failure_description),
             pog.int(id),
@@ -2328,7 +2310,9 @@ fn current_ack_rejection(
   let Claim(id:, attempt_id:, epoch:, ..) = claim
   let query =
     pog.query(
-      "SELECT state, attempt_id, attempt_epoch, attempt_owner, lease_expires_at > clock_timestamp() FROM grind_jobs WHERE id = $1 AND storage_owner = $2 AND queue = $3",
+      "SELECT state, attempt_id, attempt_epoch, attempt_owner, "
+      <> live_lease_predicate("clock_timestamp()")
+      <> " FROM grind_jobs WHERE id = $1 AND storage_owner = $2 AND queue = $3",
     )
     |> pog.parameter(pog.int(id))
     |> pog.parameter(pog.text(storage_owner))
@@ -2396,7 +2380,11 @@ fn current_ack_rejection(
   }
 }
 
-fn acknowledgement_command_id(
+/// The stable acknowledgement command ID for one attempt fence. Exposed only
+/// so tests can construct the same ID an internal reconciliation path would,
+/// without re-encoding this format themselves.
+@internal
+pub fn acknowledgement_command_id(
   job_id: Int,
   attempt_id: Int,
   epoch: Int,

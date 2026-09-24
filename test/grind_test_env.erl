@@ -1,5 +1,5 @@
 -module(grind_test_env).
--export([database_url/0, queue_database_url/0, owner_a_url/0, owner_b_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_atomic_url/0, resolution_route_a_url/0, resolution_route_b_url/0, mark_database_test_executed/1]).
+-export([database_url/0, queue_database_url/0, owner_a_url/0, owner_b_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_atomic_url/0, resolution_route_a_url/0, resolution_route_b_url/0, mark_database_test_executed/1, monotonic_ms/0]).
 
 database_url() -> env("GRIND_TEST_DATABASE_URL").
 queue_database_url() -> env("GRIND_TEST_QUEUE_DATABASE_URL").
@@ -30,3 +30,8 @@ mark_database_test_executed(Name) ->
             ok = file:write_file(Path, <<Name/binary, "\n">>, [append]),
             nil
     end.
+
+%% Monotonic wall-clock milliseconds, for measuring elapsed duration in a
+%% timing-sensitive test. Never used to derive a shared point in time across
+%% processes or as a substitute for a database-time boundary.
+monotonic_ms() -> erlang:monotonic_time(millisecond).

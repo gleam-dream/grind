@@ -20,7 +20,11 @@ if pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
 fi
 
 initdb -D "$cluster" --username=grind --auth-local=trust --auth-host=trust >/dev/null
-pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port" -l "$root/postgres.log" start >/dev/null
+# grind_never_standby never connects, so ordinary commits (synchronous_commit=local)
+# stay local and fast; a test that raises its own transaction's synchronous_commit
+# back to "on" (see the Increment 2 lost-reply tests) will park in SyncRep until
+# something terminates that backend — raising it anywhere else would hang forever.
+pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port -c synchronous_standby_names=grind_never_standby -c synchronous_commit=local" -l "$root/postgres.log" start >/dev/null
 started=1
 createdb -h 127.0.0.1 -p "$port" -U grind grind_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_queue_test
@@ -58,7 +62,7 @@ GRIND_TEST_RESOLUTION_ROUTE_A_URL="postgres://grind@127.0.0.1:$port/grind_resolu
 GRIND_TEST_RESOLUTION_ROUTE_B_URL="postgres://grind@127.0.0.1:$port/grind_resolution_route_b?sslmode=disable" \
 GRIND_TEST_MARKER="$root/database-test-ran" \
   gleam test
-for contract in admission-read-passed storage-owner-passed incompatible-schema-rejected schema-v10-conservative-recovery-installed-and-idempotent legacy-future-schema-markers-rejected missing-schema-artifacts-not-repaired failed-fresh-install-rolled-back committed-success-passed codec-contract-rejected typed-business-failure-passed worker-discard-distinct-outcome-passed worker-cancel-distinct-outcome-passed worker-uncertainty-reconciliable-no-retry cancel-before-run-committed worker-snooze-scheduled-passed worker-snooze-receipt-rollback-passed worker-snooze-delay-receipt-conflict-passed worker-snooze-audited-replay-refunds-current-attempt default-retry-backoff-database-time-passed retry-delay-maximum-postgres-ack-passed worker-retry-first-attempt-scheduled worker-retry-declined-without-error-codec long-handler-wait-passed stale-consumer-handle-rejected supervised-owner-restart-resumed-polling foreign-consumer-stop-owner-preserved consumer-stop-timeout-owner-survived consumer-stop-drained-active-worker consumer-stop-forced-active-work-retained automatic-drain-paused-poll-and-renewed overlapping-claims-skip-locked lease-renewal-loss-fenced-passed renewal-storage-error-retried-passed closed-pool-renewal-recovered-passed unstarted-worker-claim-released-passed temporary-worker-death-quarantined-no-replay dead-idle-worker-claim-released independent-consumers-single-live-claim consumer-capacity-two-enforced automatic-consumer-capacity-two-enforced automatic-contract-skip-passed queue-batch-policy-passed scheduled-due-time-passed batch-partial-commit-count-passed expired-attempt-audited-replay-passed expired-attempt-quarantine-passed quarantine-bounded-passed audited-uncertain-resolution-passed resolution-payload-bound resolution-rebind-owner-checked durable-ack-receipt-passed ack-commit-connection-loss-unknown-passed; do
+for contract in admission-read-passed storage-owner-passed incompatible-schema-rejected schema-v10-conservative-recovery-installed-and-idempotent legacy-future-schema-markers-rejected missing-schema-artifacts-not-repaired failed-fresh-install-rolled-back committed-success-passed codec-contract-rejected typed-business-failure-passed worker-discard-distinct-outcome-passed worker-cancel-distinct-outcome-passed worker-uncertainty-reconciliable-no-retry cancel-before-run-committed worker-snooze-scheduled-passed worker-snooze-receipt-rollback-passed worker-snooze-delay-receipt-conflict-passed worker-snooze-audited-replay-refunds-current-attempt default-retry-backoff-database-time-passed retry-delay-maximum-postgres-ack-passed worker-retry-first-attempt-scheduled worker-retry-declined-without-error-codec long-handler-wait-passed stale-consumer-handle-rejected supervised-owner-restart-resumed-polling foreign-consumer-stop-owner-preserved consumer-stop-timeout-owner-survived consumer-stop-drained-active-worker consumer-stop-forced-active-work-retained automatic-drain-paused-poll-and-renewed overlapping-claims-skip-locked lease-renewal-loss-fenced-passed renewal-storage-error-retried-passed closed-pool-renewal-recovered-passed unstarted-worker-claim-released-passed temporary-worker-death-quarantined-no-replay dead-idle-worker-claim-released independent-consumers-single-live-claim consumer-capacity-two-enforced automatic-consumer-capacity-two-enforced automatic-contract-skip-passed queue-batch-policy-passed scheduled-due-time-passed batch-partial-commit-count-passed expired-attempt-audited-replay-passed expired-attempt-quarantine-passed quarantine-bounded-passed audited-uncertain-resolution-passed resolution-payload-bound resolution-rebind-owner-checked durable-ack-receipt-passed ack-commit-connection-loss-unknown-passed ack-committed-reply-lost-reconciled-passed ack-committed-reply-lost-store-unavailable-unknown-passed lease-renewal-before-ack-passed exact-expiry-rejected ack-after-database-expiry-stale-no-receipt-passed automatic-wakeup-database-deadline-passed forced-stop-pool-cleanup-recovered coordinator-loss-quarantined-no-replay owner-loss-pool-restart-quarantined-no-replay stop-after-coordinator-gone-without-drain stale-shutdown-grace-timer-scoped-to-incarnation; do
   if ! grep -q "$contract" "$root/database-test-ran"; then
     echo "PostgreSQL integration contract did not execute: $contract" >&2
     exit 1
@@ -91,7 +95,7 @@ consumer_bad_url="postgres://grind@127.0.0.1:$port/grind_database_missing?sslmod
   GRIND_CONSUMER_TEST_MARKER="$root/consumer-test-ran" \
     gleam test
 )
-for contract in two-worker-consumer-passed consumer-storage-failure-passed; do
+for contract in two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed; do
   if ! grep -q "$contract" "$root/consumer-test-ran"; then
     echo "external-consumer integration contract did not execute: $contract" >&2
     exit 1
