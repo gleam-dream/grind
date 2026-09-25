@@ -7,8 +7,10 @@ import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/result
 import gleam/string
+import grind/internal/unique_admission
 import grind/job.{type JobHandle, type State, Queued, Scheduled}
 import grind/registry.{type Registry}
+import grind/unique
 import grind/worker.{type Worker}
 import pog
 
@@ -18,6 +20,7 @@ pub type Settings {
     database_url: String,
     pool_name: process.Name(pog.Message),
     pool_size: Int,
+    unique_lock_wait_ms: Int,
   )
 }
 
@@ -25,27 +28,59 @@ pub fn settings(
   database_url: String,
   pool_name: process.Name(pog.Message),
 ) -> Settings {
-  Settings(database_url:, pool_name:, pool_size: 10)
+  Settings(database_url:, pool_name:, pool_size: 10, unique_lock_wait_ms: 5000)
 }
 
 pub fn pool_size(settings: Settings, pool_size: Int) -> Settings {
   Settings(..settings, pool_size:)
 }
 
+/// Sets the bounded wait for `submit_unique`'s admission lock, in
+/// milliseconds. Exceeding it surfaces as `AdmissionContended` rather
+/// than blocking indefinitely. Validated positive by `validate`, before any
+/// pool starts.
+pub fn unique_lock_wait(settings: Settings, milliseconds: Int) -> Settings {
+  Settings(..settings, unique_lock_wait_ms: milliseconds)
+}
+
 pub type ConfigError {
   InvalidDatabaseUrl
   InvalidPoolSize
+  InvalidUniqueLockWait
 }
 
 pub opaque type ValidatedSettings {
-  ValidatedSettings(pog.Config, storage_owner: String)
+  ValidatedSettings(pog.Config, storage_owner: String, unique_lock_wait_ms: Int)
 }
 
 /// Checks the URL and pool bound before any PostgreSQL process is started.
+///
+/// Every pooled connection is also given a `default_transaction_isolation
+/// = 'read committed'` startup parameter (`pog.connection_parameter`),
+/// overriding whatever the connecting role or database's own
+/// `default_transaction_isolation` is configured to. This is not defensive
+/// decoration: several of Grind's transactions depend on `READ COMMITTED`
+/// semantics — a plain read after a wait must see what committed during
+/// that wait (the uniqueness admission transaction's domain lock), and a
+/// fenced `UPDATE` racing a concurrent retry of the exact same command must
+/// not surface PostgreSQL's `REPEATABLE READ`/`SERIALIZABLE` conflict
+/// handling (`40001 serialization_failure`) in place of the idempotent
+/// result that retry is supposed to get (the acknowledgement path) — and
+/// neither depends on a caller never configuring their role or database
+/// with a non-default isolation level. See `docs/UNIQUENESS-CONTRACT.md`,
+/// "Admission transaction" step 1, and `docs/RECOVERY-EVIDENCE.md`,
+/// "Isolation-level pinning", for the full rationale and mutation evidence.
+/// `grind/internal/unique_admission`'s own `pin_read_committed` (`SET
+/// TRANSACTION ISOLATION LEVEL READ COMMITTED` as that transaction's own
+/// first statement) is kept as defense in depth on top of this — a
+/// connection pooler between Grind and PostgreSQL could drop or ignore a
+/// startup parameter, where an in-transaction `SET TRANSACTION` cannot be
+/// silently dropped the same way.
 pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
-  case settings.pool_size > 0 {
-    False -> Error(InvalidPoolSize)
-    True ->
+  case settings.pool_size > 0, settings.unique_lock_wait_ms > 0 {
+    False, _ -> Error(InvalidPoolSize)
+    True, False -> Error(InvalidUniqueLockWait)
+    True, True ->
       case pog.url_config(settings.pool_name, settings.database_url) {
         Error(_) -> Error(InvalidDatabaseUrl)
         Ok(config) -> {
@@ -56,8 +91,14 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
             <> "/"
             <> config.database
           Ok(ValidatedSettings(
-            pog.pool_size(config, settings.pool_size),
+            config
+              |> pog.pool_size(settings.pool_size)
+              |> pog.connection_parameter(
+                name: "default_transaction_isolation",
+                value: "read committed",
+              ),
             storage_owner:,
+            unique_lock_wait_ms: settings.unique_lock_wait_ms,
           ))
         }
       }
@@ -69,6 +110,7 @@ pub opaque type Database {
     connection: pog.Connection,
     supervisor_pid: process.Pid,
     storage_owner: String,
+    unique_lock_wait_ms: Int,
   )
 }
 
@@ -94,7 +136,7 @@ pub type StartError {
 
 /// Starts a package-owned PostgreSQL pool after settings have been validated.
 pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
-  let ValidatedSettings(config, storage_owner:) = settings
+  let ValidatedSettings(config, storage_owner:, unique_lock_wait_ms:) = settings
   let pog.Config(pool_name:, ..) = config
   let supervisor =
     static_supervisor.new(static_supervisor.OneForOne)
@@ -102,7 +144,12 @@ pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
   case static_supervisor.start(supervisor) {
     Ok(started) -> {
       process.unlink(started.pid)
-      Ok(Database(pog.named_connection(pool_name), started.pid, storage_owner))
+      Ok(Database(
+        pog.named_connection(pool_name),
+        started.pid,
+        storage_owner,
+        unique_lock_wait_ms,
+      ))
     }
     Error(error) -> Error(PoolStartFailed(error))
   }
@@ -275,6 +322,29 @@ fn reconcile_matching_owner(
   connection: pog.Connection,
   command: ResolutionCommand,
 ) -> Result(ResolutionResult, ResolutionError) {
+  case resolution_receipt_outcome(connection, command) {
+    Error(error) -> Error(error)
+    Ok(Some(result)) -> Ok(result)
+    Ok(None) -> apply_uncertain_resolution(connection, command)
+  }
+}
+
+/// Looks up an existing resolution receipt for `command`'s `resolution_id`
+/// and, if one exists, checks it matches this exact command. `Ok(None)`
+/// means no receipt exists yet — the caller decides what to do (apply a
+/// fresh resolution, or — the second, post-lock call site in
+/// `apply_uncertain_resolution` below — report that reconciliation is
+/// genuinely not required). Shared by two call sites deliberately: this is
+/// the exact "re-read the receipt instead of misreporting a concurrent
+/// retry as stale" pattern the acknowledgement path already uses
+/// (`acknowledge_transaction`'s re-read of `matching_acknowledgement` after
+/// a 0-row fenced `UPDATE`), applied here to `resolve_uncertain`'s
+/// analogous race — see `docs/RECOVERY-EVIDENCE.md`, "Concurrent audited
+/// resolution".
+fn resolution_receipt_outcome(
+  connection: pog.Connection,
+  command: ResolutionCommand,
+) -> Result(Option(ResolutionResult), ResolutionError) {
   let ResolutionCommand(
     id:,
     database_owner:,
@@ -299,6 +369,7 @@ fn reconcile_matching_owner(
   }
   case find_resolution(connection, database_owner, resolution_id, payload) {
     Error(error) -> Error(error)
+    Ok(None) -> Ok(None)
     Ok(Some(#(
       job_id,
       old_queue,
@@ -326,9 +397,8 @@ fn reconcile_matching_owner(
         False -> Error(ResolutionCommandConflict)
         True ->
           resolution_state(old_target_state)
-          |> result.map(ResolutionAlreadyApplied)
+          |> result.map(fn(state) { Some(ResolutionAlreadyApplied(state)) })
       }
-    Ok(None) -> apply_uncertain_resolution(connection, command)
   }
 }
 
@@ -510,7 +580,20 @@ fn apply_uncertain_resolution(
             False -> Error(ResolutionWorkerContractMismatch)
             True ->
               case stored_state == "uncertain" {
-                False -> Error(ReconciliationNotRequired)
+                // The row is no longer `uncertain` — either genuinely no
+                // reconciliation is needed, or (the race this re-check
+                // exists for) a concurrent call for this exact command won
+                // and already committed while this call waited on the row
+                // lock just above. Re-reading the receipt here, rather
+                // than assuming the former, is the same "re-read instead
+                // of misreporting a concurrent retry as stale" pattern
+                // `acknowledge_transaction` already uses.
+                False ->
+                  case resolution_receipt_outcome(connection, command) {
+                    Error(error) -> Error(error)
+                    Ok(Some(result)) -> Ok(result)
+                    Ok(None) -> Error(ReconciliationNotRequired)
+                  }
                 True ->
                   case codec_matches {
                     False -> Error(ResolutionCodecMismatch)
@@ -670,7 +753,7 @@ fn read_schema_generation(
 ) -> Result(SchemaGeneration, StorageError) {
   let query =
     pog.query(
-      "SELECT count(*)::bigint, count(*) FILTER (WHERE relname IN ('grind_schema_migrations', 'grind_jobs', 'grind_job_resolutions', 'grind_job_acknowledgements') AND relkind = 'r')::bigint, count(*) FILTER (WHERE relname = 'grind_attempts_id_seq' AND relkind = 'S')::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND relname IN ('grind_schema_migrations', 'grind_jobs', 'grind_job_resolutions', 'grind_job_acknowledgements', 'grind_attempts_id_seq')",
+      "SELECT count(*)::bigint, count(*) FILTER (WHERE relname IN ('grind_schema_migrations', 'grind_jobs', 'grind_job_resolutions', 'grind_job_acknowledgements', 'grind_unique_submissions') AND relkind = 'r')::bigint, count(*) FILTER (WHERE relname = 'grind_attempts_id_seq' AND relkind = 'S')::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND relname IN ('grind_schema_migrations', 'grind_jobs', 'grind_job_resolutions', 'grind_job_acknowledgements', 'grind_unique_submissions', 'grind_attempts_id_seq')",
     )
     |> pog.returning({
       use owned_objects <- decode.field(0, decode.int)
@@ -690,14 +773,19 @@ fn read_schema_generation(
   )
   case owned_objects, owned_tables, attempt_sequences {
     0, 0, 0 -> Ok(FreshSchema)
-    5, 4, 1 -> read_installed_schema_version(connection)
+    6, 5, 1 -> read_installed_schema_version(connection)
+    // The exact object shape of a never-migrated schema v10 install (four
+    // tables, no `grind_unique_submissions`, the same attempt sequence). Read
+    // the marker to confirm it is genuinely the legacy v10 install rather
+    // than some other tampered or partial state.
+    5, 4, 1 -> read_legacy_schema_marker(connection)
     _, _, _ -> Error(IncompatibleSchema)
   }
 }
 
-fn read_installed_schema_version(
+fn read_schema_marker(
   connection: pog.Connection,
-) -> Result(SchemaGeneration, StorageError) {
+) -> Result(#(Int, Int, Int), StorageError) {
   let query =
     pog.query(
       "SELECT count(*)::bigint, COALESCE(min(version), 0)::bigint, COALESCE(max(version), 0)::bigint FROM grind_schema_migrations",
@@ -708,19 +796,65 @@ fn read_installed_schema_version(
       use maximum <- decode.field(2, decode.int)
       decode.success(#(count, minimum, maximum))
     })
-  use #(count, minimum, maximum) <- result.try(
-    case execute_safely(query, on: connection) {
-      Error(_) -> Error(IncompatibleSchema)
-      Ok(returned) ->
-        case returned.rows {
-          [version] -> Ok(version)
-          _ -> Error(IncompatibleSchema)
-        }
-    },
-  )
+  case execute_safely(query, on: connection) {
+    Error(_) -> Error(IncompatibleSchema)
+    Ok(returned) ->
+      case returned.rows {
+        [version] -> Ok(version)
+        _ -> Error(IncompatibleSchema)
+      }
+  }
+}
+
+fn read_installed_schema_version(
+  connection: pog.Connection,
+) -> Result(SchemaGeneration, StorageError) {
+  use #(count, minimum, maximum) <- result.try(read_schema_marker(connection))
   case count, minimum, maximum {
-    1, 10, 10 -> Ok(ExistingSchema)
+    1, 11, 11 -> read_unique_key_columns(connection)
     1, version, _ -> Error(UnsupportedSchemaVersion(version))
+    _, _, _ -> Error(IncompatibleSchema)
+  }
+}
+
+/// Cheap fail-closed check: the full v11 object shape (tables, sequence,
+/// marker) could in principle exist without `grind_jobs` ever having gained
+/// its two uniqueness key columns (a partial or tampered install). Checked
+/// here, alongside the marker, rather than trusted from object counts alone.
+fn read_unique_key_columns(
+  connection: pog.Connection,
+) -> Result(SchemaGeneration, StorageError) {
+  let query =
+    pog.query(
+      "SELECT count(*) = 2 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'grind_jobs' AND column_name IN ('unique_key_contract', 'unique_key_sha256')",
+    )
+    |> pog.returning({
+      use present <- decode.field(0, decode.bool)
+      decode.success(present)
+    })
+  case execute_safely(query, on: connection) {
+    Error(_) -> Error(IncompatibleSchema)
+    Ok(returned) ->
+      case returned.rows {
+        [True] -> Ok(ExistingSchema)
+        _ -> Error(IncompatibleSchema)
+      }
+  }
+}
+
+/// The v10 object shape has no `grind_unique_submissions` table and never
+/// gained the new `grind_jobs` key columns; it is only ever a genuine
+/// pre-v11 install, marked 10, never a partially-installed or tampered v11
+/// schema (that shape is caught separately as `IncompatibleSchema` by
+/// `read_schema_generation`'s object-count check, since dropping just
+/// `grind_unique_submissions` from a real v11 install still leaves the
+/// marker at 11). Fresh-install-only: there is no migration to v11.
+fn read_legacy_schema_marker(
+  connection: pog.Connection,
+) -> Result(SchemaGeneration, StorageError) {
+  use #(count, minimum, maximum) <- result.try(read_schema_marker(connection))
+  case count, minimum, maximum {
+    1, 10, 10 -> Error(UnsupportedSchemaVersion(10))
     _, _, _ -> Error(IncompatibleSchema)
   }
 }
@@ -748,7 +882,12 @@ fn create_fresh_schema(
     <> "state text NOT NULL CONSTRAINT grind_jobs_state_check CHECK (state IN ('queued', 'scheduled', 'retryable', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled')), "
     <> "available_at timestamptz NOT NULL, inserted_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
     <> "attempt_id bigint, attempt_epoch bigint NOT NULL DEFAULT 0, attempt_owner text, "
-    <> "lease_expires_at timestamptz, attempt_count bigint NOT NULL DEFAULT 0, max_attempts bigint NOT NULL DEFAULT 20, delivery_count bigint NOT NULL DEFAULT 0, snooze_count bigint NOT NULL DEFAULT 0, failure_description text, failure_cause text, uncertain_at timestamptz, cancel_requested_at timestamptz, CONSTRAINT grind_jobs_max_attempts_check CHECK (max_attempts > 0))"
+    <> "lease_expires_at timestamptz, attempt_count bigint NOT NULL DEFAULT 0, max_attempts bigint NOT NULL DEFAULT 20, delivery_count bigint NOT NULL DEFAULT 0, snooze_count bigint NOT NULL DEFAULT 0, failure_description text, failure_cause text, uncertain_at timestamptz, cancel_requested_at timestamptz, "
+    <> "unique_key_contract text, unique_key_sha256 bytea, "
+    <> "CONSTRAINT grind_jobs_max_attempts_check CHECK (max_attempts > 0), "
+    <> "CONSTRAINT grind_jobs_unique_key_check CHECK ((unique_key_contract IS NULL) = (unique_key_sha256 IS NULL) AND (unique_key_sha256 IS NULL OR octet_length(unique_key_sha256) = 32)))"
+  let unique_candidate_index_sql =
+    "CREATE INDEX grind_jobs_unique_candidate_idx ON grind_jobs (storage_owner, worker_id, worker_version, unique_key_contract, unique_key_sha256) WHERE unique_key_sha256 IS NOT NULL"
   let resolutions_sql =
     "CREATE TABLE grind_job_resolutions ("
     <> "storage_owner text NOT NULL, queue text NOT NULL, job_id bigint NOT NULL, worker_id text, worker_version text, "
@@ -771,14 +910,27 @@ fn create_fresh_schema(
     <> "CONSTRAINT grind_job_acknowledgements_attempt_key UNIQUE (storage_owner, job_id, attempt_id, attempt_epoch))"
   let attempts_sql =
     "CREATE SEQUENCE grind_attempts_id_seq AS bigint START WITH 1 INCREMENT BY 1 MINVALUE 1 CACHE 1 NO CYCLE"
+  let unique_submissions_sql =
+    "CREATE TABLE grind_unique_submissions ("
+    <> "storage_owner text NOT NULL, submission_id text NOT NULL, queue text NOT NULL, "
+    <> "worker_id text NOT NULL, worker_version text NOT NULL, "
+    <> "request_sha256 bytea NOT NULL CONSTRAINT grind_unique_submissions_request_sha256_check CHECK (octet_length(request_sha256) = 32), "
+    <> "decision text NOT NULL CONSTRAINT grind_unique_submissions_decision_check CHECK (decision IN ('inserted', 'existing', 'rescheduled')), "
+    <> "job_id bigint NOT NULL, job_queue text NOT NULL, "
+    <> "observed_state text NOT NULL CONSTRAINT grind_unique_submissions_observed_state_check CHECK (observed_state IN ('queued', 'scheduled', 'retryable', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled')), "
+    <> "decided_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
+    <> "rescheduled_from timestamptz, rescheduled_to timestamptz, "
+    <> "CONSTRAINT grind_unique_submissions_pkey PRIMARY KEY (storage_owner, submission_id))"
   use _ <- result.try(run_statement(connection, migration_sql))
   use _ <- result.try(run_statement(connection, jobs_sql))
+  use _ <- result.try(run_statement(connection, unique_candidate_index_sql))
   use _ <- result.try(run_statement(connection, resolutions_sql))
   use _ <- result.try(run_statement(connection, acknowledgements_sql))
   use _ <- result.try(run_statement(connection, attempts_sql))
+  use _ <- result.try(run_statement(connection, unique_submissions_sql))
   run_statement(
     connection,
-    "INSERT INTO grind_schema_migrations (version) VALUES (10)",
+    "INSERT INTO grind_schema_migrations (version) VALUES (11)",
   )
 }
 
@@ -2573,6 +2725,27 @@ fn insert_acknowledgement(
 }
 
 /// Reads the committed admission state.
+/// Maps a persisted `grind_jobs.state`/`grind_unique_submissions.observed_state`
+/// column value to its typed `State`. Shared by `state` and the uniqueness
+/// admission path (`find_unique_receipt`, `decide_unique_conflict`) so the
+/// mapping is defined once.
+fn job_state_of_stored(state: String) -> Result(State, Nil) {
+  case state {
+    "queued" -> Ok(Queued)
+    "scheduled" -> Ok(Scheduled)
+    "retryable" -> Ok(job.Retryable)
+    "executing" -> Ok(job.Executing)
+    "succeeded" -> Ok(job.Succeeded)
+    "business_failed" -> Ok(job.BusinessFailed)
+    "runtime_failed" -> Ok(job.RuntimeFailed)
+    "contract_mismatch" -> Ok(job.ContractMismatch)
+    "uncertain" -> Ok(job.Uncertain)
+    "discarded" -> Ok(job.Discarded)
+    "cancelled" -> Ok(job.Cancelled)
+    _ -> Error(Nil)
+  }
+}
+
 pub fn state(
   database: Database,
   handle: JobHandle(input, output, error),
@@ -2625,20 +2798,8 @@ pub fn state(
                   {
                     False -> Error(StateWorkerContractMismatch)
                     True ->
-                      case state {
-                        "queued" -> Ok(Queued)
-                        "scheduled" -> Ok(Scheduled)
-                        "retryable" -> Ok(job.Retryable)
-                        "executing" -> Ok(job.Executing)
-                        "succeeded" -> Ok(job.Succeeded)
-                        "business_failed" -> Ok(job.BusinessFailed)
-                        "runtime_failed" -> Ok(job.RuntimeFailed)
-                        "contract_mismatch" -> Ok(job.ContractMismatch)
-                        "uncertain" -> Ok(job.Uncertain)
-                        "discarded" -> Ok(job.Discarded)
-                        "cancelled" -> Ok(job.Cancelled)
-                        other -> Error(InvalidStoredState(other))
-                      }
+                      job_state_of_stored(state)
+                      |> result.replace_error(InvalidStoredState(state))
                   }
               }
           }
@@ -2993,4 +3154,61 @@ fn outcome_value(
       Ok(job.CancelledWithReason(failure_description |> unwrap("job cancelled")))
     other -> Error(InvalidOutcomeState(other))
   }
+}
+
+// -- Uniqueness admission ----------------------------------------------------
+//
+// The admission transaction itself lives in `grind/internal/unique_admission`
+// (which has no dependency on this module, so `grind/postgres` depends on it
+// instead). That module returns `grind/unique`'s public
+// `Admission`/`Conflict`/`SubmitError`/`PendingSubmission` types
+// directly, so `submit_unique`/`reconcile_unique` below are thin entry
+// points, not a second translating layer. See `docs/UNIQUENESS-CONTRACT.md`
+// for the full contract.
+
+/// Admits one job under a uniqueness policy. Rejects an empty queue name
+/// before acquiring any resource. See `docs/UNIQUENESS-CONTRACT.md` for the
+/// full admission transaction.
+pub fn submit_unique(
+  database: Database,
+  queue: String,
+  submission_id: unique.SubmissionId,
+  worker: Worker(input, output, error),
+  input: input,
+  availability: unique.Availability,
+  policy: unique.Policy(input),
+  on_conflict: unique.ConflictAction,
+) -> Result(
+  unique.Admission(input, output, error),
+  unique.SubmitError(input, output, error),
+) {
+  let Database(connection:, storage_owner:, unique_lock_wait_ms:, ..) = database
+  unique_admission.submit(
+    connection,
+    storage_owner,
+    unique_lock_wait_ms,
+    queue,
+    submission_id,
+    worker,
+    input,
+    availability,
+    policy,
+    on_conflict,
+  )
+}
+
+/// Re-reads the receipt a `CommitUnknown` command would have written,
+/// without repeating the admission transaction. A receipt matching the
+/// retained request returns its recorded decision; a receipt that does not
+/// match, or no receipt yet, both surface the same way a fresh `submit_unique`
+/// call would (`SubmissionConflict` / another `CommitUnknown`).
+pub fn reconcile_unique(
+  database: Database,
+  pending: unique.PendingSubmission(input, output, error),
+) -> Result(
+  unique.Admission(input, output, error),
+  unique.SubmitError(input, output, error),
+) {
+  let Database(connection:, ..) = database
+  unique_admission.reconcile(connection, pending)
 }

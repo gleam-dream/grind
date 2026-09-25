@@ -57,6 +57,28 @@ pub type State {
   Cancelled
 }
 
+/// Maps a persisted state column's text (`grind_jobs.state`,
+/// `grind_unique_submissions.observed_state`) to its typed `State`. Shared
+/// by `postgres.state` and the uniqueness admission path so the mapping is
+/// defined once.
+@internal
+pub fn state_of_stored(text: String) -> Result(State, Nil) {
+  case text {
+    "queued" -> Ok(Queued)
+    "scheduled" -> Ok(Scheduled)
+    "retryable" -> Ok(Retryable)
+    "executing" -> Ok(Executing)
+    "succeeded" -> Ok(Succeeded)
+    "business_failed" -> Ok(BusinessFailed)
+    "runtime_failed" -> Ok(RuntimeFailed)
+    "contract_mismatch" -> Ok(ContractMismatch)
+    "uncertain" -> Ok(Uncertain)
+    "discarded" -> Ok(Discarded)
+    "cancelled" -> Ok(Cancelled)
+    _ -> Error(Nil)
+  }
+}
+
 pub type Outcome(output, error) {
   Pending(State)
   SucceededWith(output)

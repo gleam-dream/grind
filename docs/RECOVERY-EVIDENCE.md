@@ -778,3 +778,1802 @@ a value the test could have computed independently.
   guarantees anything about external effects; the app's dedup table is
   doing the idempotency work, exactly as `consumer/README.md` already says
   for the crash-window case.
+
+## Increment 6 — uniqueness admission: schema v11, pure policy validation, sequential identity
+
+Full contract, decisions, and admission-transaction step order:
+`docs/UNIQUENESS-CONTRACT.md`. This increment covers schema v11 install/reject
+behavior, `grind/unique`'s pure validation, and sequential (non-concurrent)
+`submit_unique` admission and identity. Concurrent admission, period-boundary
+timing, live rescheduling, lock contention, and uncertain-commit
+reconciliation are implemented by the same production code but not yet
+tested — see the "Status" section of `docs/UNIQUENESS-CONTRACT.md`. The
+admission transaction lives in `grind/internal/unique_admission.gleam`;
+`submit_unique`/`reconcile_unique` in `grind/postgres.gleam` are thin
+wrappers around it (see `docs/UNIQUENESS-CONTRACT.md`, "Module placement").
+
+### Claim: `submit_unique` rejects an empty queue before touching storage
+
+- **Test**: `postgres_submit_unique_rejects_before_touching_storage_test`
+  (marker `unique-pre-storage-rejections-passed`).
+- **Mechanism**: the pool is started, then immediately closed
+  (`postgres.close`) before the `submit_unique` call. A passing test
+  therefore proves the rejection is a pure `case` branch that returns before
+  `unique_admission.submit` ever reaches the database — a query attempt
+  against a closed pool would surface as a storage-shaped failure
+  (`AdmissionFailed`), not the exact `EmptyQueueName` value
+  asserted. (An earlier draft of this test also asserted an
+  `Immediately`/`RescheduleScheduled` pairing was rejected before storage;
+  that combination is no longer constructible at all once the coordinator's
+  reschedule-target-on-the-action API decision landed — see
+  `docs/UNIQUENESS-CONTRACT.md`'s `ConflictAction` note — so this test now
+  covers only the empty-queue case.)
+- **Limits**: this is a characterization test (it passed on first write, so
+  red-before-green does not apply); its own construction — proving the exact
+  pure error survives a closed pool — is the evidence, not a separate
+  mutation.
+
+### Claim: a same-worker-id, different-version submission never conflicts with an earlier admission
+
+- **Test**: `postgres_submit_unique_scopes_key_to_worker_identity_test`
+  (marker `unique-worker-identity-isolation-passed`).
+- **Characterization test, proven by mutation** (passed on first write, so
+  red-before-green does not apply). Mutation: removed `worker_version = $3`
+  from the candidate-selection SQL and its matching bound parameter
+  (`candidate_sql`/`bind_candidate_params`,
+  `src/grind/internal/unique_admission.gleam`, renumbering the remaining
+  positional parameters). Re-run after the module split (R1) that moved this
+  code out of `grind/postgres.gleam`, against a **freshly recreated**
+  disposable database — reusing a database across repeated manual runs of
+  this test with the same fixed `SubmissionId`s the first time produced a
+  false negative (the receipt-lookup step, working exactly as designed,
+  returned each submission's already-committed decision from the _previous_
+  run before the mutated candidate query was ever reached at all; recreating
+  the database before the mutated run is what actually exercises the
+  candidate path). Result, against a real disposable cluster (85 passed, 1
+  failure):
+  ```
+  let assert  test/grind_test.gleam:7399
+   test: grind_test.postgres_submit_unique_scopes_key_to_worker_identity_test
+   code: let assert Ok(postgres.Inserted(_)) =
+      postgres.submit_unique(
+        database,
+        "identity",
+        submission_v2,
+        worker_v2,
+        5,
+        unique.Immediately,
+        policy,
+        unique.KeepExisting,
+      )
+  value: Ok(Existing(Conflict(13, "127.0.0.1:55995/grind_refactor_test", "identity", "unique.identity", "v2", Queued)))
+  ```
+  The same-id, different-version submission (`worker_v2`) incorrectly saw
+  the first submission (`worker_v1`, same id, different version) as a
+  candidate and returned `Existing` — note the conflict's own reported
+  worker version is `"v2"`, i.e. the row it actually matched belongs to
+  `worker_v1`'s admission but is being read back through `worker_v2`'s
+  identity, exactly the cross-version confusion this test exists to catch —
+  instead of the expected `Inserted`. Only this test failed. Reverted
+  immediately; `gleam build --warnings-as-errors` recompiled clean and `git
+diff` for `unique_admission.gleam` showed no trace of the mutated lines.
+- **Limits**: this proves worker-version isolation specifically; it does not
+  exercise concurrent admission of the two versions (a sequential-call test,
+  per this increment's scope). The false-negative-then-corrected run above
+  is itself recorded as a caution for anyone re-running this mutation
+  manually: use a fresh database, not a reused one, when the test's
+  `SubmissionId`s are fixed literals.
+
+### Claim: a plain-submitted row never participates in uniqueness admission, at any eligible-states width
+
+- **Test**: `postgres_submit_unique_ignores_plain_submitted_rows_test`
+  (marker `unique-plain-submit-non-participation-passed`).
+- **Mechanism**: the policy under test deliberately uses `unique.AllRetained`
+  (every persisted state), the widest possible eligibility, so a states
+  filter cannot be the reason the plain row is invisible — only its `NULL`
+  `unique_key_contract`/`unique_key_sha256` (columns `submit`/`submit_at`
+  never set) can explain the result.
+- **Observed**: the `submit_unique` call following the plain `submit`, with
+  an identical key/worker/queue, returns `Inserted` (a new row), not
+  `Existing`. Full gate passed (see `oracle/ORACLE-LEDGER.md` header).
+- **Limits**: characterization evidence (passed on first write); the
+  candidate query's `unique_key_contract = $n` equality can structurally
+  never match a `NULL` column, so this is closer to a proof-by-construction
+  than a mutation-discovered regression — recorded here because it is the
+  test increment 3 of the approved plan named explicitly ("plain-submit
+  non-participation").
+
+### Claim: PostgreSQL's own `jsonb::text` equality, not a cross-runtime canonical JSON, governs key conflict
+
+- **Test**: `postgres_submit_unique_json_equality_matches_postgres_jsonb_test`
+  (marker `unique-json-equality-cases-passed`).
+- **Mechanism**: a `RawInput` wrapper whose codec's `encode` returns exactly
+  the `json.Json` value the test constructs, submitted as a full-input key,
+  so each case controls the encoded JSON precisely: reordered object fields,
+  `json.int(1)` vs. `json.float(1.0)`, reordered arrays, `{"id":1}` vs.
+  `{"id":1,"extra":2}`, and an empty vs. a non-empty object. `key_digest_sql`
+  (`grind/internal/unique_admission`) casts the bound key text to `jsonb` and
+  hashes its `::text` rendering in the same SQL statement every time
+  (candidate select, insert, and lock key), so this exercises the actual
+  production digest path, not a parallel hand-written comparison. This
+  digest path is unaffected by the request-fingerprint-in-Gleam change (R1.2):
+  key equality was, and remains, computed entirely by PostgreSQL.
+- **Observed**: reordered object fields conflict (`Existing`); every other
+  pair admits both sides (`Inserted` twice) — `1`/`1.0`, reordered arrays,
+  subset/superset objects, and empty/non-empty objects are all treated as
+  distinct keys. Full gate passed (see header).
+- **Limits**: this is a deliberate, documented departure from Oban's own
+  selected-field containment semantics (`docs/UNIQUENESS-CONTRACT.md`,
+  Decisions 1–2), not an attempt to reproduce it; it does not exercise
+  `unique.selected` (a projected key), only `unique.full_input()`.
+
+### Claim: `state = ANY($n::text[])` array binding works against the pinned `pog`/`pgo` version
+
+- Not a named test; a standalone probe run during review, recorded here
+  because an earlier draft of this document (and of
+  `docs/UNIQUENESS-CONTRACT.md`) incorrectly attributed a `FunctionClause`
+  crash to array-parameter binding.
+- **Mechanism**: `pog.query("SELECT 'queued' = ANY($1::text[])") |> pog.parameter(pog.array(pog.text, ["queued", "scheduled"])) |> pog.execute(...)`
+  against a real disposable cluster.
+- **Observed**: `Ok(Returned(1, [True]))` — no crash, correct result.
+- **Correction**: the original crash (`PgTypes(Decode, ["", UnknownOid], [])`,
+  captured via a stacktrace-preserving `catch Class:Reason:Stack` FFI probe)
+  came from decoding `pg_advisory_xact_lock`'s `void` return type, not from
+  array binding — `pg_types` has no registered decoder for `void`. Once the
+  lock-acquisition query was wrapped (`SELECT true FROM (SELECT
+pg_advisory_xact_lock(...)) AS ...`) to give it a decodable result, the
+  candidate query was switched from a literal `state IN ('queued', ...)` list
+  back to `state = ANY($n::text[])` with `pog.array`, per this probe's result.
+
+## Increment 7 — uniqueness admission: queue scope, state eligibility, period boundaries at database time, and receipt idempotency (approved plan increments 4–7)
+
+Full contract: `docs/UNIQUENESS-CONTRACT.md`. All mutations below were applied
+against a **freshly recreated** disposable cluster per mutation (via a
+minimal harness that starts its own throwaway PostgreSQL cluster and runs
+`gleam test` with only `GRIND_TEST_DATABASE_URL` set), per the caution
+recorded in Increment 6: reusing a database across repeated manual runs with
+fixed `SubmissionId` literals can produce a false negative, because the
+receipt-lookup step (working exactly as designed) would return an
+already-committed decision from an earlier run before the mutated code path
+is ever reached. Each mutation below was reverted immediately after
+capturing its failure, and `gleam build --warnings-as-errors` recompiled
+clean after every revert.
+
+### Claim: `WithinQueue` admits the same key independently per queue; `AcrossQueues` conflicts with the earliest matching row regardless of which queue holds it
+
+- **Test**: `postgres_submit_unique_respects_queue_scope_test` (marker
+  `unique-queue-scope-passed`).
+- **Characterization test, proven by mutation** (passed on first write).
+  Mutation: in `candidate_sql`/`bind_candidate_params`
+  (`src/grind/internal/unique_admission.gleam`), made the `AcrossQueues`
+  branch of both `case` expressions take the same `queue = $7` clause (and
+  matching bound parameter) as `WithinQueue`, i.e. "always add
+  `queue = $q`". Result, against a fresh disposable cluster (97 passed, 1
+  failure):
+  ```
+  test: grind_test.postgres_submit_unique_respects_queue_scope_test
+  info:
+  19
+  should equal
+  18
+  ```
+  With the mutation, the `AcrossQueues` submission against queue `"q2"`
+  incorrectly matched the `WithinQueue` row already sitting in `"q2"` (job 19) instead of the earlier row in `"q1"` (job 18) that `AcrossQueues` is
+  supposed to reach — still reported `Existing`, but pointed at the wrong
+  row, which is exactly the failure mode this test's `conflict_job_id`
+  assertion exists to catch. Only this test failed. Reverted immediately;
+  `git diff` for `unique_admission.gleam` showed no trace of the mutated
+  lines.
+
+### Claim: the state-eligibility matrix — all 11 persisted states against all four `States` groups — matches `grind/unique`'s `eligible_states` table exactly
+
+- **Test**: `postgres_submit_unique_state_eligibility_matrix_test` (marker
+  `unique-state-eligibility-matrix-passed`). For each of the 11 states
+  (`queued`, `scheduled`, `retryable`, `executing`, `succeeded`,
+  `business_failed`, `runtime_failed`, `contract_mismatch`, `uncertain`,
+  `discarded`, `cancelled`), a fresh row is admitted under a unique key,
+  forced into that state by raw SQL, and then checked against each of
+  `Incomplete`, `ScheduledOnly`, `IncompleteOrSucceeded`, and `AllRetained`
+  (44 checks in one test) — every combination is proven, not just the ones
+  named in the plan.
+- **Characterization test, proven by two mutations** (passed on first
+  write), each reverted before the next was applied, each against a fresh
+  disposable cluster:
+  1. **Remove `uncertain` from `Incomplete`**
+     (`Incomplete -> ["queued", "scheduled", "retryable", "executing"]` in
+     `eligible_states`, `src/grind/unique.gleam`). Result (97 passed, 1
+     failure):
+     ```
+     test: grind_test.postgres_submit_unique_state_eligibility_matrix_test
+     code: let assert Ok(unique.Existing(conflict)) = result
+     value: Ok(Inserted(JobHandle(67, ...)))
+     info: Pattern match failed, no pattern matched the value.
+     ```
+     The `uncertain`/`Incomplete` cell (expected `Existing`) silently
+     admitted a second row instead. Only this test failed.
+  2. **Add `cancelled` to `Incomplete`**
+     (`Incomplete -> [..., "uncertain", "cancelled"]`). Result (97 passed, 1
+     failure):
+     ```
+     test: grind_test.postgres_submit_unique_state_eligibility_matrix_test
+     code: let assert Ok(unique.Inserted(_)) = result
+     value: Ok(Existing(Conflict(78, ..., Cancelled)))
+     info: Pattern match failed, no pattern matched the value.
+     ```
+     The `cancelled`/`Incomplete` cell (expected `Inserted`, since
+     `cancelled` is terminal and outside `Incomplete`) incorrectly reported
+     `Existing` against the cancelled row. Only this test failed.
+     Both mutations reverted immediately; `git diff` for `unique.gleam` showed
+     no trace of either mutated line after reverting.
+
+### Claim: a live transition through a real, manually-driven consumer — `Incomplete` sees a genuinely `queued` row, stops seeing it once the job genuinely succeeds, and `IncompleteOrSucceeded` still matches the original succeeded row
+
+- **Test**: `postgres_submit_unique_state_live_transition_test` (marker
+  `unique-state-live-transition-passed`).
+- **Mechanism**: a real `queue.start_manual`/`queue.process_one` consumer
+  claims and commits the row to `job.Succeeded` through the production
+  execution path (not a forced SQL update), between two `submit_unique`
+  calls under `Incomplete` and two under `IncompleteOrSucceeded`.
+- **Limits**: characterization evidence (passed on first write); the
+  state-forcing matrix above already proves every state/group cell by
+  mutation, so this test's own evidence is that the _transition_ (a real
+  row moving from `queued` to `succeeded` through the production queue) is
+  observed correctly, not a second mutation-discovered regression over the
+  same cells.
+
+### Claim: the shared `@internal` period predicate is inclusive at the exact database-time boundary and false one microsecond past it
+
+- **Test**: `postgres_unique_period_predicate_matches_the_exact_instant_test`
+  (marker `unique-period-predicate-exact-instant-passed`), against two
+  literal `timestamptz` expressions only (no table involved): `now = ts +
+5000ms` (expected `true`) and `now = ts + 5000ms + 1µs` (expected
+  `false`).
+- **Characterization test, proven by mutation** (passed on first write).
+  Mutation: changed `period_predicate`'s comparison from `>=` to `>`
+  (`src/grind/internal/unique_admission.gleam`). Result, against a fresh
+  disposable cluster (97 passed, 1 failure):
+  ```
+  test: grind_test.postgres_unique_period_predicate_matches_the_exact_instant_test
+  info:
+  False
+  should equal
+  True
+  ```
+  The exact-boundary case flipped to `false`, exactly the inclusive-vs-exclusive
+  distinction this test exists to catch. Only this test failed. Reverted
+  immediately; `git diff` showed no trace of the mutated operator.
+- **Limits**: proves the predicate fragment itself at an exact instant;
+  the exact-instant claim is not (and cannot cheaply be) reproduced through
+  the live `submit_unique` path, which samples `now` at an uncontrolled
+  real time — see the live boundary tests below for that side, honestly
+  bounded to a multi-second margin instead of an exact tie.
+
+### Claim: `FromInsertion` matches database-time reality through the live `submit_unique` path — 58 seconds inside a 60-second window still conflicts; 62 seconds outside it does not
+
+- **Test**:
+  `postgres_submit_unique_from_insertion_period_matches_database_time_test`
+  (marker `unique-period-from-insertion-boundary-passed`). `inserted_at` is
+  forced by raw SQL to `clock_timestamp() - interval '58 seconds'` and
+  `'62 seconds'` on two separately-keyed rows, then a real `submit_unique`
+  call (which samples its own `now` moments later) checks each.
+- **Limits**: characterization evidence (passed on first write); the exact
+  instant is proven only by the predicate-only test above. A 2-second
+  margin on each side of the 60-second boundary is deliberately generous
+  against ordinary test-runtime latency between the forced write and the
+  live call's own `clock_timestamp()` sample.
+
+### Claim: `FromSchedule` is "compared to the scheduled time" (Oban's own framing) — 121 seconds past a schedule falls outside a 120-second period; 119 seconds is still inside it
+
+- **Test**: `postgres_submit_unique_from_schedule_period_past_boundary_test`
+  (marker `unique-period-from-schedule-past-boundary-passed`).
+  `available_at` is forced to `clock_timestamp() - interval '121 seconds'`
+  (outside) and `'119 seconds'` (inside) on two separately-keyed rows.
+- **Limits**: characterization evidence (passed on first write); same
+  margin-vs-exact-instant relationship as the `FromInsertion` boundary test
+  above.
+
+### Claim: a future `FromSchedule` deadline extends the occupancy window well beyond what the same period length would already have let expire under `FromInsertion`
+
+- **Test**:
+  `postgres_submit_unique_from_schedule_future_extends_window_test` (marker
+  `unique-period-from-schedule-future-extends-window-passed`). One row is
+  forced to `inserted_at = now - 300s` and `available_at = now + 300s`; a
+  60-second `FromInsertion` policy no longer matches it (long past its
+  window), while the same 60-second `FromSchedule` policy still matches it
+  (its schedule is 5 minutes in the future, so the period counted from
+  there has not even started to elapse).
+- **Limits**: characterization evidence (passed on first write); this is an
+  original Grind observation about how the two `UniqueTimestamp` origins
+  interact with the same period length, not an upstream-derived claim.
+
+### Claim: `while_retained()` has no time boundary — a row inserted a year ago still conflicts
+
+- **Test**:
+  `postgres_submit_unique_while_retained_matches_a_year_old_row_test`
+  (marker `unique-period-while-retained-old-row-passed`). `inserted_at` is
+  forced to `clock_timestamp() - interval '1 year'`.
+- **Limits**: characterization evidence (passed on first write); `Unbounded`
+  is structurally a no-time-predicate SQL branch (`candidate_sql`), so this
+  is closer to proof-by-construction than a mutation-discovered regression.
+
+### Claim: replaying the same `SubmissionId` and request after the original row genuinely succeeded and its period has elapsed returns the original `Inserted` handle (same job id), not a second row
+
+- **Test**:
+  `postgres_submit_unique_receipt_replay_is_idempotent_after_period_elapses_test`
+  (marker `unique-receipt-idempotent-replay-passed`). A real
+  `queue.process_one` commits the row to `succeeded`; `inserted_at` is then
+  forced 6 seconds into the past against a 5-second `FromInsertion` period
+  (so a receipt-blind candidate lookup for this key would find nothing
+  eligible); the exact same `submit_unique` call is repeated with the same
+  `SubmissionId` and input.
+- **Characterization test, proven by mutation** (passed on first write).
+  Mutation: in `admission_transaction`
+  (`src/grind/internal/unique_admission.gleam`), removed the receipt check
+  entirely — after acquiring the lock, it called `admit_candidate`
+  unconditionally instead of calling `find_receipt` at all. **This mutation
+  proves the receipt check is necessary for idempotent replay; it does not
+  prove the receipt-lookup-before-candidate-selection _ordering_ the
+  contract documents** (`docs/UNIQUENESS-CONTRACT.md`, admission
+  transaction step 3) — that ordering exists to correctly resolve a
+  concurrent submitter's SyncRep-parked-but-already-committed receipt, a
+  race this increment does not exercise (sequential calls only; the
+  concurrency scenario is increments 8/11, still untested). Removing the
+  check outright is a stronger, simpler mutation that answers a different,
+  narrower question — "is the receipt consulted at all before every
+  admission attempt" — not "is it consulted _before_ candidate selection
+  specifically." Result, against a fresh disposable cluster (96 passed, 2
+  failures):
+  ```
+  test: grind_test.postgres_submit_unique_receipt_replay_is_idempotent_after_period_elapses_test
+  code: let assert Ok(unique.Inserted(replayed_handle)) = postgres.submit_unique(...)
+  value: Error(SubmissionConflict)
+  ```
+  Without the receipt check, the replayed call ran a fresh candidate lookup
+  (found nothing eligible, since the period had elapsed) and attempted an
+  `INSERT` of a new job row, then hit the receipt table's own primary-key
+  constraint (`storage_owner`, `submission_id`) trying to record a second
+  receipt for the same id. **That constraint violation rolled back the
+  whole admission transaction** — `run` in `unique_admission.gleam` maps
+  a callback `Error` to `pog.TransactionRolledBack`, which never commits
+  anything the callback did — so the attempted `INSERT` was rolled back
+  along with the receipt write; no second row persisted. This was verified
+  empirically, not just reasoned: a temporary diagnostic added to the test
+  under this same mutation printed `count_jobs_in_queue(connection,
+test_queue)` immediately after the failing call, which read `1`, not
+  `2`. The net effect of losing the receipt check is exactly the primary
+  key already protecting against a genuinely duplicated row on its own
+  (the same protection Increment 2's ack-receipt work already established
+  for a different table) — what the receipt check specifically adds is the
+  **idempotent return**: without it, a legitimate replay after the period
+  elapses surfaces as `SubmissionConflict` (an error) instead of quietly
+  handing back the original `Inserted` handle, exactly the value this test
+  asserts. A second, independent test (below) failed the same way in the
+  same run, for the same reason. Both failures reverted immediately by
+  restoring the receipt check (and the diagnostic print removed); `git
+diff` showed no trace of either.
+
+### Claim: the same `SubmissionId` with a different input conflicts
+
+- **Test**:
+  `postgres_submit_unique_receipt_replay_with_different_input_conflicts_test`
+  (marker `unique-receipt-different-input-conflict-passed`).
+- **Limits**: characterization evidence (passed on first write); this
+  exercises the request-fingerprint mismatch path directly (Decision 9),
+  not a new mechanism of its own.
+
+### Claim: a replayed `Existing` decision returns the state recorded in the receipt at decision time, not the row's current (possibly since-progressed) state
+
+- **Test**:
+  `postgres_submit_unique_receipt_replay_returns_originally_observed_state_test`
+  (marker `unique-receipt-replay-returns-observed-state-passed`). The
+  conflicting row's state is forced to `succeeded` by raw SQL _after_ its
+  `Existing` receipt was recorded (observed state `queued`); the exact same
+  `submit_unique` call is repeated.
+- **Same mutation as the idempotent-replay claim above failed this test
+  too** (same caveat: this proves the receipt check is necessary, not that
+  its ordering relative to candidate selection is — see above), in the
+  same run (96 passed, 2 failures):
+  ```
+  test: grind_test.postgres_submit_unique_receipt_replay_returns_originally_observed_state_test
+  code: let assert Ok(unique.Existing(conflict_replayed)) = postgres.submit_unique(...)
+  value: Error(SubmissionConflict)
+  ```
+  Without the receipt check, the replay ran a fresh candidate lookup (which
+  still found the row — its state is unaffected by this mutation, only
+  whether the receipt is consulted at all) but then tried to record a
+  second receipt for the same `(storage_owner, submission_id)` and hit the
+  same primary-key conflict, rolling back that transaction (no state
+  change persisted from this second call). Reverted with the same fix as
+  above.
+- **Observed (unmutated)**: `conflict_state(conflict_replayed)` reads
+  `job.Queued` — the receipt's recorded observation — even though the row's
+  actual current state is `succeeded` by the time of the replay.
+
+### Claim: replaying the same `SubmissionId` and input against a worker whose output codec version has changed conflicts (proves R2, Decision 9)
+
+- **Test**:
+  `postgres_submit_unique_receipt_replay_with_changed_output_codec_conflicts_test`
+  (marker `unique-receipt-output-codec-change-conflict-passed`). Two
+  `Worker` values share the same id, version, input codec, and handler, but
+  differ only in output codec version; the second submission (same
+  `SubmissionId`, same input, the recoded worker) conflicts.
+- **Proven by mutation** (passed on first write). Mutation: removed
+  `json.string(request.output_version)` from the fingerprint envelope
+  (`fingerprint`, `src/grind/internal/unique_admission.gleam`) — the
+  one-line change R2 names. Result, against a fresh disposable cluster (97
+  passed, 1 failure):
+  ```
+  test: grind_test.postgres_submit_unique_receipt_replay_with_changed_output_codec_conflicts_test
+  info:
+  Ok(Inserted(JobHandle(99, ..., Codec("...-output-...-v2", ...), None)))
+  should equal
+  Error(SubmissionConflict)
+  ```
+  Without the output codec version in the fingerprint, the replay silently
+  returned `Inserted`, bound to the _recoded_ worker's `-v2` output codec —
+  exactly the stale-typed-handle failure Decision 9 exists to prevent, not
+  merely an unasserted possibility. Only this test failed. Reverted
+  immediately; `gleam build --warnings-as-errors` recompiled clean and
+  `git diff` showed no trace of the mutated line.
+- **Limits**: this exercises the same request-fingerprint mechanism as the
+  different-input test above, specifically its output-codec-version field;
+  it does not exercise the input or error codec version fields of the same
+  envelope, which are unverified by mutation (asserted only by
+  construction — the envelope's shape includes them symmetrically with the
+  output version).
+
+## Increment 8 — concurrent admission under a real, barrier-forced overlap
+
+Full contract: `docs/UNIQUENESS-CONTRACT.md`. All mutations below were
+applied against a **freshly recreated** disposable cluster per mutation (the
+same minimal single-database harness used in Increment 7), each reverted
+immediately after capturing its failure, `gleam check` recompiling clean
+after every revert, and `git diff` on `src/grind/internal/unique_admission.gleam`
+confirming no trace of the mutated lines.
+
+**Mechanism.** A test-only `BEFORE INSERT` trigger on `grind_jobs`
+(`install_unique_insert_barrier`, `test/grind_test.gleam`), scoped by
+`NEW.worker_id = '<this test's worker id>'`, calls
+`pg_advisory_xact_lock(<a literal test lock key>)` — the same
+held-then-released-on-cue barrier shape `run_overlapping_claim_test`'s
+`grind_test_claim_overlap` trigger already uses for a claim `UPDATE`,
+generalized to an `INSERT` (`spawn_lock_holder` factors the
+hold-a-lock-in-an-open-transaction-then-release-on-a-message shape both
+share). The test itself holds that literal lock in an open transaction
+before starting any concurrent `submit_unique` call, so every submitter for
+that worker that reaches its own `INSERT` genuinely blocks until the test
+releases it — a real, deterministic overlap, not a timing race.
+
+**Synchronization.** Every barrier test polls `pg_stat_activity`
+(`await_overlap_shape`) for an _exact_ count of other backends whose active
+query text matches the real `INSERT INTO grind_jobs (storage_owner, queue,
+worker_id, worker_version, input_version...` text `insert_job` issues, and a
+separate exact count matching the real `SELECT true FROM (SELECT
+pg_advisory_xact_lock(hashtextextended...` text `acquire_lock` issues — both
+counted from **one** query over one snapshot of `pg_stat_activity`, so the
+two figures are never read at two different instants. Only once the exact
+expected shape is observed does the test release the barrier; there is no
+sleep anywhere in these tests standing in for a synchronization point.
+
+### Claim: three concurrent `submit_unique` calls forced to genuinely overlap, same key, `KeepExisting`, distinct `SubmissionId`s — exactly one settles `Inserted`, the other two settle `Existing` against that same job id, and exactly one row persists
+
+- **Test**: `postgres_submit_unique_concurrent_admission_forced_overlap_test`
+  (marker `unique-concurrent-forced-overlap-passed`). Three separate pools
+  (separate physical connections), same worker/key/queue, `KeepExisting`,
+  distinct `SubmissionId`s, submitted from three separate BEAM processes.
+  The test polls until it observes exactly one backend blocked inserting
+  behind the barrier and exactly two blocked acquiring the domain lock,
+  then releases.
+- **Genuine red first, by mutation**: commented out
+  `use _ <- result.try(acquire_lock(connection, request))` in
+  `admission_transaction` (`src/grind/internal/unique_admission.gleam`) —
+  the domain lock skipped entirely. With no lock serializing them, all
+  three submitters pass candidate selection concurrently (each sees zero
+  existing rows) and all three then contend for the _same_ trigger-held
+  lock instead of the domain lock the test is polling for — the expected
+  shape (one inserting, two on the domain lock) never materializes. Result,
+  against a fresh disposable cluster (99 passed, 5 failures; this test and
+  four others that depend on the same domain lock — see their own claims
+  below — all failed the same way):
+  ```
+  test: grind_test.postgres_submit_unique_concurrent_admission_forced_overlap_test
+  info:
+  False
+  should equal
+  True
+  ```
+  (`await_overlap_shape(...) |> should.equal(True)` timed out after 10
+  seconds of polling — the real state stayed at three backends waiting on
+  the trigger's lock and zero on the domain lock the whole time, never
+  reaching the one-inserting/two-domain-lock-waiting shape a working domain
+  lock guarantees.) Reverted immediately; `gleam check` recompiled clean
+  (the mutation left `acquire_lock` unused, producing only a compiler
+  warning, not an error) and `git diff` showed no trace of the mutated
+  line.
+- **Proven correct** (passed on first write, and on every rerun — 11
+  consecutive green full-suite runs against fresh disposable clusters while
+  developing this section, 0 flakes): with the domain lock restored, the
+  exact expected shape is reached and held (nothing else can happen until
+  the test releases it), release yields exactly one `Inserted` and two
+  `Existing` values whose `conflict_job_id` both equal the inserted job's
+  id, and `count_jobs_in_queue` confirms exactly one row.
+- **Limits**: this proves the shape for three same-scope (`WithinQueue`)
+  submitters sharing one queue; the mixed-scope variant below proves the
+  domain lock also serializes across `QueueScope` values on the same key.
+
+### Claim: the domain lock's deliberate exclusion of queue from its own key (Decision — admission transaction step 3) actually serializes a `WithinQueue` submission against a concurrent `AcrossQueues` submission on the same key, in different queues
+
+- **Test**: `postgres_submit_unique_concurrent_admission_mixed_scope_test`
+  (marker `unique-concurrent-mixed-scope-passed`). A `WithinQueue`
+  submission in queue `q1` is started first and confirmed blocked inserting
+  behind the barrier before an `AcrossQueues` submission in queue `q2`,
+  same key, is started — `WithinQueue`'s own candidate query only ever
+  looks inside its own queue, so (unlike the same-queue overlap test above)
+  which of the two reaches the barrier first is not incidental: if the
+  `AcrossQueues` submission inserted into `q2` first, the `WithinQueue`
+  submission's `q1`-scoped candidate query would never see it and would
+  correctly insert its own row too — two rows, correctly, per the
+  per-queue semantics `WithinQueue` already promises (Increment 4). Forcing
+  the `WithinQueue` submission first removes that ambiguity without
+  weakening the concurrency being proved: the `AcrossQueues` submission
+  still arrives while the first submission's transaction is genuinely open
+  and still needs the very same domain lock.
+- **Genuine red first, by mutation**: widened the domain lock's own hash
+  input to include `request.queue` (`lock_key_sql`/`acquire_lock`,
+  `src/grind/internal/unique_admission.gleam`) — the literal "add queue to
+  the lock key" mutation. `WithinQueue`/`q1` and `AcrossQueues`/`q2` then
+  compute _different_ domain lock keys, so the second submission no longer
+  waits behind the first's domain lock; both instead race independently to
+  the shared barrier trigger (scoped only by worker id) and end up
+  contending _there_ instead — never producing the one-inserting/one-
+  domain-lock-waiting shape the test polls for. Result, against a fresh
+  disposable cluster (101 passed, 3 failures):
+  ```
+  test: grind_test.postgres_submit_unique_concurrent_admission_mixed_scope_test
+  info:
+  False
+  should equal
+  True
+  ```
+  The other two failures in that run
+  (`postgres_submit_unique_contended_lock_wait_test`,
+  `postgres_unique_lock_timeout_does_not_leak_to_later_statements_test`)
+  are **collateral, not evidence for this claim**: both share the
+  `unique_domain_lock_query` test helper, which binds five parameters to
+  `lock_key_sql`'s SQL text; with the mutation, that text expects six,
+  so PostgreSQL's own parameter-count mismatch made those two tests'
+  lock-holder transactions fail to acquire anything at all (`Error(Nil)`
+  from `pog.execute`), which they correctly report as a hard pattern-match
+  panic rather than a silent false pass — an artifact of a shared test
+  helper coincidentally depending on `lock_key_sql`'s arity, not a
+  statement about Increment 9's own contract. Reverted immediately;
+  `gleam check` recompiled clean and `git diff` showed no trace of the
+  mutated lines.
+- **Proven correct** (passed on first write once the test itself was fixed
+  to start the `WithinQueue` submission first — see "Limits" below): with
+  the domain lock restored to excluding queue, the second submission
+  reliably waits behind the first's domain lock, the first settles
+  `Inserted`, the second settles `Existing` referencing the first's job id
+  and its actual queue (`q1`), and exactly one row exists across both
+  queues.
+- **Limits**: the very first version of this test started both submissions
+  at once (a genuine coin-flip race for the domain lock) and was
+  observably flaky under real PostgreSQL — roughly 3 of 4 runs failed with
+  a row count of 2, not because of a concurrency defect, but because
+  `AcrossQueues` sometimes won the race and inserted into `q2` first, at
+  which point `WithinQueue`'s own `q1`-scoped candidate query correctly
+  found no conflict and correctly inserted a second row. That flake, and
+  its explanation, is recorded here rather than only silently fixed,
+  because it is itself evidence of a real, documented asymmetry between
+  the two scopes (Increment 4's per-queue `WithinQueue` semantics), not a
+  defect in the domain lock this increment is otherwise about.
+
+### Claim: the receipt lookup's real invariant is "after the domain lock, before this transaction's own write" — not "before candidate selection" specifically, which is a coincidence of the unmutated code and was shown to be unobservable on its own
+
+- **Test**:
+  `postgres_submit_unique_receipt_ordering_returns_committed_decision_test`
+  (marker `unique-receipt-ordering-b-returns-a-decision-passed`) — the
+  receipt-ordering evidence deferred from Increment 7. Submitter A is
+  confirmed blocked inserting behind the barrier; submitter B — the _same_
+  `SubmissionId` and the same input, hence the same request fingerprint —
+  is then started and confirmed waiting on the domain lock A holds.
+  Releasing the barrier lets A finish: it inserts, records its `inserted`
+  receipt, and commits, which releases the domain lock. B then acquires it.
+  B's result is asserted to be `Inserted`, with the _same_ job id as A's —
+  not `Existing` against the row A just committed, which is what B would
+  get if it ran a fresh candidate selection instead of finding and
+  returning A's receipt.
+- **First mutation attempted, no observable difference — recorded
+  honestly, as the approved plan allows**: moved the receipt lookup from
+  immediately after the lock to immediately after candidate selection
+  (still strictly before the insert/decide/record-receipt write), i.e.
+  inside `admit_candidate` right after `find_candidate`, rather than in
+  `admission_transaction` before `admit_candidate` is even called
+  (`src/grind/internal/unique_admission.gleam`). Result, against a fresh
+  disposable cluster, run twice: **104 passed, no failures** both times —
+  identical to the unmutated baseline.
+  - **Why this specific reordering is genuinely unobservable here**: by
+    the time B can even acquire the domain lock, A's commit has already
+    fully finished — PostgreSQL only releases a transaction's advisory
+    locks (and ordinary row locks) as part of finishing `COMMIT`, strictly
+    after the transaction's changes are already marked committed and
+    visible to other backends' snapshots. So A's receipt row is visible to
+    B's very first statement in its own transaction regardless of whether
+    B's receipt lookup runs immediately after the lock or one read-only
+    `SELECT` later (`find_candidate` takes no row lock under
+    `KeepExisting`, so inserting it before the receipt lookup has no side
+    effect to race against). This result prompted a more precise statement
+    of the actual invariant (below), checked by two further mutations that
+    genuinely do move the lookup somewhere observably wrong.
+- **Second mutation, genuinely red — moved the lookup _before_ the domain
+  lock** (`admission_transaction`: `find_receipt` now runs immediately
+  after `pin_read_committed`, before `set_lock_timeout`/`acquire_lock`, and
+  its result is used unconditionally rather than re-checked after the
+  lock). Against a fresh disposable cluster: **104 passed, 1 failure**:
+  ```
+  test: grind_test.postgres_submit_unique_receipt_ordering_returns_committed_decision_test
+  code: let assert Ok(unique.Inserted(handle_b)) = outcome_b
+  value: Error(SubmissionConflict)
+  ```
+  With the lookup moved earlier, B's find-nothing result is captured
+  _before_ B ever waits on the domain lock, so it is stale by the time B
+  is unblocked: B proceeds straight to candidate selection using that
+  stale "no receipt" answer, finds A's committed row, and its own
+  `record_receipt` collides with A's already-committed row on
+  `grind_unique_submissions`'s primary key — exactly the different-key
+  `23505` race documented in "Admission transaction" step 4, except forced
+  here onto the _same_ key by the mutation itself. Reverted immediately;
+  `gleam check` recompiled clean and `git diff` showed no trace of the
+  mutated lines.
+- **Third mutation, genuinely red — moved the lookup _after_ `insert_job`'s
+  `INSERT`, before `record_receipt`** (`admission_transaction` calls
+  `admit_candidate` directly, with no early receipt check at all;
+  `insert_job` now runs its `INSERT` unconditionally, then checks
+  `find_receipt`, returning the existing decision if found instead of
+  recording a new receipt — but the just-inserted row is never rolled
+  back). Against a fresh disposable cluster, this single mutation was
+  caught by **two** existing tests, **103 passed, 2 failures**:
+  ```
+  test: grind_test.postgres_submit_unique_receipt_replay_is_idempotent_after_period_elapses_test
+  info:
+  2
+  should equal
+  1
+
+  test: grind_test.postgres_submit_unique_receipt_ordering_returns_committed_decision_test
+  code: let assert Ok(unique.Inserted(handle_b)) = outcome_b
+  value: Error(SubmissionConflict)
+  ```
+  The first failure is the more telling one for this mutation, and is
+  exactly why "before any write" — not merely "returns the right value" —
+  is the real invariant: Increment 7's sequential replay test (the same
+  `SubmissionId` retried after the original row's period has elapsed, so
+  candidate selection legitimately finds nothing) still gets back the
+  _correct_ `Inserted` handle from the pre-existing receipt, because the
+  post-insert receipt check still finds and returns it — but the mutated
+  code already committed a _second_, orphaned job row before making that
+  check, which only `count_jobs_in_queue` catches (the returned value looks
+  right; the database does not match it). The second failure is the same
+  `23505` symptom as the previous mutation, for the concurrent case: B's
+  `find_candidate` now correctly finds A's row (candidate selection was
+  never skipped here), takes the `decide_conflict`/`Existing` path, and its
+  own `record_receipt` for the shared `SubmissionId` collides with A's.
+  Reverted immediately; `gleam check` recompiled clean and `git diff`
+  showed no trace of the mutated lines.
+- **Limits**: this proves the ordering claim for the specific interleaving
+  the barrier forces (B waits on the domain lock for the entire duration of
+  A's transaction); it does not exercise the `23505` different-key,
+  same-`SubmissionId` race documented as out of scope in
+  `docs/UNIQUENESS-CONTRACT.md` (two submitters that never contend the same
+  domain lock at all) — though the second mutation above incidentally
+  demonstrates that exact failure mode's _symptom_, just triggered by a
+  code defect rather than by two submitters genuinely using different keys.
+
+## Isolation-level pinning
+
+Several of Grind's transactions depend on `READ COMMITTED` semantics: the
+uniqueness admission transaction's plain reads after its domain lock must
+see whatever a fellow submitter committed while it waited; the
+acknowledgement and audited-resolution paths' fenced, locking `UPDATE`s
+must not surface PostgreSQL's `REPEATABLE READ`/`SERIALIZABLE` conflict
+handling in place of the idempotent result a legitimate concurrent retry is
+supposed to get. `pog.transaction` issues a plain `BEGIN`, which takes on
+whatever the connecting role or database's own
+`default_transaction_isolation` is configured to — never audited or pinned
+before this round.
+
+**The fix is uniform, not per-path.** An initial version of this section
+pinned isolation only inside the uniqueness admission transaction
+(`pin_read_committed`, a `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`
+as that transaction's own first statement) and separately argued that every
+_other_ transaction was safe under a non-default isolation level because
+its only wait happens inside a _locking_ statement (`UPDATE`/`SELECT FOR
+UPDATE`), which PostgreSQL itself protects with `40001
+serialization_failure` rather than silently misreading — "at worst a no-op
+becomes an error," that draft said. That framing was wrong: a normal,
+legitimate concurrent retry of an idempotent command (a duplicate
+acknowledgement, a duplicate audited resolution) _surfacing as an
+unhandled query failure_ is itself a real bug, not merely an acceptable
+degraded case — proven directly below. The fix instead pins isolation once,
+for every connection in the pool, at the moment it starts:
+`postgres.validate` now adds `default_transaction_isolation = 'read
+committed'` as a `pog.connection_parameter` (a PostgreSQL startup
+parameter, sent once per physical connection), so every transaction on
+every pooled connection is `READ COMMITTED` regardless of what the
+connecting role or database is configured to default to.
+`pin_read_committed` is kept in the admission transaction as defense in
+depth on top of this — a connection pooler between Grind and PostgreSQL
+could drop or ignore a startup parameter, where an in-transaction `SET
+TRANSACTION` cannot be silently dropped the same way.
+
+### Claim: without pinning `READ COMMITTED`, a role or database configured with `default_transaction_isolation = 'repeatable read'` makes the forced-overlap admission transaction silently duplicate a row
+
+- **Test**:
+  `postgres_submit_unique_admission_safe_under_repeatable_read_test`
+  (marker `unique-admission-safe-under-repeatable-read-passed`). A
+  dedicated disposable database
+  (`grind_repeatable_read_test`/`GRIND_TEST_REPEATABLE_READ_URL`,
+  `scripts/test-postgres.sh`) is configured with `ALTER DATABASE
+grind_repeatable_read_test SET default_transaction_isolation =
+'repeatable read'` at cluster setup — a real, differently-configured
+  PostgreSQL session, not a simulated one. The test reads this database's
+  own _persisted, configured_ default back from `pg_db_role_setting`
+  joined to `pg_database` (not `SHOW default_transaction_isolation` on a
+  Grind-managed connection — once the pool-level pin below exists, a Grind
+  connection's own _active_ session setting always reads `read committed`
+  regardless of what the database is configured to default to, so a `SHOW`
+  on it would prove nothing). It then runs the same two-submitter
+  forced-overlap barrier as Increment 8's main test (same key,
+  `KeepExisting`, distinct `SubmissionId`s) against this database, and
+  asserts exactly one `Inserted` and one `Existing` referencing the same
+  job id — one row.
+- **Genuine red first**: run against the code _before_ either pin existed
+  (`admission_transaction`'s first statement was `set_lock_timeout`, and
+  `postgres.validate` did not yet set any connection parameter). Against a
+  fresh disposable cluster (with the dedicated `repeatable read` database),
+  run twice, both times deterministically:
+  ```
+  test: grind_test.postgres_submit_unique_admission_safe_under_repeatable_read_test
+  info:
+  2
+  should equal
+  1
+  ```
+  Both submitters reported `Inserted`, each with its own job id — the
+  waiting submitter's plain reads, using the snapshot frozen before it
+  ever started waiting on the domain lock, never saw the other's commit.
+- **Fix and proven correct, in two layers**: first added `pin_read_committed`
+  (`src/grind/internal/unique_admission.gleam`) alone and reran the
+  identical test three times against a fresh cluster each time: **105
+  passed, no failures** every time — the in-transaction pin alone is
+  sufficient for this specific claim. Then added the pool-level
+  `pog.connection_parameter` pin in `postgres.validate`
+  (`src/grind/postgres.gleam`) on top, and reran again: still green. The
+  full uniqueness suite was also rerun repeatedly during development with
+  zero flakes (11 additional runs after Increment 8/9, 5 more after this
+  round).
+
+### Claim: a duplicate acknowledgement — the _same_ command, retried while the first attempt's commit is still in flight — reports `Ok(True)` (idempotent success), not a query failure, regardless of the connecting session's isolation level
+
+- **Test**: `postgres_ack_duplicate_reports_ok_under_pinned_isolation_test`
+  (marker `ack-duplicate-ok-under-pinned-isolation-passed`), run against
+  the dedicated `repeatable read` database. A's fenced acknowledgement
+  `UPDATE` is blocked behind a test-only `BEFORE UPDATE` barrier trigger
+  scoped to this job (`OLD.state = 'executing' AND NEW.state <>
+'executing'`); B — the _identical_ acknowledgement command (same claim,
+  same execution outcome), from a separate pool — starts while A is
+  blocked, and B's own fenced `UPDATE` then genuinely waits on the row lock
+  A's in-flight `UPDATE` holds. `pg_stat_activity` confirms the exact
+  shape before releasing: one backend waiting on the trigger's _advisory_
+  lock (A), one waiting on the _row_ lock (B, `wait_event = 'transactionid'`
+  — a real PostgreSQL tuple-lock wait, not a second advisory wait, since
+  the two backends' query text is byte-identical and only `wait_event`
+  tells them apart here). Once A completes and commits, B's `UPDATE` no
+  longer matches (the row is no longer `executing`), so B falls through to
+  `acknowledge_transaction`'s existing re-read of the acknowledgement
+  receipt — and both A and B must report `Ok(True)`, with exactly one
+  acknowledgement row persisted.
+- **Genuine red first**: run against the code before either isolation pin
+  existed. Against a fresh disposable cluster, reproduced deterministically
+  twice:
+  ```
+  test: grind_test.postgres_ack_duplicate_reports_ok_under_pinned_isolation_test
+  info:
+  Error(QueueAckFailed(PostgresqlError("40001", "serialization_failure", "could not serialize access due to concurrent update")))
+  should equal
+  Ok(True)
+  ```
+  B's `UPDATE`, waiting on the row lock A held, found (once unblocked) that
+  the row had been modified by a transaction that committed after B's own
+  `REPEATABLE READ` snapshot was taken — PostgreSQL's own conflict
+  handling for a locking statement under that isolation level, raising
+  `40001` instead of silently re-fetching. A legitimate, idempotent retry
+  of an already-successful command surfaced as an unhandled query failure.
+- **Fix and proven correct**: the pool-level `pog.connection_parameter`
+  pin in `postgres.validate` (this path has no advisory lock and no
+  in-transaction `SET TRANSACTION` of its own — the pool-level pin is the
+  _only_ fix available to it, which is exactly why the fix had to be
+  uniform rather than per-path). Reran the identical test against a fresh
+  disposable cluster: **106 passed, no failures**; reran twice more with
+  the same result.
+- **Limits**: this proves the duplicate-acknowledgement race specifically;
+  the equivalent race for audited resolution is a separate claim (below),
+  because it is a genuinely different, pre-existing defect independent of
+  isolation level, not merely the same isolation-level fix applied to a
+  second path.
+
+### Audit of every other transaction in `src/grind`, and what actually happens to each under `REPEATABLE READ`/`SERIALIZABLE` without the pin
+
+Checked every `transaction_safely`/`pog.transaction` call site and every
+`FOR UPDATE` in `src/grind/postgres.gleam`:
+
+- `claim_registered_job`/`quarantine_expired`/`renew_claim`
+  (`grind/postgres.gleam`) issue a single `WITH candidate AS (... FOR
+UPDATE SKIP LOCKED ...) UPDATE ...`/`UPDATE ...` statement each via
+  `execute_safely`, with no explicit `BEGIN` — PostgreSQL's implicit
+  single-statement transaction takes its snapshot at that one statement
+  regardless of isolation level, and `SKIP LOCKED` never waits at all. Not
+  reachable by this class of race at all (no wait, so nothing to surface).
+- `acknowledge_transaction` (`acknowledge`) — proven directly above: a
+  duplicate acknowledgement that must wait on the row lock the first
+  attempt holds reports `QueueAckFailed(PostgresqlError("40001",
+"serialization_failure", ...))` instead of `Ok(True)`, without the pin.
+- `reconcile_matching_owner`/`apply_uncertain_resolution` (`resolve_uncertain`)
+  — `find_resolution` (a plain read, before the lock) → `SELECT ... FOR
+UPDATE` on the job row → (a separate, deferred `INSERT` into
+  `grind_job_resolutions`, then an `UPDATE` on the job row to leave the
+  `uncertain` state). A concurrent, identical resolution command that must
+  wait on the `SELECT ... FOR UPDATE` or the later `UPDATE` would, without
+  the pin, surface the wait's conflict as a `40001` query failure exactly
+  like the acknowledgement path — `Error(ReconciliationQueryFailed(...))`
+  from whichever statement's row version changed underneath it. This path
+  also has a **second, distinct defect independent of isolation level**,
+  documented as its own claim below (the same `40001`-vs-`READ COMMITTED`
+  distinction still applies to _that_ fixed code, once it does complete a
+  normal `READ COMMITTED` wait-then-refetch instead of throwing).
+- `cancel_transaction` (`cancel`) issues `SELECT ... FOR UPDATE` as its
+  transaction's own first statement; a concurrent `cancel` on the same job
+  waiting on that row lock would, without the pin, get a `40001` query
+  failure instead of PostgreSQL's `READ COMMITTED` re-fetch-and-continue
+  behavior.
+- `migrate_transaction` (`migrate`) only reads system catalogs and issues
+  DDL, with no advisory or row-lock wait step. Not reachable by this class
+  of race (schema install is not run concurrently against the same
+  not-yet-existing schema by design).
+- No other module calls `pg_advisory_xact_lock`; `grep -n "pg_advisory\|advisory_lock"
+src/grind/postgres.gleam src/grind/queue.gleam` returns nothing — the
+  uniqueness admission transaction is the only one where the _wait itself_
+  (an advisory lock, with no PostgreSQL-native conflict detection tied to
+  it) is the failure surface; every other path's wait is a row lock, whose
+  failure surface without the pin is a `40001` query failure rather than a
+  silently wrong decision — worth fixing (an idempotent retry should not
+  fail loudly either) but categorically different from admission's
+  silent-duplicate risk, which is why both this section's tests were
+  needed to characterize the fix's actual effect on both.
+
+## Concurrent audited resolution
+
+A separate, pre-existing defect in `reconcile_matching_owner`/
+`apply_uncertain_resolution`, independent of isolation level (reproducible
+under this cluster's default `READ COMMITTED`), found while auditing the
+isolation-pinning fix above.
+
+### Claim: two concurrent, identical `resolve_uncertain` calls for the same uncertain job — the same `resolution_id` and payload — both report success, with only one resolution row and one state transition
+
+`reconcile_matching_owner` checks `find_resolution` (a plain read, by
+`resolution_id`) once, _before_ `apply_uncertain_resolution`'s `SELECT ...
+FOR UPDATE` on the job row. If that first check finds nothing (no receipt
+yet), `apply_uncertain_resolution` proceeds to lock the row and, if its
+`state` is not `uncertain`, previously returned `Error(ReconciliationNotRequired)`
+unconditionally — with no re-check of `find_resolution`. Two concurrent
+calls sharing the same `resolution_id` and payload both miss the early
+check (neither has committed yet); the second then waits on the `FOR
+UPDATE` behind the first, and once unblocked re-fetches a job row the
+first call has already moved out of `uncertain` — misreporting a
+legitimate, already-applied retry as "reconciliation not required," the
+audited-resolution equivalent of the acknowledgement path's "duplicate
+retry reported as stale" failure mode — `acknowledge_transaction`'s own
+existing comment in `src/grind/postgres.gleam` names the identical
+shape: "a duplicate ACK can wait behind the first writer's row lock;
+re-read its receipt... instead of misreporting that exact retry as
+stale."
+
+- **Test**: `postgres_resolution_concurrent_same_outcome_applied_once_test`
+  (marker `resolution-concurrent-same-outcome-applied-once`), run against
+  the _default_ database (`GRIND_TEST_DATABASE_URL` — this defect is not
+  an isolation-level issue). A's `write_resolution` `UPDATE` (the one that
+  moves the job out of `uncertain`) is blocked behind a test-only `BEFORE
+UPDATE` barrier trigger scoped to this job (`OLD.state = 'uncertain'`);
+  B — the identical `AuthorizeReplay` resolution command, same
+  `resolution_id`, same details, from a separate pool — starts while A is
+  blocked, and B's own `SELECT ... FOR UPDATE` then genuinely waits on the
+  row lock A already holds (confirmed via `pg_stat_activity`'s
+  `transactionid` wait event, the same discipline the acknowledgement test
+  above uses). Once A completes and commits, B must report
+  `Ok(ResolutionAlreadyApplied(Queued))` — not
+  `Error(ReconciliationNotRequired)` — and exactly one
+  `grind_job_resolutions` row and one final job state (`queued`) must
+  exist.
+- **Genuine red first**: against a fresh disposable cluster, reproduced
+  deterministically twice:
+  ```
+  test: grind_test.postgres_resolution_concurrent_same_outcome_applied_once_test
+  info:
+  Error(ReconciliationNotRequired)
+  should equal
+  Ok(ResolutionAlreadyApplied(Queued))
+  ```
+- **Fix, minimal, chosen over the alternative and justified**: extracted
+  the exact receipt-matching logic `reconcile_matching_owner`'s early
+  check already used into its own function,
+  `resolution_receipt_outcome` (`src/grind/postgres.gleam`), and called it
+  a _second_ time from `apply_uncertain_resolution`'s `stored_state ==
+"uncertain"` `False` branch — the same "re-read the receipt instead of
+  assuming the earlier miss is still accurate" pattern the acknowledgement
+  path already uses. The alternative the review raised — moving the
+  _first_ `find_resolution` check to run after the lock instead of before
+  — was not taken: it would require restructuring
+  `reconcile_matching_owner` to always take the job's row lock even for a
+  resolution command that turns out to need no lock at all (a route
+  mismatch, a worker contract mismatch, or a job that was never
+  `uncertain`), taking a lock this function does not otherwise need for
+  those cases, for every call. Re-checking only in the one branch that
+  discovers it needs to is the smaller change and does not alter the
+  locking footprint of any other path through this function.
+- **Proven correct**: reran the identical test against a fresh disposable
+  cluster: **107 passed, no failures**; reran twice more with the same
+  result. The existing sequential resolution tests
+  (`audited-uncertain-resolution-passed` and others using
+  `postgres.resolve_uncertain` twice in a row) are unaffected — a
+  _sequential_ replay after the first call has already committed is still
+  caught entirely by `reconcile_matching_owner`'s original early check,
+  which never reaches `apply_uncertain_resolution` at all.
+- **Limits**: this proves the concurrent-resolution race for
+  `AuthorizeReplay`; `ConfirmSuccess`/`ConfirmBusinessFailure` share the
+  same code path (the `False` branch re-check is decision-agnostic) but
+  are not independently exercised under this exact forced overlap.
+
+## Increment 9 — contention
+
+Full contract: `docs/UNIQUENESS-CONTRACT.md`, Decision 6 (a blocking,
+bounded lock wait — `AdmissionContended` on PostgreSQL `55P03`, never a
+persisted-conflict implication). Mutations below follow the same
+fresh-disposable-cluster-per-mutation discipline as Increment 8.
+
+**Mechanism.** The test itself holds the _real_ lock a concurrent
+`submit_unique` call would need — either the domain advisory lock, built
+from the same `@internal unique_admission.lock_key_sql` expression
+production code uses (`unique_domain_lock_query`, so the test never
+re-encodes the key by hand), or a real PostgreSQL row lock
+(`SELECT ... FOR UPDATE` in an open transaction) — via the same
+`spawn_lock_holder` hold-then-release-on-cue helper Increment 8 uses. A
+concurrent `submit_unique` call against a pool configured with
+`postgres.unique_lock_wait(200)` then genuinely waits on that real lock for
+up to 200ms before PostgreSQL itself raises `55P03`.
+
+### Claim: a `submit_unique` call contending the real domain lock for 200ms reports `AdmissionContended`, with no job row and no receipt; the same `SubmissionId` succeeds once the lock is released
+
+- **Test**: `postgres_submit_unique_contended_lock_wait_test` (marker
+  `unique-contended-lock-wait-passed`).
+- **Proven correct** (passed on first write): while the test holds the
+  domain lock for this worker/key, a `submit_unique` call with a 200ms
+  `unique_lock_wait` reports `Error(AdmissionContended)`; `grind_jobs` has
+  no row for the queue and `grind_unique_submissions` has no receipt for
+  that `SubmissionId`. Releasing the lock and retrying the identical
+  `SubmissionId` succeeds with `Inserted`.
+- **Proven by mutation**: removed the `55P03` special case from
+  `classify_query_error` (`src/grind/internal/unique_admission.gleam`), so
+  every PostgreSQL error — including the bounded lock wait elapsing —
+  became `AdmissionFailed(error)`. Result, against a fresh disposable
+  cluster (101 passed, 3 failures; this test and the two other Increment 9
+  tests below, which share the same classification function, all failed
+  the same way):
+  ```
+  test: grind_test.postgres_submit_unique_contended_lock_wait_test
+  info:
+  Error(AdmissionFailed(PostgresqlError("55P03", "lock_not_available", "canceling statement due to lock timeout")))
+  should equal
+  Error(AdmissionContended)
+  ```
+  Reverted immediately; `gleam check` recompiled clean and `git diff`
+  showed no trace of the mutated lines.
+
+### Claim: a `RescheduleScheduledTo` submission whose candidate row lock (`FOR UPDATE`) is held by the test contends the same way; the row is left completely unchanged; the same request succeeds once the lock is released
+
+- **Test**: `postgres_submit_unique_reschedule_row_lock_contention_test`
+  (marker `unique-reschedule-row-lock-contention-passed`). A row is first
+  admitted `scheduled` far in the future; the test then holds that row's
+  own lock via an open `SELECT ... FOR UPDATE` transaction (not the domain
+  lock) — the lock `docs/UNIQUENESS-CONTRACT.md`'s admission transaction
+  step 5 takes on a `RescheduleScheduledTo` candidate. A concurrent
+  reschedule attempt against the same key, 200ms `unique_lock_wait`,
+  reports `AdmissionContended`; `available_at` is read back and confirmed
+  byte-for-byte unchanged from before the attempt. Releasing the row lock
+  and retrying the identical reschedule request succeeds with
+  `Rescheduled`, and `available_at` is read back and confirmed to equal
+  the new target exactly.
+- **Proven correct** (passed on first write); **proven by the same
+  `classify_query_error` mutation above** (101 passed, 3 failures,
+  identical `AdmissionFailed(PostgresqlError("55P03", ...))` vs.
+  `AdmissionContended` mismatch, reverted the same way) — this test
+  specifically proves the row-lock path (not just the domain-lock path
+  Increment 9's first claim covers) is classified through the same
+  function, exactly as `docs/UNIQUENESS-CONTRACT.md` documents ("every
+  query in the admission transaction ... is classified through the same
+  function").
+- **Limits**: this proves contention on the row lock a _reschedule_
+  candidate takes; it does not exercise a race between this row lock and a
+  concurrent claim already in progress on the same row (a long-held row
+  lock causing "false contention" against an unrelated in-progress
+  acknowledgement is a documented failure mode in
+  `docs/UNIQUENESS-CONTRACT.md`, not itself proven by a dedicated test).
+
+### Claim: the bounded `lock_timeout` `set_config(..., true)` sets (`is_local`, transaction-local) does not leak into a later statement that reuses the same pooled physical connection
+
+- **Test**:
+  `postgres_unique_lock_timeout_does_not_leak_to_later_statements_test`
+  (marker `unique-lock-timeout-no-leak-passed`). A dedicated pool of
+  exactly one physical connection (`postgres.pool_size(1)`) guarantees
+  every statement on that pool reuses the identical PostgreSQL session the
+  contended attempt's `set_config('lock_timeout', ..., true)` ran on —
+  there is only one connection in the pool, so there is no other
+  connection it could route to. The test checks `SHOW lock_timeout` on
+  that pool at two points: (1) immediately after a _contended_ attempt
+  (domain lock held by a separate connection, 200ms `unique_lock_wait`),
+  and (2) immediately after a _committed_ attempt on the same pool once the
+  domain lock is released. Both read back `"0"` — the disposable test
+  cluster's own default (`scripts/test-postgres.sh` never sets
+  `lock_timeout`) — not `200ms`.
+- **The first checkpoint alone cannot distinguish `is_local`**: PostgreSQL
+  reverts a `SET`/`set_config` change made inside an aborted transaction
+  regardless of whether it was transaction-local (`is_local: true`) or
+  session-level (`is_local: false`) — only a _committed_ transaction's
+  change actually depends on `is_local` to know whether it should survive
+  past that commit. The first version of this test checked only the
+  contended (hence rolled-back) case and did not catch the mutation below
+  — an empirical finding, not merely a theoretical one (see next bullet) —
+  so the test was extended with the second, post-commit checkpoint.
+- **Proven by mutation, both checkpoints run**: flipped `set_config`'s
+  third argument, `true` -> `false`
+  (`set_lock_timeout`, `src/grind/internal/unique_admission.gleam`).
+  First run (before adding the post-commit checkpoint), against a fresh
+  disposable cluster: **105 passed, no failures** — the mutation was
+  invisible to the contended-only assertion, exactly as the reasoning
+  above predicts. After extending the test with the post-commit checkpoint
+  and rerunning the same mutation, against a fresh disposable cluster:
+  **104 passed, 1 failure**:
+  ```
+  test: grind_test.postgres_unique_lock_timeout_does_not_leak_to_later_statements_test
+  info:
+  "200ms"
+  should equal
+  "0"
+  ```
+  A session-level `set_config` survives the committed transaction's
+  `COMMIT`, leaving `lock_timeout` at `200ms` for every later statement on
+  that pooled connection — exactly the leak `is_local: true` exists to
+  prevent. Reverted immediately; `gleam check` recompiled clean and `git
+diff` showed no trace of the mutated line.
+- **Also proven by the same `classify_query_error` mutation from the claim
+  above** (101 passed, 3 failures, reverted the same way) — this test's
+  contended-attempt precondition depends on `AdmissionContended` being
+  reported at all, so that mutation breaks this test's setup too.
+- **Limits**: this proves non-leakage across one contended attempt followed
+  by one committed attempt on the same connection; it does not prove
+  non-leakage across a longer sequence of mixed contended/committed
+  attempts, nor across a connection that outlives many unrelated
+  `submit_unique` calls in production use.
+
+## Increment 10 — rescheduling
+
+Full contract: `docs/UNIQUENESS-CONTRACT.md`, `ConflictAction`,
+`RescheduleScheduledTo`, and admission transaction steps 5-6.
+`postgres_submit_unique_reschedule_row_lock_contention_test` (Increment 9)
+already proves lock contention on the reschedule candidate's row; this
+increment proves the reschedule decision itself.
+
+### Claim: a scheduled conflict rescheduled to `t2` settles `Rescheduled`; `available_at` equals `t2` exactly; the job id, worker, and input are unchanged; the receipt records both the previous and new `available_at`
+
+- **Test**: `postgres_submit_unique_reschedule_moves_available_at_test`
+  (marker `unique-reschedule-moves-available-at-passed`).
+- **Limits**: characterization evidence (passed on first write); the
+  reschedule mechanism itself is proven by mutation below, against the
+  companion "non-scheduled states unchanged" and "live race" tests, which
+  exercise the same `decide_conflict` branch this test also reaches.
+
+### Claim: a `RescheduleScheduledTo` submission against a conflict in `queued`, `retryable`, `executing`, or `uncertain` settles `Existing` with the row completely unchanged, never `Rescheduled`
+
+- **Test**: `postgres_submit_unique_reschedule_leaves_non_scheduled_states_unchanged_test`
+  (marker `unique-reschedule-non-scheduled-unchanged-passed`). Each of the
+  four states is forced by raw SQL onto a freshly-keyed row (the same
+  `force_job_state` helper the Increment 7 state-eligibility matrix uses),
+  then a `RescheduleScheduledTo` submission against that same key is
+  checked.
+- **Proven by mutation** — see "Mutation: the Gleam-level state guard" below
+  (shared with the live-race test).
+
+### Claim: rescheduling a `scheduled` row to a due (past) database time makes it genuinely claimable by a real manually-driven consumer on its very next `process_one` call
+
+- **Test**: `postgres_submit_unique_reschedule_to_due_time_makes_row_claimable_test`
+  (marker `unique-reschedule-due-time-claimable-passed`). The reschedule
+  target itself is a due (past) database time (`future_available_at` with a
+  negative offset), so no separate forced write or wait is needed beyond the
+  reschedule call itself.
+- **Limits**: characterization evidence (passed on first write); this is a
+  straight-line production-path test, not a race.
+
+### Claim: the live race between a real claim (which locks the scheduled row as part of its own claim `UPDATE`) and a concurrent `RescheduleScheduledTo` submission for the same key resolves through the row's _fresh_ post-claim state, not the stale value the wait began with
+
+- **Tests**:
+  `postgres_submit_unique_reschedule_race_incomplete_returns_existing_test`
+  (marker `unique-reschedule-race-incomplete-existing-passed`) and
+  `postgres_submit_unique_reschedule_race_scheduled_only_returns_inserted_test`
+  (marker `unique-reschedule-race-scheduled-only-inserted-passed`), sharing
+  one runner (`run_unique_reschedule_claim_race_test`) parameterized only by
+  the policy's `States` group.
+- **Mechanism**: a `scheduled` row, forced due by raw SQL
+  (`force_available_at_due`, leaving `state` untouched). A `BEFORE UPDATE`
+  trigger on `grind_jobs`, scoped to this job id and `NEW.state =
+'executing'`, blocks on a fresh test-only advisory lock — the exact
+  `grind_test_claim_overlap` shape `run_overlapping_claim_test` already uses
+  for the same claim-`UPDATE` barrier, generalized here with a per-test lock
+  key (`unique_test_lock_key`). The test itself holds that advisory lock via
+  `spawn_lock_holder` before spawning a real manual consumer's
+  `queue.process_one` call, which claims the due row (locking it via its own
+  `FOR UPDATE SKIP LOCKED` candidate CTE), sets `state = 'executing'`, and
+  blocks in the trigger — the claim's row lock is held for the rest of that
+  still-open transaction. A concurrent `RescheduleScheduledTo` submission for
+  the same key is then spawned; its own candidate `SELECT ... FOR UPDATE`
+  genuinely waits on that row lock.
+- **Synchronization**: `await_lock_wait_counts(connection, 1, 1, 500)` polls
+  one `pg_stat_activity` snapshot for exactly one backend waiting on an
+  _advisory_ lock (the claim, parked in its trigger) and exactly one waiting
+  on a _row_ lock (`transactionid` — the reschedule submission's `FOR
+UPDATE`) before releasing the barrier — the same discipline
+  `postgres_ack_duplicate_reports_ok_under_pinned_isolation_test` and
+  `postgres_resolution_concurrent_same_outcome_applied_once_test` already
+  use to distinguish an advisory wait from a genuine tuple-lock wait.
+- **Determinism fix (found by independent review)**: the claimed job's
+  worker originally returned immediately (`unique_test_worker`). Once the
+  claim's `UPDATE` commits (releasing the row lock) and the barrier is
+  released, that worker's handler runs and returns instantly, letting the
+  coordinator's own subsequent acknowledgement race ahead to `succeeded`
+  (which `Incomplete` does not admit either) _before_ the reschedule
+  submission's blocked row lock is necessarily granted — an
+  environment-dependent race, not a deterministic proof, since nothing
+  ordered "the reschedule's `FOR UPDATE` re-acquires and re-evaluates" ahead
+  of "the worker returns and the ack commits." Fixed with a dedicated
+  blocking worker (`unique_test_blocking_worker`) whose handler reports
+  `FirstAttemptStarted(release)` and then blocks; the test now waits for
+  that signal (proof the claim's row lock has already been released, since
+  the claim's `UPDATE` commits, as a single-statement transaction, strictly
+  before the coordinator invokes the handler) and for the reschedule
+  submission's own result _before_ releasing the handler's barrier, so the
+  row is deterministically still `executing` — no acknowledgement has run
+  yet — for the entire window the reschedule's re-acquisition needs.
+- **Observed**: releasing the barrier lets the claim finish and commit
+  (`process.receive(claim_reply, ...) == Ok(Ok(True))`), which releases the
+  row lock. Under `Incomplete` (which admits `executing`), PostgreSQL's own
+  `EvalPlanQual` re-check — the same mechanism a concurrently-updated `SELECT
+... FOR UPDATE` target always gets — hands the reschedule submission the
+  row's fresh `executing` state, not the stale `scheduled` value it started
+  waiting behind; the Gleam-level `RescheduleScheduledTo(_), "scheduled"`
+  pattern match does not fire, and the call settles `Existing` with
+  `conflict_state` reading `Executing`, `available_at` completely untouched,
+  and exactly one row for the key. Under `ScheduledOnly` (which does not
+  admit `executing`), the same re-check finds no row matching the eligible-
+  states filter at all, so `find_candidate` returns nothing and the call
+  settles `Inserted` — a fresh row, distinct id, two rows for the key in
+  total.
+- **Mutation: the Gleam-level state guard** — widened
+  `decide_conflict`'s `unique.RescheduleScheduledTo(at), "scheduled" -> ...`
+  pattern match (`src/grind/internal/unique_admission.gleam`) to
+  `unique.RescheduleScheduledTo(at), _ -> ...`, i.e. fire the reschedule
+  branch for _any_ candidate state, not only `scheduled`. Against a fresh
+  disposable cluster, re-run after the determinism fix above (115 passed, 2
+  failures):
+  ```
+  test: grind_test.postgres_submit_unique_reschedule_leaves_non_scheduled_states_unchanged_test
+  code: let assert Ok(unique.Existing(conflict)) =
+      submit_reschedule(...)
+  value: Ok(Rescheduled(Conflict(108, "127.0.0.1:36835/grind_test", "unique-reschedule-states-...", "unique.reschedule-states-...", "v1", Scheduled)))
+  info: Pattern match failed, no pattern matched the value.
+
+  test: grind_test.postgres_submit_unique_reschedule_race_incomplete_returns_existing_test
+  code: let assert Ok(unique.Existing(conflict)) = reschedule_result
+  value: Ok(Rescheduled(Conflict(110, "127.0.0.1:36835/grind_test", "unique-reschedule-race-...-6", "unique.reschedule-race-...-6", "v1", Scheduled)))
+  info: Pattern match failed, no pattern matched the value.
+  ```
+  Both mutated calls fabricate a `Rescheduled` decision (falsely reporting
+  the observed state as `Scheduled`) against a row whose real state is
+  `queued`/`executing` and whose `available_at` the SQL-level `WHERE id = $2
+AND storage_owner = $3 AND state = 'scheduled'` guard (still present,
+  unmutated, in `reschedule_job`'s own `UPDATE`) silently leaves untouched —
+  a receipt recording "rescheduled" against a row nothing actually changed,
+  exactly the fabricated-success failure mode this test exists to catch.
+  Only these two tests failed. Reverted immediately; `gleam build
+--warnings-as-errors` recompiled clean and `git diff` for
+  `unique_admission.gleam` showed no trace of the mutated line.
+- **First mutation attempted, no observable difference — recorded honestly**:
+  dropped only the SQL-level `AND state = 'scheduled'` guard from
+  `reschedule_job`'s own `UPDATE` (leaving the Gleam-level pattern match
+  intact). Against a fresh disposable cluster, re-run after the determinism
+  fix above: **117 passed, no failures** — identical to the unmutated
+  baseline. This guard is redundant given the
+  code as written: `decide_conflict`'s Gleam-level match only ever calls
+  `reschedule_job` when `candidate.state` already reads `"scheduled"`
+  (freshly re-checked by the very `SELECT ... FOR UPDATE` that took the row
+  lock this same transaction holds for the rest of its duration), so no
+  other transaction can change that row's state between the read and the
+  `UPDATE` — the same reasoning Increment 8's own "first mutation, no
+  observable difference" entry documents for a structurally similar
+  redundancy. `docs/UNIQUENESS-CONTRACT.md`'s own wording ("re-checked under
+  the row lock from step 6, not assumed from the candidate read") is kept
+  as defense in depth regardless, on the same rationale `pin_read_committed`
+  is kept alongside the pool-level isolation pin.
+- **Limits**: the race test proves this exact interleaving (the reschedule
+  submission waits on the row lock for the claim's entire remaining
+  transaction); it does not exercise a race where the reschedule submission
+  arrives first and the claim must instead wait on _its_ domain lock (not
+  applicable — a claim never takes the uniqueness domain lock at all, only a
+  scheduled row's own row lock, which the claim's `FOR UPDATE SKIP LOCKED`
+  never waits for in the first place — `SKIP LOCKED` skips rather than
+  waits, so the only way to force this exact interleaving is what this test
+  already does).
+
+## Increment 11 — uncertain admission commits
+
+Full contract: `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" (the
+`pog.TransactionQueryError` classification and `CommitUnknown`/
+`reconcile_unique`). `install_syncrep_reply_trigger` (Increment 2) is
+generalized here to take a table and a predicate (a trusted SQL boolean
+expression referencing `NEW`), in place of its earlier hard-coded
+`grind_job_acknowledgements`/`job_id` scoping — both existing Increment 2
+call sites were updated to pass `"grind_job_acknowledgements"` and `"NEW.job_id
+= " <> int.to_string(job_id)` explicitly, with no behavior change (confirmed
+by the full gate staying green). The tests below scope it to
+`grind_unique_submissions` by `submission_id` instead: the submission id is
+chosen by the caller and known _before_ the admission transaction that would
+create a job id even starts, which the acknowledgement path's job-id scoping
+could not offer here (a `submit_unique` call's job id does not exist until
+the same transaction whose reply might be lost has already run).
+
+**Cleanup fix (found by independent review)**: `install_syncrep_reply_trigger`'s
+returned cleanup thunk ran `SET lock_timeout = '2s'` and both `DROP`
+statements as three separate queries against `connection` — a pool value,
+not one physical connection. Each separate query on a pool value checks out
+and releases a connection for that query alone, so the `SET` could land on a
+different physical connection than the one either `DROP` later happens to
+check out, leaving the `DROP`s unbounded again (able to hang indefinitely
+behind an unrelated lock, rather than failing after 2 seconds as intended).
+Fixed by running `SET LOCAL lock_timeout = '2s'` and both `DROP`s inside one
+`pog.transaction` call, pinning all three statements to the same checked-out
+connection, where `SET LOCAL` actually scopes. Backend termination (for any
+backend still parked in `SyncRep`) still runs first and separately, since it
+must reach the specific stuck backend regardless of which connection the
+cleanup transaction itself uses.
+
+### Claim (a): a pool closed _before_ `submit_unique` ever sends anything
+
+- **Test**:
+  `postgres_submit_unique_closed_pool_before_send_is_admission_failed_test`
+  (marker `unique-closed-before-send-recovers-passed`).
+- **Mechanism**: `run` (`src/grind/internal/unique_admission.gleam`) calls a
+  dedicated FFI wrapper, `transaction_or_checkout_failure`
+  (`grind_postgres_ffi.erl`, added by the fix below), which distinguishes a
+  checkout failure — the pool could not hand out a connection at all, so
+  `BEGIN` never ran — from pog's own transaction outcome. A checkout failure
+  is reported directly as `AdmissionFailed(ConnectionUnavailable)`, with no
+  `PendingSubmission` constructed and no receipt lookup attempted.
+- **Observed**: `submit_keep_existing(...) == Error(AdmissionFailed(ConnectionUnavailable))`.
+  Reopening the same pool name and retrying the identical `SubmissionId` — a
+  plain `submit_unique`, not `reconcile_unique` (there is no
+  `PendingSubmission` to reconcile from) — succeeds normally: `Inserted`,
+  exactly one row (`count_jobs_in_queue` on the reopened pool's own
+  connection).
+- **This test's own precision is proven, not coincidental, by Claim (d)'s own
+  evidence below**: applying the receipt-lookup fix (R1) _alone_, without
+  the checkout/mid-transaction distinction (R2), makes this exact test go
+  red — `AdmissionFailed` becomes `CommitUnknown` too, imprecisely, because
+  a checkout failure and a genuinely uncertain mid-transaction loss were
+  still indistinguishable. See "the bug, found and fixed" under Claim (d)
+  for the quoted output; R2 is what restores this test's precise
+  `AdmissionFailed`.
+
+### Claim (b): an aborted commit — a deferred trigger's `pg_sleep` fires during the admission transaction's own `COMMIT`
+
+- **Test**: `postgres_submit_unique_aborted_commit_is_commit_unknown_test`
+  (marker `unique-aborted-commit-is-commit-unknown-passed`).
+- **Mechanism**: the same `pg_sleep(30)`-in-a-deferred-constraint-trigger
+  shape the pre-existing `postgres_ack_commit_connection_loss_is_unknown_test`
+  uses for the acknowledgement path (a literal, un-generalized trigger —
+  distinct from `install_syncrep_reply_trigger`, which raises
+  `synchronous_commit` rather than sleeping), scoped here by `NEW.submission_id
+= '<submission text>'` on `grind_unique_submissions` instead of a job id.
+  `wait_for_commit_trigger_backend` (already table-agnostic — it polls
+  `pg_stat_activity` for `wait_event = 'PgSleep'` alone) needed no change.
+  Terminating the backend while it sleeps aborts the whole transaction
+  before it is ever marked committed — unlike (c)/(d) below, nothing is
+  visible to any other connection, not even briefly.
+- **Trap avoided**: the trigger is scoped by `submission_id` equality, and
+  the test's own _recovery_ retries the _same_ `SubmissionId` — so the
+  trigger must be dropped **before** that retry, not only deferred to test
+  teardown, or the retry's own commit would fire the identical trigger again
+  and hang for the full 30 seconds with nobody left to terminate it. An
+  earlier draft of this test deferred cleanup only, and the retry hung
+  the whole gate's subsequent tests behind a leftover `pg_sleep(30)`
+  transaction still holding a lock relevant to `grind_unique_submissions`
+  DDL — confirmed by two _other_, unrelated tests failing with
+  `Error(QueryTimeout)` on their own `CREATE CONSTRAINT TRIGGER` statements
+  in the same run. Fixed by extracting the drop into a named closure, called
+  once explicitly before the retry and again (idempotently) via
+  `exception.defer` as a safety net.
+- **Observed**: `process.receive(reply, ...) == Ok(Error(unique.CommitUnknown(pending)))`;
+  zero rows in `grind_jobs` for the queue; zero receipts for the submission
+  id. `reconcile_unique(database, pending)` still reports `CommitUnknown` —
+  nothing was ever committed, so the receipt lookup finds nothing, and would
+  keep finding nothing forever; `reconcile_unique` alone can never recover
+  this. Only a plain retry of the identical `SubmissionId` (after dropping
+  the trigger) converges: `Inserted`, exactly one row.
+- **Limits**: this is a characterization test for the classification and the
+  zero-rows/zero-receipts observation (passed on first write); the shared
+  "receipt lookup is essential" mutation below (Increment 11 (d)) also
+  affects this test's own final retry step, but inconclusively — see that
+  entry's own note on collateral timing noise.
+
+### Claim (c): a genuinely committed admission whose reply is lost after PostgreSQL has already committed locally
+
+- **Test**: `postgres_submit_unique_committed_reply_lost_returns_inserted_test`
+  (marker `unique-committed-reply-lost-inserted-passed`).
+- **Mechanism**: `install_syncrep_reply_trigger` (generalized, see above),
+  installed on `grind_unique_submissions` with predicate `NEW.submission_id
+= '<submission text>'`, on the same disposable cluster settings
+  (`synchronous_standby_names=grind_never_standby`,
+  `synchronous_commit=local`) Increment 2 requires
+  (`require_syncrep_cluster_configured`). `submit_unique` is spawned in the
+  background (it blocks for the duration of the park);
+  `wait_for_syncrep_trigger_backend` confirms the park, then
+  `terminate_backend` ends it.
+- **Observed**: `process.receive(reply, ...) == Ok(Ok(unique.Inserted(handle)))`
+  — `submit_unique` itself resolves the outcome via `run`'s own automatic
+  `reconcile_from_receipt` fallback on `pog.TransactionQueryError`, with no
+  separate `reconcile_unique` call needed; `backend_pid_is_alive == False`;
+  `postgres.arguments` reads back the original input through both the
+  returned handle and a handle freshly rebound with `bind_handle`; exactly
+  one row; the receipt exists.
+- **Proven by mutation** — see Claim (d)'s mutation entries below, both of
+  which also turn this test red.
+
+### Claim (d): committed, reply lost, _and_ Grind's own pool closed while the commit is still parked
+
+- **Test**:
+  `postgres_submit_unique_committed_reply_lost_store_unavailable_test`
+  (marker `unique-committed-reply-lost-store-unavailable-passed`).
+- **This was a correctness bug, found by independent review of an earlier
+  draft of this test's own "the classification just differs" writeup — not
+  a classification difference to document and move on from.** Root cause,
+  in `run` (`src/grind/internal/unique_admission.gleam`, pre-fix): the
+  admission transaction's own "commit" call correctly unblocked with
+  `pog.TransactionQueryError` (checked out fine, then lost the connection —
+  genuinely uncertain, might have committed), and `run` correctly routed it
+  to `reconcile_from_receipt` to check. But that follow-up `find_receipt`
+  query then _also_ failed — the pool was now fully closed — and the
+  pre-fix `Error(error) -> Error(error)` branch returned that _lookup's
+  own_ connectivity failure, `AdmissionFailed(ConnectionUnavailable)`, as if
+  it were the _admission's_ outcome, silently discarding the
+  `pending: PendingSubmission` already in hand. A caller told
+  `AdmissionFailed` reasonably treats that as "did not happen, safe to
+  retry independently" — but the zombie transaction can still commit later,
+  and nothing told the caller to check.
+- **Mechanism**: `install_syncrep_reply_trigger` on `grind_unique_submissions`
+  (scoped by `submission_id`), installed via a size-1 _observer_ pool
+  independent of Grind's own pool (the same shape
+  `postgres_ack_committed_reply_lost_with_store_unavailable_is_unknown_test`
+  uses); `submit_unique` spawned on Grind's own pool; `postgres.close` called
+  on Grind's own pool once the observer confirms the park.
+- **Red before the fix**: the test was first changed to assert the correct
+  contract (`Ok(Error(unique.CommitUnknown(pending)))`) against the
+  then-unmodified code. Against a fresh disposable cluster (116 passed, 1
+  failure):
+  ```
+  test: grind_test.postgres_submit_unique_committed_reply_lost_store_unavailable_test
+  code: let assert Ok(Error(unique.CommitUnknown(pending))) =
+      process.receive(reply, within: 10_000)
+  value: Ok(Error(AdmissionFailed(ConnectionUnavailable)))
+  info: Pattern match failed, no pattern matched the value.
+  ```
+- **The fix, in two parts**:
+  1. **(R1)** `reconcile_from_receipt` now maps a failed lookup to
+     `Error(unique.CommitUnknown(pending))`, the same as finding no receipt
+     yet (`Ok(None) | Error(_) -> Error(unique.CommitUnknown(pending))`) —
+     mirroring `reconcile_unknown_ack`'s `Ok(None) | Error(_) ->
+QueueAckUnknown` in `grind/postgres`. Applied alone, this makes the test
+     above pass — but at a cost, checked directly: it also makes Claim (a)'s
+     test go red, because a checkout failure (definitely not committed) and
+     a mid-transaction connection loss (genuinely uncertain) were still
+     indistinguishable at this point — both reached
+     `reconcile_from_receipt` the same way. Against a fresh disposable
+     cluster with R1 alone (116 passed, 1 failure):
+     ```
+     test: grind_test.postgres_submit_unique_closed_pool_before_send_is_admission_failed_test
+     info:
+     Error(CommitUnknown(PendingSubmission(...)))
+     should equal
+     Error(AdmissionFailed(ConnectionUnavailable))
+     ```
+  2. **(R2)** `run` now calls a new FFI wrapper, `transaction_or_checkout_failure`
+     (`grind_postgres_ffi.erl`), added as a sibling to the existing
+     `transaction_safely` (kept for other callers — see "Backlog" below).
+     Unlike `transaction_safely`'s `try ... catch exit:{_, {pgo_pool,
+checkout, _}} -> {error, {transaction_query_error, connection_unavailable}}`
+     (which disguises a checkout failure as the same
+     `transaction_query_error` shape a genuine mid-transaction loss
+     produces), the new wrapper returns a distinct `{error, nil}` for that
+     exact same catch, keeping `{ok, Result}` (pog's own transaction outcome,
+     untouched) for everything else. `run` maps `Error(Nil)` straight to
+     `Error(unique.AdmissionFailed(pog.ConnectionUnavailable))` — no
+     `PendingSubmission`, no receipt lookup attempted — restoring Claim (a)'s
+     precise classification on top of R1's fix.
+     Reapplying both together: **117 passed, no failures** (reproduced three
+     consecutive times against fresh disposable clusters).
+- **Mutation (regression check): revert R1 alone, keep R2** — restored
+  `reconcile_from_receipt`'s pre-fix `Error(error) -> Error(error)` branch
+  while keeping the R2 FFI wrapper in `run`. Against a fresh disposable
+  cluster (116 passed, 1 failure) — the exact original bug symptom recurs,
+  and only this one test is affected (Claim (a) stays green, confirming R2
+  alone does not fix (d); R1 is specifically what (d) needs):
+  ```
+  test: grind_test.postgres_submit_unique_committed_reply_lost_store_unavailable_test
+  code: let assert Ok(Error(unique.CommitUnknown(pending))) =
+      process.receive(reply, within: 10_000)
+  value: Ok(Error(AdmissionFailed(ConnectionUnavailable)))
+  info: Pattern match failed, no pattern matched the value.
+  ```
+  Reverted immediately; `gleam build --warnings-as-errors` recompiled clean
+  and `git diff` showed no trace of the mutated lines.
+- **Observed, with the fix**: `submit_unique` reports
+  `Ok(Error(unique.CommitUnknown(pending)))`. `reconcile_unique(reopened,
+pending)`, tried _while the zombie is still parked_, is a pure receipt
+  lookup with no lock of its own — the zombie's receipt insert is not yet
+  visible to any other session, so it still reports `CommitUnknown` (not a
+  persisted-conflict inference). A second, independent recovery path — a
+  _plain_ `submit_unique` retry of the same `SubmissionId`, tried while the
+  zombie is still parked (via a third pool with `unique_lock_wait(200)`) —
+  genuinely needs the domain lock the zombie's still-open transaction holds:
+  `Error(AdmissionContended)`, and `count_jobs_in_queue` on the observer
+  connection reads `0`. Only after the zombie backend is terminated and
+  confirmed gone (`wait_for_backend_gone` on the _observer_ connection —
+  Grind's own closed-then-reopened socket is not the ordering signal here,
+  unlike Increment 2's 2a; an independent connection is what later reads
+  visibility, matching Increment 2's 2b discipline) does
+  `reconcile_unique(reopened, pending)` resolve from the now-visible
+  receipt: `Ok(Inserted(handle))` with the original job id, exactly one row
+  — and the plain-retry path, tried again on the reopened pool, converges on
+  that same job id, still one row.
+- **Proven by mutation (isolating each half of the recovery flow)**:
+  1. **Skip `admission_transaction`'s own receipt lookup entirely** — the
+     same removal Increment 7 already proved necessary for sequential
+     replay (`admission_transaction` called `admit_candidate` unconditionally
+     instead of calling `find_receipt` at all first,
+     `src/grind/internal/unique_admission.gleam` — note this does **not**
+     touch `reconcile_from_receipt`/`reconcile_unique`, a separate function).
+     Against a fresh disposable cluster (113 passed, 4 failures): the two
+     pre-existing Increment 7 receipt-replay failures and the pre-existing
+     Increment 8 receipt-ordering failure recur exactly as documented there,
+     plus:
+     ```
+     test: grind_test.postgres_submit_unique_committed_reply_lost_store_unavailable_test
+     code: let assert Ok(unique.Inserted(retried_handle)) =
+         submit_keep_existing(reopened, test_queue, submission_text, worker_def, 13, policy)
+     value: Error(SubmissionConflict)
+     info: Pattern match failed, no pattern matched the value.
+     ```
+     `reconcile_unique(reopened, pending)` itself is unaffected by this
+     mutation (it calls `reconcile_from_receipt` directly, never
+     `admission_transaction`) and still correctly resolves `Inserted` with
+     the original job id — this mutation's failure is specifically on the
+     _second_ recovery path, the plain `submit_unique` retry: once the
+     zombie's row and receipt become visible, that retry's candidate
+     selection (run unconditionally, receipt check skipped) finds the row as
+     an ordinary conflict and attempts to record its own receipt for the
+     same `(storage_owner, submission_id)`, colliding with the zombie's
+     already-committed one — `23505` on the receipt table's primary key, the
+     exact different-key-shaped symptom Increment 8 documents for a
+     structurally similar mutation, here forced onto the identical key by
+     genuine replay rather than by a code defect elsewhere. This proves the
+     plain-retry recovery path also depends on `admission_transaction`'s own
+     receipt lookup, not on candidate selection reinterpreting the
+     now-visible row as a fresh conflict.
+     Reverted immediately; `gleam build --warnings-as-errors` recompiled
+     clean and `git diff` showed no trace of the mutated lines.
+  2. **Skip `run`'s own automatic-reconciliation fallback** — replaced
+     `Ok(Error(pog.TransactionQueryError(_))) -> reconcile_from_receipt(...)`
+     with an unconditional `Error(unique.CommitUnknown(unique.new_pending_submission(...)))`
+     in `run` (`src/grind/internal/unique_admission.gleam`), i.e. never even
+     attempt the follow-up receipt lookup for a mid-transaction loss. Against
+     a fresh disposable cluster (115 passed, 2 failures):
+     ```
+     test: grind_test.postgres_submit_unique_committed_reply_lost_returns_inserted_test
+     code: let assert Ok(Ok(unique.Inserted(handle))) =
+         process.receive(reply, within: 10_000)
+     value: Ok(Error(CommitUnknown(PendingSubmission(...))))
+     info: Pattern match failed, no pattern matched the value.
+
+     test: grind_test.postgres_submit_unique_reschedule_reply_lost_returns_rescheduled_test
+     code: let assert Ok(Ok(unique.Rescheduled(conflict))) =
+         process.receive(reply, within: 10_000)
+     value: Ok(Error(CommitUnknown(PendingSubmission(...))))
+     info: Pattern match failed, no pattern matched the value.
+     ```
+     Claims (c) and (e) — the two cases whose admission genuinely committed
+     and needs the lookup to discover that — turn red. Claim (a) is
+     unaffected (it never reaches this branch at all: `Error(Nil)` short-
+     circuits earlier). Claim (d) is also unaffected, but not because it is
+     insensitive to this code path — its first assertion
+     (`Ok(Error(unique.CommitUnknown(pending)))`) is satisfied by this
+     mutation too, since skipping the lookup and finding no receipt both
+     produce the identical `CommitUnknown(pending)` value with identical
+     contents, and its later `reconcile_unique` calls go through the
+     separate, unmutated `reconcile_from_receipt` function directly — this
+     mutation is a coincidental false negative for claim (d) specifically,
+     not evidence that (d) is correct independent of this code path (Claim
+     (d)'s own dedicated red-before-fix and R1-revert evidence above already
+     covers it directly). Only these two tests failed. Reverted immediately;
+     `gleam build --warnings-as-errors` recompiled clean and `git diff`
+     showed no trace of the mutated lines.
+- **Backlog**: `postgres.gleam`'s other `transaction_safely` callers
+  (acknowledgement, audited resolution) were left unchanged — they still
+  conservatively report their own "unknown" outcome for a checkout failure
+  too (safe, only less precise than R2's distinction), same as `run` did
+  before this fix. Noted in `docs/IMPLEMENTATION-SCOPE.md` as backlog, not
+  blocking: those paths do not retain an analogous typed "pending" value a
+  caller could otherwise reconcile from more precisely, so there is no
+  equivalent information being discarded today.
+- **Limits**: this proves the checkout-vs-mid-transaction distinction and
+  the two-path recovery for this exact fault sequence; it does not audit
+  every other `transaction_safely` call site in `grind/postgres` for the
+  same class of bug (a failed follow-up lookup discarding a retained typed
+  value) — none of those paths currently retain one, so the same bug shape
+  cannot occur there today, but this was not independently re-verified
+  against each call site line by line.
+
+### Claim (e): a reschedule whose commit reply is lost
+
+- **Test**:
+  `postgres_submit_unique_reschedule_reply_lost_returns_rescheduled_test`
+  (marker `unique-reschedule-reply-lost-rescheduled-passed`).
+- **Mechanism**: identical to (c), except the submission under the SyncRep
+  trigger is a `RescheduleScheduledTo` request against a pre-existing
+  scheduled row (inserted normally beforehand, no fault injection needed for
+  that half).
+- **Observed**: `process.receive(reply, ...) == Ok(Ok(unique.Rescheduled(conflict)))`,
+  not `Existing` — even though the row's current state (`scheduled`, at its
+  new `available_at`) looks exactly like an ordinary scheduled conflict
+  either way; `conflict_job_id` matches the original job id;
+  `job_available_at_ms` reads the new target exactly; exactly one row. The
+  receipt's own recorded _decision_ column, not the row's current state, is
+  what `find_receipt`/`outcome_of_receipt` decodes.
+- **Proven by mutation**: both mutations in Claim (d) above also turn this
+  test red (see their quoted output); no separate mutation was needed.
+
+## Increment 12 — uniqueness: selected keys
+
+Full contract: `docs/UNIQUENESS-CONTRACT.md`, "Status" (Increment 12) and
+Decision 9's key-contract discussion. `unique.selected` was already
+implemented (`src/grind/unique.gleam`'s `Selected` key variant and
+`key_material`); this increment adds the tests proving its isolation and
+equality semantics, so both tests below are characterization tests proven by
+mutation rather than red-before-green.
+
+### Claim: a selected key's contract isolates by name and by codec version, independently of the projected value; a full-input key never collides with a selected key
+
+- **Test**: `postgres_submit_unique_selected_key_scoping_test`
+  (`test/grind_test.gleam`; marker `unique-selected-key-scoping-passed`).
+- **Mechanism**: an input type (`SelectedInput`) with one field the key
+  projects (`account`, itself a raw JSON value) and one field it never sees
+  (`other`). Five submissions against the same worker and queue: (1) admits
+  under a selected key named `"account"`; (2) the identical projected value
+  with a different `other` field, same policy — still `Existing`; (3) the
+  identical projected value under a selected key with a different _name_,
+  same projection and codec — `Inserted`; (4) the identical projected value
+  under the same name and projection but a different codec _version_ --
+  `Inserted`; (5) the identical whole input under a `full_input()` policy
+  instead of any selected key — `Inserted`, never colliding with (1)-(4).
+- **Proven by mutation**: in `key_material`
+  (`src/grind/unique.gleam`), dropped the key name from the `Selected`
+  branch's contract string (`#("selected:" <> name <> ":" <> codec_version,
+...)` → `#("selected:" <> codec_version, ...)`, name unused). Against a
+  real disposable cluster:
+  ```
+  let assert  test/grind_test.gleam:11466
+   test: grind_test.postgres_submit_unique_selected_key_scoping_test
+   code: let assert Ok(unique.Inserted(_)) =
+      submit_keep_existing(
+        database,
+        test_queue,
+        "unique-selected-3-" <> suffix,
+        worker_def,
+        shared_account,
+        account_policy_other_name,
+      )
+  value: Ok(Existing(Conflict(122, "127.0.0.1:26420/grind_test", "selected-...", "unique.selected-...", "v1", Queued)))
+  info: Pattern match failed, no pattern matched the value.
+  118 passed, 1 failures
+  ```
+  With the name dropped from the contract, submission (3) (a differently-named
+  selected key, same codec version) collapses onto submission (1)'s contract
+  and falsely conflicts with its row. Only this test failed. Reverted
+  immediately; `gleam check` recompiled clean and `git diff` showed no trace
+  of the mutated line.
+- **Limits**: no separate mutation was run for dropping the codec version
+  instead of the name — the contract string concatenates both the same way,
+  so the two omissions are structurally identical bugs (a missing
+  disambiguating segment lets two distinct contracts collapse onto the same
+  string); a single representative mutation was judged sufficient, matching
+  the discipline already applied to Decision 1's key-digest and Decision
+  3's worker-identity isolation claims elsewhere in this contract.
+
+### Claim: a selected key compares by exact equality, not containment, for a projected value the same way a full-input key already does
+
+- **Test**: `postgres_submit_unique_selected_key_equality_not_containment_test`
+  (marker `unique-selected-key-equality-not-containment-passed`).
+- **Mechanism**: two submissions under the same selected key (`"account"`,
+  projecting a raw JSON value): one with `{"id":1}`, the next with
+  `{"id":1,"extra":2}` — a JSON superset of the first. Both admit as
+  `Inserted`; neither conflicts with the other.
+- **Characterization test, proven by mutation** (passed on first write, so
+  red-before-green does not apply; this exercises the same underlying
+  `unique_key_sha256` equality machinery already proven at the digest level
+  by `postgres_submit_unique_json_equality_matches_postgres_jsonb_test`'s
+  subset/superset case, applied here specifically through `unique.selected`
+  rather than `unique.full_input()`). No separate mutation was run beyond
+  that existing coverage: the SQL predicate compared
+  (`unique_key_sha256 = sha256(...)`) is identical regardless of which
+  `Key` variant produced the encoded key text, and Decision 1's own
+  digest-equality proof already covers that predicate directly.
+- **Limits**: this proves selected-key equality behaves the same as
+  full-input equality for one representative subset/superset pair; it does
+  not re-run every JSON-equality case from
+  `postgres_submit_unique_json_equality_matches_postgres_jsonb_test` (field
+  order, numeric scale, array order) through a selected key, since those all
+  reduce to the same `unique_key_sha256` comparison already proven
+  independent of which `Key` variant produced the compared text.
+
+## Increment 13 — public-API consumer coverage: uniqueness admission
+
+All claims below are exercised from `consumer/`, the separate package that
+imports only public Grind modules (`grind/unique`, `grind/postgres`,
+`grind/job`, `grind/worker`, `grind/queue`, `grind/registry`), following the
+same discipline as Increment 5. Nothing here reads `@internal` functions or
+raw `pog`; the only addition to the consumer package itself is a dev
+dependency on `gleam_time` (already transitively resolved through `pog`), so
+a test can build a `job.AvailableAt` from a real wall-clock read without a
+bespoke Erlang FFI.
+
+### Claim: `submit_unique`, an `Existing` conflict rebound with `bind_handle`, and a `SubmissionId` replay are all reachable and correct through public imports alone
+
+- **Test**: `public_consumer_unique_admission_existing_conflict_and_retry_test`
+  (`consumer/test/grind_consumer_test.gleam`; marker
+  `consumer-unique-admission-existing-conflict-retry-passed`).
+- **Mechanism**: a plain `Int`/`String` echo worker is admitted once
+  (`unique.Inserted`); a second, independently identified submission with the
+  identical key observes `unique.Existing`, whose `conflict_job_id` matches
+  the first handle's id. The conflict is rebound with the same
+  `postgres.bind_handle` path used after a restart, and its state read as
+  `Queued`. Replaying the _first_ submission's own `SubmissionId` a third
+  time returns `unique.Inserted` again with the identical job id — the
+  receipt's own recorded decision, not a fresh conflict against the
+  still-present row. A manually driven consumer (`queue.start_manual`,
+  `queue.process_one`) then actually runs the job; the rebound handle's
+  typed outcome reads `SucceededWith("42")`.
+- **Characterization test, proven by mutation** (passed on first write).
+  In `admission_transaction`
+  (`src/grind/internal/unique_admission.gleam`), replaced the `case existing
+{ Some(outcome) -> Ok(outcome) None -> admit_candidate(...) }` dispatch
+  with an unconditional `admit_candidate(connection, request)` — the same
+  "drop the receipt lookup" mutation already recorded for sequential replay
+  in `docs/UNIQUENESS-CONTRACT.md`'s Increment 8, applied here specifically
+  to observe this consumer-level test. The consumer suite was run in
+  isolation against its own fresh disposable cluster (`cd consumer && gleam
+test`, its own `grind_consumer_test` database):
+  ```
+  let assert  test/grind_consumer_test.gleam:785
+   test: grind_consumer_test.public_consumer_unique_admission_existing_conflict_and_retry_test
+   code: let assert Ok(unique.Inserted(replayed)) =
+      postgres.submit_unique(
+        database,
+        test_queue,
+        first_submission,
+        worker_def,
+        42,
+        unique.Immediately,
+        policy,
+        unique.KeepExisting,
+      )
+  value: Error(SubmissionConflict)
+  info: Pattern match failed, no pattern matched the value.
+  6 passed, 1 failures
+  ```
+  With the receipt lookup skipped, the replay of `first_submission` runs
+  candidate selection directly, finds the still-`queued` row as an ordinary
+  conflict, and attempts to record a _second_ receipt for the same
+  `(storage_owner, first_submission)` primary key — colliding with the one
+  the original admission already committed (`23505`, mapped to
+  `SubmissionConflict` by `record_receipt`'s own constraint handling) —
+  exactly the different-shaped symptom Increment 8 documents for the same
+  mutation at the root level, here forced onto the identical key by genuine
+  replay. Only this test failed. Reverted immediately; `gleam check`
+  recompiled clean and `git diff` showed no trace of the mutated lines.
+- **Limits**: this is a consumer-level demonstration of already-proven root
+  mechanisms (existing-conflict detection: Increment 6/7's identity and
+  json-equality tests; receipt replay: Increment 7); it adds no new claim
+  about the admission transaction's own SQL, only that the full flow —
+  admit, detect conflict, rebind, replay, run, read typed outcome — is
+  reachable and correct entirely through public imports.
+
+### Claim: an `AcrossQueues` policy's `RescheduleScheduledTo` moves a genuinely scheduled row's `available_at` from a submission made through a different queue, and the row is claimable and runs once due
+
+- **Test**: `public_consumer_unique_reschedule_across_queues_test`; marker
+  `consumer-unique-reschedule-across-queues-passed`.
+- **Mechanism**: a job is seeded with `unique.At` an hour in the future
+  (genuinely `Scheduled`, not already due) in queue `"consumer-unique-across-a"`.
+  A second submission, through the _different_ queue
+  `"consumer-unique-across-b"`, under an `AcrossQueues`/`ScheduledOnly`
+  policy and `RescheduleScheduledTo` targeting 50ms in the future, observes
+  `unique.Rescheduled`; `conflict_job_id` matches the original handle, and
+  `conflict_queue` reports `"consumer-unique-across-a"` — the row's actual
+  queue, not the rescheduling submission's own. The rebound handle is then
+  actually claimed and run by a manually driven consumer once its new time
+  is due (bounded polling, the same `await_claim` helper Increment 5 already
+  uses for a real retry delay), and its typed outcome reads
+  `SucceededWith("7")`.
+- **Confirmatory mutation, reusing a production mutation already proven at
+  the root level** (the same discipline as Increment 5's Mutation 2): in
+  `candidate_sql` and `bind_candidate_params`
+  (`src/grind/internal/unique_admission.gleam`), changed both `case scope`
+  matches so `AcrossQueues` takes the `WithinQueue` branch too (always
+  filtering candidate selection by `queue = $q`) — the identical mutation
+  Increment 4's own root-level `AcrossQueues` proof already uses. Reproduced
+  in two ways against a real disposable cluster:
+  1. The full gate (`scripts/test-postgres.sh`): the root suite itself goes
+     red first (117 passed, 2 failures —
+     `postgres_submit_unique_respects_queue_scope_test` and
+     `postgres_submit_unique_concurrent_admission_mixed_scope_test`, the
+     same failures Increment 4/8's own evidence already documents), so the
+     script's `set -euo pipefail` aborts before the consumer suite ever
+     runs — expected, and not itself evidence for this claim.
+  2. To observe the consumer-level failure directly, the consumer suite was
+     run in isolation against its own disposable cluster (same mutation,
+     `cd consumer && gleam test` against a freshly created
+     `grind_consumer_test` database):
+     ```
+     let assert  test/grind_consumer_test.gleam:863
+      test: grind_consumer_test.public_consumer_unique_reschedule_across_queues_test
+      code: let assert Ok(unique.Rescheduled(conflict)) =
+          postgres.submit_unique(
+            database,
+            "consumer-unique-across-b",
+            reschedule_submission,
+            worker_def,
+            7,
+            unique.Immediately,
+            policy,
+            unique.RescheduleScheduledTo(soon_at),
+          )
+     value: Ok(Inserted(JobHandle(11, "127.0.0.1:.../grind_consumer_test", "consumer-unique-across-b", "consumer.unique_reschedule_echo", "v1", ...)))
+     info: Pattern match failed, no pattern matched the value.
+     6 passed, 1 failures
+     ```
+     With every candidate query forced to filter by the submitting queue,
+     the rescheduling submission (queue `"consumer-unique-across-b"`) never
+     finds the seeded row (queue `"consumer-unique-across-a"`) as a
+     candidate at all, and inserts a second row instead of rescheduling the
+     first. Only this test failed. Reverted immediately; `gleam check`
+     recompiled clean and `git diff` showed no trace of the mutated lines.
+- **Limits**: this is a consumer-level demonstration of an already-proven
+  root mechanism (`AcrossQueues` candidate selection: Increment 4;
+  `RescheduleScheduledTo`: Increment 10); it adds no new claim about the
+  admission transaction's own SQL, only that the full flow — seed a
+  scheduled row, reschedule it across queues, observe the row's real queue
+  on the conflict, and run the rescheduled job to a typed outcome — is
+  reachable and correct entirely through public imports.

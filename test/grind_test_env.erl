@@ -1,5 +1,5 @@
 -module(grind_test_env).
--export([database_url/0, queue_database_url/0, owner_a_url/0, owner_b_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_atomic_url/0, resolution_route_a_url/0, resolution_route_b_url/0, mark_database_test_executed/1, monotonic_ms/0]).
+-export([database_url/0, queue_database_url/0, owner_a_url/0, owner_b_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_atomic_url/0, resolution_route_a_url/0, resolution_route_b_url/0, repeatable_read_url/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0]).
 
 database_url() -> env("GRIND_TEST_DATABASE_URL").
 queue_database_url() -> env("GRIND_TEST_QUEUE_DATABASE_URL").
@@ -13,9 +13,11 @@ schema_missing_migrations_url() -> env("GRIND_TEST_SCHEMA_MISSING_MIGRATIONS_URL
 schema_missing_resolutions_url() -> env("GRIND_TEST_SCHEMA_MISSING_RESOLUTIONS_URL").
 schema_missing_acknowledgements_url() -> env("GRIND_TEST_SCHEMA_MISSING_ACK_URL").
 schema_missing_attempt_sequence_url() -> env("GRIND_TEST_SCHEMA_MISSING_ATTEMPT_SEQUENCE_URL").
+schema_missing_unique_submissions_url() -> env("GRIND_TEST_SCHEMA_MISSING_UNIQUE_SUBMISSIONS_URL").
 schema_atomic_url() -> env("GRIND_TEST_SCHEMA_ATOMIC_URL").
 resolution_route_a_url() -> env("GRIND_TEST_RESOLUTION_ROUTE_A_URL").
 resolution_route_b_url() -> env("GRIND_TEST_RESOLUTION_ROUTE_B_URL").
+repeatable_read_url() -> env("GRIND_TEST_REPEATABLE_READ_URL").
 
 env(Name) ->
     case os:getenv(Name) of
@@ -35,3 +37,20 @@ mark_database_test_executed(Name) ->
 %% timing-sensitive test. Never used to derive a shared point in time across
 %% processes or as a substitute for a database-time boundary.
 monotonic_ms() -> erlang:monotonic_time(millisecond).
+
+%% A positive integer unique across both calls within one `gleam test` run
+%% AND separate runs (each of which is its own fresh Erlang VM, where
+%% `erlang:unique_integer/1` alone restarts from a small value every time —
+%% confirmed by observation: reusing it alone made a second, immediate
+%% `gleam test` run against the same un-recreated database collide with the
+%% first run's leftover receipt and fail). Combines wall-clock microseconds
+%% (differs across separate VM invocations) with the per-VM monotonic
+%% counter (differs across calls within one run). For suffixing fixed test
+%% literals (worker ids, submission ids, queue names) so uniqueness tests
+%% can be re-run against a persistent development database without
+%% colliding with rows/receipts a previous run left behind. Never used as a
+%% substitute for the disposable-cluster isolation the CI gate already
+%% provides.
+unique_test_run_id() ->
+    erlang:system_time(microsecond) * 1000000 +
+        erlang:unique_integer([positive, monotonic]) rem 1000000.

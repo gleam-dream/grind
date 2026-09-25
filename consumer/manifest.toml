@@ -27,5 +27,6 @@ exception = { version = ">= 2.1.1 and < 3.0.0" }
 gleam_erlang = { version = ">= 1.0.0 and < 2.0.0" }
 gleam_json = { version = ">= 3.1.0 and < 4.0.0" }
 gleam_stdlib = { version = ">= 0.70.0 and < 1.0.0" }
+gleam_time = { version = ">= 1.0.0 and < 2.0.0" }
 gleeunit = { version = ">= 1.0.0 and < 2.0.0" }
 grind = { path = ".." }

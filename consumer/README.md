@@ -64,5 +64,34 @@ ID with `postgres.bind_handle`:
   original receipt — the effect count for that key never exceeds 1, even
   though the handler itself ran twice.
 
+## Uniqueness admission through the public API
+
+`public_consumer_unique_admission_existing_conflict_and_retry_test` and
+`public_consumer_unique_reschedule_across_queues_test` exercise
+`grind/unique`/`postgres.submit_unique` entirely through public imports:
+`grind/unique`, `grind/postgres`, `grind/job`, `grind/worker`, `grind/queue`,
+and `grind/registry` — no `@internal` function and no raw `pog` connection.
+
+The first admits a job, observes a second, independently identified
+submission against the same key as `unique.Existing`, rebinds that conflict
+with the same `postgres.bind_handle` path used after a restart, and replays
+the _original_ `SubmissionId` a third time to confirm it returns the
+receipt's own recorded `Inserted` decision rather than a fresh conflict. A
+manually driven consumer then actually runs the job and reads its typed
+committed outcome.
+
+The second seeds a job scheduled an hour out, then reschedules it from a
+_different_ queue under an `AcrossQueues` policy and
+`unique.RescheduleScheduledTo` — `conflict_queue` reports the row's actual
+original queue, not the rescheduling submission's own, and the row is
+claimable and runs to a typed outcome once its new time is due.
+
+This exercise found no gap in the public surface: every step needed here —
+building a selected or full-input key, a policy, a `SubmissionId`, admitting,
+detecting a conflict, rebinding it, and reading a typed outcome — is already
+reachable with public imports alone. See `docs/UNIQUENESS-CONTRACT.md` and
+`docs/RECOVERY-EVIDENCE.md` (Increments 12 and 13) for the full contract and
+mutation evidence.
+
 Run the consumer as part of the disposable integration suite from the package
 root with `nix develop --command bash scripts/test-postgres.sh`.

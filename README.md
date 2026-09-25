@@ -14,10 +14,20 @@ fenced acknowledgement receipts, and conservative uncertainty recovery.
 Business failures support a persisted attempt limit, deterministic default or
 definition-bound retry policy, and typed terminal causes; queue handlers can
 also snooze with a checked delay. Explicit discard, worker uncertainty, and
-cooperative cancellation are implemented; uniqueness and lifecycle observations
-remain in the retained backlog. The experimental v10 schema installs only into
-an empty schema; earlier
-experimental markers and partial Grind schemas fail closed without repair.
+cooperative cancellation are implemented. Uniqueness admission
+(`submit_unique`/`reconcile_unique`) checks a typed full-input or selected
+key against a policy's queue scope, occupancy period, and eligible states
+inside one locked transaction, returning a typed handle, an existing
+conflict, or a rescheduled conflict; this milestone is complete, including
+concurrent admission under a forced barrier, lock contention, period-boundary
+timing, live rescheduling, uncertain-commit reconciliation, selected keys, and
+public-API consumer coverage — see
+[docs/UNIQUENESS-CONTRACT.md](docs/UNIQUENESS-CONTRACT.md) for the full
+contract and its remaining, explicitly listed gaps (cross-worker uniqueness,
+general field replacement, unique bulk insertion, and a few other named
+items). The experimental
+v11 schema installs only into an empty schema; earlier experimental markers
+(including v10) and partial Grind schemas fail closed without repair.
 Acknowledgement receipts retain committed attribution and a proposal fingerprint,
 not typed historical proposals. Typed outcome reads return the job's current
 result.

@@ -10,10 +10,12 @@ import gleam/result
 import gleeunit
 import gleeunit/should
 import grind
+import grind/internal/unique_admission
 import grind/job
 import grind/postgres
 import grind/queue
 import grind/registry
+import grind/unique
 import grind/worker
 import pog
 
@@ -1531,6 +1533,9 @@ fn schema_missing_acknowledgements_url() -> Result(String, Nil)
 @external(erlang, "grind_test_env", "schema_missing_attempt_sequence_url")
 fn schema_missing_attempt_sequence_url() -> Result(String, Nil)
 
+@external(erlang, "grind_test_env", "schema_missing_unique_submissions_url")
+fn schema_missing_unique_submissions_url() -> Result(String, Nil)
+
 @external(erlang, "grind_test_env", "schema_atomic_url")
 fn schema_atomic_url() -> Result(String, Nil)
 
@@ -1540,11 +1545,17 @@ fn resolution_route_a_url() -> Result(String, Nil)
 @external(erlang, "grind_test_env", "resolution_route_b_url")
 fn resolution_route_b_url() -> Result(String, Nil)
 
+@external(erlang, "grind_test_env", "repeatable_read_url")
+fn repeatable_read_url() -> Result(String, Nil)
+
 @external(erlang, "grind_test_env", "mark_database_test_executed")
 fn mark_database_test_executed(contract: String) -> Nil
 
 @external(erlang, "grind_test_env", "monotonic_ms")
 fn monotonic_ms() -> Int
+
+@external(erlang, "grind_test_env", "unique_test_run_id")
+fn unique_test_run_id() -> Int
 
 pub fn postgres_admission_round_trips_typed_arguments_test() {
   case database_url() {
@@ -1698,7 +1709,7 @@ fn run_schema_v10_install_test(database_url: String) -> Nil {
   let connection = pog.named_connection(pool_name)
   let assert Ok(schema) =
     pog.query(
-      "SELECT (SELECT count(*) = 1 AND min(version) = 10 AND max(version) = 10 FROM grind_schema_migrations), (SELECT count(*) = 4 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname IN ('grind_schema_migrations', 'grind_jobs', 'grind_job_resolutions', 'grind_job_acknowledgements') AND c.relkind = 'r'), (SELECT count(*) = 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_sequence s ON s.seqrelid = c.oid WHERE n.nspname = current_schema() AND c.relname = 'grind_attempts_id_seq' AND c.relkind = 'S' AND s.seqtypid = 'bigint'::regtype AND s.seqstart = 1 AND s.seqincrement = 1 AND s.seqmin = 1 AND s.seqcache = 1 AND NOT s.seqcycle), (SELECT count(*) = 13 AND count(*) FILTER (WHERE column_name IN ('storage_owner', 'command_id', 'queue', 'job_id', 'worker_id', 'worker_version', 'attempt_id', 'attempt_epoch', 'attempt_owner', 'committed_state', 'failure_cause', 'committed_at', 'proposal_sha256')) = 13 AND count(*) FILTER (WHERE column_name IN ('proposed_state', 'output', 'output_version', 'error', 'error_version', 'failure_description', 'committed_description', 'requested_delay_ms')) = 0 AND count(*) FILTER (WHERE column_name = 'proposal_sha256' AND udt_name = 'bytea') = 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'grind_job_acknowledgements'), (SELECT count(*) = 12 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema() AND c.convalidated AND c.conname IN ('grind_schema_migrations_pkey', 'grind_jobs_pkey', 'grind_jobs_state_check', 'grind_jobs_max_attempts_check', 'grind_job_resolutions_pkey', 'grind_job_resolutions_decision_check', 'grind_job_resolutions_target_state_check', 'grind_job_acknowledgements_pkey', 'grind_job_acknowledgements_attempt_key', 'grind_job_acknowledgements_committed_state_check', 'grind_job_acknowledgements_failure_cause_check', 'grind_job_acknowledgements_proposal_sha256_check'))",
+      "SELECT (SELECT count(*) = 1 AND min(version) = 11 AND max(version) = 11 FROM grind_schema_migrations), (SELECT count(*) = 5 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname IN ('grind_schema_migrations', 'grind_jobs', 'grind_job_resolutions', 'grind_job_acknowledgements', 'grind_unique_submissions') AND c.relkind = 'r'), (SELECT count(*) = 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_sequence s ON s.seqrelid = c.oid WHERE n.nspname = current_schema() AND c.relname = 'grind_attempts_id_seq' AND c.relkind = 'S' AND s.seqtypid = 'bigint'::regtype AND s.seqstart = 1 AND s.seqincrement = 1 AND s.seqmin = 1 AND s.seqcache = 1 AND NOT s.seqcycle), (SELECT count(*) = 13 AND count(*) FILTER (WHERE column_name IN ('storage_owner', 'command_id', 'queue', 'job_id', 'worker_id', 'worker_version', 'attempt_id', 'attempt_epoch', 'attempt_owner', 'committed_state', 'failure_cause', 'committed_at', 'proposal_sha256')) = 13 AND count(*) FILTER (WHERE column_name IN ('proposed_state', 'output', 'output_version', 'error', 'error_version', 'failure_description', 'committed_description', 'requested_delay_ms')) = 0 AND count(*) FILTER (WHERE column_name = 'proposal_sha256' AND udt_name = 'bytea') = 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'grind_job_acknowledgements'), (SELECT count(*) = 17 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = current_schema() AND c.convalidated AND c.conname IN ('grind_schema_migrations_pkey', 'grind_jobs_pkey', 'grind_jobs_state_check', 'grind_jobs_max_attempts_check', 'grind_jobs_unique_key_check', 'grind_job_resolutions_pkey', 'grind_job_resolutions_decision_check', 'grind_job_resolutions_target_state_check', 'grind_job_acknowledgements_pkey', 'grind_job_acknowledgements_attempt_key', 'grind_job_acknowledgements_committed_state_check', 'grind_job_acknowledgements_failure_cause_check', 'grind_job_acknowledgements_proposal_sha256_check', 'grind_unique_submissions_pkey', 'grind_unique_submissions_decision_check', 'grind_unique_submissions_request_sha256_check', 'grind_unique_submissions_observed_state_check')), (SELECT count(*) = 2 AND count(*) FILTER (WHERE column_name = 'unique_key_contract' AND udt_name = 'text') = 1 AND count(*) FILTER (WHERE column_name = 'unique_key_sha256' AND udt_name = 'bytea') = 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'grind_jobs' AND column_name IN ('unique_key_contract', 'unique_key_sha256')), (SELECT count(*) = 13 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'grind_unique_submissions'), (SELECT count(*) = 1 FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'grind_jobs' AND indexname = 'grind_jobs_unique_candidate_idx')",
     )
     |> pog.returning({
       use version <- decode.field(0, decode.bool)
@@ -1706,11 +1717,24 @@ fn run_schema_v10_install_test(database_url: String) -> Nil {
       use sequence <- decode.field(2, decode.bool)
       use receipt_columns <- decode.field(3, decode.bool)
       use constraints <- decode.field(4, decode.bool)
-      decode.success(#(version, tables, sequence, receipt_columns, constraints))
+      use unique_job_columns <- decode.field(5, decode.bool)
+      use unique_submission_columns <- decode.field(6, decode.bool)
+      use unique_index <- decode.field(7, decode.bool)
+      decode.success(#(
+        version,
+        tables,
+        sequence,
+        receipt_columns,
+        constraints,
+        unique_job_columns,
+        unique_submission_columns,
+        unique_index,
+      ))
     })
     |> pog.execute(on: connection)
   let assert [installed] = schema.rows
-  installed |> should.equal(#(True, True, True, True, True))
+  installed
+  |> should.equal(#(True, True, True, True, True, True, True, True))
 
   let assert Ok(sequence) =
     pog.query("SELECT nextval('grind_attempts_id_seq')")
@@ -1751,7 +1775,7 @@ fn run_schema_v10_install_test(database_url: String) -> Nil {
   postgres.migrate(database) |> should.equal(Ok(Nil))
   let assert Ok(preserved) =
     pog.query(
-      "SELECT (SELECT count(*) = 1 AND min(version) = 10 AND max(version) = 10 FROM grind_schema_migrations), (SELECT count(*) = 1 FROM grind_jobs WHERE id = $1 AND state = 'succeeded'), (SELECT count(*) = 1 FROM grind_job_acknowledgements WHERE command_id = 'schema-command' AND job_id = $1 AND attempt_id = $2 AND proposal_sha256 = sha256(convert_to('synthetic proposal', 'UTF8'))), (SELECT last_value = $2 AND is_called FROM grind_attempts_id_seq)",
+      "SELECT (SELECT count(*) = 1 AND min(version) = 11 AND max(version) = 11 FROM grind_schema_migrations), (SELECT count(*) = 1 FROM grind_jobs WHERE id = $1 AND state = 'succeeded'), (SELECT count(*) = 1 FROM grind_job_acknowledgements WHERE command_id = 'schema-command' AND job_id = $1 AND attempt_id = $2 AND proposal_sha256 = sha256(convert_to('synthetic proposal', 'UTF8'))), (SELECT last_value = $2 AND is_called FROM grind_attempts_id_seq)",
     )
     |> pog.parameter(pog.int(job_id))
     |> pog.parameter(pog.int(attempt_id))
@@ -1840,7 +1864,8 @@ fn run_schema_marker_rejection_test(database_url: String) -> Nil {
   let assert Ok(_) =
     pog.query("INSERT INTO grind_schema_migrations (version) VALUES (10)")
     |> pog.execute(on: connection)
-  postgres.migrate(database) |> should.equal(Ok(Nil))
+  postgres.migrate(database)
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(10)))
 
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations")
@@ -1848,14 +1873,22 @@ fn run_schema_marker_rejection_test(database_url: String) -> Nil {
   let assert Ok(_) =
     pog.query("INSERT INTO grind_schema_migrations (version) VALUES (11)")
     |> pog.execute(on: connection)
-  postgres.migrate(database)
-  |> should.equal(Error(postgres.UnsupportedSchemaVersion(11)))
+  postgres.migrate(database) |> should.equal(Ok(Nil))
 
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations")
     |> pog.execute(on: connection)
   let assert Ok(_) =
-    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (10)")
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (12)")
+    |> pog.execute(on: connection)
+  postgres.migrate(database)
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(12)))
+
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (11)")
     |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query("INSERT INTO grind_schema_migrations (version) VALUES (8)")
@@ -1870,13 +1903,15 @@ pub fn postgres_migration_refuses_missing_owned_artifacts_test() {
     schema_missing_migrations_url(),
     schema_missing_resolutions_url(),
     schema_missing_acknowledgements_url(),
-    schema_missing_attempt_sequence_url()
+    schema_missing_attempt_sequence_url(),
+    schema_missing_unique_submissions_url()
   {
     Ok(jobs),
       Ok(migrations),
       Ok(resolutions),
       Ok(acknowledgements),
-      Ok(sequence)
+      Ok(sequence),
+      Ok(unique_submissions)
     -> {
       run_missing_schema_artifact_test(jobs, "grind_jobs", False)
       run_missing_schema_artifact_test(
@@ -1895,9 +1930,21 @@ pub fn postgres_migration_refuses_missing_owned_artifacts_test() {
         False,
       )
       run_missing_schema_artifact_test(sequence, "grind_attempts_id_seq", True)
+      // The exact object-count shape a dropped `grind_unique_submissions`
+      // leaves behind is identical to a never-migrated schema v10 install
+      // (four tables, the same attempt sequence). This proves the two are
+      // not confused: a real v11 install missing only this table still
+      // fails closed as `IncompatibleSchema`, not as the friendly
+      // `UnsupportedSchemaVersion(10)` reserved for a genuine legacy
+      // install (see `read_legacy_schema_marker` in `src/grind/postgres.gleam`).
+      run_missing_schema_artifact_test(
+        unique_submissions,
+        "grind_unique_submissions",
+        False,
+      )
       mark_database_test_executed("missing-schema-artifacts-not-repaired")
     }
-    _, _, _, _, _ -> Nil
+    _, _, _, _, _, _ -> Nil
   }
 }
 
@@ -2509,45 +2556,32 @@ fn run_overlapping_claim_test(database_url: String) -> Nil {
     Nil
   })
 
-  let lock_ready = process.new_subject()
-  let lock_finished = process.new_subject()
-  let _ =
-    process.spawn_unlinked(fn() {
-      let release_lock = process.new_subject()
-      let transaction_result =
-        pog.transaction(connection, fn(transaction_connection) {
-          case
-            pog.query(
-              "SELECT 1 FROM (SELECT pg_advisory_xact_lock(74126, 31)) AS held",
-            )
-            |> pog.execute(on: transaction_connection)
-          {
-            Error(_) -> Error(Nil)
-            Ok(_) -> {
-              process.send(lock_ready, ClaimGateAcquired(release_lock))
-              case process.receive(release_lock, within: 10_000) {
-                Ok(ReleaseAttempt) -> Ok(Nil)
-                Error(Nil) -> Error(Nil)
-              }
-            }
-          }
-        })
-      process.send(
-        lock_finished,
-        ClaimGateReleased(result.is_ok(transaction_result)),
-      )
-    })
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(
+      connection,
+      pog.query(
+        "SELECT 1 FROM (SELECT pg_advisory_xact_lock(74126, 31)) AS held",
+      ),
+    )
   let assert Ok(ClaimGateAcquired(release_lock)) =
     process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
 
   let assert Ok(consumer_a) = queue.start_manual(database_a, workers_a)
   use <- exception.defer(fn() { queue.stop(consumer_a) })
   let assert Ok(consumer_b) = queue.start_manual(database_b, workers_b)
   use <- exception.defer(fn() { queue.stop(consumer_b) })
-  use <- exception.defer(fn() {
-    process.send(release_lock, ReleaseAttempt)
-    Nil
-  })
 
   let first_reply = process.new_subject()
   let _ =
@@ -2914,9 +2948,16 @@ fn require_syncrep_cluster_configured(connection: pog.Connection) -> Nil {
   }
 }
 
-/// Installs a deferred constraint trigger on `grind_job_acknowledgements`,
-/// scoped to `job_id`, whose function raises only that one ack transaction's
-/// `synchronous_commit` to `on` — see the Increment 2 tests below. Returns a
+/// Installs a deferred constraint trigger on `table`, scoped by `predicate`
+/// (a trusted SQL boolean expression referencing `NEW`, spliced verbatim —
+/// never caller/user input), whose function raises only that one matching
+/// transaction's `synchronous_commit` to `on` — see the Increment 2 tests
+/// below, and Increment 11's uncertain-commit tests
+/// (`grind_unique_submissions`, scoped by `submission_id` rather than a
+/// server-generated `job_id`, since the submission id is known before the
+/// admission transaction that would create the job id even starts).
+/// Generalized from an earlier draft that hard-coded both
+/// `grind_job_acknowledgements` and a `job_id` equality check. Returns a
 /// cleanup thunk for the caller to register with `exception.defer`, which
 /// first terminates any backend this same trigger still has parked in
 /// `SyncRep` (so a failing assertion earlier in the test cannot hang the
@@ -2925,22 +2966,25 @@ fn require_syncrep_cluster_configured(connection: pog.Connection) -> Nil {
 fn install_syncrep_reply_trigger(
   connection: pog.Connection,
   name: String,
-  job_id: Int,
+  table: String,
+  predicate: String,
 ) -> fn() -> Nil {
   let assert Ok(_) =
     pog.query(
       "CREATE FUNCTION "
       <> name
-      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_id <> "
-      <> int.to_string(job_id)
-      <> " THEN RETURN NEW; END IF; PERFORM set_config('synchronous_commit', 'on', true); RETURN NEW; END $$",
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NOT ("
+      <> predicate
+      <> ") THEN RETURN NEW; END IF; PERFORM set_config('synchronous_commit', 'on', true); RETURN NEW; END $$",
     )
     |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query(
       "CREATE CONSTRAINT TRIGGER "
       <> name
-      <> " AFTER INSERT ON grind_job_acknowledgements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+      <> " AFTER INSERT ON "
+      <> table
+      <> " DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
       <> name
       <> "()",
     )
@@ -2950,15 +2994,26 @@ fn install_syncrep_reply_trigger(
       Ok(stuck_pid) -> terminate_backend(connection, stuck_pid)
       Error(Nil) -> True
     }
-    let _ = pog.query("SET lock_timeout = '2s'") |> pog.execute(on: connection)
+    // `connection` is a pool, not one physical connection: a `SET
+    // lock_timeout` on its own checks out and releases a connection for
+    // that one statement alone, so it would not reliably apply to whichever
+    // (possibly different) connection the following `DROP`s happen to check
+    // out — silently leaving the DROPs unbounded again. Running
+    // `SET LOCAL` and both `DROP`s inside one `pog.transaction` pins them to
+    // the same checked-out connection, where `SET LOCAL` actually scopes.
     let _ =
-      pog.query(
-        "DROP TRIGGER IF EXISTS " <> name <> " ON grind_job_acknowledgements",
-      )
-      |> pog.execute(on: connection)
-    let _ =
-      pog.query("DROP FUNCTION IF EXISTS " <> name <> "()")
-      |> pog.execute(on: connection)
+      pog.transaction(connection, fn(transaction_connection) {
+        let _ =
+          pog.query("SET LOCAL lock_timeout = '2s'")
+          |> pog.execute(on: transaction_connection)
+        let _ =
+          pog.query("DROP TRIGGER IF EXISTS " <> name <> " ON " <> table)
+          |> pog.execute(on: transaction_connection)
+        let _ =
+          pog.query("DROP FUNCTION IF EXISTS " <> name <> "()")
+          |> pog.execute(on: transaction_connection)
+        Ok(Nil)
+      })
     Nil
   }
 }
@@ -3055,7 +3110,8 @@ fn run_ack_committed_reply_lost_reconciles_test(database_url: String) -> Nil {
   use <- exception.defer(install_syncrep_reply_trigger(
     connection,
     "grind_test_syncrep_reply_lost",
-    job_id,
+    "grind_job_acknowledgements",
+    "NEW.job_id = " <> int.to_string(job_id),
   ))
 
   process.send(release, ReleaseAttempt)
@@ -3183,7 +3239,8 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
   use <- exception.defer(install_syncrep_reply_trigger(
     observer_connection,
     "grind_test_syncrep_reply_lost_unavailable",
-    job_id,
+    "grind_job_acknowledgements",
+    "NEW.job_id = " <> int.to_string(job_id),
   ))
 
   process.send(release, ReleaseAttempt)
@@ -7000,4 +7057,4512 @@ fn run_incompatible_schema_test(database_url: String) -> Nil {
     |> pog.execute(on: connection)
   unrepaired.rows |> should.equal([#(True, True, True, True)])
   mark_database_test_executed("incompatible-schema-rejected")
+}
+
+// -- Uniqueness (grind/unique, submit_unique/reconcile_unique) --------------
+//
+// Shared helpers for the uniqueness test suite below (this section and the
+// increments-4-7 section that follows it). `unique_test_suffix` gives each
+// test run a fresh, per-process-unique numeric string; every fixed worker
+// id, queue name, and submission id these tests use includes it, so
+// re-running this suite against a persistent development database (not the
+// gate's disposable per-run cluster) never collides with rows or receipts a
+// previous run left behind.
+
+fn unique_test_suffix() -> String {
+  int.to_string(unique_test_run_id())
+}
+
+/// Starts a pool, migrates, hands the database and a raw connection to
+/// `run`, and closes the pool afterwards — the setup every uniqueness test
+/// below needs except `run_submit_unique_pre_storage_rejection_test`, which
+/// deliberately closes its pool before migrating.
+fn with_unique_database(
+  database_url: String,
+  name: String,
+  run: fn(postgres.Database, pog.Connection) -> Nil,
+) -> Nil {
+  let pool_name = process.new_name(name)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  run(database, pog.named_connection(pool_name))
+}
+
+/// The multi-pool counterpart to `with_unique_database` above: starts one
+/// separate pool (a separate physical connection) per name in `pool_names`,
+/// migrates via the first, defers closing every one, and hands the whole
+/// list of `#(Database, Connection)` pairs to `run` — for the
+/// concurrent-admission tests below that need several independent
+/// connections to the same database rather than one. Paired with its own
+/// connection (rather than returning `Database` alone) because
+/// `postgres.Database` has no public accessor back to the raw `pog.Connection`
+/// these tests need for barrier triggers, advisory locks, and
+/// `pg_stat_activity` polling — the same reason `with_unique_database` above
+/// also hands back both.
+fn with_unique_databases(
+  database_url: String,
+  pool_names: List(String),
+  run: fn(List(#(postgres.Database, pog.Connection))) -> Nil,
+) -> Nil {
+  let entries =
+    list.map(pool_names, fn(name) {
+      let pool_name = process.new_name(name)
+      let assert Ok(validated) =
+        postgres.settings(database_url, pool_name) |> postgres.validate
+      let assert Ok(database) = postgres.start(validated)
+      #(database, pog.named_connection(pool_name))
+    })
+  use <- exception.defer(fn() {
+    list.each(entries, fn(entry) { postgres.close(entry.0) })
+  })
+  let assert [#(first, _), ..] = entries
+  let assert Ok(Nil) = postgres.migrate(first)
+  run(entries)
+}
+
+/// Spawns a background process that runs `submit` (a zero-argument closure
+/// so callers can partially apply `submit_keep_existing`/`submit_reschedule`/
+/// `postgres.acknowledge_claim`/etc. with whichever database/queue/submission
+/// it needs) and sends the result to `result` — the small boilerplate every
+/// concurrent test below otherwise repeats once per concurrent caller.
+/// Generic over the result type so both the uniqueness admission tests and
+/// the acknowledgement contention test share it.
+fn spawn_submit(result: process.Subject(a), submit: fn() -> a) -> Nil {
+  let _ = process.spawn_unlinked(fn() { process.send(result, submit()) })
+  Nil
+}
+
+/// The `Int` input / `String` output (`int.to_string`) worker shape most
+/// uniqueness tests below use. `id` should already carry a
+/// `unique_test_suffix()`.
+fn unique_test_worker(id: String) -> worker.Worker(Int, String, e) {
+  let assert Ok(input_codec) =
+    worker.codec(id <> "-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(id <> "-output-v1", json.string, decode.string)
+  let assert Ok(worker_def) =
+    worker.define(id, "v1", input_codec, output_codec, fn(value) {
+      Ok(int.to_string(value))
+    })
+  worker_def
+}
+
+/// Like `unique_test_worker`, but the handler blocks (reporting
+/// `FirstAttemptStarted(release)` on `started` first) until explicitly
+/// released, instead of returning immediately. Used by the reschedule/claim
+/// race test below, which needs the claimed row to stay genuinely
+/// `executing` for a controlled window — a worker that returns immediately
+/// lets the coordinator's own subsequent acknowledgement race ahead to
+/// `succeeded` before the concurrent reschedule submission's blocked row
+/// lock is even granted, an environment-dependent race, not a deterministic
+/// proof.
+fn unique_test_blocking_worker(
+  id: String,
+  started: process.Subject(LeaseSignal),
+) -> worker.Worker(Int, String, LookupFailure) {
+  let assert Ok(input_codec) =
+    worker.codec(id <> "-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(id <> "-output-v1", json.string, decode.string)
+  let assert Ok(worker_def) =
+    worker.define(id, "v1", input_codec, output_codec, fn(value) {
+      let release = process.new_subject()
+      process.send(started, FirstAttemptStarted(release))
+      case process.receive(release, within: 10_000) {
+        Ok(ReleaseAttempt) -> Ok(int.to_string(value))
+        Error(Nil) -> Error(AccountMissing(value))
+      }
+    })
+  worker_def
+}
+
+/// `submit_unique` under the `Immediately`/`KeepExisting` case every test
+/// below needs (none of these increments exercise rescheduling).
+fn submit_keep_existing(
+  database: postgres.Database,
+  queue: String,
+  id_text: String,
+  worker_def: worker.Worker(input, output, error),
+  input: input,
+  policy: unique.Policy(input),
+) -> Result(
+  unique.Admission(input, output, error),
+  unique.SubmitError(input, output, error),
+) {
+  let assert Ok(submission) = unique.submission_id(id_text)
+  postgres.submit_unique(
+    database,
+    queue,
+    submission,
+    worker_def,
+    input,
+    unique.Immediately,
+    policy,
+    unique.KeepExisting,
+  )
+}
+
+pub fn unique_period_validation_test() {
+  unique.within_milliseconds(0, unique.FromInsertion)
+  |> should.equal(Error(unique.NonPositivePeriod))
+  unique.within_milliseconds(-1, unique.FromSchedule)
+  |> should.equal(Error(unique.NonPositivePeriod))
+  let too_large = worker.retry_delay_maximum_milliseconds() + 1
+  unique.within_milliseconds(too_large, unique.FromInsertion)
+  |> should.equal(Error(unique.PeriodAbovePrecisionBound))
+  let assert Ok(_) = unique.within_milliseconds(1000, unique.FromInsertion)
+  let assert Ok(_) =
+    unique.within_milliseconds(
+      worker.retry_delay_maximum_milliseconds(),
+      unique.FromSchedule,
+    )
+  Nil
+}
+
+pub fn unique_key_and_submission_id_validation_test() {
+  let assert Ok(codec) = worker.codec("unique-key-v1", json.int, decode.int)
+  unique.selected("", fn(input: Int) { input }, codec)
+  |> should.equal(Error(unique.EmptyKeyName))
+  let assert Ok(_) = unique.selected("account", fn(input: Int) { input }, codec)
+
+  unique.submission_id("") |> should.equal(Error(unique.EmptySubmissionId))
+  let assert Ok(id) = unique.submission_id("abc-123")
+  unique.submission_id_value(id) |> should.equal("abc-123")
+}
+
+pub fn postgres_unique_lock_wait_must_be_positive_test() {
+  let name = process.new_name("grind_unique_lock_wait_validation")
+  let base = postgres.settings("postgres://grind@127.0.0.1:5432/unused", name)
+
+  base
+  |> postgres.unique_lock_wait(0)
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidUniqueLockWait))
+
+  base
+  |> postgres.unique_lock_wait(-5)
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidUniqueLockWait))
+
+  case base |> postgres.unique_lock_wait(200) |> postgres.validate {
+    Ok(_) -> Nil
+    Error(_) -> should.fail()
+  }
+}
+
+type RawInput {
+  RawInput(json.Json)
+}
+
+fn encode_raw_input(input: RawInput) -> json.Json {
+  let RawInput(value) = input
+  value
+}
+
+fn raw_input_decoder() -> decode.Decoder(RawInput) {
+  decode.success(RawInput(json.null()))
+}
+
+pub fn postgres_submit_unique_rejects_before_touching_storage_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_submit_unique_pre_storage_rejection_test(database_url)
+  }
+}
+
+fn run_submit_unique_pre_storage_rejection_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_unique_closed_pool")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  // Closed immediately: any query attempt beyond this point would fail at
+  // the storage boundary, so a passing test here proves the empty-queue
+  // rejection is a pure check that runs before `submit_unique` ever reaches
+  // the database.
+  postgres.close(database)
+
+  let worker_def = unique_test_worker("unique.closed-" <> suffix)
+  let assert Ok(period) = unique.within_milliseconds(1000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  submit_keep_existing(
+    database,
+    "",
+    "unique-closed-" <> suffix,
+    worker_def,
+    1,
+    policy,
+  )
+  |> should.equal(Error(unique.EmptyQueueName))
+
+  mark_database_test_executed("unique-pre-storage-rejections-passed")
+}
+
+pub fn postgres_submit_unique_admits_and_detects_existing_conflict_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_unique_existing_conflict_test(database_url)
+  }
+}
+
+fn run_submit_unique_existing_conflict_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_pool",
+  )
+  let worker_def = unique_test_worker("unique.existing-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "default-" <> suffix
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-existing-1-" <> suffix,
+      worker_def,
+      7,
+      policy,
+    )
+
+  let assert Ok(unique.Existing(conflict)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-existing-2-" <> suffix,
+      worker_def,
+      7,
+      policy,
+    )
+  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
+  unique.conflict_queue(conflict) |> should.equal(test_queue)
+  unique.conflict_state(conflict) |> should.equal(job.Queued)
+
+  let assert Ok(bound) =
+    postgres.bind_handle(database, worker_def, unique.conflict_job_id(conflict))
+  postgres.arguments(database, bound) |> should.equal(Ok(7))
+
+  let assert Ok(unique.Inserted(other_handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-existing-3-" <> suffix,
+      worker_def,
+      8,
+      policy,
+    )
+  job.id_value(other_handle) |> should.not_equal(job.id_value(handle))
+
+  mark_database_test_executed("unique-admission-existing-conflict-passed")
+}
+
+pub fn postgres_submit_unique_json_equality_matches_postgres_jsonb_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_unique_json_equality_test(database_url)
+  }
+}
+
+fn run_submit_unique_json_equality_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_json_pool",
+  )
+  let assert Ok(input_codec) =
+    worker.codec(
+      "unique-json-input-" <> suffix <> "-v1",
+      encode_raw_input,
+      raw_input_decoder(),
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "unique-json-output-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(worker_def) =
+    worker.define(
+      "unique.json-equality-" <> suffix,
+      "v1",
+      input_codec,
+      output_codec,
+      fn(_) { Ok("done") },
+    )
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "json-equality-" <> suffix
+
+  let admit = fn(tag: String, value: json.Json) {
+    submit_keep_existing(
+      database,
+      test_queue,
+      tag <> "-" <> suffix,
+      worker_def,
+      RawInput(value),
+      policy,
+    )
+  }
+
+  // Field order is irrelevant: {"a":1,"b":2} conflicts with {"b":2,"a":1}.
+  let assert Ok(unique.Inserted(_)) =
+    admit(
+      "field-order-1",
+      json.object([#("a", json.int(1)), #("b", json.int(2))]),
+    )
+  let assert Ok(unique.Existing(_)) =
+    admit(
+      "field-order-2",
+      json.object([#("b", json.int(2)), #("a", json.int(1))]),
+    )
+
+  // 1 and 1.0 are distinct scalars under PostgreSQL's own jsonb::text
+  // rendering: a deliberate departure from a cross-language canonical JSON
+  // equality (see docs/UNIQUENESS-CONTRACT.md).
+  let assert Ok(unique.Inserted(_)) = admit("numeric-int", json.int(1))
+  let assert Ok(unique.Inserted(_)) = admit("numeric-float", json.float(1.0))
+
+  // Array order is significant.
+  let assert Ok(unique.Inserted(_)) =
+    admit("array-order-1", json.array([1, 2], of: json.int))
+  let assert Ok(unique.Inserted(_)) =
+    admit("array-order-2", json.array([2, 1], of: json.int))
+
+  // {id:1} does not conflict with {id:1, extra:2}: exact equality, not
+  // Oban's containment semantics.
+  let assert Ok(unique.Inserted(_)) =
+    admit("subset-1", json.object([#("id", json.int(1))]))
+  let assert Ok(unique.Inserted(_)) =
+    admit(
+      "subset-2",
+      json.object([#("id", json.int(1)), #("extra", json.int(2))]),
+    )
+
+  // An empty object does not conflict with a non-empty one.
+  let assert Ok(unique.Inserted(_)) = admit("empty", json.object([]))
+  let assert Ok(unique.Inserted(_)) =
+    admit("non-empty", json.object([#("a", json.int(1))]))
+
+  mark_database_test_executed("unique-json-equality-cases-passed")
+}
+
+pub fn postgres_submit_unique_scopes_key_to_worker_identity_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_unique_worker_identity_test(database_url)
+  }
+}
+
+fn run_submit_unique_worker_identity_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_worker_pool",
+  )
+  let assert Ok(input_codec) =
+    worker.codec(
+      "unique-identity-input-" <> suffix <> "-v1",
+      json.int,
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "unique-identity-output-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let worker_id = "unique.identity-" <> suffix
+  let assert Ok(worker_v1) =
+    worker.define(worker_id, "v1", input_codec, output_codec, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let assert Ok(worker_v2) =
+    worker.define(worker_id, "v2", input_codec, output_codec, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let assert Ok(other_worker) =
+    worker.define(
+      "unique.identity-other-" <> suffix,
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "identity-" <> suffix
+
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-identity-v1-" <> suffix,
+      worker_v1,
+      5,
+      policy,
+    )
+
+  // Same worker id, different worker version: proven-by-mutation isolation
+  // (dropping worker_version from the candidate match makes this line see
+  // the v1 row above as a false conflict instead of `Inserted`).
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-identity-v2-" <> suffix,
+      worker_v2,
+      5,
+      policy,
+    )
+
+  // A different worker id entirely: does not conflict either.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-identity-other-" <> suffix,
+      other_worker,
+      5,
+      policy,
+    )
+
+  // The same worker and version, same input, does still conflict.
+  let assert Ok(unique.Existing(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-identity-repeat-" <> suffix,
+      worker_v1,
+      5,
+      policy,
+    )
+
+  mark_database_test_executed("unique-worker-identity-isolation-passed")
+}
+
+pub fn postgres_submit_unique_ignores_plain_submitted_rows_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_unique_plain_submit_test(database_url)
+  }
+}
+
+fn run_submit_unique_plain_submit_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_plain_pool",
+  )
+  let worker_def = unique_test_worker("unique.plain-" <> suffix)
+  let test_queue = "plain-" <> suffix
+  let assert Ok(_plain_handle) =
+    postgres.submit(database, test_queue, worker_def, 99)
+
+  // AllRetained deliberately widens eligibility to every persisted state, so
+  // a false match here could only come from the plain row's NULL
+  // unique_key_contract/unique_key_sha256 being mishandled, not from a
+  // states filter accidentally excluding it.
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.AllRetained,
+    )
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-plain-1-" <> suffix,
+      worker_def,
+      99,
+      policy,
+    )
+
+  mark_database_test_executed("unique-plain-submit-non-participation-passed")
+}
+
+// -- Uniqueness increments 4-7 (queue scope, state eligibility, period
+// boundaries at database time, receipts/idempotency) -----------------------
+//
+// Shared helpers for forcing a persisted column via raw SQL and for counting
+// rows, used by the tests below.
+
+fn force_job_timestamp(
+  connection: pog.Connection,
+  job_id: Int,
+  column: String,
+  sql_expression: String,
+) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET "
+      <> column
+      <> " = "
+      <> sql_expression
+      <> " WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  Nil
+}
+
+fn force_job_state(
+  connection: pog.Connection,
+  job_id: Int,
+  state: String,
+) -> Nil {
+  let assert Ok(_) =
+    pog.query("UPDATE grind_jobs SET state = $1 WHERE id = $2")
+    |> pog.parameter(pog.text(state))
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  Nil
+}
+
+fn count_jobs_in_queue(connection: pog.Connection, queue: String) -> Int {
+  let assert Ok(returned) =
+    pog.query("SELECT count(*)::bigint FROM grind_jobs WHERE queue = $1")
+    |> pog.parameter(pog.text(queue))
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+    |> pog.execute(on: connection)
+  let assert [count] = returned.rows
+  count
+}
+
+fn count_acknowledgements_for_job(
+  connection: pog.Connection,
+  job_id: Int,
+) -> Int {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT count(*)::bigint FROM grind_job_acknowledgements WHERE job_id = $1",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+    |> pog.execute(on: connection)
+  let assert [count] = returned.rows
+  count
+}
+
+/// Polls (bounded) until the number of other active backends waiting on an
+/// **advisory** lock equals `advisory_target` and the number waiting on a
+/// **row** lock (`transactionid`, PostgreSQL's wait event for a tuple lock
+/// held by another transaction) equals `transactionid_target` — both from
+/// one query over one snapshot, the same discipline `await_overlap_shape`
+/// above uses. Unlike `await_overlap_shape`, this does not key off query
+/// text: the two waiters here run byte-identical SQL (the same
+/// acknowledgement command retried), so only `wait_event` tells them apart.
+fn await_lock_wait_counts(
+  connection: pog.Connection,
+  advisory_target: Int,
+  transactionid_target: Int,
+  checks_remaining: Int,
+) -> Bool {
+  let counts =
+    pog.query(
+      "SELECT count(*) FILTER (WHERE wait_event = 'advisory'), count(*) FILTER (WHERE wait_event = 'transactionid') FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock'",
+    )
+    |> pog.returning({
+      use advisory <- decode.field(0, decode.int)
+      use transactionid <- decode.field(1, decode.int)
+      decode.success(#(advisory, transactionid))
+    })
+    |> pog.execute(on: connection)
+    |> result.map_error(fn(_) { Nil })
+    |> result.try(fn(returned) {
+      case returned.rows {
+        [pair] -> Ok(pair)
+        _ -> Error(Nil)
+      }
+    })
+  case counts {
+    Ok(#(advisory, transactionid))
+      if advisory == advisory_target && transactionid == transactionid_target
+    -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_lock_wait_counts(
+            connection,
+            advisory_target,
+            transactionid_target,
+            checks_remaining - 1,
+          )
+        }
+        False -> False
+      }
+  }
+}
+
+// -- Uniqueness (increments 8-9: forced concurrent overlap, contention) ----
+//
+// Shared helpers for the barrier-forced-overlap and lock-contention tests
+// below. These reuse `ClaimGateSignal`/`LeaseCommand` (already declared for
+// `run_overlapping_claim_test`'s inline hold-then-release-on-cue shape) and
+// generalize that same shape into `spawn_lock_holder`, rather than
+// re-declaring it per test.
+
+/// Spawns a background process that opens its own transaction on
+/// `connection`, executes `acquire_query` (expected to run and hold some
+/// PostgreSQL lock for the rest of that transaction — an advisory lock or a
+/// row lock), signals `ClaimGateAcquired` once `acquire_query` has returned,
+/// then waits (bounded) for a release before committing (which releases
+/// whatever lock it holds). `run_overlapping_claim_test` uses this exact
+/// shape inline for its own claim-`UPDATE` barrier; factored out here so
+/// every uniqueness barrier/contention test below shares one
+/// implementation instead of re-declaring it.
+fn spawn_lock_holder(
+  connection: pog.Connection,
+  acquire_query: pog.Query(a),
+) -> #(process.Subject(ClaimGateSignal), process.Subject(ClaimGateSignal)) {
+  let lock_ready = process.new_subject()
+  let lock_finished = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      // `release_lock` must be created by this spawned process, not the
+      // caller: `process.receive` only allows the subject's own creator to
+      // receive on it, exactly like `run_overlapping_claim_test`'s inline
+      // version of this same shape above declares it inside the spawned
+      // closure and hands it to the caller via `ClaimGateAcquired`.
+      let release_lock = process.new_subject()
+      let transaction_result =
+        pog.transaction(connection, fn(transaction_connection) {
+          case pog.execute(acquire_query, on: transaction_connection) {
+            Error(_) -> Error(Nil)
+            Ok(_) -> {
+              process.send(lock_ready, ClaimGateAcquired(release_lock))
+              case process.receive(release_lock, within: 10_000) {
+                Ok(ReleaseAttempt) -> Ok(Nil)
+                Error(Nil) -> Error(Nil)
+              }
+            }
+          }
+        })
+      process.send(
+        lock_finished,
+        ClaimGateReleased(result.is_ok(transaction_result)),
+      )
+    })
+  #(lock_ready, lock_finished)
+}
+
+/// Installs a `BEFORE INSERT` trigger on `grind_jobs`, scoped to
+/// `worker_id`, that blocks any insert for that worker behind
+/// `pg_advisory_xact_lock(lock_key)` — the same held-then-released-on-cue
+/// barrier shape `run_overlapping_claim_test`'s `grind_test_claim_overlap`
+/// trigger uses for a claim `UPDATE`, generalized here to an `INSERT` and
+/// parameterized by worker id and lock key so the forced-overlap tests
+/// below (including the mixed-scope variant, which needs its own separate
+/// lock key) share one trigger implementation. Returns a cleanup thunk for
+/// `exception.defer`.
+fn install_unique_insert_barrier(
+  connection: pog.Connection,
+  name: String,
+  worker_id: String,
+  lock_key: Int,
+) -> fn() -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.worker_id = '"
+      <> worker_id
+      <> "' THEN PERFORM pg_advisory_xact_lock("
+      <> int.to_string(lock_key)
+      <> "); END IF; RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER "
+      <> name
+      <> " BEFORE INSERT ON grind_jobs FOR EACH ROW EXECUTE FUNCTION "
+      <> name
+      <> "()",
+    )
+    |> pog.execute(on: connection)
+  fn() {
+    let _ =
+      pog.query("DROP TRIGGER IF EXISTS " <> name <> " ON grind_jobs")
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> name <> "()")
+      |> pog.execute(on: connection)
+    Nil
+  }
+}
+
+/// A deterministic advisory-lock key, distinct per test run (derived from
+/// `unique_test_run_id()`) and offset well clear of every other literal
+/// advisory-lock key this suite hard-codes elsewhere (74126/31 in
+/// `run_overlapping_claim_test`), for the forced-overlap barrier triggers
+/// below. `salt` lets one test declare more than one distinct key (the
+/// mixed-scope variant runs alongside the main overlap test, in the same
+/// `gleam test` process, and must not share a lock key with it).
+fn unique_test_lock_key(salt: Int) -> Int {
+  let assert Ok(reduced) = int.modulo(unique_test_run_id(), by: 100_000_000)
+  900_000_000 + reduced + salt
+}
+
+/// Polls (bounded) until the number of other active backends whose query
+/// text matches `insert_like` equals `insert_target`, and the number
+/// matching `lock_like` equals `lock_target`, **at the same instant** — both
+/// counted from one query so the two figures are never read from two
+/// different moments in time. Used to prove the forced-overlap barrier's
+/// exact expected shape (one backend blocked inserting behind the test's
+/// own held trigger lock, N others blocked acquiring the real uniqueness
+/// domain lock) rather than inferring it from timing alone, the same
+/// discipline `await_claim_waiting_on_advisory` above uses for the
+/// claim-overlap barrier.
+fn await_overlap_shape(
+  connection: pog.Connection,
+  insert_like: String,
+  lock_like: String,
+  insert_target: Int,
+  lock_target: Int,
+  checks_remaining: Int,
+) -> Bool {
+  let counts =
+    pog.query(
+      "SELECT count(*) FILTER (WHERE query LIKE $1), count(*) FILTER (WHERE query LIKE $2) FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND pid <> pg_backend_pid() AND state = 'active' AND wait_event_type = 'Lock' AND wait_event = 'advisory'",
+    )
+    |> pog.parameter(pog.text(insert_like))
+    |> pog.parameter(pog.text(lock_like))
+    |> pog.returning({
+      use inserting <- decode.field(0, decode.int)
+      use locking <- decode.field(1, decode.int)
+      decode.success(#(inserting, locking))
+    })
+    |> pog.execute(on: connection)
+    |> result.map_error(fn(_) { Nil })
+    |> result.try(fn(returned) {
+      case returned.rows {
+        [pair] -> Ok(pair)
+        _ -> Error(Nil)
+      }
+    })
+  case counts {
+    Ok(#(inserting, locking))
+      if inserting == insert_target && locking == lock_target
+    -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_overlap_shape(
+            connection,
+            insert_like,
+            lock_like,
+            insert_target,
+            lock_target,
+            checks_remaining - 1,
+          )
+        }
+        False -> False
+      }
+  }
+}
+
+/// The exact query text `grind/internal/unique_admission`'s `insert_job`
+/// issues, as a `LIKE` prefix for `await_overlap_shape`/`pg_stat_activity`.
+const unique_insert_query_like = "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version%"
+
+/// The exact query text `grind/internal/unique_admission`'s `acquire_lock`
+/// issues, as a `LIKE` prefix for `await_overlap_shape`/`pg_stat_activity`.
+const unique_domain_lock_query_like = "SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended%"
+
+fn unique_receipt_exists(
+  connection: pog.Connection,
+  storage_owner: String,
+  submission_id_text: String,
+) -> Bool {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT EXISTS(SELECT 1 FROM grind_unique_submissions WHERE storage_owner = $1 AND submission_id = $2)",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(submission_id_text))
+    |> pog.returning({
+      use exists <- decode.field(0, decode.bool)
+      decode.success(exists)
+    })
+    |> pog.execute(on: connection)
+  let assert [exists] = returned.rows
+  exists
+}
+
+fn job_available_at_ms(connection: pog.Connection, job_id: Int) -> Int {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT (extract(epoch FROM available_at) * 1000)::bigint FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.returning({
+      use ms <- decode.field(0, decode.int)
+      decode.success(ms)
+    })
+    |> pog.execute(on: connection)
+  let assert [ms] = returned.rows
+  ms
+}
+
+/// Forces a row's `available_at` to a due (past) database time directly,
+/// leaving `state` untouched — used by the Increment 10 reschedule/claim race
+/// test to make a genuinely `scheduled` row immediately claimable without
+/// waiting on wall-clock time, so the only real synchronization point in that
+/// test is the barrier-forced lock overlap itself.
+fn force_available_at_due(connection: pog.Connection, job_id: Int) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET available_at = clock_timestamp() - interval '2 seconds' WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  Nil
+}
+
+/// Reads a receipt's `rescheduled_from`/`rescheduled_to` columns (both
+/// `NULL` for a non-reschedule decision), in milliseconds, for the Increment
+/// 10 reschedule tests.
+fn unique_receipt_reschedule_fields(
+  connection: pog.Connection,
+  storage_owner: String,
+  submission_id_text: String,
+) -> #(Option(Int), Option(Int)) {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT (extract(epoch FROM rescheduled_from) * 1000)::bigint, (extract(epoch FROM rescheduled_to) * 1000)::bigint FROM grind_unique_submissions WHERE storage_owner = $1 AND submission_id = $2",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(submission_id_text))
+    |> pog.returning({
+      use from_ms <- decode.field(0, decode.optional(decode.int))
+      use to_ms <- decode.field(1, decode.optional(decode.int))
+      decode.success(#(from_ms, to_ms))
+    })
+    |> pog.execute(on: connection)
+  let assert [row] = returned.rows
+  row
+}
+
+/// `submit_unique` under `Immediately`/`RescheduleScheduledTo(target)`, the
+/// counterpart to `submit_keep_existing` above for the reschedule-action
+/// tests below.
+fn submit_reschedule(
+  database: postgres.Database,
+  queue: String,
+  id_text: String,
+  worker_def: worker.Worker(input, output, error),
+  input: input,
+  policy: unique.Policy(input),
+  target: job.AvailableAt,
+) -> Result(
+  unique.Admission(input, output, error),
+  unique.SubmitError(input, output, error),
+) {
+  let assert Ok(submission) = unique.submission_id(id_text)
+  postgres.submit_unique(
+    database,
+    queue,
+    submission,
+    worker_def,
+    input,
+    unique.Immediately,
+    policy,
+    unique.RescheduleScheduledTo(target),
+  )
+}
+
+/// A future database-time `AvailableAt`, `offset_ms` ahead of the test
+/// cluster's own `clock_timestamp()` — never the calling BEAM node's clock —
+/// read through `connection`.
+fn future_available_at(
+  connection: pog.Connection,
+  offset_ms: Int,
+) -> job.AvailableAt {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT (extract(epoch FROM clock_timestamp()) * 1000)::bigint + $1",
+    )
+    |> pog.parameter(pog.int(offset_ms))
+    |> pog.returning({
+      use ms <- decode.field(0, decode.int)
+      decode.success(ms)
+    })
+    |> pog.execute(on: connection)
+  let assert [future_ms] = returned.rows
+  let assert Ok(available_at) = job.available_at(future_ms)
+  available_at
+}
+
+/// The domain-wide uniqueness advisory lock's own SQL and parameters (`@internal
+/// unique_admission.lock_key_sql`), built from a worker/input pair exactly the
+/// way `grind/internal/unique_admission`'s `acquire_lock` would for a real
+/// `submit_unique` call against that worker and input under `full_input()`
+/// — used by the increment 9 contention tests below to hold, from the test
+/// itself, the *same* lock a concurrent `submit_unique` call would need.
+fn unique_domain_lock_query(
+  database: postgres.Database,
+  worker_def: worker.Worker(input, output, error),
+  input: input,
+) -> pog.Query(Bool) {
+  let storage_owner = postgres.storage_owner(database)
+  let worker_meta = worker.metadata(worker_def)
+  let encoded_input = worker.encode_input(worker_def, input)
+  let #(key_contract, encoded_key) =
+    unique.key_material(
+      unique.full_input(),
+      input,
+      worker_meta.input_version,
+      encoded_input,
+    )
+  unique_admission.lock_query(
+    storage_owner,
+    worker_meta.id,
+    worker_meta.worker_version,
+    key_contract,
+    encoded_key,
+  )
+}
+
+/// Increment 4: `WithinQueue` admits the same key independently in two
+/// queues; `AcrossQueues` then conflicts with the earlier of the two rows
+/// (lowest id) regardless of which queue it lives in.
+pub fn postgres_submit_unique_respects_queue_scope_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_unique_queue_scope_test(database_url)
+  }
+}
+
+fn run_submit_unique_queue_scope_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_queue_scope",
+  )
+  let worker_def = unique_test_worker("unique.queue-scope-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy_within =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let policy_across =
+    unique.policy(
+      unique.full_input(),
+      unique.AcrossQueues,
+      period,
+      unique.Incomplete,
+    )
+  let queue_1 = "q1-" <> suffix
+  let queue_2 = "q2-" <> suffix
+
+  let assert Ok(unique.Inserted(handle_q1)) =
+    submit_keep_existing(
+      database,
+      queue_1,
+      "unique-queue-scope-q1-" <> suffix,
+      worker_def,
+      1,
+      policy_within,
+    )
+
+  // WithinQueue: the same key admits independently in a second queue.
+  let assert Ok(unique.Inserted(handle_q2)) =
+    submit_keep_existing(
+      database,
+      queue_2,
+      "unique-queue-scope-q2-" <> suffix,
+      worker_def,
+      1,
+      policy_within,
+    )
+  job.id_value(handle_q2) |> should.not_equal(job.id_value(handle_q1))
+
+  // AcrossQueues submitted against q2 conflicts with the earlier q1 row.
+  let assert Ok(unique.Existing(conflict)) =
+    submit_keep_existing(
+      database,
+      queue_2,
+      "unique-queue-scope-across-" <> suffix,
+      worker_def,
+      1,
+      policy_across,
+    )
+  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle_q1))
+  unique.conflict_queue(conflict) |> should.equal(queue_1)
+
+  mark_database_test_executed("unique-queue-scope-passed")
+}
+
+/// Increment 5(a): force each of the 11 persisted states by raw SQL and
+/// assert each of the four named `States` groups' eligibility for it.
+type StateEligibility {
+  StateEligibility(
+    stored: String,
+    incomplete: Bool,
+    scheduled_only: Bool,
+    incomplete_or_succeeded: Bool,
+    all_retained: Bool,
+  )
+}
+
+fn unique_state_eligibility_matrix() -> List(StateEligibility) {
+  [
+    StateEligibility("queued", True, False, True, True),
+    StateEligibility("scheduled", True, True, True, True),
+    StateEligibility("retryable", True, False, True, True),
+    StateEligibility("executing", True, False, True, True),
+    StateEligibility("succeeded", False, False, True, True),
+    StateEligibility("business_failed", False, False, False, True),
+    StateEligibility("runtime_failed", False, False, False, True),
+    StateEligibility("contract_mismatch", False, False, False, True),
+    StateEligibility("uncertain", True, False, True, True),
+    StateEligibility("discarded", False, False, False, True),
+    StateEligibility("cancelled", False, False, False, True),
+  ]
+}
+
+pub fn postgres_submit_unique_state_eligibility_matrix_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_state_eligibility_matrix_test(database_url)
+  }
+}
+
+fn run_state_eligibility_matrix_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_states_pool",
+  )
+  let assert Ok(input_codec) =
+    worker.codec(
+      "unique-states-input-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "unique-states-output-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(worker_def) =
+    worker.define(
+      "unique.states-" <> suffix,
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(value) },
+    )
+  let period = unique.while_retained()
+  let test_queue = "states-" <> suffix
+
+  let groups = [
+    #(unique.Incomplete, "incomplete", fn(row: StateEligibility) {
+      row.incomplete
+    }),
+    #(unique.ScheduledOnly, "scheduled-only", fn(row: StateEligibility) {
+      row.scheduled_only
+    }),
+    #(
+      unique.IncompleteOrSucceeded,
+      "incomplete-or-succeeded",
+      fn(row: StateEligibility) { row.incomplete_or_succeeded },
+    ),
+    #(unique.AllRetained, "all-retained", fn(row: StateEligibility) {
+      row.all_retained
+    }),
+  ]
+
+  unique_state_eligibility_matrix()
+  |> list.each(fn(row) {
+    groups
+    |> list.each(fn(group) {
+      let #(states, label, eligible) = group
+      let key_input = suffix <> "/" <> row.stored <> "/" <> label
+      let policy =
+        unique.policy(unique.full_input(), unique.WithinQueue, period, states)
+
+      let assert Ok(unique.Inserted(handle)) =
+        submit_keep_existing(
+          database,
+          test_queue,
+          "unique-states-insert-" <> key_input,
+          worker_def,
+          key_input,
+          policy,
+        )
+      let job_id = job.id_value(handle)
+      force_job_state(connection, job_id, row.stored)
+
+      let result =
+        submit_keep_existing(
+          database,
+          test_queue,
+          "unique-states-check-" <> key_input,
+          worker_def,
+          key_input,
+          policy,
+        )
+      case eligible(row) {
+        True -> {
+          let assert Ok(unique.Existing(conflict)) = result
+          unique.conflict_job_id(conflict) |> should.equal(job_id)
+        }
+        False -> {
+          let assert Ok(unique.Inserted(_)) = result
+          Nil
+        }
+      }
+    })
+  })
+
+  mark_database_test_executed("unique-state-eligibility-matrix-passed")
+}
+
+/// Increment 5(b): a live transition through a real, manually-driven
+/// consumer — `Incomplete` sees the row while it is genuinely `queued`, then
+/// stops seeing it once the job has genuinely succeeded, while
+/// `IncompleteOrSucceeded` still matches the original succeeded row.
+pub fn postgres_submit_unique_state_live_transition_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_state_live_transition_test(database_url)
+  }
+}
+
+fn run_state_live_transition_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_live_transition",
+  )
+  let worker_def = unique_test_worker("unique.live-" <> suffix)
+  let test_queue = "unique-live-" <> suffix
+  let assert Ok(registry_workers) = registry.new(test_queue)
+  let assert Ok(registry_workers) =
+    registry.register(registry_workers, worker_def)
+  let assert Ok(consumer) = queue.start_manual(database, registry_workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let period = unique.while_retained()
+  let policy_incomplete =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let policy_incomplete_or_succeeded =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.IncompleteOrSucceeded,
+    )
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-live-1-" <> suffix,
+      worker_def,
+      99,
+      policy_incomplete,
+    )
+
+  // While the row is genuinely still queued, `Incomplete` sees it.
+  let assert Ok(unique.Existing(conflict_while_queued)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-live-2-" <> suffix,
+      worker_def,
+      99,
+      policy_incomplete,
+    )
+  unique.conflict_job_id(conflict_while_queued)
+  |> should.equal(job.id_value(handle))
+
+  // Run it to a real, committed success.
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
+
+  // After a genuine success, `Incomplete` no longer counts it: a fresh row
+  // is admitted.
+  let assert Ok(unique.Inserted(handle_after_success)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-live-3-" <> suffix,
+      worker_def,
+      99,
+      policy_incomplete,
+    )
+  job.id_value(handle_after_success)
+  |> should.not_equal(job.id_value(handle))
+
+  // `IncompleteOrSucceeded` still matches the original succeeded row (lowest
+  // id), not the fresh one `Incomplete` just admitted.
+  let assert Ok(unique.Existing(conflict_after_success)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-live-4-" <> suffix,
+      worker_def,
+      99,
+      policy_incomplete_or_succeeded,
+    )
+  unique.conflict_job_id(conflict_after_success)
+  |> should.equal(job.id_value(handle))
+  unique.conflict_state(conflict_after_success) |> should.equal(job.Succeeded)
+
+  mark_database_test_executed("unique-state-live-transition-passed")
+}
+
+/// Increment 6(a): the shared `@internal` period predicate at an exact
+/// database-time instant, against literal timestamps only (no table
+/// involved) — `now = ts + period` is inclusive (`true`); one microsecond
+/// later is not.
+pub fn postgres_unique_period_predicate_matches_the_exact_instant_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_period_predicate_exact_instant_test(database_url)
+  }
+}
+
+fn run_period_predicate_exact_instant_test(database_url: String) -> Nil {
+  use _database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_period_predicate",
+  )
+  let ts = "timestamptz '2024-01-01 00:00:00+00'"
+  let now_at_boundary = "timestamptz '2024-01-01 00:00:05+00'"
+  let now_past_boundary = "timestamptz '2024-01-01 00:00:05.000001+00'"
+  let period_ms = "5000"
+
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT "
+      <> unique_admission.period_predicate(ts, now_at_boundary, period_ms)
+      <> ", "
+      <> unique_admission.period_predicate(ts, now_past_boundary, period_ms),
+    )
+    |> pog.returning({
+      use at_boundary <- decode.field(0, decode.bool)
+      use past_boundary <- decode.field(1, decode.bool)
+      decode.success(#(at_boundary, past_boundary))
+    })
+    |> pog.execute(on: connection)
+  let assert [#(at_boundary, past_boundary)] = returned.rows
+  at_boundary |> should.equal(True)
+  past_boundary |> should.equal(False)
+
+  mark_database_test_executed("unique-period-predicate-exact-instant-passed")
+}
+
+/// Increment 6(b): `FromInsertion` at the database clock, live through
+/// `submit_unique` (not the predicate alone) — 58 seconds inside a 60-second
+/// window still conflicts; 62 seconds outside it does not.
+pub fn postgres_submit_unique_from_insertion_period_matches_database_time_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_period_from_insertion_boundary_test(database_url)
+  }
+}
+
+fn run_period_from_insertion_boundary_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_from_insertion",
+  )
+  let worker_def = unique_test_worker("unique.from-insertion-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(60_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "from-insertion-" <> suffix
+
+  // Inserted 58 seconds ago: still inside the 60-second window.
+  let assert Ok(unique.Inserted(handle_within)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-insertion-within-1-" <> suffix,
+      worker_def,
+      1,
+      policy,
+    )
+  force_job_timestamp(
+    connection,
+    job.id_value(handle_within),
+    "inserted_at",
+    "clock_timestamp() - interval '58 seconds'",
+  )
+  let assert Ok(unique.Existing(conflict_within)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-insertion-within-2-" <> suffix,
+      worker_def,
+      1,
+      policy,
+    )
+  unique.conflict_job_id(conflict_within)
+  |> should.equal(job.id_value(handle_within))
+
+  // Inserted 62 seconds ago: outside the 60-second window.
+  let assert Ok(unique.Inserted(handle_outside)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-insertion-outside-1-" <> suffix,
+      worker_def,
+      2,
+      policy,
+    )
+  force_job_timestamp(
+    connection,
+    job.id_value(handle_outside),
+    "inserted_at",
+    "clock_timestamp() - interval '62 seconds'",
+  )
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-insertion-outside-2-" <> suffix,
+      worker_def,
+      2,
+      policy,
+    )
+
+  mark_database_test_executed("unique-period-from-insertion-boundary-passed")
+}
+
+/// Increment 6(c): `FromSchedule`, "compared to the scheduled time" (Oban's
+/// own framing) — a row whose `available_at` is 121 seconds in the past no
+/// longer conflicts under a 120-second period; 119 seconds still does.
+pub fn postgres_submit_unique_from_schedule_period_past_boundary_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_period_from_schedule_past_boundary_test(database_url)
+  }
+}
+
+fn run_period_from_schedule_past_boundary_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_from_schedule_past",
+  )
+  let worker_def = unique_test_worker("unique.from-schedule-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(120_000, unique.FromSchedule)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "from-schedule-past-" <> suffix
+
+  // Scheduled 121 seconds in the past: outside the 120-second window.
+  let assert Ok(unique.Inserted(handle_outside)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-schedule-outside-1-" <> suffix,
+      worker_def,
+      1,
+      policy,
+    )
+  force_job_timestamp(
+    connection,
+    job.id_value(handle_outside),
+    "available_at",
+    "clock_timestamp() - interval '121 seconds'",
+  )
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-schedule-outside-2-" <> suffix,
+      worker_def,
+      1,
+      policy,
+    )
+
+  // Scheduled 119 seconds in the past: still inside the 120-second window.
+  let assert Ok(unique.Inserted(handle_inside)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-schedule-inside-1-" <> suffix,
+      worker_def,
+      2,
+      policy,
+    )
+  force_job_timestamp(
+    connection,
+    job.id_value(handle_inside),
+    "available_at",
+    "clock_timestamp() - interval '119 seconds'",
+  )
+  let assert Ok(unique.Existing(conflict_inside)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-schedule-inside-2-" <> suffix,
+      worker_def,
+      2,
+      policy,
+    )
+  unique.conflict_job_id(conflict_inside)
+  |> should.equal(job.id_value(handle_inside))
+
+  mark_database_test_executed(
+    "unique-period-from-schedule-past-boundary-passed",
+  )
+}
+
+/// Increment 6(d): a future `FromSchedule` deadline extends the occupancy
+/// window well beyond what the same period length would already have let
+/// expire under `FromInsertion` — the same row, the same 60-second period,
+/// inserted 5 minutes ago (long past a `FromInsertion` window) but scheduled
+/// 5 minutes from now (comfortably inside a `FromSchedule` window).
+pub fn postgres_submit_unique_from_schedule_future_extends_window_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_period_from_schedule_future_extends_window_test(database_url)
+  }
+}
+
+fn run_period_from_schedule_future_extends_window_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_from_schedule_future",
+  )
+  let worker_def = unique_test_worker("unique.from-schedule-future-" <> suffix)
+  let assert Ok(period_from_schedule) =
+    unique.within_milliseconds(60_000, unique.FromSchedule)
+  let policy_from_schedule =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period_from_schedule,
+      unique.Incomplete,
+    )
+  let assert Ok(period_from_insertion) =
+    unique.within_milliseconds(60_000, unique.FromInsertion)
+  let policy_from_insertion =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period_from_insertion,
+      unique.Incomplete,
+    )
+  let test_queue = "from-schedule-future-" <> suffix
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-schedule-future-1-" <> suffix,
+      worker_def,
+      9,
+      policy_from_schedule,
+    )
+  let job_id = job.id_value(handle)
+  force_job_timestamp(
+    connection,
+    job_id,
+    "inserted_at",
+    "clock_timestamp() - interval '300 seconds'",
+  )
+  force_job_timestamp(
+    connection,
+    job_id,
+    "available_at",
+    "clock_timestamp() + interval '300 seconds'",
+  )
+
+  // `FromInsertion`, same key: the row's insertion is long past the
+  // 60-second period, so it no longer conflicts.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-schedule-future-2-" <> suffix,
+      worker_def,
+      9,
+      policy_from_insertion,
+    )
+
+  // `FromSchedule`, same key, same 60-second period: measured from a
+  // schedule 5 minutes in the future, it still covers the original row.
+  let assert Ok(unique.Existing(conflict)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-from-schedule-future-3-" <> suffix,
+      worker_def,
+      9,
+      policy_from_schedule,
+    )
+  unique.conflict_job_id(conflict) |> should.equal(job_id)
+
+  mark_database_test_executed(
+    "unique-period-from-schedule-future-extends-window-passed",
+  )
+}
+
+/// Increment 6(e): `while_retained()` has no time boundary at all — a row
+/// inserted a year ago still conflicts.
+pub fn postgres_submit_unique_while_retained_matches_a_year_old_row_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_period_while_retained_old_row_test(database_url)
+  }
+}
+
+fn run_period_while_retained_old_row_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_while_retained",
+  )
+  let worker_def = unique_test_worker("unique.while-retained-" <> suffix)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      unique.while_retained(),
+      unique.Incomplete,
+    )
+  let test_queue = "while-retained-" <> suffix
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-while-retained-1-" <> suffix,
+      worker_def,
+      3,
+      policy,
+    )
+  force_job_timestamp(
+    connection,
+    job.id_value(handle),
+    "inserted_at",
+    "clock_timestamp() - interval '1 year'",
+  )
+
+  let assert Ok(unique.Existing(conflict)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-while-retained-2-" <> suffix,
+      worker_def,
+      3,
+      policy,
+    )
+  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
+
+  mark_database_test_executed("unique-period-while-retained-old-row-passed")
+}
+
+/// Increment 7(a): the same `SubmissionId` with the same request, retried
+/// after the original row genuinely succeeded and its short period has
+/// elapsed, returns the original `Inserted` handle (same job id) from the
+/// receipt — not a second row (which a fresh, receipt-blind candidate
+/// lookup would create, since the succeeded row is by then outside its own
+/// period).
+pub fn postgres_submit_unique_receipt_replay_is_idempotent_after_period_elapses_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_receipt_idempotent_replay_test(database_url)
+  }
+}
+
+fn run_receipt_idempotent_replay_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_receipt_idempotent",
+  )
+  let worker_def = unique_test_worker("unique.receipt-idempotent-" <> suffix)
+  let test_queue = "receipt-idempotent-" <> suffix
+  let assert Ok(registry_workers) = registry.new(test_queue)
+  let assert Ok(registry_workers) =
+    registry.register(registry_workers, worker_def)
+  let assert Ok(consumer) = queue.start_manual(database, registry_workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let assert Ok(period) = unique.within_milliseconds(5000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.IncompleteOrSucceeded,
+    )
+  let submission_text = "unique-receipt-idempotent-1-" <> suffix
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
+
+  // The 5-second period has elapsed: without the receipt, a fresh candidate
+  // lookup for this key would now find nothing eligible.
+  force_job_timestamp(
+    connection,
+    job.id_value(handle),
+    "inserted_at",
+    "clock_timestamp() - interval '6 seconds'",
+  )
+
+  let assert Ok(unique.Inserted(replayed_handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  job.id_value(replayed_handle) |> should.equal(job.id_value(handle))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed("unique-receipt-idempotent-replay-passed")
+}
+
+/// Increment 7(b): the same `SubmissionId` with a different input conflicts.
+pub fn postgres_submit_unique_receipt_replay_with_different_input_conflicts_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_receipt_different_input_conflict_test(database_url)
+  }
+}
+
+fn run_receipt_different_input_conflict_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_receipt_conflict",
+  )
+  let worker_def = unique_test_worker("unique.receipt-conflict-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "receipt-conflict-" <> suffix
+  let submission_text = "unique-receipt-conflict-1-" <> suffix
+
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  submit_keep_existing(
+    database,
+    test_queue,
+    submission_text,
+    worker_def,
+    2,
+    policy,
+  )
+  |> should.equal(Error(unique.SubmissionConflict))
+
+  mark_database_test_executed("unique-receipt-different-input-conflict-passed")
+}
+
+/// Increment 7(c): a replayed `Existing` decision returns the observed state
+/// recorded in the receipt at decision time, not the row's current
+/// (possibly since-progressed) state.
+pub fn postgres_submit_unique_receipt_replay_returns_originally_observed_state_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_receipt_replay_observed_state_test(database_url)
+  }
+}
+
+fn run_receipt_replay_observed_state_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_receipt_observed_state",
+  )
+  let worker_def = unique_test_worker("unique.receipt-observed-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "receipt-observed-" <> suffix
+  let submission_replay = "unique-receipt-observed-2-" <> suffix
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-receipt-observed-1-" <> suffix,
+      worker_def,
+      1,
+      policy,
+    )
+  let assert Ok(unique.Existing(conflict_first)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_replay,
+      worker_def,
+      1,
+      policy,
+    )
+  unique.conflict_state(conflict_first) |> should.equal(job.Queued)
+
+  // The row genuinely progresses after the receipt was recorded.
+  force_job_state(connection, job.id_value(handle), "succeeded")
+
+  let assert Ok(unique.Existing(conflict_replayed)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_replay,
+      worker_def,
+      1,
+      policy,
+    )
+  unique.conflict_job_id(conflict_replayed)
+  |> should.equal(job.id_value(handle))
+  unique.conflict_state(conflict_replayed) |> should.equal(job.Queued)
+
+  mark_database_test_executed(
+    "unique-receipt-replay-returns-observed-state-passed",
+  )
+}
+
+/// Increment 7(d), proving R2 (Decision 9): replaying the same
+/// `SubmissionId` and input against a worker whose output codec version has
+/// changed conflicts, rather than returning a handle bound to a different
+/// codec than the one it was originally admitted under.
+pub fn postgres_submit_unique_receipt_replay_with_changed_output_codec_conflicts_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_receipt_output_codec_change_conflict_test(database_url)
+  }
+}
+
+fn run_receipt_output_codec_change_conflict_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_receipt_codec_change",
+  )
+  let assert Ok(input_codec) =
+    worker.codec(
+      "unique-receipt-codec-input-" <> suffix <> "-v1",
+      json.int,
+      decode.int,
+    )
+  let assert Ok(output_codec_v1) =
+    worker.codec(
+      "unique-receipt-codec-output-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let worker_id = "unique.receipt-codec-change-" <> suffix
+  let assert Ok(worker_v1) =
+    worker.define(worker_id, "v1", input_codec, output_codec_v1, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let assert Ok(output_codec_v2) =
+    worker.codec(
+      "unique-receipt-codec-output-" <> suffix <> "-v2",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(worker_v1_recoded) =
+    worker.define(worker_id, "v1", input_codec, output_codec_v2, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "receipt-codec-change-" <> suffix
+  let submission_text = "unique-receipt-codec-1-" <> suffix
+
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_v1,
+      1,
+      policy,
+    )
+  submit_keep_existing(
+    database,
+    test_queue,
+    submission_text,
+    worker_v1_recoded,
+    1,
+    policy,
+  )
+  |> should.equal(Error(unique.SubmissionConflict))
+
+  mark_database_test_executed(
+    "unique-receipt-output-codec-change-conflict-passed",
+  )
+}
+
+// -- Increment 8: concurrent admission under a forced barrier --------------
+//
+// See `docs/RECOVERY-EVIDENCE.md`, Increment 8, for the mutation evidence
+// (a genuine red run with the domain lock skipped, and one with the lock
+// key widened to include the queue) these tests were checked against.
+
+/// Three `submit_unique` calls, same key, `KeepExisting`, distinct
+/// `SubmissionId`s, from three separate pools, forced to actually overlap by
+/// a test-only `BEFORE INSERT` barrier trigger: exactly one settles as
+/// `Inserted` and the other two settle as `Existing` referencing that same
+/// job id, and exactly one row is ever persisted.
+pub fn postgres_submit_unique_concurrent_admission_forced_overlap_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_concurrent_overlap_test(database_url)
+  }
+}
+
+fn run_unique_concurrent_overlap_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let worker_id = "unique.overlap-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-overlap-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  use entries <- with_unique_databases(database_url, [
+    "grind_unique_overlap_a_" <> suffix,
+    "grind_unique_overlap_b_" <> suffix,
+    "grind_unique_overlap_c_" <> suffix,
+  ])
+  let assert [
+    #(database_a, barrier_connection),
+    #(database_b, _),
+    #(database_c, _),
+  ] = entries
+  let lock_key = unique_test_lock_key(0)
+  let cleanup_trigger =
+    install_unique_insert_barrier(
+      barrier_connection,
+      "grind_test_unique_overlap_" <> suffix,
+      worker_id,
+      lock_key,
+    )
+  use <- exception.defer(cleanup_trigger)
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_unique_overlap_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(barrier_connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let submission_a = "unique-overlap-a-" <> suffix
+  let submission_b = "unique-overlap-b-" <> suffix
+  let submission_c = "unique-overlap-c-" <> suffix
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  let result_c = process.new_subject()
+  spawn_submit(result_a, fn() {
+    submit_keep_existing(
+      database_a,
+      test_queue,
+      submission_a,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+  spawn_submit(result_b, fn() {
+    submit_keep_existing(
+      database_b,
+      test_queue,
+      submission_b,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+  spawn_submit(result_c, fn() {
+    submit_keep_existing(
+      database_c,
+      test_queue,
+      submission_c,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+
+  // Exactly one submitter has won the domain lock and blocked inserting
+  // behind the test's own held trigger lock; the other two are blocked
+  // acquiring that same domain lock.
+  await_overlap_shape(
+    barrier_connection,
+    unique_insert_query_like,
+    unique_domain_lock_query_like,
+    1,
+    2,
+    500,
+  )
+  |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 5000)
+  let assert Ok(outcome_b) = process.receive(result_b, within: 5000)
+  let assert Ok(outcome_c) = process.receive(result_c, within: 5000)
+  let outcomes = [outcome_a, outcome_b, outcome_c]
+
+  let inserted_ids =
+    list.filter_map(outcomes, fn(outcome) {
+      case outcome {
+        Ok(unique.Inserted(handle)) -> Ok(job.id_value(handle))
+        _ -> Error(Nil)
+      }
+    })
+  let existing_conflicts =
+    list.filter_map(outcomes, fn(outcome) {
+      case outcome {
+        Ok(unique.Existing(conflict)) -> Ok(conflict)
+        _ -> Error(Nil)
+      }
+    })
+  list.length(inserted_ids) |> should.equal(1)
+  list.length(existing_conflicts) |> should.equal(2)
+  let assert [inserted_id] = inserted_ids
+  list.each(existing_conflicts, fn(conflict) {
+    unique.conflict_job_id(conflict) |> should.equal(inserted_id)
+  })
+  count_jobs_in_queue(barrier_connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed("unique-concurrent-forced-overlap-passed")
+}
+
+/// The uniqueness domain lock key deliberately excludes queue
+/// (`docs/UNIQUENESS-CONTRACT.md`, admission transaction step 3), so a
+/// `WithinQueue` submission in one queue and an `AcrossQueues` submission in
+/// another, on the same key, still serialize against each other: one row,
+/// not two.
+pub fn postgres_submit_unique_concurrent_admission_mixed_scope_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_concurrent_mixed_scope_test(database_url)
+  }
+}
+
+fn run_unique_concurrent_mixed_scope_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let worker_id = "unique.mixed-scope-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let queue_a = "unique-mixed-scope-q1-" <> suffix
+  let queue_b = "unique-mixed-scope-q2-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy_within =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let policy_across =
+    unique.policy(
+      unique.full_input(),
+      unique.AcrossQueues,
+      period,
+      unique.Incomplete,
+    )
+
+  use entries <- with_unique_databases(database_url, [
+    "grind_unique_mixed_a_" <> suffix,
+    "grind_unique_mixed_b_" <> suffix,
+  ])
+  let assert [#(database_a, barrier_connection), #(database_b, _)] = entries
+  let lock_key = unique_test_lock_key(1)
+  let cleanup_trigger =
+    install_unique_insert_barrier(
+      barrier_connection,
+      "grind_test_unique_mixed_" <> suffix,
+      worker_id,
+      lock_key,
+    )
+  use <- exception.defer(cleanup_trigger)
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_unique_mixed_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(barrier_connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let submission_a = "unique-mixed-scope-a-" <> suffix
+  let submission_b = "unique-mixed-scope-b-" <> suffix
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    submit_keep_existing(
+      database_a,
+      queue_a,
+      submission_a,
+      worker_def,
+      1,
+      policy_within,
+    )
+  })
+
+  // A (`WithinQueue`, `queue_a`) must actually be blocked inserting behind
+  // the barrier before B starts. A `WithinQueue` candidate query only ever
+  // looks inside its own queue, so which of A/B reaches the domain lock
+  // first is not incidental here the way it was for the same-queue overlap
+  // test above: if B (`AcrossQueues`, `queue_b`) inserted *first*, A's own
+  // `queue_a`-scoped candidate query would never see B's `queue_b` row and
+  // would legitimately insert its own — two rows, correctly, by the
+  // documented per-queue semantics `WithinQueue` already promises (Increment
+  // 4). Starting A alone first and waiting for it to reach the barrier
+  // fixes the order without weakening the concurrency being proved: B still
+  // arrives while A's insert transaction is genuinely open and still needs
+  // the same domain lock A holds, which is exactly what the lock key
+  // excluding queue (`docs/UNIQUENESS-CONTRACT.md`, admission transaction
+  // step 2) is being proved to guarantee.
+  await_overlap_shape(
+    barrier_connection,
+    unique_insert_query_like,
+    unique_domain_lock_query_like,
+    1,
+    0,
+    500,
+  )
+  |> should.equal(True)
+
+  spawn_submit(result_b, fn() {
+    submit_keep_existing(
+      database_b,
+      queue_b,
+      submission_b,
+      worker_def,
+      1,
+      policy_across,
+    )
+  })
+
+  await_overlap_shape(
+    barrier_connection,
+    unique_insert_query_like,
+    unique_domain_lock_query_like,
+    1,
+    1,
+    500,
+  )
+  |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 5000)
+  let assert Ok(unique.Inserted(handle_a)) = outcome_a
+  let assert Ok(outcome_b) = process.receive(result_b, within: 5000)
+  let assert Ok(unique.Existing(conflict_b)) = outcome_b
+  unique.conflict_job_id(conflict_b) |> should.equal(job.id_value(handle_a))
+  unique.conflict_queue(conflict_b) |> should.equal(queue_a)
+  count_jobs_in_queue(barrier_connection, queue_a) |> should.equal(1)
+  count_jobs_in_queue(barrier_connection, queue_b) |> should.equal(0)
+
+  mark_database_test_executed("unique-concurrent-mixed-scope-passed")
+}
+
+/// Increment 8's deferred receipt-ordering evidence: submitter A commits its
+/// `Inserted` decision (and its receipt) while submitter B — the *same*
+/// `SubmissionId` and the same request — is still waiting on the domain
+/// lock A holds. Once A releases, B must return A's recorded `Inserted`
+/// decision (same job id, same `JobHandle`-carrying variant), not a fresh
+/// `Existing` conflict against the row A just committed — proving the
+/// receipt lookup genuinely runs, and matches, before B ever performs its
+/// own candidate selection.
+pub fn postgres_submit_unique_receipt_ordering_returns_committed_decision_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_receipt_ordering_test(database_url)
+  }
+}
+
+fn run_unique_receipt_ordering_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let worker_id = "unique.receipt-order-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-receipt-order-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  use entries <- with_unique_databases(database_url, [
+    "grind_unique_receipt_order_a_" <> suffix,
+    "grind_unique_receipt_order_b_" <> suffix,
+  ])
+  let assert [#(database_a, barrier_connection), #(database_b, _)] = entries
+  let lock_key = unique_test_lock_key(2)
+  let cleanup_trigger =
+    install_unique_insert_barrier(
+      barrier_connection,
+      "grind_test_unique_receipt_order_" <> suffix,
+      worker_id,
+      lock_key,
+    )
+  use <- exception.defer(cleanup_trigger)
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_unique_receipt_order_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(barrier_connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let shared_submission = "unique-receipt-order-shared-" <> suffix
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    submit_keep_existing(
+      database_a,
+      test_queue,
+      shared_submission,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+
+  // A must actually be blocked inserting behind the barrier before B
+  // starts, or B could race A for the domain lock instead of waiting
+  // behind it.
+  await_overlap_shape(
+    barrier_connection,
+    unique_insert_query_like,
+    unique_domain_lock_query_like,
+    1,
+    0,
+    500,
+  )
+  |> should.equal(True)
+
+  spawn_submit(result_b, fn() {
+    submit_keep_existing(
+      database_b,
+      test_queue,
+      shared_submission,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+
+  // B must be waiting on the domain lock A still holds before we release A
+  // — otherwise this run proves nothing about ordering.
+  await_overlap_shape(
+    barrier_connection,
+    unique_insert_query_like,
+    unique_domain_lock_query_like,
+    1,
+    1,
+    500,
+  )
+  |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 5000)
+  let assert Ok(unique.Inserted(handle_a)) = outcome_a
+  let assert Ok(outcome_b) = process.receive(result_b, within: 5000)
+  let assert Ok(unique.Inserted(handle_b)) = outcome_b
+  job.id_value(handle_b) |> should.equal(job.id_value(handle_a))
+  count_jobs_in_queue(barrier_connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed(
+    "unique-receipt-ordering-b-returns-a-decision-passed",
+  )
+}
+
+// -- Increment 9: contention -------------------------------------------------
+//
+// See `docs/RECOVERY-EVIDENCE.md`, Increment 9, for this section's evidence.
+
+/// The test itself holds the real domain lock (via `unique_domain_lock_query`,
+/// built from the same `@internal lock_key_sql` production code uses) in its
+/// own open transaction; a concurrent `submit_unique` with a 200ms
+/// `unique_lock_wait` for the same key contends and reports
+/// `AdmissionContended`, with no job row and no receipt. Once the lock is
+/// released, the same `SubmissionId` succeeds.
+pub fn postgres_submit_unique_contended_lock_wait_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_contended_lock_wait_test(database_url)
+  }
+}
+
+fn run_unique_contended_lock_wait_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let worker_id = "unique.contended-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-contended-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  let holder_pool = process.new_name("grind_unique_contended_holder_" <> suffix)
+  let assert Ok(holder_settings) =
+    postgres.settings(database_url, holder_pool) |> postgres.validate
+  let assert Ok(holder_database) = postgres.start(holder_settings)
+  use <- exception.defer(fn() { postgres.close(holder_database) })
+  let assert Ok(Nil) = postgres.migrate(holder_database)
+  let holder_connection = pog.named_connection(holder_pool)
+  let storage_owner = postgres.storage_owner(holder_database)
+
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(
+      holder_connection,
+      unique_domain_lock_query(holder_database, worker_def, 1),
+    )
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let submitter_pool =
+    process.new_name("grind_unique_contended_submitter_" <> suffix)
+  let assert Ok(submitter_settings) =
+    postgres.settings(database_url, submitter_pool)
+    |> postgres.unique_lock_wait(200)
+    |> postgres.validate
+  let assert Ok(submitter_database) = postgres.start(submitter_settings)
+  use <- exception.defer(fn() { postgres.close(submitter_database) })
+
+  let submission_text = "unique-contended-1-" <> suffix
+  submit_keep_existing(
+    submitter_database,
+    test_queue,
+    submission_text,
+    worker_def,
+    1,
+    policy,
+  )
+  |> should.equal(Error(unique.AdmissionContended))
+  count_jobs_in_queue(holder_connection, test_queue) |> should.equal(0)
+  unique_receipt_exists(holder_connection, storage_owner, submission_text)
+  |> should.equal(False)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      submitter_database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  count_jobs_in_queue(holder_connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed("unique-contended-lock-wait-passed")
+}
+
+/// The row-lock variant of contention: a scheduled row's own row lock (held
+/// by the test through an open `SELECT ... FOR UPDATE` transaction, not the
+/// domain lock) blocks a `RescheduleScheduledTo` submission's candidate
+/// selection (which takes that same row lock, per
+/// `docs/UNIQUENESS-CONTRACT.md`'s admission transaction step 6) until its
+/// 200ms `unique_lock_wait` elapses; the row is left completely unchanged.
+/// Once released, the same reschedule request succeeds.
+pub fn postgres_submit_unique_reschedule_row_lock_contention_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_reschedule_row_lock_test(database_url)
+  }
+}
+
+fn run_unique_reschedule_row_lock_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_reschedule_lock_" <> suffix,
+  )
+  let worker_id = "unique.reschedule-lock-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-reschedule-lock-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.ScheduledOnly,
+    )
+
+  let far_future = future_available_at(connection, 3_600_000)
+  let assert Ok(seed_submission) =
+    unique.submission_id("unique-reschedule-lock-seed-" <> suffix)
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      seed_submission,
+      worker_def,
+      1,
+      unique.At(far_future),
+      policy,
+      unique.KeepExisting,
+    )
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  let original_available_at_ms =
+    job_available_at_ms(connection, job.id_value(handle))
+
+  let row_lock_query =
+    pog.query("SELECT 1 FROM grind_jobs WHERE id = $1 FOR UPDATE")
+    |> pog.parameter(pog.int(job.id_value(handle)))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection, row_lock_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let contended_pool =
+    process.new_name("grind_unique_reschedule_contended_" <> suffix)
+  let assert Ok(contended_settings) =
+    postgres.settings(database_url, contended_pool)
+    |> postgres.unique_lock_wait(200)
+    |> postgres.validate
+  let assert Ok(contended_database) = postgres.start(contended_settings)
+  use <- exception.defer(fn() { postgres.close(contended_database) })
+
+  let later_target = future_available_at(connection, 7_200_000)
+  let reschedule_submission = "unique-reschedule-lock-retry-" <> suffix
+  submit_reschedule(
+    contended_database,
+    test_queue,
+    reschedule_submission,
+    worker_def,
+    1,
+    policy,
+    later_target,
+  )
+  |> should.equal(Error(unique.AdmissionContended))
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  job_available_at_ms(connection, job.id_value(handle))
+  |> should.equal(original_available_at_ms)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(unique.Rescheduled(conflict)) =
+    submit_reschedule(
+      contended_database,
+      test_queue,
+      reschedule_submission,
+      worker_def,
+      1,
+      policy,
+      later_target,
+    )
+  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
+  job_available_at_ms(connection, job.id_value(handle))
+  |> should.equal(job.available_at_unix_milliseconds(later_target))
+
+  mark_database_test_executed("unique-reschedule-row-lock-contention-passed")
+}
+
+/// `set_config('lock_timeout', ..., true)` (step 1 of the admission
+/// transaction) is transaction-local: it must not leak into a later
+/// statement that reuses the same pooled physical connection. A
+/// single-connection pool guarantees the reuse; after a contended attempt
+/// on it, `SHOW lock_timeout` on that same pool must read back the
+/// cluster's own default, not `200ms`.
+pub fn postgres_unique_lock_timeout_does_not_leak_to_later_statements_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_lock_timeout_no_leak_test(database_url)
+  }
+}
+
+fn run_unique_lock_timeout_no_leak_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let worker_id = "unique.timeout-leak-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-timeout-leak-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  let holder_pool =
+    process.new_name("grind_unique_timeout_leak_holder_" <> suffix)
+  let assert Ok(holder_settings) =
+    postgres.settings(database_url, holder_pool) |> postgres.validate
+  let assert Ok(holder_database) = postgres.start(holder_settings)
+  use <- exception.defer(fn() { postgres.close(holder_database) })
+  let assert Ok(Nil) = postgres.migrate(holder_database)
+  let holder_connection = pog.named_connection(holder_pool)
+
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(
+      holder_connection,
+      unique_domain_lock_query(holder_database, worker_def, 1),
+    )
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let probe_pool =
+    process.new_name("grind_unique_timeout_leak_probe_" <> suffix)
+  let assert Ok(probe_settings) =
+    postgres.settings(database_url, probe_pool)
+    |> postgres.pool_size(1)
+    |> postgres.unique_lock_wait(200)
+    |> postgres.validate
+  let assert Ok(probe_database) = postgres.start(probe_settings)
+  use <- exception.defer(fn() { postgres.close(probe_database) })
+
+  submit_keep_existing(
+    probe_database,
+    test_queue,
+    "unique-timeout-leak-1-" <> suffix,
+    worker_def,
+    1,
+    policy,
+  )
+  |> should.equal(Error(unique.AdmissionContended))
+
+  let probe_connection = pog.named_connection(probe_pool)
+  let show_lock_timeout = fn() {
+    let assert Ok(returned) =
+      pog.query("SHOW lock_timeout")
+      |> pog.returning({
+        use value <- decode.field(0, decode.string)
+        decode.success(value)
+      })
+      |> pog.execute(on: probe_connection)
+    let assert [value] = returned.rows
+    value
+  }
+
+  // A *rolled-back* transaction's `SET`/`set_config` change is undone
+  // regardless of `is_local` — PostgreSQL reverts GUC changes made inside
+  // an aborted transaction either way, so a contended (and hence
+  // rolled-back) attempt alone cannot distinguish `is_local: true` from
+  // `false`. Checked anyway, for completeness, but the assertion below
+  // (after a *committed* attempt on this same connection) is the one that
+  // actually exercises `is_local`'s documented difference.
+  show_lock_timeout() |> should.equal("0")
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  // With the domain lock now free, this same pooled connection commits a
+  // fresh submission. `is_local: true` (`set_config`'s third argument)
+  // means `SET LOCAL`-style transaction-local scope: the setting reverts at
+  // COMMIT, not only at ROLLBACK. `is_local: false` would instead behave
+  // like a plain session-level `SET`, which survives the COMMIT and would
+  // leave `lock_timeout` at `200` for every later statement on this pool.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      probe_database,
+      test_queue,
+      "unique-timeout-leak-2-" <> suffix,
+      worker_def,
+      1,
+      policy,
+    )
+  show_lock_timeout() |> should.equal("0")
+
+  mark_database_test_executed("unique-lock-timeout-no-leak-passed")
+}
+
+// -- Isolation-level pinning (R1) --------------------------------------------
+//
+// See `docs/RECOVERY-EVIDENCE.md`, "Isolation-level pinning", for the red
+// evidence this test was checked against.
+
+/// The admission transaction's correctness (a waiter's plain reads after the
+/// domain lock must see whatever committed while it waited) depends on
+/// `READ COMMITTED` semantics, not merely the cluster's *default* being
+/// `READ COMMITTED` — a role or database configured with
+/// `default_transaction_isolation = 'repeatable read'` would otherwise
+/// silently break admission with no code-visible signal. This test runs the
+/// same forced-overlap barrier as Increment 8's main test, but against a
+/// dedicated disposable database whose own configured default really is
+/// `repeatable read` (`GRIND_TEST_REPEATABLE_READ_URL`,
+/// `scripts/test-postgres.sh`), and proves the admission transaction still
+/// produces exactly one `Inserted` and one `Existing` against that same job
+/// id — not two rows.
+pub fn postgres_submit_unique_admission_safe_under_repeatable_read_test() {
+  case repeatable_read_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_repeatable_read_test(database_url)
+  }
+}
+
+fn run_unique_repeatable_read_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let worker_id = "unique.repeatable-read-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-repeatable-read-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  use entries <- with_unique_databases(database_url, [
+    "grind_unique_rr_a_" <> suffix,
+    "grind_unique_rr_b_" <> suffix,
+  ])
+  let assert [#(database_a, barrier_connection), #(database_b, _)] = entries
+
+  // Confirm this database's own *persisted, configured* default directly,
+  // rather than trust `scripts/test-postgres.sh`'s setup silently — and
+  // read it from `pg_db_role_setting`/`pg_database`, not `SHOW
+  // default_transaction_isolation` on a Grind-managed connection: Grind's
+  // own pool now pins `default_transaction_isolation` to `read committed`
+  // as a startup connection parameter (see `postgres.validate`), so a
+  // Grind connection's *active* session setting reads `read committed`
+  // regardless of what this database is configured to default to. The
+  // catalog query below reads the database-level configuration itself,
+  // which this connection's own override does not change.
+  let assert Ok(isolation_returned) =
+    pog.query(
+      "SELECT EXISTS (SELECT 1 FROM pg_db_role_setting JOIN pg_database ON pg_database.oid = pg_db_role_setting.setdatabase WHERE pg_database.datname = current_database() AND pg_db_role_setting.setrole = 0 AND EXISTS (SELECT 1 FROM unnest(pg_db_role_setting.setconfig) AS cfg WHERE cfg = 'default_transaction_isolation=repeatable read'))",
+    )
+    |> pog.returning({
+      use configured <- decode.field(0, decode.bool)
+      decode.success(configured)
+    })
+    |> pog.execute(on: barrier_connection)
+  let assert [True] = isolation_returned.rows
+
+  let lock_key = unique_test_lock_key(3)
+  let cleanup_trigger =
+    install_unique_insert_barrier(
+      barrier_connection,
+      "grind_test_unique_rr_" <> suffix,
+      worker_id,
+      lock_key,
+    )
+  use <- exception.defer(cleanup_trigger)
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_unique_rr_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(barrier_connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: releases the barrier unconditionally on the way out,
+  // registered after the trigger-cleanup defer above so it unwinds first —
+  // a panic between here and the explicit release below must not leave a
+  // deferred `DROP TRIGGER`/`DROP FUNCTION` waiting (up to
+  // `spawn_lock_holder`'s own 10-second bound) on a transaction still
+  // blocked inside that very trigger. Sending `ReleaseAttempt` again after
+  // the explicit release further down is harmless (the holder process has
+  // already exited by then).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let submission_a = "unique-rr-a-" <> suffix
+  let submission_b = "unique-rr-b-" <> suffix
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    submit_keep_existing(
+      database_a,
+      test_queue,
+      submission_a,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+  spawn_submit(result_b, fn() {
+    submit_keep_existing(
+      database_b,
+      test_queue,
+      submission_b,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+
+  await_overlap_shape(
+    barrier_connection,
+    unique_insert_query_like,
+    unique_domain_lock_query_like,
+    1,
+    1,
+    500,
+  )
+  |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 5000)
+  let assert Ok(outcome_b) = process.receive(result_b, within: 5000)
+  let outcomes = [outcome_a, outcome_b]
+
+  let inserted_ids =
+    list.filter_map(outcomes, fn(outcome) {
+      case outcome {
+        Ok(unique.Inserted(handle)) -> Ok(job.id_value(handle))
+        _ -> Error(Nil)
+      }
+    })
+  let existing_conflicts =
+    list.filter_map(outcomes, fn(outcome) {
+      case outcome {
+        Ok(unique.Existing(conflict)) -> Ok(conflict)
+        _ -> Error(Nil)
+      }
+    })
+  list.length(inserted_ids) |> should.equal(1)
+  list.length(existing_conflicts) |> should.equal(1)
+  let assert [inserted_id] = inserted_ids
+  let assert [existing_conflict] = existing_conflicts
+  unique.conflict_job_id(existing_conflict) |> should.equal(inserted_id)
+  count_jobs_in_queue(barrier_connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed(
+    "unique-admission-safe-under-repeatable-read-passed",
+  )
+}
+
+/// A retried (duplicate) acknowledgement forced to genuinely overlap the
+/// first one's commit: A's fenced `UPDATE` is blocked behind a test-only
+/// `BEFORE UPDATE` barrier trigger scoped to this job (the same
+/// held-then-released-on-cue shape used throughout); B — the identical
+/// acknowledgement command, from a separate pool — starts while A is still
+/// blocked, and B's own fenced `UPDATE` then genuinely waits on the row
+/// lock A's in-flight `UPDATE` holds (a real PostgreSQL tuple-lock wait,
+/// confirmed via `pg_stat_activity`'s `transactionid` wait event — not the
+/// advisory wait A is parked on). Once A completes and commits, B's
+/// `UPDATE` no longer matches (the row is no longer `executing`), so B
+/// falls through to `acknowledge_transaction`'s own re-read of the
+/// acknowledgement receipt and must return `Ok(True)`, exactly as A did —
+/// not a query failure. See `docs/RECOVERY-EVIDENCE.md`, "Isolation-level
+/// pinning", for the genuine red this test produced before
+/// `postgres.validate` pinned every pooled connection's own
+/// `default_transaction_isolation` to `read committed`.
+pub fn postgres_ack_duplicate_reports_ok_under_pinned_isolation_test() {
+  case repeatable_read_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_ack_duplicate_repeatable_read_test(database_url)
+  }
+}
+
+fn run_ack_duplicate_repeatable_read_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use entries <- with_unique_databases(database_url, [
+    "grind_ack_rr_a_" <> suffix,
+    "grind_ack_rr_b_" <> suffix,
+  ])
+  let assert [#(database_a, connection_a), #(database_b, _)] = entries
+
+  let assert Ok(input_codec) =
+    worker.codec("ack-rr-input-" <> suffix <> "-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "ack-rr-output-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "ack.rr-" <> suffix,
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("ack-rr-" <> suffix)
+  let assert Ok(workers) = registry.register(workers, definition)
+  let test_queue = "ack-rr-" <> suffix
+  let attempt_owner = "ack-rr-owner-" <> suffix
+
+  let assert Ok(_handle) =
+    postgres.submit(database_a, test_queue, definition, 8)
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(database_a, test_queue, workers, attempt_owner, 30_000)
+  let execution = postgres.execute_claim(claimed)
+  let #(job_id, _, _) = postgres.claim_identity(claimed)
+
+  let lock_key = unique_test_lock_key(4)
+  let trigger_name = "grind_test_ack_overlap_" <> suffix
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> trigger_name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = "
+      <> int.to_string(job_id)
+      <> " AND OLD.state = 'executing' AND NEW.state <> 'executing' THEN PERFORM pg_advisory_xact_lock("
+      <> int.to_string(lock_key)
+      <> "); END IF; RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection_a)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER "
+      <> trigger_name
+      <> " BEFORE UPDATE ON grind_jobs FOR EACH ROW EXECUTE FUNCTION "
+      <> trigger_name
+      <> "()",
+    )
+    |> pog.execute(on: connection_a)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query("DROP TRIGGER IF EXISTS " <> trigger_name <> " ON grind_jobs")
+      |> pog.execute(on: connection_a)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> trigger_name <> "()")
+      |> pog.execute(on: connection_a)
+    Nil
+  })
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_ack_overlap_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection_a, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net (see the uniqueness barrier tests above for why this is
+  // registered here, right after obtaining `release_lock`, rather than only
+  // sending it explicitly further down).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    postgres.acknowledge_claim(
+      database_a,
+      test_queue,
+      attempt_owner,
+      claimed,
+      execution,
+    )
+  })
+
+  // A must actually be blocked updating behind the barrier (an advisory
+  // wait) before B starts.
+  await_lock_wait_counts(connection_a, 1, 0, 500) |> should.equal(True)
+
+  spawn_submit(result_b, fn() {
+    postgres.acknowledge_claim(
+      database_b,
+      test_queue,
+      attempt_owner,
+      claimed,
+      execution,
+    )
+  })
+
+  // B must be genuinely waiting on the row lock A's own `UPDATE` holds
+  // (`transactionid`, a real tuple-lock wait — not the advisory wait A is
+  // parked on) before we release the barrier, or this proves nothing about
+  // the overlap.
+  await_lock_wait_counts(connection_a, 1, 1, 500) |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 5000)
+  let assert Ok(outcome_b) = process.receive(result_b, within: 5000)
+  outcome_a |> should.equal(Ok(True))
+  outcome_b |> should.equal(Ok(True))
+  count_acknowledgements_for_job(connection_a, job_id) |> should.equal(1)
+
+  mark_database_test_executed("ack-duplicate-ok-under-pinned-isolation-passed")
+}
+
+/// R4: `reconcile_matching_owner`'s idempotency check
+/// (`resolution_receipt_outcome`, shared with `apply_uncertain_resolution`'s
+/// own re-check after its `FOR UPDATE`) runs once before that lock and is
+/// never re-checked when the locked row is no longer `uncertain` — a
+/// concurrent retry of the *same* `resolution_id` and payload that waits
+/// behind the first resolution's row lock would otherwise misreport
+/// `ReconciliationNotRequired` instead of the recorded
+/// `ResolutionAlreadyApplied` outcome. Forced to genuinely overlap: A's
+/// `write_resolution` update is blocked behind a test-only `BEFORE UPDATE`
+/// barrier trigger scoped to this job (`OLD.state = 'uncertain'`); B — the
+/// identical resolution command, from a separate pool — starts while A is
+/// blocked, and B's own `SELECT ... FOR UPDATE` then genuinely waits on the
+/// row lock A already holds (confirmed via `pg_stat_activity`'s
+/// `transactionid` wait event). Once A completes and commits, B must return
+/// `Ok(ResolutionAlreadyApplied(target_state))` — not
+/// `Error(ReconciliationNotRequired)` — and only one resolution row and one
+/// state transition (one redelivery) must exist.
+pub fn postgres_resolution_concurrent_same_outcome_applied_once_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_resolution_concurrent_test(database_url)
+  }
+}
+
+fn run_resolution_concurrent_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use entries <- with_unique_databases(database_url, [
+    "grind_resolution_concurrent_a_" <> suffix,
+    "grind_resolution_concurrent_b_" <> suffix,
+  ])
+  let assert [#(database_a, connection_a), #(database_b, _)] = entries
+
+  let assert Ok(input_codec) =
+    worker.codec(
+      "resolution-concurrent-input-" <> suffix <> "-v1",
+      json.int,
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "resolution-concurrent-output-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "resolution.concurrent-" <> suffix,
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let test_queue = "resolution-concurrent-" <> suffix
+  let assert Ok(handle) = postgres.submit(database_a, test_queue, definition, 3)
+  let #(job_id, _, _, _, _, _) = job.storage_fields(handle)
+
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'uncertain', attempt_id = 1, attempt_epoch = 1, attempt_owner = 'resolution-concurrent-owner', lease_expires_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection_a)
+
+  let lock_key = unique_test_lock_key(5)
+  let trigger_name = "grind_test_resolution_overlap_" <> suffix
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> trigger_name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = "
+      <> int.to_string(job_id)
+      <> " AND OLD.state = 'uncertain' THEN PERFORM pg_advisory_xact_lock("
+      <> int.to_string(lock_key)
+      <> "); END IF; RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection_a)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER "
+      <> trigger_name
+      <> " BEFORE UPDATE ON grind_jobs FOR EACH ROW EXECUTE FUNCTION "
+      <> trigger_name
+      <> "()",
+    )
+    |> pog.execute(on: connection_a)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query("DROP TRIGGER IF EXISTS " <> trigger_name <> " ON grind_jobs")
+      |> pog.execute(on: connection_a)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> trigger_name <> "()")
+      |> pog.execute(on: connection_a)
+    Nil
+  })
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_resolution_overlap_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection_a, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let resolution_id = "resolution-concurrent-" <> suffix
+  let resolved_by = "on-call-" <> suffix
+  let details = "confirm external idempotency record before replay"
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    postgres.resolve_uncertain(
+      database_a,
+      handle,
+      resolution_id,
+      resolved_by,
+      details,
+      postgres.AuthorizeReplay,
+    )
+  })
+
+  // A must actually be blocked inside `write_resolution`'s `UPDATE`,
+  // behind the barrier (an advisory wait), before B starts.
+  await_lock_wait_counts(connection_a, 1, 0, 500) |> should.equal(True)
+
+  spawn_submit(result_b, fn() {
+    postgres.resolve_uncertain(
+      database_b,
+      handle,
+      resolution_id,
+      resolved_by,
+      details,
+      postgres.AuthorizeReplay,
+    )
+  })
+
+  // B must be genuinely waiting on the row lock A's own `SELECT ... FOR
+  // UPDATE` (still held through A's blocked `UPDATE`) holds
+  // (`transactionid`, a real tuple-lock wait — not the advisory wait A is
+  // parked on) before we release the barrier.
+  await_lock_wait_counts(connection_a, 1, 1, 500) |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 5000)
+  let assert Ok(outcome_b) = process.receive(result_b, within: 5000)
+  outcome_a |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+  outcome_b |> should.equal(Ok(postgres.ResolutionAlreadyApplied(job.Queued)))
+
+  let assert Ok(resolution_count_returned) =
+    pog.query(
+      "SELECT count(*)::bigint FROM grind_job_resolutions WHERE job_id = $1 AND resolution_id = $2",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.parameter(pog.text(resolution_id))
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+    |> pog.execute(on: connection_a)
+  let assert [1] = resolution_count_returned.rows
+  postgres.state(database_a, handle) |> should.equal(Ok(job.Queued))
+
+  mark_database_test_executed("resolution-concurrent-same-outcome-applied-once")
+}
+
+// -- Increment 10: rescheduling ---------------------------------------------
+//
+// Full contract: `docs/UNIQUENESS-CONTRACT.md`, `ConflictAction`,
+// `RescheduleScheduledTo`, and admission transaction steps 5-6.
+// `postgres_submit_unique_reschedule_row_lock_contention_test` above already
+// proves lock contention on the reschedule candidate's row; the tests below
+// prove the reschedule decision itself (moving `available_at`, leaving other
+// states alone, making a rescheduled row genuinely claimable, and the live
+// race against a real claim).
+
+/// A scheduled conflict rescheduled to `t2` settles `Rescheduled`;
+/// `available_at` in the database equals `t2` exactly; the job id, worker,
+/// and input are unchanged (rebinding the same id under the same worker
+/// still reads the originally submitted input); the receipt records both the
+/// previous and the new `available_at`.
+pub fn postgres_submit_unique_reschedule_moves_available_at_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_reschedule_basic_test(database_url)
+  }
+}
+
+fn run_unique_reschedule_basic_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_reschedule_basic_" <> suffix,
+  )
+  let worker_id = "unique.reschedule-basic-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-reschedule-basic-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.ScheduledOnly,
+    )
+
+  let original_target = future_available_at(connection, 3_600_000)
+  let assert Ok(seed_submission) =
+    unique.submission_id("unique-reschedule-basic-seed-" <> suffix)
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      seed_submission,
+      worker_def,
+      7,
+      unique.At(original_target),
+      policy,
+      unique.KeepExisting,
+    )
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  let job_id = job.id_value(handle)
+
+  let new_target = future_available_at(connection, 7_200_000)
+  let reschedule_submission = "unique-reschedule-basic-retry-" <> suffix
+  let assert Ok(unique.Rescheduled(conflict)) =
+    submit_reschedule(
+      database,
+      test_queue,
+      reschedule_submission,
+      worker_def,
+      7,
+      policy,
+      new_target,
+    )
+
+  unique.conflict_job_id(conflict) |> should.equal(job_id)
+  unique.conflict_queue(conflict) |> should.equal(test_queue)
+  unique.conflict_state(conflict) |> should.equal(job.Scheduled)
+  job_available_at_ms(connection, job_id)
+  |> should.equal(job.available_at_unix_milliseconds(new_target))
+
+  // The job id, worker, and input are unchanged: the same id under the same
+  // worker still reads the originally submitted input, and only one row for
+  // this key exists.
+  postgres.arguments(database, handle) |> should.equal(Ok(7))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+
+  let #(from_ms, to_ms) =
+    unique_receipt_reschedule_fields(
+      connection,
+      postgres.storage_owner(database),
+      reschedule_submission,
+    )
+  from_ms
+  |> should.equal(Some(job.available_at_unix_milliseconds(original_target)))
+  to_ms |> should.equal(Some(job.available_at_unix_milliseconds(new_target)))
+
+  mark_database_test_executed("unique-reschedule-moves-available-at-passed")
+}
+
+/// A `RescheduleScheduledTo` submission against a conflict in `queued`,
+/// `retryable`, `executing`, or `uncertain` — every non-`scheduled` state
+/// `Incomplete` admits — settles `Existing` with the row completely
+/// unchanged (`available_at` untouched), never `Rescheduled`. Oban's own
+/// "replacing fields based on job state" is inspired-by-upstream here,
+/// limited to `available_at` on `scheduled` rows specifically.
+pub fn postgres_submit_unique_reschedule_leaves_non_scheduled_states_unchanged_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_reschedule_non_scheduled_test(database_url)
+  }
+}
+
+fn run_unique_reschedule_non_scheduled_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_reschedule_states_" <> suffix,
+  )
+  let worker_def = unique_test_worker("unique.reschedule-states-" <> suffix)
+  let test_queue = "unique-reschedule-states-" <> suffix
+  let period = unique.while_retained()
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  let cases = [
+    #("queued", job.Queued, 501),
+    #("retryable", job.Retryable, 502),
+    #("executing", job.Executing, 503),
+    #("uncertain", job.Uncertain, 504),
+  ]
+
+  cases
+  |> list.each(fn(entry) {
+    let #(stored, expected_state, input_value) = entry
+    let assert Ok(unique.Inserted(handle)) =
+      submit_keep_existing(
+        database,
+        test_queue,
+        "unique-reschedule-states-seed-" <> suffix <> "-" <> stored,
+        worker_def,
+        input_value,
+        policy,
+      )
+    let job_id = job.id_value(handle)
+    force_job_state(connection, job_id, stored)
+    let before_ms = job_available_at_ms(connection, job_id)
+
+    let target = future_available_at(connection, 3_600_000)
+    let assert Ok(unique.Existing(conflict)) =
+      submit_reschedule(
+        database,
+        test_queue,
+        "unique-reschedule-states-check-" <> suffix <> "-" <> stored,
+        worker_def,
+        input_value,
+        policy,
+        target,
+      )
+    unique.conflict_job_id(conflict) |> should.equal(job_id)
+    unique.conflict_state(conflict) |> should.equal(expected_state)
+    job_available_at_ms(connection, job_id) |> should.equal(before_ms)
+  })
+
+  mark_database_test_executed(
+    "unique-reschedule-non-scheduled-unchanged-passed",
+  )
+}
+
+/// Rescheduling a `scheduled` row to a due (past) database time makes it
+/// genuinely claimable by a real manually-driven consumer on its very next
+/// `process_one` call.
+pub fn postgres_submit_unique_reschedule_to_due_time_makes_row_claimable_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_reschedule_claimable_test(database_url)
+  }
+}
+
+fn run_unique_reschedule_claimable_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_reschedule_claimable_" <> suffix,
+  )
+  let worker_id = "unique.reschedule-claimable-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-reschedule-claimable-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.ScheduledOnly,
+    )
+
+  let far_future = future_available_at(connection, 3_600_000)
+  let assert Ok(seed_submission) =
+    unique.submission_id("unique-reschedule-claimable-seed-" <> suffix)
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      seed_submission,
+      worker_def,
+      9,
+      unique.At(far_future),
+      policy,
+      unique.KeepExisting,
+    )
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+
+  let due_target = future_available_at(connection, -2000)
+  let assert Ok(unique.Rescheduled(_)) =
+    submit_reschedule(
+      database,
+      test_queue,
+      "unique-reschedule-claimable-retry-" <> suffix,
+      worker_def,
+      9,
+      policy,
+      due_target,
+    )
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+
+  let assert Ok(registry_workers) = registry.new(test_queue)
+  let assert Ok(registry_workers) =
+    registry.register(registry_workers, worker_def)
+  let assert Ok(consumer) = queue.start_manual(database, registry_workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
+
+  mark_database_test_executed("unique-reschedule-due-time-claimable-passed")
+}
+
+/// The live race between a manual consumer's claim (which locks the
+/// scheduled row as part of its own claim `UPDATE`) and a concurrent
+/// `RescheduleScheduledTo` submission for the same key (whose candidate
+/// selection also locks that row, per `docs/UNIQUENESS-CONTRACT.md`'s
+/// admission transaction step 5). The claim is blocked mid-`UPDATE` — after
+/// it has already locked the row via its own `FOR UPDATE SKIP LOCKED`
+/// candidate CTE, before it commits — by a `BEFORE UPDATE` trigger scoped to
+/// this job id (the same `grind_test_claim_overlap` shape
+/// `run_overlapping_claim_test` uses), holding a fresh test-only advisory
+/// lock via `spawn_lock_holder`; the reschedule submission's own candidate
+/// `SELECT ... FOR UPDATE` then genuinely waits on the row lock the claim's
+/// still-open transaction holds (`pg_stat_activity`'s `transactionid` wait
+/// event — a real tuple-lock wait, not a second advisory wait, confirmed
+/// alongside the claim's own advisory wait via `await_lock_wait_counts`).
+/// Releasing the barrier lets the claim finish (`state -> executing`,
+/// commit), which releases the row lock. PostgreSQL's own `EvalPlanQual`
+/// re-check for a `SELECT ... FOR UPDATE` whose target row was concurrently
+/// updated then re-evaluates the reschedule submission's eligible-states
+/// filter against the row's *fresh* post-commit state, not the stale
+/// `scheduled` value the row had when the wait began:
+///
+/// - Under `Incomplete` (which admits `executing`), the fresh state still
+///   matches the filter, so the row is returned with `state = "executing"`;
+///   the Gleam-level `RescheduleScheduledTo(_), "scheduled"` pattern match
+///   does not fire, and the call settles `Existing` with the observed
+///   `Executing` state, `available_at` completely untouched.
+/// - Under `ScheduledOnly` (which does not admit `executing`), the fresh
+///   state no longer matches the filter at all, so `find_candidate` returns
+///   no row and the call settles `Inserted` — a fresh row.
+///
+/// The claimed job's handler (`unique_test_blocking_worker`) deliberately
+/// blocks rather than returning immediately, and is released only *after*
+/// this test has already observed the reschedule submission's own result: a
+/// handler that returns immediately would let the coordinator's own
+/// subsequent acknowledgement race ahead to `succeeded` (which `Incomplete`
+/// does not admit either) before the reschedule's blocked row lock is even
+/// granted — an environment-dependent race, not a deterministic proof. The
+/// handler starting (`FirstAttemptStarted`) is itself proof the claim's row
+/// lock has already been released (the claim's `UPDATE` commits, as a
+/// single-statement transaction, strictly before the coordinator invokes
+/// the handler), so waiting for it before checking the reschedule's result
+/// is a real synchronization point, not a sleep.
+pub fn postgres_submit_unique_reschedule_race_incomplete_returns_existing_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_unique_reschedule_claim_race_test(
+        database_url,
+        unique.Incomplete,
+        6,
+        "unique-reschedule-race-incomplete-existing-passed",
+      )
+  }
+}
+
+pub fn postgres_submit_unique_reschedule_race_scheduled_only_returns_inserted_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_unique_reschedule_claim_race_test(
+        database_url,
+        unique.ScheduledOnly,
+        7,
+        "unique-reschedule-race-scheduled-only-inserted-passed",
+      )
+  }
+}
+
+fn run_unique_reschedule_claim_race_test(
+  database_url: String,
+  states: unique.States,
+  salt: Int,
+  marker: String,
+) -> Nil {
+  let run_id = unique_test_suffix()
+  let suffix = run_id <> "-" <> int.to_string(salt)
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_reschedule_race_" <> suffix,
+  )
+  let worker_id = "unique.reschedule-race-" <> suffix
+  let handler_started = process.new_subject()
+  let worker_def = unique_test_blocking_worker(worker_id, handler_started)
+  let test_queue = "unique-reschedule-race-" <> suffix
+  let assert Ok(registry_workers) = registry.new(test_queue)
+  let assert Ok(registry_workers) =
+    registry.register(registry_workers, worker_def)
+  let assert Ok(consumer) = queue.start_manual(database, registry_workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let period = unique.while_retained()
+  let policy =
+    unique.policy(unique.full_input(), unique.WithinQueue, period, states)
+
+  let far_future = future_available_at(connection, 3_600_000)
+  let assert Ok(seed_submission) =
+    unique.submission_id("unique-reschedule-race-seed-" <> suffix)
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      seed_submission,
+      worker_def,
+      11,
+      unique.At(far_future),
+      policy,
+      unique.KeepExisting,
+    )
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+  let job_id = job.id_value(handle)
+  force_available_at_due(connection, job_id)
+  let original_available_at_ms = job_available_at_ms(connection, job_id)
+
+  let lock_key = unique_test_lock_key(salt)
+  let trigger_name =
+    "grind_test_reschedule_race_" <> run_id <> "_" <> int.to_string(salt)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> trigger_name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = "
+      <> int.to_string(job_id)
+      <> " AND NEW.state = 'executing' THEN PERFORM pg_advisory_xact_lock("
+      <> int.to_string(lock_key)
+      <> "); END IF; RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER "
+      <> trigger_name
+      <> " BEFORE UPDATE ON grind_jobs FOR EACH ROW EXECUTE FUNCTION "
+      <> trigger_name
+      <> "()",
+    )
+    |> pog.execute(on: connection)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query("DROP TRIGGER IF EXISTS " <> trigger_name <> " ON grind_jobs")
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> trigger_name <> "()")
+      |> pog.execute(on: connection)
+    Nil
+  })
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_reschedule_race_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net (see the uniqueness barrier tests above for why this is
+  // registered right after obtaining `release_lock`).
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let claim_reply = process.new_subject()
+  spawn_submit(claim_reply, fn() { queue.process_one(consumer) })
+  await_claim_waiting_on_advisory(connection, 250) |> should.equal(True)
+
+  let reschedule_target = future_available_at(connection, 7_200_000)
+  let reschedule_submission = "unique-reschedule-race-retry-" <> suffix
+  let reschedule_reply = process.new_subject()
+  spawn_submit(reschedule_reply, fn() {
+    submit_reschedule(
+      database,
+      test_queue,
+      reschedule_submission,
+      worker_def,
+      11,
+      policy,
+      reschedule_target,
+    )
+  })
+
+  // The claim is blocked in its trigger (advisory wait) and the reschedule
+  // submission is genuinely waiting on the row lock the claim's still-open
+  // transaction holds (a real tuple-lock wait) — both from one snapshot.
+  await_lock_wait_counts(connection, 1, 1, 500) |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  // The claim's own `UPDATE` has now committed (`state = 'executing'`, its
+  // row lock released) and the coordinator has invoked the handler, which
+  // blocks immediately — the row stays genuinely `executing` (no
+  // acknowledgement has run yet) for as long as this barrier is held, which
+  // is deterministically until this test releases it below, *after*
+  // confirming the reschedule submission's own result. Without this
+  // barrier, a handler that returns immediately would let the
+  // acknowledgement race ahead to `succeeded` before the reschedule's
+  // blocked row lock is even granted — an environment-dependent race, not
+  // proof.
+  let assert Ok(FirstAttemptStarted(handler_release)) =
+    process.receive(handler_started, within: 5000)
+
+  let assert Ok(reschedule_result) =
+    process.receive(reschedule_reply, within: 5000)
+
+  process.send(handler_release, ReleaseAttempt)
+  process.receive(claim_reply, within: 5000) |> should.equal(Ok(Ok(True)))
+
+  case states {
+    unique.Incomplete -> {
+      let assert Ok(unique.Existing(conflict)) = reschedule_result
+      unique.conflict_job_id(conflict) |> should.equal(job_id)
+      unique.conflict_state(conflict) |> should.equal(job.Executing)
+      job_available_at_ms(connection, job_id)
+      |> should.equal(original_available_at_ms)
+      count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+    }
+    unique.ScheduledOnly -> {
+      let assert Ok(unique.Inserted(new_handle)) = reschedule_result
+      job.id_value(new_handle) |> should.not_equal(job_id)
+      count_jobs_in_queue(connection, test_queue) |> should.equal(2)
+    }
+    _ -> should.fail()
+  }
+
+  mark_database_test_executed(marker)
+}
+
+// -- Increment 11: uncertain admission commits -------------------------------
+//
+// Full contract: `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" (the
+// `pog.TransactionQueryError` classification and `CommitUnknown`/
+// `reconcile_unique`). `install_syncrep_reply_trigger` above is generalized
+// (table + predicate) so the same mechanism Increment 2 proved for the
+// acknowledgement path proves the same claims here, scoped by
+// `submission_id` on `grind_unique_submissions` rather than a
+// server-generated `job_id` — the submission id is chosen by the caller and
+// known before the admission transaction that would create a job id even
+// starts, which the acknowledgement path's job-id scoping could not offer.
+
+/// (a) A pool closed *before* `submit_unique` ever sends anything: `run`
+/// (`src/grind/internal/unique_admission.gleam`) calls
+/// `transaction_or_checkout_failure`, whose checkout-failure branch (the
+/// pool could not hand out a connection at all, so `BEGIN` never ran) is
+/// reported directly as `AdmissionFailed(ConnectionUnavailable)`, with no
+/// `PendingSubmission` constructed and no receipt lookup attempted — this is
+/// knowably not-committed, not merely uncertain. See
+/// `docs/RECOVERY-EVIDENCE.md`, Increment 11, for why this needed its own
+/// FFI wrapper distinguishing a checkout failure from `run`'s other,
+/// genuinely uncertain `pog.TransactionQueryError` case (case (d) below).
+/// Reopening the same pool name and retrying the identical `SubmissionId` —
+/// a plain `submit_unique`, not `reconcile_unique` (there is no
+/// `PendingSubmission` to reconcile from) — then succeeds normally:
+/// `Inserted`, exactly one row.
+pub fn postgres_submit_unique_closed_pool_before_send_is_admission_failed_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_closed_before_send_test(database_url)
+  }
+}
+
+fn run_unique_closed_before_send_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_unique_closed_before_send_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  let assert Ok(Nil) = postgres.migrate(database)
+  let worker_def = unique_test_worker("unique.closed-before-send-" <> suffix)
+  let test_queue = "unique-closed-before-send-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let submission_text = "unique-closed-before-send-" <> suffix
+
+  postgres.close(database)
+
+  submit_keep_existing(
+    database,
+    test_queue,
+    submission_text,
+    worker_def,
+    1,
+    policy,
+  )
+  |> should.equal(Error(unique.AdmissionFailed(pog.ConnectionUnavailable)))
+
+  let assert Ok(reopened_validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(reopened) = postgres.start(reopened_validated)
+  use <- exception.defer(fn() { postgres.close(reopened) })
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      reopened,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  count_jobs_in_queue(pog.named_connection(pool_name), test_queue)
+  |> should.equal(1)
+  postgres.arguments(reopened, handle) |> should.equal(Ok(1))
+
+  mark_database_test_executed("unique-closed-before-send-recovers-passed")
+}
+
+/// (b) An aborted commit: a deferred constraint trigger's `pg_sleep(30)`
+/// fires during the admission transaction's own COMMIT (the same mechanism
+/// the pre-existing `ack-commit-connection-loss-unknown` test uses for the
+/// acknowledgement path), scoped by `submission_id` on
+/// `grind_unique_submissions`. Terminating the backend while it sleeps
+/// aborts the whole transaction before it is ever marked committed — unlike
+/// (c)/(d) below, nothing is visible to any other connection, not even
+/// briefly. `submit_unique`'s own reply is `CommitUnknown(pending)`, exactly
+/// as (c)/(d) also report, because the follow-up receipt lookup — run on a
+/// fresh connection after the connection loss — genuinely cannot tell an
+/// aborted commit from a lost reply after a real one; that ambiguity is
+/// exactly what `CommitUnknown` documents. An independent read confirms zero
+/// jobs and zero receipts for this key. Because nothing was ever durably
+/// recorded, `reconcile_unique` alone can never resolve this (it would find
+/// nothing again, forever) — the only correct recovery is a plain retry of
+/// the same `SubmissionId`, which this test proves converges to `Inserted`,
+/// exactly one row.
+pub fn postgres_submit_unique_aborted_commit_is_commit_unknown_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_aborted_commit_test(database_url)
+  }
+}
+
+fn run_unique_aborted_commit_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_unique_aborted_commit_" <> suffix,
+  )
+  let worker_def = unique_test_worker("unique.aborted-commit-" <> suffix)
+  let test_queue = "unique-aborted-commit-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let submission_text = "unique-aborted-commit-" <> suffix
+
+  let trigger_name = "grind_test_unique_aborted_commit_" <> suffix
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> trigger_name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NOT (NEW.submission_id = '"
+      <> submission_text
+      <> "') THEN RETURN NEW; END IF; PERFORM pg_sleep(30); RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER "
+      <> trigger_name
+      <> " AFTER INSERT ON grind_unique_submissions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+      <> trigger_name
+      <> "()",
+    )
+    |> pog.execute(on: connection)
+  let drop_trigger = fn() {
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS "
+        <> trigger_name
+        <> " ON grind_unique_submissions",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> trigger_name <> "()")
+      |> pog.execute(on: connection)
+    Nil
+  }
+  use <- exception.defer(drop_trigger)
+
+  let reply = process.new_subject()
+  spawn_submit(reply, fn() {
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+
+  let assert Ok(backend_pid) = wait_for_commit_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  let assert Ok(Error(unique.CommitUnknown(pending))) =
+    process.receive(reply, within: 10_000)
+
+  count_jobs_in_queue(connection, test_queue) |> should.equal(0)
+  unique_receipt_exists(
+    connection,
+    postgres.storage_owner(database),
+    submission_text,
+  )
+  |> should.equal(False)
+
+  // `reconcile_unique` alone can never recover this: nothing was ever
+  // committed, so the receipt lookup finds nothing, forever.
+  let assert Error(unique.CommitUnknown(_)) =
+    postgres.reconcile_unique(database, pending)
+
+  // Drop the trigger *before* retrying: it is still scoped by this exact
+  // `submission_id`, so a retry reusing the same `SubmissionId` (the whole
+  // point of this claim) would otherwise fire it again and hang the retry's
+  // own commit in another 30-second `pg_sleep`, with nobody left to
+  // terminate that backend — exactly the trap this early cleanup avoids.
+  drop_trigger()
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+  postgres.arguments(database, handle) |> should.equal(Ok(1))
+
+  mark_database_test_executed("unique-aborted-commit-is-commit-unknown-passed")
+}
+
+/// (c) A genuinely committed admission whose reply is lost after PostgreSQL
+/// has already committed locally (the same SyncRep-park-then-terminate
+/// mechanism Increment 2 uses for the acknowledgement path).
+/// `submit_unique` itself still returns `Ok(Inserted(handle))` — resolved by
+/// the follow-up receipt lookup `run` performs on a fresh connection after
+/// the connection loss, not a `CommitUnknown` the caller must separately
+/// reconcile. `bind_handle` agrees on the same job id and input.
+pub fn postgres_submit_unique_committed_reply_lost_returns_inserted_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_committed_reply_lost_test(database_url)
+  }
+}
+
+fn run_unique_committed_reply_lost_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_unique_reply_lost_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  require_syncrep_cluster_configured(connection)
+
+  let worker_def = unique_test_worker("unique.reply-lost-" <> suffix)
+  let test_queue = "unique-reply-lost-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let submission_text = "unique-reply-lost-" <> suffix
+
+  use <- exception.defer(install_syncrep_reply_trigger(
+    connection,
+    "grind_test_unique_reply_lost_" <> suffix,
+    "grind_unique_submissions",
+    "NEW.submission_id = '" <> submission_text <> "'",
+  ))
+
+  let reply = process.new_subject()
+  spawn_submit(reply, fn() {
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      5,
+      policy,
+    )
+  })
+
+  let assert Ok(backend_pid) = wait_for_syncrep_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  let assert Ok(Ok(unique.Inserted(handle))) =
+    process.receive(reply, within: 10_000)
+  backend_pid_is_alive(connection, backend_pid) |> should.equal(False)
+
+  postgres.arguments(database, handle) |> should.equal(Ok(5))
+  let assert Ok(rebound) =
+    postgres.bind_handle(database, worker_def, job.id_value(handle))
+  postgres.arguments(database, rebound) |> should.equal(Ok(5))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+  unique_receipt_exists(
+    connection,
+    postgres.storage_owner(database),
+    submission_text,
+  )
+  |> should.equal(True)
+
+  mark_database_test_executed("unique-committed-reply-lost-inserted-passed")
+}
+
+/// (d) Committed, reply lost, *and* Grind's own pool closed while the commit
+/// is still parked in `SyncRep`.
+///
+/// **This was found to be a correctness bug in `run`
+/// (`src/grind/internal/unique_admission.gleam`), not a classification
+/// difference to document and move on from.** The admission transaction's
+/// own "commit" call correctly unblocks with `pog.TransactionQueryError`
+/// (checked out fine, then lost the connection — genuinely uncertain, might
+/// have committed), and `run` correctly routes it to
+/// `reconcile_from_receipt` to check. But that follow-up `find_receipt`
+/// query then *also* fails — the pool is now fully closed — and the
+/// unfixed code's `Error(error) -> Error(error)` branch returned that
+/// *lookup's own* connectivity failure, `AdmissionFailed(ConnectionUnavailable)`,
+/// as if it were the *admission's* outcome, silently discarding the
+/// `pending: PendingSubmission` that was already in hand. A caller told
+/// `AdmissionFailed` reasonably treats that as "did not happen, safe to
+/// retry independently" — but the zombie transaction can still commit
+/// later. **Fixed** by two changes: (R1) `reconcile_from_receipt` now maps
+/// a failed lookup to `Error(unique.CommitUnknown(pending))`, the same as
+/// finding no receipt yet — mirroring `reconcile_unknown_ack`'s `Ok(None) |
+/// Error(_) -> QueueAckUnknown` in `grind/postgres`, so a transient failure
+/// while *checking* is never confused with a definite answer; (R2) `run`
+/// now calls a new FFI wrapper, `transaction_or_checkout_failure`
+/// (`grind_postgres_ffi.erl`), that distinguishes a checkout failure
+/// (nothing was ever attempted — genuinely `AdmissionFailed`, no
+/// `PendingSubmission`, no receipt lookup even tried) from pog's own
+/// transaction outcome, so a checkout failure is no longer disguised as the
+/// same `TransactionQueryError` shape a genuinely uncertain mid-transaction
+/// loss produces — R1 alone would have made every checkout failure
+/// (including (a) above) report `CommitUnknown` too, imprecisely; R2
+/// restores (a)'s precise `AdmissionFailed`. See
+/// `docs/RECOVERY-EVIDENCE.md` for the red-before-fix output and the R1
+/// mutation that reverts to the bug.
+///
+/// With the fix: `submit_unique` reports `CommitUnknown(pending)`.
+/// `reconcile_unique(reopened, pending)` while the zombie is still parked is
+/// a pure receipt lookup with no lock of its own — the zombie's receipt
+/// insert is not yet visible to any other session, so it still reports
+/// `CommitUnknown` (not a persisted-conflict inference). A second,
+/// independent recovery path — a *plain* `submit_unique` retry of the same
+/// `SubmissionId`, attempted while the zombie is still parked — genuinely
+/// needs the domain lock the zombie's still-open transaction holds, and
+/// reports `AdmissionContended`; no second row either way. Only after the
+/// zombie backend is terminated and confirmed gone (`wait_for_backend_gone`
+/// — an independent observer connection is what later reads visibility
+/// here, not Grind's own closed-then-reopened socket) does
+/// `reconcile_unique(reopened, pending)` resolve from the now-visible
+/// receipt: `Inserted`, with the original job id, exactly one row — and the
+/// plain-retry path, tried again, converges on that same job id.
+pub fn postgres_submit_unique_committed_reply_lost_store_unavailable_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_unique_committed_reply_lost_store_unavailable_test(database_url)
+  }
+}
+
+fn run_unique_committed_reply_lost_store_unavailable_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_unique_reply_lost_unavail_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let observer_pool_name =
+    process.new_name("grind_unique_reply_lost_unavail_observer_" <> suffix)
+  let observer_settings =
+    postgres.settings(database_url, observer_pool_name)
+    |> postgres.pool_size(1)
+  let assert Ok(observer_validated) = postgres.validate(observer_settings)
+  let assert Ok(observer) = postgres.start(observer_validated)
+  use <- exception.defer(fn() { postgres.close(observer) })
+  let observer_connection = pog.named_connection(observer_pool_name)
+  require_syncrep_cluster_configured(observer_connection)
+
+  let worker_def = unique_test_worker("unique.reply-lost-unavail-" <> suffix)
+  let test_queue = "unique-reply-lost-unavail-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let submission_text = "unique-reply-lost-unavail-" <> suffix
+
+  use <- exception.defer(install_syncrep_reply_trigger(
+    observer_connection,
+    "grind_test_unique_reply_lost_unavail_" <> suffix,
+    "grind_unique_submissions",
+    "NEW.submission_id = '" <> submission_text <> "'",
+  ))
+
+  let reply = process.new_subject()
+  spawn_submit(reply, fn() {
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      13,
+      policy,
+    )
+  })
+
+  let assert Ok(backend_pid) =
+    wait_for_syncrep_trigger_backend(observer_connection, 300)
+
+  postgres.close(database)
+
+  // The admission transaction reached the database (its own "commit" call
+  // was genuinely mid-flight when the pool closed) — genuinely uncertain,
+  // not knowably absent: `CommitUnknown`, carrying a `PendingSubmission` to
+  // reconcile from.
+  let assert Ok(Error(unique.CommitUnknown(pending))) =
+    process.receive(reply, within: 10_000)
+
+  let assert Ok(reopened_validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(reopened) = postgres.start(reopened_validated)
+  use <- exception.defer(fn() { postgres.close(reopened) })
+
+  // While the zombie is still parked, its receipt insert is not yet visible
+  // to any other session — a pure receipt lookup still finds nothing and
+  // reports `CommitUnknown` again (not a persisted-conflict inference).
+  let assert Error(unique.CommitUnknown(_)) =
+    postgres.reconcile_unique(reopened, pending)
+
+  // A fresh admission retry, unlike `reconcile_unique`, genuinely needs the
+  // domain lock the zombie's still-open transaction holds — the same
+  // safety `reconcile_unique` alone already provided above, confirmed here
+  // as a second, independent recovery path.
+  let contended_pool_name =
+    process.new_name("grind_unique_reply_lost_unavail_retry_" <> suffix)
+  let assert Ok(contended_settings) =
+    postgres.settings(database_url, contended_pool_name)
+    |> postgres.unique_lock_wait(200)
+    |> postgres.validate
+  let assert Ok(contended) = postgres.start(contended_settings)
+  use <- exception.defer(fn() { postgres.close(contended) })
+  submit_keep_existing(
+    contended,
+    test_queue,
+    submission_text,
+    worker_def,
+    13,
+    policy,
+  )
+  |> should.equal(Error(unique.AdmissionContended))
+  count_jobs_in_queue(observer_connection, test_queue) |> should.equal(0)
+
+  terminate_backend(observer_connection, backend_pid) |> should.equal(True)
+  let assert Ok(Nil) =
+    wait_for_backend_gone(observer_connection, backend_pid, 300)
+
+  // `reconcile_unique`, once the zombie is gone, resolves from the now-
+  // visible receipt — not by candidate selection reinterpreting the row as
+  // a fresh conflict.
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.reconcile_unique(reopened, pending)
+  let original_job_id = job.id_value(handle)
+  count_jobs_in_queue(observer_connection, test_queue) |> should.equal(1)
+  postgres.arguments(reopened, handle) |> should.equal(Ok(13))
+
+  // Second recovery path: a plain retry of the same `SubmissionId` (no
+  // retained `PendingSubmission` needed) converges on the identical job id
+  // through `admission_transaction`'s own receipt lookup — still one row.
+  let assert Ok(unique.Inserted(retried_handle)) =
+    submit_keep_existing(
+      reopened,
+      test_queue,
+      submission_text,
+      worker_def,
+      13,
+      policy,
+    )
+  job.id_value(retried_handle) |> should.equal(original_job_id)
+  count_jobs_in_queue(observer_connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed(
+    "unique-committed-reply-lost-store-unavailable-passed",
+  )
+}
+
+/// (e) A reschedule whose commit reply is lost: replay via the same internal
+/// receipt lookup returns `Rescheduled`, not `Existing`, even though the
+/// row's current state (`scheduled`, at its new `available_at`) looks
+/// exactly like an ordinary scheduled conflict either way — the receipt's
+/// own recorded *decision* column, not the row's current state, is what
+/// `find_receipt`/`outcome_of_receipt` decodes.
+pub fn postgres_submit_unique_reschedule_reply_lost_returns_rescheduled_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_unique_reschedule_reply_lost_test(database_url)
+  }
+}
+
+fn run_unique_reschedule_reply_lost_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name =
+    process.new_name("grind_unique_reschedule_reply_lost_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  require_syncrep_cluster_configured(connection)
+
+  let worker_def = unique_test_worker("unique.reschedule-reply-lost-" <> suffix)
+  let test_queue = "unique-reschedule-reply-lost-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.ScheduledOnly,
+    )
+
+  let original_target = future_available_at(connection, 3_600_000)
+  let assert Ok(seed_submission) =
+    unique.submission_id("unique-reschedule-reply-lost-seed-" <> suffix)
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      seed_submission,
+      worker_def,
+      21,
+      unique.At(original_target),
+      policy,
+      unique.KeepExisting,
+    )
+  let job_id = job.id_value(handle)
+
+  let new_target = future_available_at(connection, 7_200_000)
+  let reschedule_submission = "unique-reschedule-reply-lost-retry-" <> suffix
+
+  use <- exception.defer(install_syncrep_reply_trigger(
+    connection,
+    "grind_test_unique_reschedule_reply_lost_" <> suffix,
+    "grind_unique_submissions",
+    "NEW.submission_id = '" <> reschedule_submission <> "'",
+  ))
+
+  let reply = process.new_subject()
+  spawn_submit(reply, fn() {
+    submit_reschedule(
+      database,
+      test_queue,
+      reschedule_submission,
+      worker_def,
+      21,
+      policy,
+      new_target,
+    )
+  })
+
+  let assert Ok(backend_pid) = wait_for_syncrep_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  let assert Ok(Ok(unique.Rescheduled(conflict))) =
+    process.receive(reply, within: 10_000)
+  unique.conflict_job_id(conflict) |> should.equal(job_id)
+  job_available_at_ms(connection, job_id)
+  |> should.equal(job.available_at_unix_milliseconds(new_target))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed("unique-reschedule-reply-lost-rescheduled-passed")
+}
+
+// -- Uniqueness increment 12 (selected keys) ---------------------------------
+//
+// `unique.selected` projects part of an admitted input into its own key,
+// encoded with its own codec, independently of the rest of the input. These
+// tests prove: a non-selected field never enters the key (only the projected
+// value matters); the key contract string is `"selected:" <> name <> ":" <>
+// codec_version`, so a different name or a different codec version alone
+// isolates two selected keys that project the identical value; a full-input
+// key and a selected key never collide, even over the exact same input,
+// because their contract prefixes differ; and a selected key's equality is
+// exact, not containment, the same departure from Oban's own selected-field
+// semantics already proven for full-input keys
+// (`postgres_submit_unique_json_equality_matches_postgres_jsonb_test`) --
+// inspired by `oracle/deps/oban/test/oban/engine_test.exs`, "scoping
+// uniqueness to specific argument keys".
+
+/// An input with one field the key projects (`account`, itself a raw JSON
+/// value via `RawInput`, reused from the JSON-equality tests above) and one
+/// field the key never sees (`other`).
+type SelectedInput {
+  SelectedInput(account: RawInput, other: Int)
+}
+
+fn encode_selected_input(input: SelectedInput) -> json.Json {
+  let SelectedInput(account:, other:) = input
+  json.object([
+    #("account", encode_raw_input(account)),
+    #("other", json.int(other)),
+  ])
+}
+
+fn selected_input_decoder() -> decode.Decoder(SelectedInput) {
+  decode.success(SelectedInput(RawInput(json.null()), 0))
+}
+
+fn account_projection(input: SelectedInput) -> RawInput {
+  let SelectedInput(account:, ..) = input
+  account
+}
+
+fn selected_input_worker(
+  id: String,
+) -> worker.Worker(SelectedInput, String, e) {
+  let assert Ok(input_codec) =
+    worker.codec(
+      id <> "-input-v1",
+      encode_selected_input,
+      selected_input_decoder(),
+    )
+  let assert Ok(output_codec) =
+    worker.codec(id <> "-output-v1", json.string, decode.string)
+  let assert Ok(worker_def) =
+    worker.define(id, "v1", input_codec, output_codec, fn(input) {
+      let SelectedInput(other:, ..) = input
+      Ok(int.to_string(other))
+    })
+  worker_def
+}
+
+pub fn postgres_submit_unique_selected_key_scoping_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_submit_unique_selected_key_scoping_test(database_url)
+  }
+}
+
+fn run_submit_unique_selected_key_scoping_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_selected_pool",
+  )
+  let worker_def = selected_input_worker("unique.selected-" <> suffix)
+  let assert Ok(account_codec) =
+    worker.codec(
+      "unique-selected-account-" <> suffix <> "-v1",
+      encode_raw_input,
+      raw_input_decoder(),
+    )
+  let assert Ok(other_version_codec) =
+    worker.codec(
+      "unique-selected-account-" <> suffix <> "-v2",
+      encode_raw_input,
+      raw_input_decoder(),
+    )
+  let assert Ok(account_key) =
+    unique.selected("account", account_projection, account_codec)
+  let assert Ok(account_key_other_name) =
+    unique.selected("account-alt", account_projection, account_codec)
+  let assert Ok(account_key_other_codec_version) =
+    unique.selected("account", account_projection, other_version_codec)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let account_policy =
+    unique.policy(account_key, unique.WithinQueue, period, unique.Incomplete)
+  let account_policy_other_name =
+    unique.policy(
+      account_key_other_name,
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let account_policy_other_codec_version =
+    unique.policy(
+      account_key_other_codec_version,
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let full_input_policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "selected-" <> suffix
+  let shared_account = SelectedInput(RawInput(json.int(1)), 10)
+
+  // Same projected key, a different non-selected field: still `Existing` --
+  // `other` never enters the key.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-selected-1-" <> suffix,
+      worker_def,
+      shared_account,
+      account_policy,
+    )
+  let assert Ok(unique.Existing(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-selected-2-" <> suffix,
+      worker_def,
+      SelectedInput(RawInput(json.int(1)), 20),
+      account_policy,
+    )
+
+  // A different key name, same projection and codec, same projected value:
+  // `Inserted` -- the key contract string ("selected:" <> name <> ":" <>
+  // codec_version) differs by name alone.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-selected-3-" <> suffix,
+      worker_def,
+      shared_account,
+      account_policy_other_name,
+    )
+
+  // A different key codec version, same name and projection, same projected
+  // value: `Inserted` -- the contract string differs by codec version alone.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-selected-4-" <> suffix,
+      worker_def,
+      shared_account,
+      account_policy_other_codec_version,
+    )
+
+  // A full-input key and a selected key never collide, even over the exact
+  // same input: their contract prefixes ("full-input:" vs "selected:")
+  // differ unconditionally.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-selected-5-" <> suffix,
+      worker_def,
+      shared_account,
+      full_input_policy,
+    )
+
+  mark_database_test_executed("unique-selected-key-scoping-passed")
+}
+
+pub fn postgres_submit_unique_selected_key_equality_not_containment_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_submit_unique_selected_key_containment_test(database_url)
+  }
+}
+
+fn run_submit_unique_selected_key_containment_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_selected_containment_pool",
+  )
+  let worker_def =
+    selected_input_worker("unique.selected-containment-" <> suffix)
+  let assert Ok(account_codec) =
+    worker.codec(
+      "unique-selected-containment-account-" <> suffix <> "-v1",
+      encode_raw_input,
+      raw_input_decoder(),
+    )
+  let assert Ok(account_key) =
+    unique.selected("account", account_projection, account_codec)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(account_key, unique.WithinQueue, period, unique.Incomplete)
+  let test_queue = "selected-containment-" <> suffix
+
+  // A subset projected value never conflicts with a stored superset: a
+  // selected key compares by exact equality, the same as a full-input key
+  // (docs/UNIQUENESS-CONTRACT.md, Decision 2) -- a deliberate departure from
+  // Oban's own containment semantics for a selected-field comparison.
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-selected-subset-" <> suffix,
+      worker_def,
+      SelectedInput(RawInput(json.object([#("id", json.int(1))])), 0),
+      policy,
+    )
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "unique-selected-superset-" <> suffix,
+      worker_def,
+      SelectedInput(
+        RawInput(json.object([#("id", json.int(1)), #("extra", json.int(2))])),
+        0,
+      ),
+      policy,
+    )
+
+  mark_database_test_executed(
+    "unique-selected-key-equality-not-containment-passed",
+  )
 }

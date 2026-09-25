@@ -3,12 +3,14 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/json
+import gleam/time/timestamp
 import gleeunit
 import gleeunit/should
 import grind/job
 import grind/postgres
 import grind/queue
 import grind/registry
+import grind/unique
 import grind/worker
 import grind_consumer.{
   type PaymentError, type PaymentRequest, PaymentRejected, PaymentRequest,
@@ -16,6 +18,15 @@ import grind_consumer.{
 
 pub fn main() -> Nil {
   gleeunit.main()
+}
+
+/// The current wall-clock time as Unix milliseconds, for building an
+/// application-owned `job.AvailableAt` value. Public `gleam_time` only, no
+/// direct Erlang FFI.
+fn now_unix_ms() -> Int {
+  let #(seconds, nanoseconds) =
+    timestamp.system_time() |> timestamp.to_unix_seconds_and_nanoseconds
+  seconds * 1000 + nanoseconds / 1_000_000
 }
 
 type Probe {
@@ -683,4 +694,202 @@ pub fn storage_start_failure_is_reported_test() {
       mark("consumer-storage-failure-passed")
     }
   }
+}
+
+// -- Uniqueness admission through the public API -----------------------------
+//
+// `grind/unique`/`postgres.submit_unique`/`postgres.reconcile_unique` are
+// exercised here through public imports only, mirroring the rest of this
+// file's discipline: no `@internal` function, no `grind/postgres.Database`
+// internals, no raw `pog` connection. See `docs/UNIQUENESS-CONTRACT.md` for
+// the full contract these calls implement.
+
+/// The `Int` input / `String` output worker shape both uniqueness tests
+/// below need.
+fn unique_echo_worker(id: String) -> worker.Worker(Int, String, Nil) {
+  let assert Ok(input) = worker.codec(id <> "-input-v1", json.int, decode.int)
+  let assert Ok(output) =
+    worker.codec(id <> "-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(id, "v1", input, output, fn(value) {
+      Ok(int.to_string(value))
+    })
+  definition
+}
+
+pub fn public_consumer_unique_admission_existing_conflict_and_retry_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> run_unique_admission_existing_conflict_and_retry_test(url)
+  }
+}
+
+fn run_unique_admission_existing_conflict_and_retry_test(url: String) -> Nil {
+  let assert Ok(settings) =
+    postgres.settings(url, process.new_name("consumer_unique_pool"))
+    |> postgres.validate
+  let assert Ok(database) = postgres.start(settings)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let worker_def = unique_echo_worker("consumer.unique_echo")
+  let assert Ok(workers) = registry.new("consumer-unique")
+  let assert Ok(workers) = registry.register(workers, worker_def)
+
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "consumer-unique"
+
+  let assert Ok(first_submission) =
+    unique.submission_id("consumer-unique-first")
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      first_submission,
+      worker_def,
+      42,
+      unique.Immediately,
+      policy,
+      unique.KeepExisting,
+    )
+
+  // A second, independently identified admission with the same key hits the
+  // still-queued conflict instead of inserting a new row.
+  let assert Ok(second_submission) =
+    unique.submission_id("consumer-unique-second")
+  let assert Ok(unique.Existing(conflict)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      second_submission,
+      worker_def,
+      42,
+      unique.Immediately,
+      policy,
+      unique.KeepExisting,
+    )
+  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
+
+  // `Conflict` is not a handle: the caller rebinds it through the same
+  // durable-id path used after a restart before reading typed state.
+  let assert Ok(bound) =
+    postgres.bind_handle(database, worker_def, unique.conflict_job_id(conflict))
+  postgres.state(database, bound) |> should.equal(Ok(job.Queued))
+
+  // Replaying the *original* SubmissionId returns the receipt's own recorded
+  // decision -- the original job id, as `Inserted` again -- rather than
+  // treating the still-present row as a fresh conflict.
+  let assert Ok(unique.Inserted(replayed)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      first_submission,
+      worker_def,
+      42,
+      unique.Immediately,
+      policy,
+      unique.KeepExisting,
+    )
+  job.id_value(replayed) |> should.equal(job.id_value(handle))
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  await_state(database, bound, job.Succeeded, 250) |> should.equal(True)
+  postgres.outcome(database, bound) |> should.equal(Ok(job.SucceededWith("42")))
+
+  mark("consumer-unique-admission-existing-conflict-retry-passed")
+}
+
+pub fn public_consumer_unique_reschedule_across_queues_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> run_unique_reschedule_across_queues_test(url)
+  }
+}
+
+fn run_unique_reschedule_across_queues_test(url: String) -> Nil {
+  let assert Ok(settings) =
+    postgres.settings(url, process.new_name("consumer_unique_reschedule_pool"))
+    |> postgres.validate
+  let assert Ok(database) = postgres.start(settings)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let worker_def = unique_echo_worker("consumer.unique_reschedule_echo")
+  let assert Ok(workers) = registry.new("consumer-unique-across-a")
+  let assert Ok(workers) = registry.register(workers, worker_def)
+
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.AcrossQueues,
+      period,
+      unique.ScheduledOnly,
+    )
+
+  // Seeded far enough in the future that it is genuinely `scheduled`, not
+  // already due.
+  let far_future_ms = now_unix_ms() + 3_600_000
+  let assert Ok(far_future_at) = job.available_at(far_future_ms)
+  let assert Ok(seed_submission) =
+    unique.submission_id("consumer-unique-across-seed")
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_unique(
+      database,
+      "consumer-unique-across-a",
+      seed_submission,
+      worker_def,
+      7,
+      unique.At(far_future_at),
+      policy,
+      unique.KeepExisting,
+    )
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+
+  // A second submission through a *different* queue, under `AcrossQueues`,
+  // reschedules the same key's still-scheduled row to a near-future time --
+  // it never inserts a second row in its own submitting queue.
+  let soon_ms = now_unix_ms() + 50
+  let assert Ok(soon_at) = job.available_at(soon_ms)
+  let assert Ok(reschedule_submission) =
+    unique.submission_id("consumer-unique-across-reschedule")
+  let assert Ok(unique.Rescheduled(conflict)) =
+    postgres.submit_unique(
+      database,
+      "consumer-unique-across-b",
+      reschedule_submission,
+      worker_def,
+      7,
+      unique.Immediately,
+      policy,
+      unique.RescheduleScheduledTo(soon_at),
+    )
+  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
+  // The row's actual queue is the one it was originally inserted under, not
+  // the rescheduling submission's own queue.
+  unique.conflict_queue(conflict) |> should.equal("consumer-unique-across-a")
+
+  let assert Ok(bound) =
+    postgres.bind_handle(database, worker_def, unique.conflict_job_id(conflict))
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  await_claim(consumer, 250) |> should.equal(Ok(True))
+
+  await_state(database, bound, job.Succeeded, 250) |> should.equal(True)
+  postgres.outcome(database, bound) |> should.equal(Ok(job.SucceededWith("7")))
+
+  mark("consumer-unique-reschedule-across-queues-passed")
 }
