@@ -1,0 +1,1 @@
+UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, error_version = NULL, failure_description = 'cancelled by caller', failure_cause = NULL, uncertain_at = NULL, cancel_requested_at = NULL WHERE id = $1 AND state IN ('queued', 'scheduled', 'retryable') RETURNING id

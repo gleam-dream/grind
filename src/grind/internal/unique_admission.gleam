@@ -12,6 +12,7 @@ import gleam/int
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import grind/internal/sql
 import grind/job
 import grind/unique
 import grind/worker.{type Worker}
@@ -21,6 +22,15 @@ import pog
 fn execute_safely(
   query: pog.Query(a),
   on connection: pog.Connection,
+) -> Result(pog.Returned(a), pog.QueryError)
+
+/// Generic form of `execute_safely`, for calling a Squirrel-generated query
+/// function (`grind/internal/sql`) that invokes `pog.execute` itself rather
+/// than going through `execute_safely`. See `grind/postgres`'s identical
+/// binding for the full rationale.
+@external(erlang, "grind_postgres_ffi", "call_safely")
+fn call_safely(
+  run: fn() -> Result(pog.Returned(a), pog.QueryError),
 ) -> Result(pog.Returned(a), pog.QueryError)
 
 /// Distinguishes a checkout failure (the pool could not hand out a
@@ -71,6 +81,27 @@ type Request(input, output, error) {
   )
 }
 
+/// The proven-committed outcome of one `submit` call, carried from wherever
+/// it was proven (a fresh write, or a durable receipt read back matching
+/// this exact submission) up to `grind/postgres`'s `submit_unique`, which is
+/// the only place that emits `[grind, job, admitted]` for it — never from
+/// inside a transaction callback. Mirrors `grind/postgres`'s own internal
+/// `AckCommit`. `via_receipt_match: True` means this call's own transaction
+/// (or its post-`CommitUnknown` reconciliation) did not write anything new —
+/// the exact same submission was already durably decided, so the
+/// observation's `confirmation` is `Reconciled` rather than `Replied`, and
+/// `available_at_unix_ms` is `None` (a receipt read cannot re-derive it, the
+/// same limitation `AckCommit` documents for a receipt-matched
+/// acknowledgement).
+pub type Commit(input, output, error) {
+  Commit(
+    outcome: unique.Admission(input, output, error),
+    committed_state: job.State,
+    available_at_unix_ms: Option(Int),
+    via_receipt_match: Bool,
+  )
+}
+
 pub fn submit(
   connection: pog.Connection,
   storage_owner: String,
@@ -83,7 +114,7 @@ pub fn submit(
   policy: unique.Policy(input),
   on_conflict: unique.ConflictAction,
 ) -> Result(
-  unique.Admission(input, output, error),
+  Commit(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
   case queue {
@@ -122,7 +153,10 @@ pub fn reconcile(
   unique.Admission(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
-  reconcile_from_receipt(connection, pending)
+  case reconcile_from_receipt(connection, pending) {
+    Ok(#(outcome, _committed_state)) -> Ok(outcome)
+    Error(error) -> Error(error)
+  }
 }
 
 fn build_request(
@@ -219,7 +253,7 @@ fn run(
   request: Request(input, output, error),
   lock_wait_ms: Int,
 ) -> Result(
-  unique.Admission(input, output, error),
+  Commit(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
   case
@@ -233,18 +267,29 @@ fn run(
     // lookup on this same unreachable store could tell us that we don't
     // already know).
     Error(Nil) -> Error(unique.AdmissionFailed(pog.ConnectionUnavailable))
-    Ok(Ok(outcome)) -> Ok(outcome)
+    Ok(Ok(commit)) -> Ok(commit)
     Ok(Error(pog.TransactionRolledBack(error))) -> Error(error)
     Ok(Error(pog.TransactionQueryError(_))) ->
-      reconcile_from_receipt(
-        connection,
-        unique.new_pending_submission(
-          request.storage_owner,
-          request.submission_id,
-          request.worker,
-          request.request_sha256,
-        ),
-      )
+      case
+        reconcile_from_receipt(
+          connection,
+          unique.new_pending_submission(
+            request.storage_owner,
+            request.submission_id,
+            request.worker,
+            request.request_sha256,
+          ),
+        )
+      {
+        Ok(#(outcome, committed_state)) ->
+          Ok(Commit(
+            outcome:,
+            committed_state:,
+            available_at_unix_ms: None,
+            via_receipt_match: True,
+          ))
+        Error(error) -> Error(error)
+      }
   }
 }
 
@@ -252,7 +297,7 @@ fn reconcile_from_receipt(
   connection: pog.Connection,
   pending: unique.PendingSubmission(input, output, error),
 ) -> Result(
-  unique.Admission(input, output, error),
+  #(unique.Admission(input, output, error), job.State),
   unique.SubmitError(input, output, error),
 ) {
   let storage_owner = unique.pending_submission_storage_owner(pending)
@@ -267,8 +312,22 @@ fn reconcile_from_receipt(
       request_sha256,
     )
   {
-    Ok(Some(outcome)) -> Ok(outcome)
-    Ok(None) | Error(_) -> Error(unique.CommitUnknown(pending))
+    Ok(Some(outcome_with_state)) -> Ok(outcome_with_state)
+    Ok(None) -> Error(unique.CommitUnknown(pending))
+    // A fingerprint mismatch (or an unrecognized stored `decision`/
+    // `observed_state`) is knowable, not uncertain: this exact
+    // `SubmissionId` was already durably decided for a *different* request,
+    // so a caller retrying `CommitUnknown` forever would never converge.
+    // Pass it through unchanged, mirroring `reconcile_unknown_ack`'s
+    // `QueueAckCommandConflict` passthrough for the acknowledgement path.
+    // Every other error here (a lock-timeout-shaped or otherwise failed
+    // lookup) means the check itself could not run, which is exactly what
+    // `CommitUnknown` documents.
+    Error(unique.SubmissionConflict) -> Error(unique.SubmissionConflict)
+    Error(unique.AdmissionContended)
+    | Error(unique.AdmissionFailed(_))
+    | Error(unique.EmptyQueueName)
+    | Error(unique.CommitUnknown(_)) -> Error(unique.CommitUnknown(pending))
   }
 }
 
@@ -303,7 +362,7 @@ fn admission_transaction(
   lock_wait_ms: Int,
   request: Request(input, output, error),
 ) -> Result(
-  unique.Admission(input, output, error),
+  Commit(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
   use _ <- result.try(pin_read_committed(connection))
@@ -317,7 +376,13 @@ fn admission_transaction(
     request.request_sha256,
   ))
   case existing {
-    Some(outcome) -> Ok(outcome)
+    Some(#(outcome, committed_state)) ->
+      Ok(Commit(
+        outcome:,
+        committed_state:,
+        available_at_unix_ms: None,
+        via_receipt_match: True,
+      ))
     None -> admit_candidate(connection, request)
   }
 }
@@ -342,8 +407,10 @@ fn admission_transaction(
 fn pin_read_committed(
   connection: pog.Connection,
 ) -> Result(Nil, unique.SubmitError(input, output, error)) {
-  let query = pog.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-  use _ <- result.try(unique_execute(query, connection))
+  use _ <- result.try(
+    call_safely(fn() { sql.pin_read_committed(connection) })
+    |> result.map_error(classify_query_error),
+  )
   Ok(Nil)
 }
 
@@ -351,10 +418,12 @@ fn set_lock_timeout(
   connection: pog.Connection,
   lock_wait_ms: Int,
 ) -> Result(Nil, unique.SubmitError(input, output, error)) {
-  let query =
-    pog.query("SELECT set_config('lock_timeout', $1, true)")
-    |> pog.parameter(pog.text(int.to_string(lock_wait_ms)))
-  use _ <- result.try(unique_execute(query, connection))
+  use _ <- result.try(
+    call_safely(fn() {
+      sql.set_lock_timeout(connection, int.to_string(lock_wait_ms))
+    })
+    |> result.map_error(classify_query_error),
+  )
   Ok(Nil)
 }
 
@@ -463,18 +532,6 @@ pub fn period_predicate(
   <> "::double precision * interval '1 millisecond')"
 }
 
-type ReceiptRow {
-  ReceiptRow(
-    decision: String,
-    job_id: Int,
-    job_queue: String,
-    observed_state: String,
-    worker_id: String,
-    worker_version: String,
-    request_sha256: BitArray,
-  )
-}
-
 /// `Ok(None)` means no receipt yet; a fingerprint mismatch or an
 /// unrecognized `decision`/`observed_state` both fail closed as
 /// `SubmissionConflict`.
@@ -485,34 +542,15 @@ fn find_receipt(
   worker_def: Worker(input, output, error),
   request_sha256: BitArray,
 ) -> Result(
-  Option(unique.Admission(input, output, error)),
+  Option(#(unique.Admission(input, output, error), job.State)),
   unique.SubmitError(input, output, error),
 ) {
-  let query =
-    pog.query(
-      "SELECT decision, job_id, job_queue, observed_state, worker_id, worker_version, request_sha256 FROM grind_unique_submissions WHERE storage_owner = $1 AND submission_id = $2",
-    )
-    |> pog.parameter(pog.text(storage_owner))
-    |> pog.parameter(pog.text(submission_id_value))
-    |> pog.returning({
-      use decision <- decode.field(0, decode.string)
-      use job_id <- decode.field(1, decode.int)
-      use job_queue <- decode.field(2, decode.string)
-      use observed_state <- decode.field(3, decode.string)
-      use row_worker_id <- decode.field(4, decode.string)
-      use row_worker_version <- decode.field(5, decode.string)
-      use stored_sha256 <- decode.field(6, decode.bit_array)
-      decode.success(ReceiptRow(
-        decision:,
-        job_id:,
-        job_queue:,
-        observed_state:,
-        worker_id: row_worker_id,
-        worker_version: row_worker_version,
-        request_sha256: stored_sha256,
-      ))
+  use returned <- result.try(
+    call_safely(fn() {
+      sql.find_receipt(connection, storage_owner, submission_id_value)
     })
-  use returned <- result.try(unique_execute(query, connection))
+    |> result.map_error(classify_query_error),
+  )
   case returned.rows {
     [] -> Ok(None)
     [row] ->
@@ -520,7 +558,7 @@ fn find_receipt(
         False -> Error(unique.SubmissionConflict)
         True ->
           case outcome_of_receipt(worker_def, storage_owner, row) {
-            Ok(outcome) -> Ok(Some(outcome))
+            Ok(outcome_with_state) -> Ok(Some(outcome_with_state))
             Error(Nil) -> Error(unique.SubmissionConflict)
           }
       }
@@ -531,8 +569,8 @@ fn find_receipt(
 fn outcome_of_receipt(
   worker_def: Worker(input, output, error),
   storage_owner: String,
-  row: ReceiptRow,
-) -> Result(unique.Admission(input, output, error), Nil) {
+  row: sql.FindReceiptRow,
+) -> Result(#(unique.Admission(input, output, error), job.State), Nil) {
   use state <- result.try(job.state_of_stored(row.observed_state))
   let conflict =
     unique.new_conflict(
@@ -545,16 +583,17 @@ fn outcome_of_receipt(
     )
   case row.decision {
     "inserted" ->
-      Ok(
+      Ok(#(
         unique.Inserted(job.new_handle(
           row.job_id,
           storage_owner,
           row.job_queue,
           worker_def,
         )),
-      )
-    "existing" -> Ok(unique.Existing(conflict))
-    "rescheduled" -> Ok(unique.Rescheduled(conflict))
+        state,
+      ))
+    "existing" -> Ok(#(unique.Existing(conflict), state))
+    "rescheduled" -> Ok(#(unique.Rescheduled(conflict), state))
     _ -> Error(Nil)
   }
 }
@@ -563,7 +602,7 @@ fn admit_candidate(
   connection: pog.Connection,
   request: Request(input, output, error),
 ) -> Result(
-  unique.Admission(input, output, error),
+  Commit(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
   use now_us <- result.try(sample_now(connection))
@@ -577,16 +616,12 @@ fn admit_candidate(
 fn sample_now(
   connection: pog.Connection,
 ) -> Result(Int, unique.SubmitError(input, output, error)) {
-  let query =
-    pog.query(
-      "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint",
-    )
-    |> pog.returning({
-      use now <- decode.field(0, decode.int)
-      decode.success(now)
-    })
-  use returned <- result.try(unique_execute(query, connection))
-  Ok(single_row(returned.rows))
+  use returned <- result.try(
+    call_safely(fn() { sql.sample_now(connection) })
+    |> result.map_error(classify_query_error),
+  )
+  let sql.SampleNowRow(int8: now) = single_row(returned.rows)
+  Ok(now)
 }
 
 type Candidate {
@@ -691,16 +726,31 @@ fn find_candidate(
 fn initial_state(
   availability: unique.Availability,
   now_ms: Int,
-) -> #(String, Int) {
+) -> #(job.State, Int) {
   case availability {
-    unique.Immediately -> #("queued", now_ms)
+    unique.Immediately -> #(job.Queued, now_ms)
     unique.At(at) -> {
       let target_ms = job.available_at_unix_milliseconds(at)
       case target_ms <= now_ms {
-        True -> #("queued", target_ms)
-        False -> #("scheduled", target_ms)
+        True -> #(job.Queued, target_ms)
+        False -> #(job.Scheduled, target_ms)
       }
     }
+  }
+}
+
+/// `available_at_unix_ms` is only a meaningful "next eligibility" signal for
+/// a committed/observed state where that even applies — `Queued`,
+/// `Scheduled`, or `Retryable`. An `Existing` conflict can land on any
+/// policy-eligible state (`Incomplete`/`AllRetained` reach as far as
+/// `Executing`, `Succeeded`, or beyond); reporting that row's raw
+/// `available_at` for those would misrepresent it as a real next-run time.
+/// Mirrors `postgres`'s own `available_at_for_observation` for
+/// `acknowledged`.
+fn admitted_available_at(state: job.State, ms: Int) -> Option(Int) {
+  case state {
+    job.Queued | job.Scheduled | job.Retryable -> Some(ms)
+    _ -> None
   }
 }
 
@@ -709,7 +759,7 @@ fn insert_job(
   request: Request(input, output, error),
   now_us: Int,
 ) -> Result(
-  unique.Admission(input, output, error),
+  Commit(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
   let now_ms = now_us / 1000
@@ -737,7 +787,7 @@ fn insert_job(
     |> pog.parameter(pog.text(request.output_version))
     |> pog.parameter(error_version_param)
     |> pog.parameter(pog.int(request.max_attempts))
-    |> pog.parameter(pog.text(state))
+    |> pog.parameter(pog.text(job.state_to_stored(state)))
     |> pog.parameter(pog.int(available_at_ms))
     |> pog.parameter(pog.int(now_us))
     |> pog.parameter(pog.text(request.key_contract))
@@ -754,18 +804,21 @@ fn insert_job(
     "inserted",
     job_id,
     request.queue,
-    state,
+    job.state_to_stored(state),
     None,
     None,
   ))
-  Ok(
-    unique.Inserted(job.new_handle(
+  Ok(Commit(
+    outcome: unique.Inserted(job.new_handle(
       job_id,
       request.storage_owner,
       request.queue,
       request.worker,
     )),
-  )
+    committed_state: state,
+    available_at_unix_ms: admitted_available_at(state, available_at_ms),
+    via_receipt_match: False,
+  ))
 }
 
 fn decide_conflict(
@@ -773,7 +826,7 @@ fn decide_conflict(
   request: Request(input, output, error),
   candidate: Candidate,
 ) -> Result(
-  unique.Admission(input, output, error),
+  Commit(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
   case request.on_conflict, candidate.state {
@@ -795,8 +848,8 @@ fn decide_conflict(
         Some(candidate.available_at_us / 1000),
         Some(new_ms),
       ))
-      Ok(
-        unique.Rescheduled(unique.new_conflict(
+      Ok(Commit(
+        outcome: unique.Rescheduled(unique.new_conflict(
           candidate.id,
           request.storage_owner,
           candidate.queue,
@@ -804,7 +857,10 @@ fn decide_conflict(
           request.worker_version,
           job.Scheduled,
         )),
-      )
+        committed_state: job.Scheduled,
+        available_at_unix_ms: admitted_available_at(job.Scheduled, new_ms),
+        via_receipt_match: False,
+      ))
     }
     _, _ -> {
       use state <- result.try(
@@ -821,8 +877,8 @@ fn decide_conflict(
         None,
         None,
       ))
-      Ok(
-        unique.Existing(unique.new_conflict(
+      Ok(Commit(
+        outcome: unique.Existing(unique.new_conflict(
           candidate.id,
           request.storage_owner,
           candidate.queue,
@@ -830,7 +886,13 @@ fn decide_conflict(
           request.worker_version,
           state,
         )),
-      )
+        committed_state: state,
+        available_at_unix_ms: admitted_available_at(
+          state,
+          candidate.available_at_us / 1000,
+        ),
+        via_receipt_match: False,
+      ))
     }
   }
 }
@@ -841,16 +903,12 @@ fn reschedule_job(
   job_id: Int,
   new_ms: Int,
 ) -> Result(Nil, unique.SubmitError(input, output, error)) {
-  let query =
-    pog.query(
-      "UPDATE grind_jobs SET available_at = "
-      <> to_timestamptz_sql(1, "1000.0")
-      <> " WHERE id = $2 AND storage_owner = $3 AND state = 'scheduled'",
-    )
-    |> pog.parameter(pog.int(new_ms))
-    |> pog.parameter(pog.int(job_id))
-    |> pog.parameter(pog.text(storage_owner))
-  use _ <- result.try(unique_execute(query, connection))
+  use _ <- result.try(
+    call_safely(fn() {
+      sql.reschedule_job(connection, new_ms, job_id, storage_owner)
+    })
+    |> result.map_error(classify_query_error),
+  )
   Ok(Nil)
 }
 

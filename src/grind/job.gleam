@@ -79,6 +79,30 @@ pub fn state_of_stored(text: String) -> Result(State, Nil) {
   }
 }
 
+/// The inverse of `state_of_stored`: a typed `State`'s persisted column
+/// text. Total (every `State` variant has a stored representation), unlike
+/// `state_of_stored`'s partial direction (stored text can be tampered with
+/// or, for a closed enum read back from an `Option`/receipt column, absent).
+/// Shared the same way, so `grind/observation` and `grind/postgres` encode a
+/// `State` through this one definition rather than each keeping its own
+/// copy.
+@internal
+pub fn state_to_stored(state: State) -> String {
+  case state {
+    Queued -> "queued"
+    Scheduled -> "scheduled"
+    Retryable -> "retryable"
+    Executing -> "executing"
+    Succeeded -> "succeeded"
+    BusinessFailed -> "business_failed"
+    RuntimeFailed -> "runtime_failed"
+    ContractMismatch -> "contract_mismatch"
+    Uncertain -> "uncertain"
+    Discarded -> "discarded"
+    Cancelled -> "cancelled"
+  }
+}
+
 pub type Outcome(output, error) {
   Pending(State)
   SucceededWith(output)

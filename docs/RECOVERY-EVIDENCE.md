@@ -2577,3 +2577,1266 @@ test`, its own `grind_consumer_test` database):
   scheduled row, reschedule it across queues, observe the row's real queue
   on the conflict, and run the rescheduled job to a typed outcome — is
   reachable and correct entirely through public imports.
+
+## Acknowledged observation — `[grind, job, acknowledged]` (Round 1)
+
+Grind's first Sinal event descriptor (`grind/observation.acknowledged()`),
+wired per the design decision that Grind owns no telemetry event sum type:
+Grind depends on Sinal directly (path dependency, the same pattern as
+`saga`/`relay`/`llm_wire`), starts one `sinal/forwarder.Forwarder` per
+`Database` as a sibling child of its existing pool supervisor, and emits
+through that forwarder — never a plain `sinal.emit` — only after
+`grind/postgres.acknowledge`'s commit is proven. All tests below run against
+a real disposable PostgreSQL cluster (`scripts/test-postgres.sh`); markers
+are listed in the script.
+
+### Claim: `InvalidObservationCapacity` is rejected before any process starts
+
+- **Test**: `postgres_settings_reject_non_positive_observation_capacity_test`
+  (pure — no database, no marker).
+- **Observed**: `postgres.observation_capacity(settings, 0)` and `(-1)` both
+  fail `validate` with `Error(postgres.InvalidObservationCapacity)`, checked
+  ahead of `pog.url_config` in `validate`'s own multi-subject `case`, so an
+  invalid capacity never reaches pool or forwarder construction.
+
+### Claim: the observation is emitted strictly after the commit — reading `postgres.state` from inside the attached handler already observes the committed state
+
+- **Test**: `postgres_acknowledged_observation_commit_ordering_test`
+  (marker `acknowledged-observation-commit-ordering-passed`).
+- **Mechanism**: a plain `sinal.observe` handler on `observation.acknowledged()`
+  calls `postgres.state(database, handle)` from inside its own callback (which
+  runs in the forwarder process, per Sinal's documented hand-off) and reports
+  the read back to the test. A successful job is run through
+  `queue.process_one`.
+- **Observed**: the in-handler read is `Ok(job.Succeeded)`; the decoded
+  metadata's `committed_state` is also `job.Succeeded`, `proposed` is
+  `ProposedSuccess`, `confirmation` is `Replied`, `available_at_unix_ms` is
+  `None`, and `command_id` equals
+  `postgres.acknowledgement_command_id(job_id, attempt_id, epoch)` for the
+  attempt actually stored. Exactly one event arrives.
+- **Proven by mutation — actually run, both forms recorded** (a coordinator
+  review caught the first attempt at this evidence as unrun/asserted rather
+  than observed, and a real second attempt found the naive form does not
+  reliably catch the bug): temporarily moved the `emit_acknowledged` call in
+  `acknowledge` to run before `transaction_safely` (ahead of the commit),
+  building its `AckCommit` from the proposal instead of a real commit.
+  - **Naive form (no added delay)**: against a fresh disposable cluster
+    (`gleam test`, `128 passed, 8 failures`), this test was _not_ among the
+    failures. Reading the reason: `forwarder.emit`'s hand-off is a fire-and-
+    forget async send, and the actual `transaction_safely` call — a local,
+    synchronous PostgreSQL round trip — reliably completes before the BEAM
+    scheduler gets around to running the forwarder's handler in practice.
+    Moving the _call site_ earlier does not reliably move the _observed
+    read_ earlier: this specific test, as written, cannot deterministically
+    distinguish "emits before the transaction is issued" from "emits after",
+    only "emits so much earlier that the handler's read loses the race to a
+    synchronous local commit" — which the naive mutation does not achieve.
+  - **Forced form (delay added to widen the race window)**: the same
+    mutation, plus a `process.sleep(50)` immediately after the (mutated)
+    early emit call and before `transaction_safely` runs — a deliberate
+    synchronization delay whose only purpose is to force the already-real
+    race open wide enough to observe, the standard technique for making an
+    order-dependent bug reproducible rather than scheduler-luck-dependent.
+    Against a fresh disposable cluster (`gleam test`, `127 passed, 9
+failures`), this test is among the failures:
+    ```
+    panic src/gleeunit/should.gleam:10
+     test: grind_test.postgres_acknowledged_observation_commit_ordering_test
+     info:
+    Ok(Executing)
+    should equal
+    Ok(Succeeded)
+    ```
+  - **What this does and does not prove**: it confirms the code path _can_
+    observably violate the ordering claim if emission is moved early enough,
+    and that this specific test's assertion is what would catch it. It does
+    not claim the naive, undelayed mutation is itself caught — that claim
+    (present in an earlier draft of this section) was false and has been
+    removed, along with the unrelated claim that the "emit on Error path"
+    mutation (below) also fails this ordering test; that mutation's own
+    negative-path tests are what actually catch it, not this one.
+  - Reverted immediately in both cases; `gleam check` recompiled clean and
+    `git diff` showed no trace of the mutated lines.
+
+### Claim: isolation — a gate-blocked handler for one job's observation does not stall a second job's lease renewal or completion under the same coordinator
+
+- **Test**: `postgres_acknowledged_observation_isolation_test` (marker
+  `acknowledged-observation-isolation-passed`).
+- **Mechanism**: two jobs (A, B) run under one manually driven consumer,
+  `maximum_concurrency: 2`, `lease_duration_ms: 300` (renewal every
+  `lease_duration_ms / 3` ≈ 100ms). A `sinal.observe` handler on
+  `observation.acknowledged()` blocks only for job A's event, on a gate
+  created _inside_ the handler (so it is owned by the forwarder process that
+  will `process.receive` it — a `process.Subject` created in the test process
+  cannot be received on from a different process; this exact bug was hit and
+  fixed while writing this test, see "Test-harness bug" below) and handed
+  back to the test over a signal subject. A completes and acks while B is
+  still executing; with A's own observation now gate-blocked in the
+  forwarder, the test polls `queue.renewal_status` for
+  `LeaseRenewalConfirmed` (proving at least one renewal tick reached the
+  database while A's gate stayed shut), then releases B and asserts
+  `postgres.state(database, handle_b) == Ok(job.Succeeded)` — all before
+  releasing A's gate.
+- **Observed**: B's renewal confirms and B succeeds while A's gate remains
+  shut; A's gate is only released afterward, in cleanup.
+- **Proven by mutation — "call `sinal.emit` directly in `acknowledge`"**,
+  re-run against a fresh disposable cluster with a recorded clean baseline
+  (see "Mutation evidence: clean baselines and deltas" below for the full
+  table): temporarily replaced the `forwarder.emit` call in
+  `emit_acknowledged` with a direct `sinal.emit` call (bypassing the
+  forwarder entirely — the emission now runs synchronously in the
+  coordinator, exactly the regression this test exists to catch). Clean
+  baseline `136 passed, 0 failures`; mutated `133 passed, 3 failures` — this
+  test, `postgres_acknowledged_observation_overflow_reports_dropped_test`,
+  and `postgres_forwarder_crash_loop_does_not_stop_the_pool_test` (all three
+  depend on genuine forwarder dispatch/capacity semantics), and no others.
+  This test's own failure: `Error(Nil) should equal Ok(Ok(True))` (B's reply
+  never arrives — the coordinator is now synchronously blocked running A's
+  gate-blocked handler itself). Reverted immediately; `gleam check`
+  recompiled clean and `git diff` showed no trace of the mutated lines.
+
+### Claim: negative paths — a rolled-back, aborted, stale, or commit-unknown acknowledgement emits nothing
+
+- **Tests** (deterministic sentinel pattern, not a fixed wall-clock wait —
+  see "Sentinel pattern, not `within: 500`" below for why: a `sinal.observe`
+  handler forwards every received event to a test subject; after the
+  negative path, a distinct sentinel job is submitted and acknowledged
+  through the _same_ consumer/producer, registered via a second, trivial,
+  instantly-completing worker (`register_sentinel_worker`) so driving it to
+  completion can never itself block on the original worker's own gate; the
+  assertion is that the very next event received carries the sentinel's
+  `job_id`, never the original job's):
+  - `postgres_acknowledged_observation_absent_on_commit_unknown_test` (marker
+    `acknowledged-observation-absent-on-commit-unknown-passed`) — the same
+    "kill the backend mid-`pg_sleep` deferred trigger during `COMMIT`"
+    technique as `postgres_ack_commit_connection_loss_is_unknown_test`:
+    nothing is durably committed, `acknowledge_claim` reports
+    `QueueAckUnknown`, `postgres.state` stays `Ok(job.Executing)`.
+  - `postgres_acknowledged_observation_absent_on_stale_ack_test` (marker
+    `acknowledged-observation-absent-on-stale-ack-passed`) — the same forced
+    lease-expiry technique as
+    `postgres_ack_after_database_expiry_is_stale_without_receipt_test`: the
+    fenced `UPDATE` affects zero rows, `acknowledge_claim` reports
+    `QueueAckStale`.
+- **Note on scope**: in this codebase "rollback" and "stale" are the same
+  mechanism (any `Error(..)` returned from inside `acknowledge_transaction`
+  rolls the whole ack transaction back via `pog`'s own transaction wrapper),
+  and "abort" and "unknown" are likewise the same mechanism (a connection
+  lost during `COMMIT` is unconditionally reported `QueueAckUnknown`,
+  whether or not the transaction actually reached commit) — two negative
+  tests cover the four named categories from the plan, not four
+  independently distinct code paths.
+- **Proven by mutation — "emit on an Error path"**, re-run against a fresh
+  disposable cluster with a recorded clean baseline: temporarily made
+  `acknowledge`'s final `case` also call `emit_acknowledged` (with a
+  synthesized fake `AckCommit`) on the `Error(error) -> Error(error)` branch
+  before re-raising the same error. Clean baseline `136 passed, 0 failures`;
+  mutated `134 passed, 2 failures` — exactly
+  `postgres_acknowledged_observation_absent_on_commit_unknown_test` and
+  `postgres_acknowledged_observation_absent_on_stale_ack_test`, and no
+  others. Both failures show the sentinel assertion catching a genuine extra
+  event precisely, by job id, e.g.:
+  ```
+  test: grind_test.postgres_acknowledged_observation_absent_on_commit_unknown_test
+  info:
+  75
+  should equal
+  76
+  ```
+  (`75` is the original job's own spurious mutated event, arriving ahead of
+  sentinel job `76` — exactly what the FIFO-ordered sentinel check is
+  designed to catch). Reverted immediately; `gleam check` recompiled clean
+  and `git diff` showed no trace of the mutated lines.
+
+### Claim: lost reply (`SyncRep` harness) — exactly one event, and its `confirmation` is `Reconciled`, never `Replied`
+
+- **Test**:
+  `postgres_acknowledged_observation_reconciled_after_lost_reply_test`
+  (marker `acknowledged-observation-reconciled-after-lost-reply-passed`).
+- **Mechanism**: the same `SyncRep`-park-then-terminate technique as
+  `postgres_ack_committed_reply_lost_reconciles_from_receipt_test` (Increment
+  2 above): the ack genuinely commits, but this call's own connection is
+  severed while `COMMIT` is parked in `SyncRep`, so `acknowledge` only learns
+  the outcome via `reconcile_unknown_ack` reading the receipt back.
+- **Observed**: exactly one `[grind, job, acknowledged]` event arrives for
+  this command, checked deterministically (a sentinel job's own
+  acknowledgement, run through the same consumer afterward, must be the very
+  next event — see "Sentinel pattern, not `within: 500`" below); `confirmation`
+  is `Reconciled`; `committed_state` is `job.Succeeded`; `command_id` matches
+  the attempt actually stored.
+- **Proven by mutation — "label `Replied` always"**, re-run against a fresh
+  disposable cluster with a recorded clean baseline: temporarily replaced
+  `emit_acknowledged`'s `case commit.via_receipt_match { True -> Reconciled;
+False -> Replied }` with a hard-coded `Replied`. Clean baseline `136
+passed, 0 failures`; mutated `134 passed, 2 failures` — exactly this test
+  and `postgres_acknowledged_observation_reconciled_on_sequential_duplicate_ack_test`
+  (the round 2 addition proving the other receipt-match site, below), and no
+  others:
+  ```
+  panic src/gleeunit/should.gleam:10
+   test: grind_test.postgres_acknowledged_observation_reconciled_after_lost_reply_test
+   info:
+  Replied
+  should equal
+  Reconciled
+  ```
+  Reverted immediately; `gleam check` recompiled clean and `git diff` showed
+  no trace of the mutated line.
+
+### Claim: proposed vs. committed — cancel-while-running emits a `proposed: ProposedSuccess` / `committed_state: Cancelled` event, `committed_state` always taken from the commit, never re-derived from the proposal
+
+- **Test**:
+  `postgres_acknowledged_observation_committed_state_overrides_proposal_test`
+  (marker
+  `acknowledged-observation-committed-state-overrides-proposal-passed`).
+- **Mechanism**: the same technique as
+  `postgres_cancel_running_worker_overrides_proposal_on_ack_test`: a worker
+  is mid-execution when `postgres.cancel` requests cancellation
+  (`CancellationRequested`); the worker then completes with a proposed
+  success, but the fenced ack's own `CASE WHEN cancel_requested_at IS NOT
+NULL` commits `Cancelled` instead.
+- **Observed**: the single received event has `proposed ==
+observation.ProposedSuccess`, `committed_state == job.Cancelled`,
+  `confirmation == observation.Replied`; checked deterministically, a
+  sentinel job's own acknowledgement run afterward must be the very next
+  event.
+- **Proven by mutation — "take committed from the proposal"**, re-run
+  against a fresh disposable cluster with a recorded clean baseline:
+  temporarily replaced the metadata's `committed_state:` field with a value
+  derived purely from `proposed_of_execution(execution)` (ignoring the
+  actual `AckCommit`). Clean baseline `136 passed, 0 failures`; mutated `134
+passed, 2 failures` — exactly this test and
+  `postgres_acknowledged_observation_available_at_none_when_cancel_overrides_retry_test`
+  (the round 2 addition below, a proposed-retry variant of the same
+  override), and no others:
+  ```
+  panic src/gleeunit/should.gleam:10
+   test: grind_test.postgres_acknowledged_observation_committed_state_overrides_proposal_test
+   info:
+  Succeeded
+  should equal
+  Cancelled
+
+   test: grind_test.postgres_acknowledged_observation_available_at_none_when_cancel_overrides_retry_test
+   info:
+  Retryable
+  should equal
+  Cancelled
+  ```
+  Reverted immediately; `gleam check` recompiled clean and `git diff` showed
+  no trace of the mutated lines.
+
+### Claim: overflow — capacity 1 with a blocked handler reports `[sinal, forwarder, dropped]`, job states unchanged
+
+- **Test**: `postgres_acknowledged_observation_overflow_reports_dropped_test`
+  (marker `acknowledged-observation-overflow-reports-dropped-passed`).
+- **Mechanism**: `postgres.observation_capacity(settings, 1)`. Job A's
+  acknowledged handler holds the forwarder's only in-flight slot on a gate
+  (again created inside the handler, per the isolation test's fix). Job B's
+  own acknowledgement still commits normally through `queue.process_one`,
+  but its forwarded observation exceeds capacity while A's slot is held and
+  is dropped.
+- **Observed**: `[sinal, forwarder, dropped]` reports `Dropped(rejected: 1,
+lost: 0)`; both `postgres.state(database, handle_a)` and
+  `postgres.state(database, handle_b)` are `Ok(job.Succeeded)` — the
+  forwarder's own capacity accounting never touches either job's committed
+  outcome. This exercises the exact mechanism `sinal/forwarder`'s own test
+  suite proves in isolation (`capacity_exceeded_emits_single_dropped_event_from_forwarder_test`),
+  wired through Grind's `Database`.
+- **Test-harness bug found and fixed while writing this test**: the release
+  gate was originally created in the _test_ process and handed to the
+  handler by closure capture; since a `process.Subject` can only be received
+  on by the process that created it (`gleam_erlang`), the forwarder's own
+  `process.receive` on that subject could never actually match a message
+  sent to it, so the handler always ran its own internal timeout instead of
+  being released promptly. This did not produce a false pass — the assertion
+  it fed (`process.receive(dropped_signal, ...)`) simply timed out and
+  failed honestly — but it made the test far slower and less deterministic
+  than intended. Fixed by creating the gate _inside_ the handler (owned by
+  the forwarder) and handing it back to the test over a signal subject,
+  matching the pattern `sinal/forwarder`'s own test suite already uses for
+  exactly this reason.
+
+### Claim: a raising handler leaves the job's own committed outcome unchanged
+
+- **Test**: `postgres_acknowledged_observation_raising_handler_test` (marker
+  `acknowledged-observation-raising-handler-outcome-unchanged-passed`).
+- **Mechanism**: a `sinal.observe` handler on `observation.acknowledged()`
+  unconditionally `panic`s. A job is run through `queue.process_one`.
+- **Observed**: `queue.process_one(consumer) == Ok(True)`,
+  `postgres.state(database, handle) == Ok(job.Succeeded)`,
+  `postgres.outcome(database, handle) == Ok(job.SucceededWith("raising-7"))`
+  — unaffected. Native `:telemetry` isolates the raise and auto-detaches the
+  faulty handler; by the time any handler runs at all,
+  `forwarder.emit`'s own hand-off to the forwarder has already returned,
+  decoupled from the coordinator regardless.
+
+### Claim: the descriptor is usable end to end from outside the package, using only public imports
+
+- **Test**: `public_consumer_observes_acknowledged_test` (external
+  `consumer/` package; marker `consumer-observes-acknowledged-passed`).
+- **Mechanism**: `sinal.observe` attached to `grind/observation.acknowledged()`
+  from the consumer package, importing only `grind/observation` and `sinal`
+  (both public), running one typed job through the public consumer API.
+- **Observed**: the decoded record's `job_id`, `queue`, `worker_id`,
+  `committed_state`, `proposed`, and `confirmation` all match the run.
+
+## Round 1 follow-up (coordinator review)
+
+Independent review of round 1 found one genuine isolation hole, one
+committed-value bug, two untested emission sites, an unrun mutation claim,
+and stale mutation-evidence counts (recorded against a disposable cluster
+already reused across several prior mutation runs in the same session,
+rather than a clean one). Each is addressed below, with the review's own
+wording as the section title.
+
+### Claim: a handler that exits or is killed cannot exhaust the pool's own supervisor and stop the pool
+
+- **Test**: `postgres_forwarder_crash_loop_does_not_stop_the_pool_test`
+  (marker `forwarder-crash-loop-pool-survives-passed`).
+- **Red first, against the unfixed round-1 code**: a minimal standalone
+  reproduction (not the full suite, to get a clean signal fast) — a
+  `sinal.observe` handler on `observation.acknowledged()` that
+  `process.kill(process.self())`s on every invocation, driven by six
+  acknowledged events in quick succession (80ms apart). Before the fix, the
+  forwarder was a plain `Permanent` sibling of the PostgreSQL pool under one
+  shared `OneForOne` supervisor at its OTP default restart intensity (2
+  restarts / 5 seconds). Observed against a real disposable cluster:
+  ```
+  =SUPERVISOR REPORT====
+      supervisor: {<0.129.0>,gleam@otp@static_supervisor}
+      errorContext: shutdown
+      reason: reached_max_restart_intensity
+  ...
+  {ok,true}                    // job 4's own process_one
+  {ok,true}                    // job 5's own process_one
+  {ok,true}                    // job 6's own process_one
+  final submit
+  {error,{submit_query_failed,{connection_unavailable}}}
+  ```
+  On the third crash the _shared_ supervisor exhausted its own restart
+  budget and shut down — terminating the pool along with the forwarder — so
+  the very next `postgres.submit` failed outright with
+  `SubmitQueryFailed(ConnectionUnavailable)`. This is strictly worse than
+  "acks fail": admission itself stops working.
+- **The fix** (`grind/postgres.start`): the forwarder is now nested under
+  its own dedicated `static_supervisor`, added to the root as a `Temporary`
+  child (`supervision.restart(.., supervision.Temporary)`). A `Temporary`
+  child's termination is never restarted by its parent and never counts
+  toward the parent's own restart intensity — so if the _nested_ supervisor
+  exhausts its own budget (still 2/5s by default) from a persistently
+  crashing forwarder and terminates itself, the root supervisor simply drops
+  it and moves on; the pool is never touched.
+- **Green after the fix**, same standalone reproduction: the nested
+  supervisor's own `reached_max_restart_intensity` shutdown is now the last
+  supervisor report; every subsequent submit and `process_one` (including
+  the final one, after the forwarder subtree is permanently gone) succeeds
+  normally:
+  ```
+  =SUPERVISOR REPORT====
+      supervisor: {<0.129.0>,gleam@otp@static_supervisor}   // the nested one
+      errorContext: shutdown
+      reason: reached_max_restart_intensity
+  iteration begin
+  submitted
+  {ok,true}
+  iteration begin
+  submitted
+  {ok,true}
+  iteration begin
+  submitted
+  {ok,true}
+  final submit
+  {ok,true}
+  {ok,succeeded}
+  DONE
+  ```
+  Confirmed again as a permanent regression test against a clean disposable
+  cluster (`gleam test`, `136 passed, 0 failures`, this test included).
+- **Degraded-mode contract**: once the forwarder subtree is gone, further
+  `forwarder.emit` calls report `ForwarderUnavailable`, which
+  `grind/postgres` already discards — jobs keep being admitted, claimed, and
+  acknowledged normally; only observations become unavailable. Documented in
+  `README.md` and `docs/IMPLEMENTATION-SCOPE.md`.
+- **Not applied**: the review's optional suggestion to derive the forwarder's
+  `process.Name` from the pool's own name. `gleam_erlang`'s `process.Name`
+  is fully opaque in the resolved version (`process.new_name(prefix:
+String) -> Name(message)`, no reverse string accessor), so there is no
+  public API to read a string back out of the caller-supplied `pool_name`
+  to derive a related forwarder name from — not "simple" as the review
+  anticipated, so left as its own independently generated name.
+
+### Claim: `available_at_unix_ms` is chosen from the committed state, never the proposed state
+
+- **The bug**: `available_at_for_observation` gated on `proposed_state` (the
+  `AckProposal`'s own vocabulary — `"retryable"`/`"snoozed"`) instead of the
+  actual `committed_state` read back from `RETURNING`. A proposed
+  retry/snooze overridden by a concurrent cancellation commits `"cancelled"`
+  and leaves the row's `available_at` column at its unrelated, stale pre-ack
+  value — the bug would still report that stale value as `Some(ms)`, exactly
+  contradicting the "committed state, never the proposal" invariant the rest
+  of this descriptor's fields already uphold.
+- **The fix**: `available_at_for_observation` now takes the committed-state
+  string and gates on `"retryable" | "scheduled"` (the actual `RETURNING`
+  vocabulary), not the proposal's.
+- **Tests**:
+  - `postgres_acknowledged_observation_available_at_for_committed_retry_test`
+    (marker `acknowledged-observation-available-at-committed-retry-passed`):
+    a proposed, genuinely committed retry — `available_at_unix_ms` is
+    `Some(ms)`, within the default 15-second backoff's bounds
+    (`before_ack_ms + 15_000` .. `after_ack_ms + 15_000`).
+  - `postgres_acknowledged_observation_available_at_for_committed_snooze_test`
+    (marker `acknowledged-observation-available-at-committed-snooze-passed`):
+    a proposed, genuinely committed snooze (commits `scheduled`) —
+    `Some(ms)`, within the requested 60-second delay's bounds.
+  - `postgres_acknowledged_observation_available_at_none_when_cancel_overrides_retry_test`
+    (marker
+    `acknowledged-observation-available-at-none-cancel-overrides-retry-passed`):
+    a proposed retry (`ProposedRetryable`) overridden by a concurrent
+    cancellation — commits `Cancelled`, and `available_at_unix_ms` is
+    `None`, never the stale pre-ack value.
+- **Proven by mutation — "gate on the proposed state, the original bug"**,
+  against a fresh disposable cluster with a recorded clean baseline: reverted
+  `available_at_for_observation` to gate on `proposed_state` (`"retryable" |
+"snoozed"`). Clean baseline `136 passed, 0 failures`; mutated `135 passed,
+1 failure` — exactly the cancel-overrides-retry test:
+  ```
+  panic src/gleeunit/should.gleam:10
+   test: grind_test.postgres_acknowledged_observation_available_at_none_when_cancel_overrides_retry_test
+   info:
+  Some(1790340070892)
+  should equal
+  None
+  ```
+  Reverted immediately; `gleam check` recompiled clean and `git diff` showed
+  no trace of the mutated lines.
+
+### Claim: both untested receipt-match ("early" and "post-0-row-`UPDATE`") sites are `Reconciled`
+
+Round 1 only exercised `reconcile_unknown_ack`'s own receipt-match site (the
+lost-reply claim above). Two further sites construct `AckCommit(...,
+via_receipt_match: True)` and were untested: the check at the very top of
+`acknowledge_transaction`, before any `UPDATE` is attempted, and the re-check
+after a fenced `UPDATE` affects zero rows.
+
+- **Test (early site)**:
+  `postgres_acknowledged_observation_reconciled_on_sequential_duplicate_ack_test`
+  (marker `acknowledged-observation-reconciled-on-sequential-duplicate-passed`).
+  Reached deterministically, no concurrency needed: the exact same
+  `ClaimedJob`/`Execution`, acknowledged a second time, finds the first
+  call's own receipt already durably recorded before any `UPDATE` runs. The
+  first ack's event is `Replied`; the second (duplicate) is `Reconciled`,
+  same `command_id`. A sentinel ack afterward confirms exactly two events.
+- **Test (post-0-row-`UPDATE` site)**:
+  `postgres_acknowledged_observation_reconciled_on_concurrent_duplicate_ack_test`
+  (marker `acknowledged-observation-reconciled-on-concurrent-duplicate-passed`,
+  gated on `GRIND_TEST_REPEATABLE_READ_URL`). Reuses
+  `run_ack_duplicate_repeatable_read_test`'s exact forced-overlap mechanism
+  (`postgres_ack_duplicate_reports_ok_under_pinned_isolation_test`): a
+  `BEFORE UPDATE` trigger parks acknowledgement A behind a held advisory
+  lock while it still holds the row lock; acknowledgement B (the _same_
+  claim, from a separate pool) genuinely waits on that row lock (confirmed
+  via `pg_stat_activity` wait events, not inferred). A's `UPDATE` commits
+  first (`Replied`); B's own `UPDATE` then affects zero rows against the
+  now-committed row and re-checks the receipt, finding A's — the site under
+  test. `count_acknowledgements_for_job == 1` confirms only one row was ever
+  written. A sentinel ack through A's own pool afterward confirms exactly
+  two events (B's separate pool is not exercised again, so nothing further
+  could arrive from it either).
+- **Proven by mutation — "`via_receipt_match: False` at both sites"**,
+  against a fresh disposable cluster with a recorded clean baseline
+  (`GRIND_TEST_REPEATABLE_READ_URL` set, so the concurrent test actually
+  runs rather than skipping): hardcoded `False` at both the early and the
+  post-0-row-`UPDATE` construction sites simultaneously. Clean baseline `136
+passed, 0 failures`; mutated `134 passed, 2 failures` — exactly the two
+  tests above, and no others:
+  ```
+  panic src/gleeunit/should.gleam:10
+   test: grind_test.postgres_acknowledged_observation_reconciled_on_sequential_duplicate_ack_test
+   info:
+  Replied
+  should equal
+  Reconciled
+
+   test: grind_test.postgres_acknowledged_observation_reconciled_on_concurrent_duplicate_ack_test
+   info:
+  False
+  should equal
+  True
+  ```
+  Reverted immediately; `gleam check` recompiled clean and `git diff` showed
+  no trace of the mutated lines.
+
+### Sentinel pattern, not `within: 500`
+
+Every negative ("nothing arrived") and "exactly N" ("nothing _more_
+arrived") assertion in this suite now uses a deterministic sentinel instead
+of a fixed wall-clock wait: after the interesting event(s), a distinct,
+known-good job is acknowledged through the _same_ consumer/producer (a
+second, trivial, always-succeeding worker registered onto the same registry
+via `register_sentinel_worker`, so it can never itself block on the original
+worker's own gate), and the assertion is that the very next event received
+carries the sentinel's `job_id`. `sinal/forwarder` guarantees per-producer
+FIFO delivery (its own module documentation), so if the code under test had
+wrongly emitted an extra event for the original job, it would have been
+enqueued ahead of the sentinel's and would be the one actually received —
+deterministically, not racily. A fixed-duration wait (the round 1 draft's
+`process.receive(signal, within: 500)`) is either too short under load
+(false pass) or wastes wall-clock time otherwise (true negative, but slow);
+the sentinel pattern has neither failure mode. Applied to: both negative
+tests above, the lost-reply "exactly one" check, the cancel-overrides
+"exactly one" check, and the sequential/concurrent duplicate-ack "exactly
+two" checks.
+
+### Mutation evidence: clean baselines and deltas
+
+Every mutation below was run against a freshly created disposable PostgreSQL
+cluster (`initdb`/`pg_ctl` per run, the same shape `scripts/test-postgres.sh`
+uses, with `GRIND_TEST_QUEUE_DATABASE_URL` and — for the one concurrent
+duplicate-ack mutation — `GRIND_TEST_REPEATABLE_READ_URL` pointed at it), not
+a cluster already reused across other test/mutation runs in the same
+session; an earlier pass of this evidence recorded counts against a reused
+cluster, whose accumulated cross-run state produced additional, unrelated
+apparent failures that had nothing to do with the mutation under test. Each
+row below is its own clean baseline immediately before its own mutation, in
+the same session, on the same fresh cluster:
+
+| Mutation                                              | Clean baseline         | Mutated                | Failing tests (only)                                                                                                                                                                                                    |
+| ----------------------------------------------------- | ---------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bypass forwarder (`sinal.emit` directly)              | 136 passed, 0 failures | 133 passed, 3 failures | isolation, overflow, forwarder-crash-loop                                                                                                                                                                               |
+| Hardcode `Replied` always                             | 136 passed, 0 failures | 134 passed, 2 failures | reconciled-after-lost-reply, reconciled-on-sequential-duplicate                                                                                                                                                         |
+| Committed state derived from proposal                 | 136 passed, 0 failures | 134 passed, 2 failures | committed-state-overrides-proposal, available-at-none-cancel-overrides-retry                                                                                                                                            |
+| Emit on an `Error` path                               | 136 passed, 0 failures | 134 passed, 2 failures | absent-on-commit-unknown, absent-on-stale-ack                                                                                                                                                                           |
+| `available_at` gated on proposed state                | 136 passed, 0 failures | 135 passed, 1 failure  | available-at-none-cancel-overrides-retry                                                                                                                                                                                |
+| `via_receipt_match: False` at both untested sites     | 136 passed, 0 failures | 134 passed, 2 failures | reconciled-on-sequential-duplicate, reconciled-on-concurrent-duplicate                                                                                                                                                  |
+| Emit before the transaction (naive)                   | 136 passed, 0 failures | 128 passed, 8 failures | none of the observation tests (see the commit-ordering claim above — this naive form does not reliably catch the bug); the 8 failures there are unrelated flakiness under a cluster already reused once in that session |
+| Emit before the transaction, with a forced 50ms delay | 136 passed, 0 failures | 127 passed, 9 failures | commit-ordering, plus the same 8 unrelated failures as the row above (same reused cluster)                                                                                                                              |
+
+The last two rows are the one pair not run on a maximally clean cluster
+(each reused the cluster from the row immediately above it in the same
+short investigation); the commit-ordering claim's own section above quotes
+the specific panic and treats only that test's result as evidence, not the
+raw counts, for exactly this reason.
+
+### Limits and deliberate decisions
+
+- **`reconcile_acknowledgement` does not emit — including when `acknowledge`
+  itself never did either.** The plan allows the public
+  `reconcile_acknowledgement`/`reconcile_unique` reconciliation reads to
+  optionally emit with `confirmation: Reconciled`, "decide consistently;
+  document". This round emits only from the two internal call sites that are
+  the actual first proof of a commit (`acknowledge`'s own
+  `resolve_ack_transaction_result`/`reconcile_unknown_ack`), not from
+  `reconcile_acknowledgement` itself. When `acknowledge`'s own call already
+  emitted (its transaction reply came back normally, or `reconcile_unknown_ack`
+  resolved a lost reply within that same call), this correctly avoids
+  multiplying observation events for the same commit when an operator or test
+  calls `reconcile_acknowledgement` repeatedly afterward (as several existing
+  tests already do, to prove idempotent reads). But when `acknowledge` itself
+  returned `QueueAckUnknown` (its own reply lost _and_ `reconcile_unknown_ack`
+  could not resolve it within that call, e.g. the store was unavailable right
+  then), nothing was ever emitted for that commit — and a later
+  `reconcile_acknowledgement` call that does resolve it still does not emit.
+  That committed disposition can end up with no observation at all, ever,
+  even though `grind_job_acknowledgements` holds a fully correct receipt.
+  This is a genuine, accepted gap in delivery (see README.md's "best-effort"
+  bullet), not merely a double-reporting safeguard.
+- **`available_at_unix_ms` is `None` on every `Reconciled` event.** It is
+  only ever known from a fresh write's own `RETURNING` (the
+  `acknowledge_transaction` UPDATE was extended with one additional
+  `RETURNING` column, `(extract(epoch FROM available_at) * 1000)::bigint`,
+  present on every proposed-state branch); a duplicate-receipt match
+  (`Reconciled`) cannot recover it, since `grind_job_acknowledgements` does
+  not retain `available_at`. Inventing a value there was rejected as
+  misleading; `None` documents the genuine gap instead. Separately from
+  `Reconciled` vs. `Replied`, the value is also gated on the _committed_
+  state (`"retryable" | "scheduled"`), never the proposed one — see "Round 1
+  follow-up" above for the bug this was and its mutation evidence.
+- **Retry-budget exhaustion does not change a committed outcome away from
+  what was proposed.** An earlier draft of this documentation claimed
+  "retry-budget exhaustion can turn a proposed `Retryable` into a committed
+  `RuntimeFailed`/`Discarded` outcome" — this was wrong and has been
+  corrected in `grind/observation` and `README.md`. Exhaustion is decided by
+  the worker's own business retry policy _before_ the acknowledgement ever
+  runs: an exhausted retry is proposed as a business failure
+  (`worker.ExecutedBusinessFailure(.., BudgetExhausted)`, so `proposed` is
+  already `ProposedBusinessFailure`), never as a `Retryable` proposal the
+  acknowledgement later reinterprets. The acknowledgement's own `retryable`
+  commit path re-checks `attempt_count < max_attempts` as a defensive
+  consistency guard, not a policy decision: if that guard fails for a
+  genuinely proposed retry, the whole acknowledgement is rejected as stale
+  (no commit, no observation), not silently committed as something else. The
+  only thing that actually overrides a proposal in this descriptor is a
+  concurrent cancellation, covered above.
+- Round 2 (`[grind, job, admitted]`, `[grind, job, claimed]`,
+  `[grind, job, quarantined]`, `[grind, job, resolved]`,
+  `[grind, job, cancellation]`, `[grind, job, released]`,
+  `[grind, job, contract_mismatch]`) is delivered; see "Round 2
+  observations" below for its own evidence and mutation table.
+
+## Round 2 observations — `[grind, job, admitted/claimed/quarantined/resolved/cancellation/released/contract_mismatch]`
+
+Every descriptor below shares `grind/observation`'s `JobRef`/`AttemptRef`
+codecs and the same delivery discipline `acknowledged` established: emitted
+only once a commit is proven, never from inside a transaction callback,
+through the one `Forwarder` a `Database` owns (shared across every
+`[grind, job, *]` event — see the overflow claim below for what that implies
+for capacity). Each has at least one emission test asserting the exact
+metadata a consumer would read, one no-emission test for its read-only or
+error outcomes (proven with the same "the very next observation on this
+channel is a known sentinel" technique the Round 1 evidence above documents,
+never a fixed wall-clock wait), and a named mutation.
+
+### Claim: `[grind, job, admitted]` — a plain `submit`/`submit_at` is always `Replied`, with `committed_state`/`available_at_unix_ms` from its own `RETURNING`
+
+`postgres_admitted_observation_plain_submit_test` submits immediately (state
+`queued`) and at a future time (`submit_at`, state `scheduled`), reading both
+`committed_state` and `available_at_unix_ms` from the insert's own extended
+`RETURNING id, state, (extract(epoch FROM available_at) * 1000)::bigint` —
+the same "commit reply, never the proposal" discipline `acknowledged`
+documents, applied to admission. `submission_id` is `None` for both, and
+`confirmation` is `Replied` for both (a plain submission has no receipt to
+reconcile from). The same test also submits at a target time already in the
+past _by the database's own clock_: the insert's `CASE ... <=
+clock_timestamp()` still commits `queued`, not `scheduled` — proving
+`committed_state` is read back from that same `RETURNING`, never inferred
+client-side from the request's own "immediate vs. future" intent (which a
+client clock could disagree with the database's about, at the boundary).
+**Named mutation**: deriving `committed_state` from
+`available_at_unix_ms`'s request-side presence (`Some` → `Scheduled`, `None`
+→ `Queued`) instead of the `RETURNING`-decoded `state` is caught by this
+exact past-time assertion.
+
+### Claim: `[grind, job, admitted]` — unique admission: `Inserted` is `Replied`; replaying the exact same `submission_id` is `Reconciled` via the in-transaction receipt hit
+
+`postgres_admitted_observation_unique_inserted_and_reconciled_test` submits
+once (`Inserted`, `Replied`, a known `available_at_unix_ms`), then replays
+the identical `submission_id`/request through `submit_keep_existing`.
+`admission_transaction`'s own leading `find_receipt` call finds the first
+attempt's receipt before any candidate row is even looked up; that decision
+is proven by a receipt read, not a fresh write, so the second observation is
+`Reconciled` with `available_at_unix_ms: None` — mirroring the limitation
+`acknowledged` already documents for its own receipt-matched commits.
+**Named mutation**: hardcoding `confirmation: Replied` regardless of
+`via_receipt_match` in `postgres.submit_unique` turns the second
+observation's `Reconciled` into `Replied` — red exactly on this test.
+
+### Claim: `[grind, job, admitted]` — the other `Reconciled` path: a commit reply lost after PostgreSQL already committed, resolved transparently within the same `submit_unique` call
+
+`postgres_admitted_observation_in_call_post_commit_unknown_reconciled_test`
+reuses `run_unique_committed_reply_lost_test`'s `SyncRep`
+park-then-terminate harness (scenario (c) in "Increment 11" above):
+`submit_unique`'s own transaction reply is lost, so its result comes back as
+`pog.TransactionQueryError` — but `run`'s own follow-up
+`reconcile_from_receipt` call, made within this exact same `submit_unique`
+call before it ever returns to the caller, finds the now-visible receipt and
+resolves `Ok(Inserted(handle))` transparently. This is distinct from the
+in-transaction receipt hit above (that one never even reaches a
+`TransactionQueryError`): here the whole transaction result actually came
+back uncertain, and it is `run`'s _own_ recovery, not `admission_transaction`'s
+leading lookup, that establishes the commit. Exactly one `admitted` event is
+emitted, `Reconciled`, `available_at_unix_ms: None`. **Named mutation**:
+flipping `via_receipt_match` to `False` at this exact fallback site (`run`,
+`unique_admission.gleam`) is caught by this test alone.
+
+### Claim: `[grind, job, admitted]` — a distinct `submission_id` landing on an occupied key (`Existing`) is its own fresh, `Replied` commit
+
+`postgres_admitted_observation_unique_existing_conflict_test` proves both the
+first (`Inserted`) and second (`Existing`) submissions each emit their own
+`Replied` observation, tagged with their own `submission_id` — the `Existing`
+receipt row is a genuine write for this exact submission, even though the
+job row itself is untouched.
+
+### Claim: `[grind, job, admitted]` — `available_at_unix_ms` is `None` for an `Existing` conflict against a non-eligibility state, even though the decision is `Replied`
+
+`postgres_admitted_observation_existing_over_executing_available_at_none_test`
+forces a job into `executing` directly, then submits a distinct
+`submission_id` under an `Incomplete` policy (which treats `executing` as
+still occupying the key). The resulting `Existing` conflict is a fresh,
+`Replied` commit — but `committed_state: Executing` is not `Queued`,
+`Scheduled`, or `Retryable`, so `available_at_unix_ms` must still be `None`:
+`Replied` alone does not imply a meaningful next-run time. **Named
+mutation**: removing `admitted_available_at`'s state gate
+(`unique_admission.gleam`), so it reports `Some` unconditionally, is caught
+by this test.
+
+### Claim: `[grind, job, admitted]` — `SubmissionConflict` never commits and never emits
+
+`postgres_admitted_observation_absent_on_submission_conflict_test` replays a
+`submission_id` with a materially different request (`SubmissionConflict`)
+and asserts nothing arrives on the `admitted` channel, then submits a fresh,
+distinct submission through the same producer as the sentinel.
+
+### Claim: `[grind, job, admitted]` — public `reconcile_unique` never emits, even when it recovers a genuinely committed `Inserted` outcome
+
+`postgres_admitted_observation_absent_from_reconcile_unique_test` reuses the
+exact "(d) committed, reply lost, pool closed" `SyncRep` scenario from
+`run_unique_committed_reply_lost_store_unavailable_test`
+(`docs/UNIQUENESS-CONTRACT.md`): `submit_unique` itself reports
+`CommitUnknown`; while the zombie transaction is still parked,
+`reconcile_unique` reports `CommitUnknown` again (no receipt visible yet, no
+emission); once the zombie backend is confirmed terminated,
+`reconcile_unique` resolves the genuine `Inserted` outcome from the
+now-visible receipt — and still emits nothing. A subsequent fresh submission
+through the same producer arrives as the very next `admitted` observation,
+proving the channel itself is unaffected. This is the round 1 "does
+`reconcile_acknowledgement` emit?" decision applied consistently to
+`reconcile_unique`: both are pure receipt reads offered for a caller's own
+return value, independent of whatever call originally produced the commit.
+In this exact test's own scenario the originating `submit_unique` call did
+_not_ emit anything — it returned `CommitUnknown`, precisely because its own
+attempt to prove the commit (including its in-call receipt-lookup fallback)
+failed. Since `reconcile_unique` also never emits, this genuinely committed
+`Inserted` admission ends up with no `admitted` observation at all, ever —
+a real gap, not a double-reporting safeguard; see README.md's "best-effort"
+bullet and the round 1 "reconcile_acknowledgement" limits bullet above,
+which document the same gap for `acknowledge`/`reconcile_acknowledgement`.
+
+### Claim: `[grind, job, claimed]` — the claim's own autocommitted `RETURNING` is the proof of commit
+
+`postgres_claimed_observation_emission_test` claims a freshly submitted job
+and reads `attempt_id`/`epoch` back off `postgres.claim_identity` for direct
+comparison against the observation's own `AttemptRef`, plus `attempt: 1` and
+`previous_state: Queued`. **Named mutation**: swapping the `attempt_id`/
+`epoch` arguments in `postgres.gleam`'s `emit_claimed` call site is caught by
+both this test and the ordering test below (attempt_id, a global sequence
+value, is never equal to epoch in practice).
+
+### Claim: `[grind, job, claimed]` — nothing due (`Ok(None)`) never emits
+
+`postgres_claimed_observation_absent_when_nothing_due_test` claims an empty
+queue, asserts nothing arrives, then claims a genuine job through the same
+producer as the sentinel.
+
+### Claim: `[grind, job, quarantined]` — one event per row the quarantine scan's own `RETURNING` reports, with `cancellation_was_requested` distinguishing an ordinary abandoned attempt from one with a pending cancellation
+
+`postgres_quarantined_observation_emission_test` forces two jobs into
+`executing` with an already-expired lease — one plain, one also
+`cancel_requested_at`-set — and drives the scan twice (`LIMIT 1` quarantines
+at most one row per `claim_one` call), asserting `cancellation_was_requested`
+is `False` then `True`. **Named mutation**: hardcoding
+`cancellation_was_requested: False` in `emit_quarantined` is caught by the
+second assertion.
+
+### Claim: `[grind, job, quarantined]` — an ordinary claim with nothing expired never emits
+
+`postgres_quarantined_observation_absent_when_nothing_expired_test` claims
+one job normally (no expiry), asserts nothing arrives, then expires its
+lease and re-runs the scan as the sentinel.
+
+### Claim: `[grind, job, resolved]` — the first audited resolution is `Replied`; replaying the same `resolution_id` is `Reconciled` via `resolution_receipt_outcome`'s own receipt read
+
+`postgres_resolved_observation_replied_and_reconciled_test` reuses the
+`run_uncertain_resolution_test` shape (force a row `executing` with a stale
+lease, quarantine it via a `queue.process_one` poll, then
+`resolve_uncertain` with `AuthorizeReplay` twice for the same
+`resolution_id`), asserting `Replied` then `Reconciled`. **Named mutation**:
+swapping the two `Confirmation` values in `emit_resolved`'s `case result` is
+caught by this test's own two assertions (which read `Reconciled` where
+`Replied` was expected, and vice versa).
+
+### Claim: `[grind, job, resolved]` — `ReconciliationNotRequired` never emits
+
+`postgres_resolved_observation_absent_on_reconciliation_not_required_test`
+calls `resolve_uncertain` against a job that was never `uncertain`, asserts
+nothing arrives, then resolves a genuinely `uncertain` job through the same
+producer as the sentinel.
+
+### Claim: `[grind, job, resolved]` — a genuinely aborted commit (`ResolutionCommitUnknown`) never emits
+
+`postgres_resolved_observation_absent_on_commit_unknown_test` reuses the
+deferred-constraint-trigger-plus-`pg_terminate_backend` abort mechanism
+`postgres_submit_unique_aborted_commit_is_commit_unknown_test` uses for
+admission, applied here to an `AFTER INSERT` trigger on
+`grind_job_resolutions`: the whole `resolve_uncertain` transaction — its
+receipt insert and its `grind_jobs` update alike — is genuinely rolled back,
+so `ResolutionCommitUnknown` is reported and the job is still `uncertain`
+afterward. The sentinel is a _second_, distinct uncertain job resolved
+through the same producer, not a retry of the same job — reusing the same
+job would not distinguish a stray wrongly-emitted event (which would carry
+that job's own id) from the real sentinel event, since both would carry an
+identical id either way. **Named mutation**: emitting on
+`resolve_uncertain`'s `TransactionQueryError` branch instead of staying
+silent is caught by the sentinel's job-id mismatch.
+
+### Claim: `[grind, job, cancellation]` — `CancelledBeforeRun` and `CancellationRequested` are the only genuine writes; `CancellationRequested` can repeat for an idempotent re-request
+
+`postgres_cancellation_observation_before_run_and_requested_test` cancels a
+queued job (`CancelledBeforeRun`) and an executing job twice
+(`CancellationRequested` both times, proving the documented repeat), each
+tagged with the row's own `previous_state`. **Named mutation**: also
+emitting for `AlreadyCancelled` in `emit_cancellation`'s `case outcome` is
+caught by the companion absence test below (the sentinel's job id no longer
+matches the very next observation once the unwanted `AlreadyCancelled` event
+lands ahead of it).
+
+### Claim: `[grind, job, cancellation]` — the read-only outcomes (`AlreadyCancelled`, `AlreadyUncertain`, `AlreadyFinished`) never emit
+
+`postgres_cancellation_observation_absent_on_already_cancelled_test` cancels
+an already-cancelled job, asserts nothing arrives, then cancels a distinct
+queued job through the same producer as the sentinel.
+
+### Claim: `[grind, job, cancellation]` — a genuinely aborted commit (`CancellationCommitUnknown`) never emits
+
+`postgres_cancellation_observation_absent_on_commit_unknown_test` uses the
+same deferred-trigger-plus-terminate abort mechanism, applied to an
+`AFTER UPDATE` trigger on `grind_jobs` matching the cancelled job's own
+`id`: killing the backend mid-`COMMIT` rolls back `cancel_before_run`'s own
+`UPDATE` too, so the job is still `queued` afterward and
+`CancellationCommitUnknown` is reported. The sentinel cancels a second,
+distinct queued job (not the same one again) for the same reason the
+`resolved` commit-unknown test above uses a distinct job: cancelling the
+same job again would emit the identical `CancelledBeforeRunOutcome`/job-id
+pair either way, unable to distinguish a stray wrongly-emitted event from
+the real one. **Named mutation**: emitting on `cancel`'s
+`TransactionQueryError` branch instead of staying silent is caught by the
+sentinel's job-id mismatch.
+
+### Claim: `[grind, job, released]` — `release_unstarted_claim`'s own `RETURNING` is the proof of commit
+
+`postgres_released_observation_emission_test` claims then releases before
+any execution, asserting `attempt_id`/`epoch` against `claim_identity` and
+`restored_state: Queued`. **Named mutation**: hardcoding
+`restored_state: job.Retryable` (ignoring the real previous state) in
+`emit_released` is caught by this test.
+
+### Claim: `[grind, job, released]` — `Ok(False)` (the attempt fence no longer matches) never emits
+
+`postgres_released_observation_absent_when_not_unstarted_test` acknowledges a
+claim successfully, then calls `release_unstarted_claim` against that same
+now-stale `ClaimedJob` (`Ok(False)`, since the row is no longer `executing`
+under that attempt), asserts nothing arrives, then releases a genuinely
+unstarted claim through the same producer as the sentinel.
+
+### Claim: `[grind, job, contract_mismatch]` — a claimed attempt released for a codec version no longer matching the registered worker
+
+`postgres_contract_mismatch_observation_emission_test` reuses
+`run_batch_partial_error_test`'s forced `output_version` mismatch, asserting
+`kind: OutputCodec`, `expected_version`/`actual_version` from the stored vs.
+registered codec versions. **Named mutation**: hardcoding `kind: InputCodec`
+in `emit_contract_mismatch` is caught by both this test and the companion
+absence test below (the sentinel's mismatch is also on `output`).
+
+### Claim: `[grind, job, contract_mismatch]` — an ordinary, matching-codec claim never emits
+
+`postgres_contract_mismatch_observation_absent_on_matching_codec_test` claims
+and runs a normal job to completion (no mismatch), asserts nothing arrives,
+then forces a genuine mismatch on a second job through the same producer as
+the sentinel.
+
+### Claim: a coordinator's `[grind, job, claimed]` for one attempt always arrives before that same attempt's `[grind, job, acknowledged]`
+
+`postgres_claimed_observation_precedes_acknowledged_test` attaches to both
+descriptors before claiming, tags each received event with its own
+`attempt_id`, and asserts the `claimed` event for that `attempt_id` is
+received strictly before the `acknowledged` one — both are emitted by the
+same producer (the queue actor claiming, then later acknowledging, one
+attempt) through the one `Forwarder` a `Database` owns, and `sinal/forwarder`
+guarantees per-producer FIFO delivery.
+
+### Claim: the shared forwarder's capacity is exceeded by round 2 traffic the same way it already was for `acknowledged` alone
+
+Adding `[grind, job, claimed]` changed
+`postgres_acknowledged_observation_overflow_reports_dropped_test`'s own
+expected drop count: with a gate-blocked `acknowledged` handler for job A
+holding the forwarder's single in-flight slot, job B's own `claimed` _and_
+`acknowledged` observations are both forwarded while that slot is held (one
+`Forwarder` per `Database`, not one per event kind) and both are dropped,
+coalesced into one `[sinal, forwarder, dropped]` report — `rejected` moved
+from `1` to `2`. Job A's own `claimed` observation is unaffected: it is
+emitted and drained before A's `acknowledged` handler ever blocks the
+forwarder. This is a real, documented behavior change (more observation
+traffic shares the same bounded forwarder), not a regression in either
+descriptor's own correctness — job outcomes for both A and B are unchanged
+either way.
+
+### Claim: the external `consumer/` package can attach to a Round 2 descriptor using only public imports
+
+`public_consumer_observes_claimed_test` (`consumer/test/grind_consumer_test.gleam`)
+attaches `sinal.observe` to `grind/observation.claimed()` from outside the
+package, submits and claims a job through `postgres`/`queue`, and decodes a
+real `ClaimedMeasurements`/`ClaimedMetadata` pair — the same proof round 1
+already gave for `acknowledged`.
+
+### Mutation evidence: clean baselines and deltas (Round 2)
+
+Every mutation below was applied to `src/grind/postgres.gleam` or
+`src/grind/internal/unique_admission.gleam`, run against a freshly created
+disposable PostgreSQL cluster (`initdb`/`pg_ctl` per run,
+`GRIND_TEST_QUEUE_DATABASE_URL` and `GRIND_TEST_DATABASE_URL` pointed at
+separate fresh databases on it — the same shape `scripts/test-postgres.sh`
+uses), then reverted. Each row is its own clean baseline immediately before
+its own mutation, in the same session, on the same fresh cluster; the full
+`scripts/test-postgres.sh` gate (disposable cluster, squirrel check, the
+pinned Oban oracle, the `grind` suite, and the external `consumer/` suite)
+was run once more after every mutation in this table was reverted, with all
+contract markers present.
+
+The first seven rows were captured in an earlier pass, against a
+154-passed baseline (before the coordinator-review follow-up below added
+five more tests). The remaining five rows were captured together in one
+later pass, against the resulting 158-passed baseline; both passes are
+equally valid clean-baseline evidence, just at different points in the same
+round.
+
+| Mutation                                                                                                                                                  | Clean baseline         | Mutated                | Failing tests (only)                                                                           |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- | ---------------------- | ---------------------------------------------------------------------------------------------- |
+| `admitted`: hardcode `confirmation: Replied` in `submit_unique`'s emit call                                                                               | 154 passed, 0 failures | 153 passed, 1 failure  | admitted-observation-unique-inserted-reconciled                                                |
+| `claimed`: swap `attempt_id`/`epoch` args in `emit_claimed`'s call site                                                                                   | 154 passed, 0 failures | 152 passed, 2 failures | claimed-observation-emission, claimed-precedes-acknowledged-ordering                           |
+| `quarantined`: hardcode `cancellation_was_requested: False` in `emit_quarantined`                                                                         | 154 passed, 0 failures | 153 passed, 1 failure  | quarantined-observation-emission                                                               |
+| `resolved`: swap `Replied`/`Reconciled` in `emit_resolved`'s `case result`                                                                                | 154 passed, 0 failures | 153 passed, 1 failure  | resolved-observation-replied-and-reconciled                                                    |
+| `cancellation`: also emit for `AlreadyCancelled` in `emit_cancellation`                                                                                   | 154 passed, 0 failures | 153 passed, 1 failure  | cancellation-observation-absent-on-already-cancelled                                           |
+| `released`: hardcode `restored_state: Retryable` in `emit_released`                                                                                       | 154 passed, 0 failures | 153 passed, 1 failure  | released-observation-emission                                                                  |
+| `contract_mismatch`: hardcode `kind: InputCodec` in `emit_contract_mismatch`                                                                              | 154 passed, 0 failures | 152 passed, 2 failures | contract-mismatch-observation-emission, contract-mismatch-observation-absent-on-matching-codec |
+| `admitted`, in-call post-`CommitUnknown` path: flip `via_receipt_match` to `False` in `run`'s `TransactionQueryError` fallback (`unique_admission.gleam`) | 158 passed, 0 failures | 157 passed, 1 failure  | admitted-observation-in-call-post-commit-unknown-reconciled                                    |
+| `resolved`: emit on `resolve_uncertain`'s `TransactionQueryError` branch (aborted-commit case) instead of staying silent                                  | 158 passed, 0 failures | 157 passed, 1 failure  | resolved-observation-absent-on-commit-unknown                                                  |
+| `cancellation`: emit on `cancel`'s `TransactionQueryError` branch (aborted-commit case) instead of staying silent                                         | 158 passed, 0 failures | 157 passed, 1 failure  | cancellation-observation-absent-on-commit-unknown                                              |
+| `admitted`, `available_at_unix_ms` gating: remove `admitted_available_at`'s state gate (`unique_admission.gleam`), reporting `Some` unconditionally       | 158 passed, 0 failures | 157 passed, 1 failure  | admitted-observation-existing-over-executing-available-at-none                                 |
+| `admitted`, plain submit: derive `committed_state` from the request's `available_at_unix_ms` presence instead of the insert's own `RETURNING`             | 158 passed, 0 failures | 157 passed, 1 failure  | admitted-observation-plain-submit                                                              |
+
+### Limits and deliberate decisions (Round 2)
+
+- **`quarantine_expired`'s `RETURNING` and `submit`/`submit_at`'s extra
+  `RETURNING` columns are both plain inline SQL, not Squirrel-managed** —
+  neither function was ever routed through `grind/internal/sql`
+  (Squirrel-generated), so no `scripts/generate-sql.sh` regeneration was
+  needed for round 2; `gleam run -m squirrel check` (run as part of
+  `scripts/test-postgres.sh`) stays green unchanged.
+- **`available_at_unix_ms` is `None` on every unique-admission `Reconciled`
+  event**, the same limitation `acknowledged` documents for its own
+  receipt-matched commits: `grind_unique_submissions` does not retain a
+  generally reusable `available_at`, so a receipt-proven decision (an
+  in-transaction receipt hit, or a post-`CommitUnknown` reconciliation inside
+  `submit_unique`'s own `run`) cannot re-derive it. A `Rescheduled` receipt
+  does retain its own `rescheduled_to` column, which could in principle
+  recover this one case — left as `None` uniformly for simplicity and
+  consistency, since a `Reconciled` observation is already documented as
+  best-effort and not the durable source of this value.
+- **The ordinary quarantine scan's `RETURNING` decodes `attempt_id` as
+  `Option(Int)` defensively**, even though every row this scan can match is
+  already `state = 'executing'` (which always has an attempt on record) —
+  consistent with this module's existing fail-closed handling of every other
+  stored-state mapping (`job.state_of_stored`), never an `assert` on
+  data read back from storage.
+- **`available_at_unix_ms` on `admitted` is `Some` only for `Queued`,
+  `Scheduled`, or `Retryable`**, never for any other policy-eligible state an
+  `Existing` conflict can land on (`Incomplete` reaches `Executing`/
+  `Uncertain`; `AllRetained` reaches every terminal state too) —
+  `admitted_available_at` (`grind/internal/unique_admission`) gates on the
+  committed/observed state itself, not on which `Admission` variant produced
+  it, so `Inserted`/`Rescheduled` (always `Queued`/`Scheduled`) and `Existing`
+  share one definition. Proven by
+  `postgres_admitted_observation_existing_over_executing_available_at_none_test`
+  (an `Existing` conflict against a row forced `executing`) and by mutation
+  (removing the gate reports `Some` unconditionally — red on that test).
+- **A claim whose commit reply is lost (not "detected as an error", but
+  genuinely never reaches the calling process at all — the OTP process
+  making the claim call exits between PostgreSQL committing the claim
+  `UPDATE` and this code reaching its own `emit_claimed` call) has no
+  `claimed` event, ever.** Nothing in this design retries or reconciles a
+  `claimed` observation after the fact the way `acknowledged`/`admitted`/
+  `resolved` reconcile a lost _transaction_ reply — a claim's own
+  `RETURNING` is read synchronously in the same call that decides whether to
+  emit, with no separate "was it committed?" question to later resolve. If
+  the lease is never renewed after such a crash, the claim-time quarantine
+  scan later emits a `[grind, job, quarantined]` event for that exact
+  `attempt_id`/`epoch` with no matching `[grind, job, claimed]` ever having
+  been observed — a consumer that expects one `claimed` per `quarantined`
+  (by `attempt_id`) cannot assume that pairing holds. Not tested here (it
+  requires killing the claiming OTP process itself mid-flight, not a
+  database-level fault); documented as a real, accepted gap.
+
+## Independent-review follow-up: `reconcile_unique` conflict passthrough, free-capacity polling, and automatic ack-unknown retry
+
+Three fixes from an independent correctness review, each proven red before
+its fix and green after, against the 161-passed baseline this pass leaves
+behind (158 baseline plus these three tests). All three were exercised both
+in isolation (a disposable local cluster with only `grind_test`/
+`grind_queue_test`) and as part of the full `scripts/test-postgres.sh` gate.
+
+### Claim: `reconcile_unique` must not turn a genuine `SubmissionConflict` into `CommitUnknown`
+
+`grind/internal/unique_admission.gleam`'s `reconcile_from_receipt` (reached
+by both public `reconcile_unique` and `run`'s own post-`TransactionQueryError`
+fallback) collapsed every `find_receipt` error — including
+`unique.SubmissionConflict` from a genuine fingerprint mismatch (Decision 9;
+`docs/UNIQUENESS-CONTRACT.md`) — into `Error(unique.CommitUnknown(pending))`.
+A caller whose `SubmissionId` was already committed by a _different_ request
+would get `CommitUnknown` forever from `reconcile_unique`, never the
+`SubmissionConflict` a fresh `submit_unique` call against the same id would
+have reported immediately.
+
+**Test**: `postgres_reconcile_unique_mismatched_pending_reports_conflict_test`
+(`test/grind_test.gleam`) commits request A under a `submission_id`, then
+calls `reconcile_unique` with a `PendingSubmission` built via the `@internal`
+`unique.new_pending_submission` carrying an arbitrary, non-matching
+`request_sha256` — standing in for a different request B's `CommitUnknown`
+being reconciled against the same id. Red before the fix:
+`postgres.reconcile_unique` returned `Error(CommitUnknown(pending))`; the
+test asserts `Error(SubmissionConflict)`.
+
+**Fix**: `reconcile_from_receipt` now matches `find_receipt`'s result
+explicitly — `Ok(None)`, `AdmissionContended`, and `AdmissionFailed` still
+report `CommitUnknown(pending)` (genuinely unknown, or the check itself could
+not run); `SubmissionConflict` passes through unchanged, mirroring
+`grind/postgres`'s own `reconcile_unknown_ack` → `QueueAckCommandConflict`
+passthrough for the acknowledgement path.
+
+**Red/green** (isolated cluster, `grind_test` only): red — 158 passed, 1
+failure (`postgres_reconcile_unique_mismatched_pending_reports_conflict_test`,
+`Error(CommitUnknown(...))` where `Error(SubmissionConflict)` was expected).
+Green after the fix — 159 passed, no failures. Reverted with `Edit`, not
+`git checkout`, and reapplied after confirming red; final state proven green
+again against the same isolated cluster and again as part of the full gate
+(161 passed overall, all contract markers present).
+
+Not separately covered: a fingerprint mismatch surfacing through `run`'s own
+post-connection-loss path (both faults — a lost connection mid-transaction
+_and_ a different request's receipt already present — forced simultaneously)
+is not exercised by a dedicated test. `run`'s fallback calls the exact same
+`reconcile_from_receipt` this test already proves correct, so the fix is
+structurally covered either way; a combined-fault test was judged not to add
+distinct evidence for the added harness complexity.
+
+### Claim: an automatic consumer with free capacity must keep polling while another attempt is still active
+
+`grind/queue.gleam`'s `continue_if_idle` armed the next `Poll` timer only
+when `active` was completely empty and the poll batch was drained
+(`poll_remaining_jobs == 0`). With `maximum_concurrency > 1`, one long-running
+attempt left every other slot idle for as long as it kept running: a newly
+submitted, already-due job — and the claim-time expired-lease quarantine
+scan, which piggybacks on the same claim query — had to wait for every
+active attempt to finish before the next poll was even scheduled, no matter
+how much capacity was free in the meantime.
+
+**Test**: `postgres_automatic_consumer_polls_while_capacity_free_test`
+(`test/grind_test.gleam`). An automatic consumer with
+`maximum_concurrency: 2`, `maximum_jobs_per_poll: 1`, and a 50ms poll
+interval claims job 1, which blocks on its own handler-owned gate. Only once
+job 1 is confirmed running is job 2 submitted — it did not exist at the poll
+that claimed job 1, so only a _later_, freshly scheduled poll can find it
+due. The test asserts job 2's worker starts within 2 seconds while job 1 is
+still blocked, then releases both and confirms both succeed.
+
+**Fix**: `continue_if_idle` now arms the next poll whenever the consumer is
+not shutting down, this round is done claiming, and `active` is below
+`maximum_concurrency` — not only when `active` is empty. A new
+`ConsumerState.poll_scheduled: Bool` field is the single-outstanding-timer
+guard this relies on: `continue_if_idle` only arms a timer when one is not
+already pending, and the `Poll` message handler clears the flag as the very
+first thing it does (before any other branch), so the one timer this design
+intentionally keeps outstanding is never allowed to become two overlapping
+ones.
+
+**Red/green** (isolated cluster, `grind_test` + `grind_queue_test`): red —
+`let assert Ok(CapacityWorkerStarted(22, second_release)) = process.receive(started, within: 2000)`
+panicked with "Pattern match failed" (job 2 never started while job 1 was
+blocked). Green after the fix. Reverted with `Edit` and reapplied after
+confirming red; existing shutdown/drain tests
+(`automatic-drain-paused-poll-and-renewed`,
+`stale-shutdown-grace-timer-scoped-to-incarnation`, and the rest of the
+`consumer-stop-*`/`automatic-*` suite) stayed green throughout, including in
+the final full-gate run.
+
+### Claim: automatic mode must not silently drop a `QueueAckUnknown` acknowledgement
+
+`finish_completion`'s `Automatic` branch treated every `ProcessError` —
+including `QueueProcessFailed(QueueAckUnknown(command_id, proposed))` — the
+same as an ordinary "nothing due" result: the claim was simply dropped, with
+no caller left holding the `ClaimedJob`/`Execution` to retry. The row was
+left `executing` until its lease naturally expired and some consumer's
+claim-time scan quarantined it to `uncertain` — recoverable only by an
+operator's audited resolution, never on its own, even though the
+acknowledgement's own `command_id` fencing
+(`postgres.acknowledgement_command_id`, deterministic in job id, attempt id,
+and epoch) already makes a retry of the exact same `acknowledge_claim` call
+safe.
+
+**Decision**: the coordinator now keeps a `QueueAckUnknown` attempt in
+`active` (`ActiveAttempt.pending_ack: Some(execution)`) and retries the exact
+same `acknowledge_claim` call on this incarnation's own renewal-interval
+timer — reusing the `Renew` message and timer instead of adding new
+machinery — until a non-`QueueAckUnknown` result (`Ok`, or one of the ack's
+own known-outcome errors such as `QueueAckStale`/`QueueAckCommandConflict`)
+resolves it. **Scoped to `Automatic` completion only**: a `Manual`
+`process_one` caller keeps getting `QueueAckUnknown` back synchronously,
+exactly as before — it already has a live reply channel and can call
+`reconcile_acknowledgement` itself; only automatic mode had no caller left to
+hand an unknown ack to. This was proven the hard way: an early version of
+the fix retried under `Manual` completion too, which made
+`postgres_ack_commit_connection_loss_is_unknown_test` (and two `acknowledged`
+observation tests sharing the same fault mechanism) hang past their own
+10-second reply timeout, since `process_one`'s caller stopped getting an
+immediate answer. Scoping the retry to `Automatic` fixed all four at once.
+
+**Corrected after independent re-review (R1/R2/R3 below)**: an earlier
+version of this fix deliberately did _not_ renew the lease while an ack was
+pending, on the claim that "nothing is still running that a lease protects,
+and every retry is fenced regardless of lease currency". That claim is
+wrong: a not-yet-committed retry's own acknowledgement `UPDATE` is _itself_
+gated on `postgres.live_lease_predicate` (only the already-committed,
+receipt-matched replay path is lease-independent), so never renewing meant a
+merely-transient outage could exhaust the lease and strand the job after
+only ~3 renewal intervals, well before a genuinely transient fault would
+have cleared. Fixed by renewing first, then retrying, bounded — see R1.
+
+**R1 — renew while pending, bounded** (`retry_pending_ack`): each pending
+tick calls the same fenced `postgres.renew_claim` first (fenced to
+`executing`, this exact `attempt_id`/`epoch`/`attempt_owner`, and a still
+live lease — identical to an ordinary in-progress attempt's own renewal),
+then retries `acknowledge_claim` regardless of the renewal's own result. If
+the original attempt's transaction had actually committed already (a lost
+reply, not an abort), `renew_claim`'s fence no longer matches (state is no
+longer `executing` under this attempt) and it harmlessly reports `Ok(False)`
+— the acknowledgement retry right after it still reconciles correctly from
+the now-visible receipt, since that path never depended on the lease at all.
+**Bounded** by `ConsumerState.pending_ack_retry_budget` (approximately one
+lease duration's worth of ticks — `lease_duration_ms / renewal_interval_ms`,
+computed once, at least 1): once `ActiveAttempt.pending_ack_ticks` reaches
+it, ticks stop renewing (but keep retrying the acknowledgement, which stays
+cheap and safe) and the lease is left to lapse — a persistently failing
+commit then converges on a known `QueueAckStale(_, AckLeaseExpired(..))`
+once the lease is truly gone (or on whatever a claim-time quarantine scan's
+own `state` change surfaces as, if that runs first), ending the retry chain
+rather than renewing forever.
+
+**R2 — exactly one timer chain per pending attempt** (`renewal_generation`):
+transitioning an attempt into `pending_ack` always finds exactly one
+ordinary-renewal timer already outstanding (the chain `start_attempt`/
+`renew_lease` maintains) — arming a second, pending-retry timer on top of it
+without invalidating the first would double the retry/renewal rate. Fixed
+by adding `ActiveAttempt.renewal_generation`, bumped only the first time
+`retry_ack_until_known` moves an attempt from `pending_ack: None` to `Some`,
+carried in the `Renew(attempt_id, epoch, generation)` message, and checked
+by `renew_active_attempt` against the attempt's current stored generation —
+a mismatch means a stale, invalidated chain, dropped with no further
+scheduling. A later re-arm for the same still-pending attempt keeps the same
+generation (the leftover ordinary timer has already fired and been consumed
+by this exact chain by then).
+
+**R3 corrected `unique.AdmissionFailed` doc wording**: "a controlled
+rollback the database itself confirms" overclaimed what is actually known.
+The accurate claim (now in the doc comment) is narrower: the transaction
+callback failed, so this code never sent `COMMIT`, and therefore the
+admission cannot have committed — regardless of whether the resulting
+`ROLLBACK` itself ever reached the server (it may not, if the connection was
+already lost). The same corrected reasoning is now also documented on
+`postgres.QueueAckFailed` (previously undocumented), since it is produced by
+the exact same "callback returned `Error`, pog reports a controlled
+`TransactionRolledBack`" mechanism on the acknowledgement path.
+
+**Optional fixes also applied**: (1) a `QueueAckFailed` on a retry already
+in flight (`pending_ack: Some`) is now treated the same as another
+`QueueAckUnknown` — retried within the same bound — since it is exactly as
+safe to retry (`command_id` idempotency) and surfacing it immediately would
+silently drop the claim in `Automatic` mode the same way an unhandled
+`QueueAckUnknown` did; a _first_ attempt's own `QueueAckFailed` is
+unaffected. (2) "call `fill_automatic_slots`/`continue_if_idle` after a
+pending retry resolves" was already true by construction: a resolved retry
+still flows through the shared `finalize_ack_result` → `finish_completion`,
+whose `Automatic` branch already calls `fill_automatic_slots` (`Ok(True)`)
+or `continue_if_idle` (`Ok(False)`/`Error(_)`) exactly as it does for an
+ordinary first-attempt result — no separate change was needed.
+
+**Test**: `postgres_automatic_ack_commit_connection_loss_recovers_test`
+(`test/grind_test.gleam`), the same deferred-constraint-trigger
+aborted-commit harness `run_ack_commit_connection_loss_test` uses (a
+`DEFERRABLE INITIALLY DEFERRED` trigger on `grind_job_acknowledgements`
+scoped to this job's id sleeps at commit time; terminating that backend
+aborts the whole transaction before it ever commits — proven by
+`postgres.reconcile_acknowledgement` finding no receipt), driven against an
+**automatic** consumer instead of a manually stepped one. After the trigger
+is dropped, the job reaches `succeeded` on its own, with the coordinator's
+own retried `acknowledge_claim` performing the acknowledgement fresh (the
+aborted transaction left nothing to reconcile from) — without ever passing
+through `uncertain`. `lease_duration: 1000` (checked against the R1/R2
+redesign too, not just the original fix) stayed robust across 5+ consecutive
+full local runs; not raised.
+
+**Red/green** (isolated cluster, `grind_test` + `grind_queue_test`): red —
+`wait_for_job_state_tolerating_errors(database, handle, job.Succeeded, 750)`
+returned `False` (the job stayed `executing` for the whole wait, exactly the
+pre-fix drop-and-wait-for-lease-expiry behavior). Green after the fix.
+Reverted with `Edit` (only the `finalize_ack_result` branch, keeping the
+surrounding `pending_ack`/`retry_ack_until_known`/`retry_pending_ack`
+machinery in place so the revert exercises the same code shape a reviewer
+would see) and reapplied after confirming red.
+
+Two flakiness fixes were needed to make this test's own harness reliable,
+independent of the production fix: `wait_for_job_state` bails out on the
+first `postgres.state` error rather than retrying, which is wrong
+immediately after this same test kills a connection on the pool it is about
+to read from again — `wait_for_job_state_tolerating_errors` (a copy that
+treats a transient read error as "not yet" instead of "never") is used
+instead, for both the `Executing`-then-`Succeeded` wait and (via
+`retry_transient_query`) the final `postgres.arguments`/`postgres.outcome`
+reads.
+
+### Claim (R1): a persistently aborting commit does not retry forever — bounded renewal ends it as `uncertain`
+
+`postgres_automatic_ack_retry_bounded_eventually_uncertain_test`
+(`test/grind_test.gleam`) keeps the same deferred-constraint-trigger abort
+installed for the _entire_ test (never dropped mid-test, unlike the recovery
+test above) — every acknowledgement attempt for this job, the first and
+every retry alike, hits it. `maximum_concurrency: 2` keeps this consumer
+polling throughout (the free-capacity fix), so its own claim-time quarantine
+scan keeps running. A helper
+(`kill_ack_backends_until_uncertain`) repeatedly finds and kills this job's
+own sleeping backend via `pg_stat_activity` (a real database-time barrier,
+not a wall-clock guess), checking the job's own state between kills, up to a
+generous 40-iteration cap; once the ack retry loop itself gives up (a known
+`QueueAckStale` once the lease lapses), no further backend ever sleeps for
+this job (`current_ack_rejection` reads the row directly once it is no
+longer `executing`, never reaching the trigger's `INSERT`), so a "miss" just
+means waiting for a poll's quarantine scan to catch up.
+
+**Red/green**: red — with the retry budget forced to always renew (`case
+pending_ack_ticks < state.pending_ack_retry_budget` replaced with `case True`
+in `retry_pending_ack`, `src/grind/queue.gleam`), the loop exhausted its
+40-iteration cap with the job still `executing`, never reaching `uncertain`
+(`False` where `True` was expected) — proving that without a bound, this
+exact persistent-failure scenario retries indefinitely. Green after
+reverting to the real budget check. Stable across 3 consecutive full local
+runs after the fix.
+
+### Claim (R2): the generation guard prevents a doubled retry/renewal rate
+
+Not committed as a permanent asserting test (the exact rate is inherently
+timing-sensitive across machines and load, so a hard pass/fail threshold
+here would be a flaky-test liability far out of proportion to what it
+proves); instead, mutation evidence, following this document's own
+established pattern for a claim whose exact effect size is not worth
+threshold-asserting.
+
+**Mechanism**: a temporary experiment (not part of the retained suite)
+reused the persistent-abort harness from R1's test above but with
+`maximum_concurrency: 1`, `lease_duration_ms: 2000` (long enough that the
+retry budget never runs out mid-measurement, isolating the renewal-rate
+question from the separate bounded-exhaustion one), and counted how many
+distinct sleeping backends it found and killed inside a fixed 2000ms
+wall-clock window starting right after the worker released.
+
+**Clean baseline** (the real `retry_ack_until_known`, generation bumped on
+first transition into `pending_ack`): 3, 2, 2 kills across three runs
+(≈1 every ~666ms, matching `renewal_interval_ms = lease_duration_ms / 3`).
+
+**Mutated** (`retry_ack_until_known`'s `generation` always kept as
+`renewal_generation` unchanged, never bumped — reintroducing R2's bug: the
+leftover ordinary-renewal timer chain and the new pending-retry chain both
+stay "current" and both keep re-arming): 5, 8, 5 kills across three runs —
+roughly 2–3× the clean baseline's rate, consistent with two overlapping
+timer chains both firing on the same cadence (`wait_for_commit_trigger_backend`
+only ever returns the single most-recent sleeping backend, so two
+near-simultaneous sleepers show up as two kills in quick succession rather
+than one, which is why the ratio is noisy rather than exactly 2×).
+
+### Full-gate confirmation
+
+`nix develop --command bash scripts/test-postgres.sh` was run to completion
+after all fixes above (the original three fixes, R1/R2/R3, the two optional
+fixes, plus the doc-only and dead-code-removal items from the same overall
+pass): root package 162 passed, 0 failures; external consumer 9 passed, 0
+failures; the pinned Oban oracle harness and `gleam run -m squirrel check`
+both green; every contract marker in both `for contract in ...` loops
+present. `gleam check` (root and `consumer/`), `nix fmt`, and `nix flake
+check` all clean; `git diff --check` reports no whitespace errors.

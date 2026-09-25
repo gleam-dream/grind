@@ -13,6 +13,9 @@ gleam_otp = ">= 1.0.0 and < 2.0.0"
 pog = ">= 4.1.0 and < 5.0.0"
 gleam_json = ">= 3.1.0 and < 4.0.0"
 exception = ">= 2.1.1 and < 3.0.0"
+sinal = { path = "../sinal" }
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
+squirrel = ">= 4.7.0 and < 5.0.0"
+simplifile = ">= 2.7.0 and < 3.0.0"

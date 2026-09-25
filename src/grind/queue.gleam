@@ -235,7 +235,7 @@ type Message {
   BeginShutdown(process.Subject(ShutdownReply))
   ShutdownGraceExpired(Int)
   ReadShutdownState(process.Subject(Bool))
-  Renew(attempt_id: Int, epoch: Int)
+  Renew(attempt_id: Int, epoch: Int, generation: Int)
   ReadRenewalStatus(reply: process.Subject(Option(RenewalStatus)))
   InjectWorkerStartFailure(reply: process.Subject(Nil))
   KillNextWorkerBeforeMonitor(reply: process.Subject(Nil))
@@ -290,6 +290,42 @@ type ActiveAttempt {
     monitor: process.Monitor,
     completion: Completion,
     renewal_status: RenewalStatus,
+    /// `Some(execution)` once this `Automatic`-completion attempt's worker
+    /// has already returned and its acknowledgement came back
+    /// `QueueAckUnknown` (the ack transaction reached the database but its
+    /// reply was lost) — the attempt is kept in `active` rather than
+    /// dropped, so it still counts against `maximum_concurrency` and blocks
+    /// a clean shutdown drain, but its `worker_subject`/`monitor` are
+    /// already stale (the worker was stopped and demonitored before the ack
+    /// was ever attempted). This incarnation's own renewal timer retries the
+    /// exact same `acknowledge_claim` call (`postgres.acknowledgement_command_id`
+    /// is deterministic in job id, attempt id, and epoch, so the retry is
+    /// idempotent), renewing the lease first on each tick while within
+    /// `ConsumerState.pending_ack_retry_budget` — see `retry_pending_ack`'s
+    /// and `retry_ack_until_known`'s doc comments for the full mechanism and
+    /// why renewing (bounded) is the safe choice, not the lease-independence
+    /// an earlier version of this fix wrongly assumed. Always `None` for a
+    /// `Manual` completion — a `process_one` caller already gets
+    /// `QueueAckUnknown` back synchronously and can retry itself — and for
+    /// an attempt whose worker is still running normally.
+    pending_ack: Option(worker.Execution),
+    /// Number of retry attempts already made while `pending_ack` has been
+    /// `Some` (0 for the first one, about to be made). Compared against
+    /// `ConsumerState.pending_ack_retry_budget` to decide whether this
+    /// tick still renews the lease before retrying the acknowledgement.
+    /// Meaningless (left at its last value) while `pending_ack` is `None`.
+    pending_ack_ticks: Int,
+    /// Invalidates a still-outstanding timer from an earlier chain: bumped
+    /// only when `retry_ack_until_known` first moves this attempt from
+    /// `pending_ack: None` to `Some` (there is always exactly one leftover
+    /// ordinary-renewal timer already scheduled at that point, from the
+    /// chain `start_attempt`/`renew_lease` maintains), and carried unchanged
+    /// by every later tick of the same chain (ordinary renewal or pending
+    /// retry alike). `renew_active_attempt` ignores a `Renew` whose own
+    /// `generation` does not match this field — see its doc comment for why
+    /// this, not just the existing `attempt_id`/`epoch` match, is needed to
+    /// guarantee exactly one outstanding timer per attempt.
+    renewal_generation: Int,
   )
 }
 
@@ -334,8 +370,27 @@ type ConsumerState {
     policy: ValidatedPolicy,
     lease_duration_ms: Int,
     renewal_interval_ms: Int,
+    /// How many `pending_ack` retry ticks (see `ActiveAttempt.pending_ack_ticks`)
+    /// keep renewing the lease before giving up on renewal and letting it
+    /// lapse — approximately one lease duration's worth of ticks
+    /// (`lease_duration_ms / renewal_interval_ms`, at least 1), computed once
+    /// alongside `renewal_interval_ms`. A persistently failing commit still
+    /// keeps retrying the acknowledgement after this budget is spent (that
+    /// stays safe and cheap), it just stops extending the lease — so the
+    /// lease eventually expires, a claim-time quarantine scan (this
+    /// consumer's own next poll, or another consumer's) can pick the row up,
+    /// and the retry's next attempt observes that as an ordinary known
+    /// `QueueAckStale(_, AckLeaseExpired(..))` rather than retrying forever.
+    pending_ack_retry_budget: Int,
     active: List(ActiveAttempt),
     poll_remaining_jobs: Int,
+    /// True while a `Poll` timer is already scheduled against
+    /// `incarnation_subject` and has not yet fired. `continue_if_idle` is the
+    /// sole scheduler and checks this before arming another one, so free
+    /// capacity (`maximum_concurrency` above `active`'s length) while other
+    /// attempts are still running never accumulates more than one pending
+    /// timer — see its doc comment.
+    poll_scheduled: Bool,
     fail_next_worker_start: Bool,
     kill_next_worker_before_monitor: Bool,
     shutting_down: Bool,
@@ -477,6 +532,11 @@ fn start_configured_consumer_with_handoff(
     True -> lease_duration_ms / 3
     False -> 1
   }
+  // See `ConsumerState.pending_ack_retry_budget`'s doc comment.
+  let pending_ack_retry_budget = case lease_duration_ms / renewal_interval_ms {
+    budget if budget > 0 -> budget
+    _ -> 1
+  }
   let worker_factory_builder =
     factory_supervisor.worker_child(fn(request) {
       actor.start(worker_actor(request))
@@ -524,8 +584,10 @@ fn start_configured_consumer_with_handoff(
                 policy:,
                 lease_duration_ms:,
                 renewal_interval_ms:,
+                pending_ack_retry_budget:,
                 active: [],
                 poll_remaining_jobs: 0,
+                poll_scheduled: auto_poll,
                 fail_next_worker_start: False,
                 kill_next_worker_before_monitor: False,
                 shutting_down: False,
@@ -906,6 +968,12 @@ fn handle_message(
 ) -> actor.Next(ConsumerState, Message) {
   case message {
     Poll -> {
+      // This message is the one outstanding timer `poll_scheduled` was
+      // tracking (or the initial kick `start_polling` sent) — clear it
+      // before anything else so `continue_if_idle` is free to arm the next
+      // one, on this round or a later one, regardless of which branch below
+      // is taken.
+      let state = ConsumerState(..state, poll_scheduled: False)
       let ValidatedPolicy(maximum_jobs_per_poll:, ..) = state.policy
       case state.shutting_down {
         True -> actor.continue(state)
@@ -937,7 +1005,8 @@ fn handle_message(
       process.send(reply, state.shutting_down)
       actor.continue(state)
     }
-    Renew(attempt_id, epoch) -> renew_active_attempt(state, attempt_id, epoch)
+    Renew(attempt_id, epoch, generation) ->
+      renew_active_attempt(state, attempt_id, epoch, generation)
     ReadRenewalStatus(reply) -> {
       let status = case state.active {
         [] -> None
@@ -1112,12 +1181,15 @@ fn start_attempt(
                   monitor:,
                   completion:,
                   renewal_status: LeaseRenewalConfirmed,
+                  pending_ack: None,
+                  pending_ack_ticks: 0,
+                  renewal_generation: 0,
                 )
               let _ =
                 process.send_after(
                   incarnation_subject,
                   renewal_interval_ms,
-                  Renew(attempt_id, epoch),
+                  Renew(attempt_id, epoch, 0),
                 )
               let state =
                 ConsumerState(
@@ -1246,8 +1318,7 @@ fn finish_attempt(
   case find_active(state.active, id, attempt_id, epoch) {
     Error(Nil) -> actor.continue(state)
     Ok(active) -> {
-      let ActiveAttempt(claimed:, worker_subject:, monitor:, completion:, ..) =
-        active
+      let ActiveAttempt(claimed:, worker_subject:, monitor:, ..) = active
       process.demonitor_process(monitor)
       process.send(worker_subject, StopWorker)
       let result =
@@ -1258,6 +1329,44 @@ fn finish_attempt(
           claimed,
           execution,
         )
+      finalize_ack_result(state, active, result)
+    }
+  }
+}
+
+/// Shared by a first acknowledgement attempt (`finish_attempt`) and every
+/// retry of one still `pending_ack` (`retry_pending_ack`): in `Automatic`
+/// mode only, `QueueAckUnknown` keeps the attempt `active` and schedules
+/// another retry. A retry already in flight (`pending_ack: Some`) also
+/// retries on a plain `QueueAckFailed` — the transaction callback failed so
+/// `COMMIT` was never sent (the same "genuinely did not commit" reasoning
+/// `unique.AdmissionFailed`'s doc comment gives), but surfacing that here
+/// would silently drop the claim in `Automatic` mode exactly like an
+/// unhandled `QueueAckUnknown` would, and retrying costs nothing extra since
+/// `command_id` already makes it idempotent; a *first* attempt's own
+/// `QueueAckFailed` is unaffected and still resolves immediately, unchanged.
+/// Anything else — success, one of the ack's own known-outcome errors
+/// (`QueueAckStale`, `QueueAckCommandConflict`, ...), or any result at all
+/// under `Manual` completion — resolves it exactly like an ordinary
+/// first-attempt result always has, which for `Automatic` completion means
+/// `finish_completion` calling straight through to `fill_automatic_slots`/
+/// `continue_if_idle`, so a slot a resolved retry frees is reused promptly.
+/// `Manual` deliberately never retries: a `process_one` caller already gets
+/// `QueueAckUnknown` back synchronously today and can already call
+/// `reconcile_acknowledgement` itself; only automatic mode had no caller
+/// left to hand an unknown ack to, which is the gap this fixes.
+fn finalize_ack_result(
+  state: ConsumerState,
+  active: ActiveAttempt,
+  result: Result(Bool, postgres.QueueRunError),
+) -> actor.Next(ConsumerState, Message) {
+  case result, active.completion, active.pending_ack {
+    Error(postgres.QueueAckUnknown(_, proposed)), Automatic, _ ->
+      retry_ack_until_known(state, active, proposed)
+    Error(postgres.QueueAckFailed(_)), Automatic, Some(proposed) ->
+      retry_ack_until_known(state, active, proposed)
+    _, _, _ -> {
+      let ActiveAttempt(id:, attempt_id:, epoch:, completion:, ..) = active
       let state =
         ConsumerState(
           ..state,
@@ -1270,6 +1379,114 @@ fn finish_attempt(
       )
     }
   }
+}
+
+/// Marks `active` as `pending_ack` (rather than removing it) and arms one
+/// more retry on this incarnation's renewal timer, reusing the renewal
+/// interval as its cadence per the `ActiveAttempt.pending_ack` doc comment.
+/// `renewal_generation` is bumped only the first time this fires for a given
+/// attempt (`pending_ack` still `None` on entry): exactly one ordinary
+/// renewal timer is always already outstanding at that point (the chain
+/// `start_attempt`/`renew_lease` maintains), and bumping the generation makes
+/// `renew_active_attempt` ignore that leftover tick as stale rather than
+/// running a second, overlapping timer chain — see `renew_active_attempt`'s
+/// doc comment. A later call for the same still-`Some` attempt (another
+/// `QueueAckUnknown`/`QueueAckFailed` on a retry already in flight) keeps the
+/// same generation: by then the leftover ordinary timer has already fired
+/// and been consumed by this exact chain, so there is nothing left to
+/// invalidate.
+fn retry_ack_until_known(
+  state: ConsumerState,
+  active: ActiveAttempt,
+  execution: worker.Execution,
+) -> actor.Next(ConsumerState, Message) {
+  let ActiveAttempt(
+    id:,
+    attempt_id:,
+    epoch:,
+    pending_ack:,
+    renewal_generation:,
+    ..,
+  ) = active
+  let generation = case pending_ack {
+    None -> renewal_generation + 1
+    Some(_) -> renewal_generation
+  }
+  let _ =
+    process.send_after(
+      state.incarnation_subject,
+      state.renewal_interval_ms,
+      Renew(attempt_id, epoch, generation),
+    )
+  actor.continue(
+    ConsumerState(
+      ..state,
+      active: replace_active(
+        state.active,
+        id,
+        attempt_id,
+        epoch,
+        ActiveAttempt(
+          ..active,
+          pending_ack: Some(execution),
+          renewal_generation: generation,
+        ),
+      ),
+    ),
+  )
+}
+
+/// Performs one `pending_ack` retry tick. Renews the lease first — fenced to
+/// `executing`, this exact `attempt_id`/`epoch`/`attempt_owner`, and a still
+/// live lease, exactly like an ordinary in-progress attempt's renewal — for
+/// as long as `pending_ack_ticks` stays under `ConsumerState.
+/// pending_ack_retry_budget`; a not-yet-committed retry's own acknowledgement
+/// UPDATE is *itself* fenced the same way (`postgres.live_lease_predicate`),
+/// so renewing is what keeps that path retriable rather than merely
+/// "possible in principle": once the lease is gone, only a receipt-matched
+/// commit can still resolve it. If the original attempt's transaction
+/// actually committed already (a lost reply, not an abort), `renew_claim`'s
+/// own fence no longer matches (the row is no longer `executing` under this
+/// attempt) and it harmlessly reports `Ok(False)`; the acknowledgement retry
+/// right after it reconciles from the now-visible receipt regardless — that
+/// path never depended on the lease. Once the budget is spent, this stops
+/// renewing (and lets the lease lapse) but keeps retrying the
+/// acknowledgement itself, which stays cheap and safe; a persistently
+/// failing commit then converges on a known `QueueAckStale(_,
+/// AckLeaseExpired(..))` once the lease is truly gone, ending the retry
+/// chain — not a new failure mode, the same lease-expiry-to-`uncertain`
+/// recovery this codebase already relies on elsewhere, just reached instead
+/// of retried forever.
+fn retry_pending_ack(
+  state: ConsumerState,
+  active: ActiveAttempt,
+  execution: worker.Execution,
+) -> actor.Next(ConsumerState, Message) {
+  let ActiveAttempt(claimed:, pending_ack_ticks:, ..) = active
+  case pending_ack_ticks < state.pending_ack_retry_budget {
+    True -> {
+      let _ =
+        postgres.renew_claim(
+          state.database,
+          state.queue,
+          state.attempt_owner,
+          claimed,
+          state.lease_duration_ms,
+        )
+      Nil
+    }
+    False -> Nil
+  }
+  let result =
+    postgres.acknowledge_claim(
+      state.database,
+      state.queue,
+      state.attempt_owner,
+      claimed,
+      execution,
+    )
+  let active = ActiveAttempt(..active, pending_ack_ticks: pending_ack_ticks + 1)
+  finalize_ack_result(state, active, result)
 }
 
 fn finish_completion(
@@ -1324,6 +1541,22 @@ fn continue_after_completion(
   }
 }
 
+/// Called at the end of every poll round (this poll's claim batch drained,
+/// or an active attempt just finished). Arms the next `Poll` timer whenever
+/// this consumer is not shutting down, this round is done claiming
+/// (`poll_remaining_jobs == 0`), and free capacity remains
+/// (`active` below `maximum_concurrency`) — not only when `active` is fully
+/// empty. A `maximum_concurrency` above 1 otherwise leaves spare slots idle
+/// for as long as one attempt keeps running: with the old empty-only check,
+/// a newly due job (or the claim-time expired-lease quarantine scan, which
+/// piggybacks on the same claim query) had to wait for every currently
+/// active attempt to finish before the next poll was even scheduled, no
+/// matter how much capacity was actually free in the meantime.
+/// `poll_scheduled` is the single-outstanding-timer guard this relies on: an
+/// active attempt finishing while a timer from an earlier round is already
+/// pending must not arm a second, overlapping one (see the field's doc
+/// comment). Shutdown draining is unaffected — a consumer already shutting
+/// down never re-arms a poll regardless of capacity.
 fn continue_if_idle(
   state: ConsumerState,
 ) -> actor.Next(ConsumerState, Message) {
@@ -1338,14 +1571,21 @@ fn continue_if_idle(
         }
         False -> actor.continue(state)
       }
-    False ->
-      case list.is_empty(state.active) && state.poll_remaining_jobs == 0 {
+    False -> {
+      let ValidatedPolicy(maximum_concurrency:, ..) = state.policy
+      case
+        state.auto_poll
+        && !state.poll_scheduled
+        && state.poll_remaining_jobs == 0
+        && list.length(state.active) < maximum_concurrency
+      {
         True -> {
           schedule_next_poll(state)
-          actor.continue(state)
+          actor.continue(ConsumerState(..state, poll_scheduled: True))
         }
         False -> actor.continue(state)
       }
+    }
   }
 }
 
@@ -1390,69 +1630,123 @@ fn remove_active(
   })
 }
 
+/// This incarnation's renewal timer fires once per active attempt every
+/// `renewal_interval_ms`. A `pending_ack` attempt (its worker has already
+/// returned; see `ActiveAttempt`'s doc comment) repurposes this same tick to
+/// retry its acknowledgement instead of renewing a lease nothing is running
+/// against.
+fn replace_active(
+  active_attempts: List(ActiveAttempt),
+  id: Int,
+  attempt_id: Int,
+  epoch: Int,
+  replacement: ActiveAttempt,
+) -> List(ActiveAttempt) {
+  list.map(active_attempts, fn(active) {
+    let ActiveAttempt(
+      id: active_id,
+      attempt_id: active_attempt_id,
+      epoch: active_epoch,
+      ..,
+    ) = active
+    case
+      active_id == id
+      && active_attempt_id == attempt_id
+      && active_epoch == epoch
+    {
+      True -> replacement
+      False -> active
+    }
+  })
+}
+
+/// This incarnation's renewal timer fires once per active attempt every
+/// `renewal_interval_ms`. A `pending_ack` attempt (its worker has already
+/// returned; see `ActiveAttempt`'s doc comment) repurposes this same tick to
+/// renew-then-retry its acknowledgement instead of only renewing a lease.
+/// `tick_generation` must match the attempt's own current
+/// `renewal_generation`, not just its `attempt_id`/`epoch`
+/// (`renewal_is_current`): the latter alone guards against a stale tick from
+/// a *different* attempt that happens to reuse this row, but not against two
+/// overlapping timer chains for the *same* still-active attempt — exactly
+/// what would otherwise happen the moment `retry_ack_until_known` arms a
+/// pending-retry timer while an ordinary renewal timer from before is still
+/// outstanding. A generation mismatch means this exact tick belongs to an
+/// invalidated chain; it is dropped with no further scheduling, because the
+/// chain that replaced it already has its own outstanding timer.
 fn renew_active_attempt(
   state: ConsumerState,
   tick_attempt_id: Int,
   tick_epoch: Int,
+  tick_generation: Int,
 ) -> actor.Next(ConsumerState, Message) {
   case find_active_by_attempt(state.active, tick_attempt_id, tick_epoch) {
     Error(Nil) -> actor.continue(state)
     Ok(active) -> {
-      let ActiveAttempt(attempt_id:, epoch:, ..) = active
-      case renewal_is_current(attempt_id, epoch, tick_attempt_id, tick_epoch) {
+      let ActiveAttempt(
+        attempt_id:,
+        epoch:,
+        pending_ack:,
+        renewal_generation:,
+        ..,
+      ) = active
+      case
+        renewal_is_current(attempt_id, epoch, tick_attempt_id, tick_epoch)
+        && tick_generation == renewal_generation
+      {
         False -> actor.continue(state)
-        True -> {
-          let result =
-            postgres.renew_claim(
-              state.database,
-              state.queue,
-              state.attempt_owner,
-              active.claimed,
-              state.lease_duration_ms,
-            )
-          case result {
-            Ok(True) -> {
-              let state =
-                set_renewal_status(
-                  state,
-                  tick_attempt_id,
-                  tick_epoch,
-                  LeaseRenewalConfirmed,
-                )
-              let _ =
-                process.send_after(
-                  state.incarnation_subject,
-                  state.renewal_interval_ms,
-                  Renew(attempt_id, epoch),
-                )
-              actor.continue(state)
-            }
-            Ok(False) ->
-              actor.continue(set_renewal_status(
-                state,
-                tick_attempt_id,
-                tick_epoch,
-                LeaseRenewalLost,
-              ))
-            Error(_) -> {
-              let state =
-                set_renewal_status(
-                  state,
-                  tick_attempt_id,
-                  tick_epoch,
-                  LeaseRenewalUnknown,
-                )
-              let _ =
-                process.send_after(
-                  state.incarnation_subject,
-                  state.renewal_interval_ms,
-                  Renew(attempt_id, epoch),
-                )
-              actor.continue(state)
-            }
+        True ->
+          case pending_ack {
+            Some(execution) -> retry_pending_ack(state, active, execution)
+            None -> renew_lease(state, active)
           }
-        }
       }
+    }
+  }
+}
+
+fn renew_lease(
+  state: ConsumerState,
+  active: ActiveAttempt,
+) -> actor.Next(ConsumerState, Message) {
+  let ActiveAttempt(attempt_id:, epoch:, renewal_generation:, ..) = active
+  let result =
+    postgres.renew_claim(
+      state.database,
+      state.queue,
+      state.attempt_owner,
+      active.claimed,
+      state.lease_duration_ms,
+    )
+  case result {
+    Ok(True) -> {
+      let state =
+        set_renewal_status(state, attempt_id, epoch, LeaseRenewalConfirmed)
+      let _ =
+        process.send_after(
+          state.incarnation_subject,
+          state.renewal_interval_ms,
+          Renew(attempt_id, epoch, renewal_generation),
+        )
+      actor.continue(state)
+    }
+    Ok(False) ->
+      actor.continue(set_renewal_status(
+        state,
+        attempt_id,
+        epoch,
+        LeaseRenewalLost,
+      ))
+    Error(_) -> {
+      let state =
+        set_renewal_status(state, attempt_id, epoch, LeaseRenewalUnknown)
+      let _ =
+        process.send_after(
+          state.incarnation_subject,
+          state.renewal_interval_ms,
+          Renew(attempt_id, epoch, renewal_generation),
+        )
+      actor.continue(state)
     }
   }
 }

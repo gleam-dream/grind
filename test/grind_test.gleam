@@ -7,17 +7,22 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/result
+import gleam/string
 import gleeunit
 import gleeunit/should
 import grind
 import grind/internal/unique_admission
 import grind/job
+import grind/observation
 import grind/postgres
 import grind/queue
 import grind/registry
 import grind/unique
 import grind/worker
 import pog
+import simplifile
+import sinal
+import sinal/forwarder
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -26,6 +31,27 @@ pub fn main() -> Nil {
 pub fn version_test() {
   grind.version()
   |> should.equal("0.1.0")
+}
+
+/// Proves `grind/postgres.schema_ddl_statements` (what `create_fresh_schema`
+/// actually executes) stays byte-identical to the plain-SQL copy at
+/// `src/grind/internal/schema.sql` that `scripts/generate-sql.sh` applies
+/// with `psql` ahead of running Squirrel's codegen. Runs with no database.
+pub fn postgres_schema_ddl_matches_sql_file_test() {
+  let assert Ok(contents) =
+    simplifile.read(from: "src/grind/internal/schema.sql")
+  let statements_from_file =
+    contents
+    |> string.split("\n")
+    |> list.filter(fn(line) {
+      let trimmed = string.trim(line)
+      trimmed != "" && !string.starts_with(trimmed, "--")
+    })
+    |> string.join("")
+    |> string.split(";")
+    |> list.map(string.trim)
+    |> list.filter(fn(statement) { statement != "" })
+  statements_from_file |> should.equal(postgres.schema_ddl_statements())
 }
 
 pub type LookupFailure {
@@ -1798,9 +1824,7 @@ fn run_schema_v10_install_test(database_url: String) -> Nil {
     })
     |> pog.execute(on: connection)
   after.rows |> should.equal([sequence_before])
-  mark_database_test_executed(
-    "schema-v10-conservative-recovery-installed-and-idempotent",
-  )
+  mark_database_test_executed("schema-v11-fresh-install-idempotent-passed")
 }
 
 pub fn postgres_migration_rejects_legacy_and_future_markers_test() {
@@ -2161,6 +2185,40 @@ pub fn postgres_closed_pool_renewal_recovers_without_rerun_test() {
   }
 }
 
+/// `call_safely` is the generic sibling of `execute_safely`: Squirrel-generated
+/// query functions call `pog.execute` directly rather than going through
+/// `execute_safely`, so `call_safely` wraps that call instead. Proven directly
+/// here, against a closed pool, ahead of any generated caller.
+pub fn postgres_call_safely_wrapper_reports_closed_pool_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_call_safely_closed_pool_test(database_url)
+  }
+}
+
+@external(erlang, "grind_postgres_ffi", "call_safely")
+fn call_safely_probe(
+  run: fn() -> Result(pog.Returned(Int), pog.QueryError),
+) -> Result(pog.Returned(Int), pog.QueryError)
+
+fn run_call_safely_closed_pool_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_call_safely_probe")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  postgres.close(database)
+  let connection = pog.named_connection(pool_name)
+  let probe_query =
+    pog.query("select 1")
+    |> pog.returning({
+      use value <- decode.field(0, decode.int)
+      decode.success(value)
+    })
+  call_safely_probe(fn() { pog.execute(probe_query, connection) })
+  |> should.equal(Error(pog.ConnectionUnavailable))
+  mark_database_test_executed("call-safely-wrapper-closed-pool-passed")
+}
+
 pub fn postgres_known_worker_start_failure_releases_unstarted_claim_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
@@ -2395,6 +2453,95 @@ fn run_automatic_consumer_capacity_test(database_url: String) -> Nil {
   mark_database_test_executed("automatic-consumer-capacity-two-enforced")
 }
 
+/// `maximum_concurrency: 2` with one long-running job must not leave the
+/// other slot idle: a job submitted only after the first has already
+/// claimed and started must still be picked up promptly, by a freshly
+/// scheduled poll, rather than waiting for the first job to finish. Before
+/// the fix, `continue_if_idle` only ever armed the next poll timer once
+/// `active` was fully empty, so free capacity went unused for as long as any
+/// one attempt kept running.
+pub fn postgres_automatic_consumer_polls_while_capacity_free_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_automatic_consumer_polls_while_capacity_free_test(database_url)
+  }
+}
+
+fn run_automatic_consumer_polls_while_capacity_free_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_auto_free_capacity")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("auto-free-capacity-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("auto-free-capacity-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "auto.free-capacity",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, CapacityWorkerStarted(value, release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("free-capacity-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("consumer-free-capacity-auto")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(first_handle) =
+    postgres.submit(database, "consumer-free-capacity-auto", definition, 21)
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_poll_interval(50)
+    |> queue.with_maximum_jobs_per_poll(1)
+    |> queue.with_maximum_concurrency(2)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  // Job 1 claims the first slot and blocks on its own gate. The poll that
+  // claimed it then finds nothing else due and drains its batch, which is
+  // exactly the state the fix must keep polling from.
+  let assert Ok(CapacityWorkerStarted(21, first_release)) =
+    process.receive(started, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(first_release, ReleaseAttempt)
+    Nil
+  })
+
+  // Submitted only now: this job did not exist at the poll that claimed job
+  // 1, so only a later, freshly scheduled poll can ever find it due.
+  let assert Ok(second_handle) =
+    postgres.submit(database, "consumer-free-capacity-auto", definition, 22)
+
+  // The second slot is free and job 1 is still blocked; job 2 must start
+  // within a handful of poll intervals, not only once job 1 finishes.
+  let assert Ok(CapacityWorkerStarted(22, second_release)) =
+    process.receive(started, within: 2000)
+  postgres.state(database, first_handle) |> should.equal(Ok(job.Executing))
+
+  process.send(first_release, ReleaseAttempt)
+  process.send(second_release, ReleaseAttempt)
+  wait_for_job_state(database, first_handle, job.Succeeded, 250)
+  |> should.equal(True)
+  wait_for_job_state(database, second_handle, job.Succeeded, 250)
+  |> should.equal(True)
+  mark_database_test_executed(
+    "automatic-consumer-polls-while-capacity-free-passed",
+  )
+}
+
 fn wait_for_job_state(
   database: postgres.Database,
   handle: job.JobHandle(input, output, error),
@@ -2412,6 +2559,59 @@ fn wait_for_job_state(
         False, False -> False
       }
     Error(_) -> False
+  }
+}
+
+/// Like `wait_for_job_state` above, but a transient `postgres.state` error
+/// counts as "not yet" and keeps retrying instead of failing the wait
+/// outright. Used where the test itself just closed or killed a connection
+/// on this same pool moments earlier, so an immediate read can genuinely
+/// error while the pool recovers — that is not evidence the state will never
+/// reach `expected`, only that this one read failed.
+fn wait_for_job_state_tolerating_errors(
+  database: postgres.Database,
+  handle: job.JobHandle(input, output, error),
+  expected: job.State,
+  remaining_checks: Int,
+) -> Bool {
+  let matches = case postgres.state(database, handle) {
+    Ok(state) -> state == expected
+    Error(_) -> False
+  }
+  case matches, remaining_checks > 0 {
+    True, _ -> True
+    False, True -> {
+      process.sleep(20)
+      wait_for_job_state_tolerating_errors(
+        database,
+        handle,
+        expected,
+        remaining_checks - 1,
+      )
+    }
+    False, False -> False
+  }
+}
+
+/// Retries a query on any `Error`, tolerating the same kind of transient
+/// pool-recovery failure `wait_for_job_state_tolerating_errors` above
+/// tolerates for a state read — for a plain one-shot read (`arguments`,
+/// `outcome`) taken moments after this test's own connection kill, where
+/// there is no polling loop already absorbing that latency.
+fn retry_transient_query(
+  attempt: fn() -> Result(a, b),
+  remaining: Int,
+) -> Result(a, b) {
+  case attempt() {
+    Ok(value) -> Ok(value)
+    Error(error) ->
+      case remaining > 0 {
+        True -> {
+          process.sleep(50)
+          retry_transient_query(attempt, remaining - 1)
+        }
+        False -> Error(error)
+      }
   }
 }
 
@@ -2796,6 +2996,293 @@ fn run_ack_commit_connection_loss_test(database_url: String) -> Nil {
   queue.process_one(consumer) |> should.equal(Ok(False))
   process.receive(invoked, within: 0) |> should.equal(Error(Nil))
   mark_database_test_executed("ack-commit-connection-loss-unknown-passed")
+}
+
+/// Same aborted-commit fault as `run_ack_commit_connection_loss_test` above,
+/// but against an AUTOMATIC consumer instead of a manually driven one: no
+/// caller is waiting on `process_one`'s reply to retry anything, so recovery
+/// here depends entirely on the coordinator's own handling of
+/// `QueueAckUnknown`. Before the fix, the coordinator dropped the claim on
+/// any `ProcessError` (including this one), so the job sat `Executing` until
+/// its lease eventually expired and a claim-time scan quarantined it to
+/// `Uncertain` — recoverable only by an operator's audited resolution, never
+/// on its own. With the fix, the coordinator keeps retrying the exact same
+/// `acknowledge_claim` on its renewal timer; once the trigger stops sleeping
+/// (the transaction that aborted never left a receipt behind, so the retry
+/// performs the acknowledgement fresh, exactly like the unique-admission
+/// aborted-commit test's plain retry converges), the job reaches `succeeded`
+/// on its own, without ever needing `resolve_uncertain`.
+pub fn postgres_automatic_ack_commit_connection_loss_recovers_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_automatic_ack_commit_connection_loss_recovers_test(database_url)
+  }
+}
+
+fn run_automatic_ack_commit_connection_loss_recovers_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_auto_ack_commit_loss")
+  let settings = postgres.settings(database_url, pool_name)
+  let assert Ok(validated) = postgres.validate(settings)
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("auto-ack-commit-loss-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("auto-ack-commit-loss-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "auto.ack.commit.loss",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("auto-terminated-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("auto-ack-commit-loss")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "auto-ack-commit-loss", definition, 41)
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_lease_duration(1000)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+
+  let connection = pog.named_connection(pool_name)
+  let job_id = job.id_value(handle)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION grind_test_kill_ack_backend_auto() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_id <> "
+      <> int.to_string(job_id)
+      <> " THEN RETURN NEW; END IF; PERFORM pg_sleep(30); RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER grind_test_kill_ack_backend_auto AFTER INSERT ON grind_job_acknowledgements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION grind_test_kill_ack_backend_auto()",
+    )
+    |> pog.execute(on: connection)
+  let drop_trigger = fn() {
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS grind_test_kill_ack_backend_auto ON grind_job_acknowledgements",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS grind_test_kill_ack_backend_auto()")
+      |> pog.execute(on: connection)
+    Nil
+  }
+  use <- exception.defer(drop_trigger)
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(backend_pid) = wait_for_commit_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  // The aborted transaction left no receipt at all — same proof
+  // `run_ack_commit_connection_loss_test` uses above — so this is genuinely
+  // the "never committed" case, not a lost reply after a real commit.
+  // `wait_for_job_state_tolerating_errors`, not the plain
+  // `wait_for_job_state`: the pool just lost the connection this test itself
+  // terminated, and a read against the same pool can transiently error while
+  // it recovers — that must not be mistaken for "state observed and it
+  // doesn't match yet".
+  wait_for_job_state_tolerating_errors(database, handle, job.Executing, 250)
+  |> should.equal(True)
+
+  // Dropping the trigger before the coordinator's own retry mirrors the
+  // unique-admission aborted-commit test's own ordering: the same
+  // `command_id` would hang in another 30-second sleep otherwise, with
+  // nobody left to terminate that backend.
+  drop_trigger()
+
+  // `pg_terminate_backend` only signals the backend; it can take several
+  // seconds of real time for the coordinator's own blocked `acknowledge_claim`
+  // call to observe the closed connection (the same reason
+  // `run_ack_commit_connection_loss_test` above waits up to 10 seconds for
+  // its reply) — this budget must cover that detection latency plus at
+  // least one retry interval afterward.
+  wait_for_job_state_tolerating_errors(database, handle, job.Succeeded, 750)
+  |> should.equal(True)
+  // Same transient-pool-recovery tolerance as the wait above: the row is
+  // already confirmed committed at this point, but a plain read moments
+  // after this test's own killed connection can still transiently time out
+  // while the pool recovers.
+  retry_transient_query(fn() { postgres.arguments(database, handle) }, 20)
+  |> should.equal(Ok(41))
+  retry_transient_query(fn() { postgres.outcome(database, handle) }, 20)
+  |> should.equal(Ok(job.SucceededWith("auto-terminated-41")))
+  mark_database_test_executed(
+    "automatic-ack-commit-connection-loss-recovers-passed",
+  )
+}
+
+/// A *persistently* aborting commit — every acknowledgement attempt for
+/// this job, first and every retry alike, hits the same deferred-trigger
+/// abort (the trigger is never dropped mid-test) — must not retry forever.
+/// Bounded renewal (`ConsumerState.pending_ack_retry_budget`, roughly one
+/// lease duration's worth of ticks) means only the first few retries renew
+/// the lease; once that budget is spent the lease is left to lapse, and
+/// either the retry's own next attempt observes a known
+/// `QueueAckStale(_, AckLeaseExpired(..))` or a poll's ordinary
+/// claim-time quarantine scan gets there first — either way the job ends up
+/// `uncertain`, not stuck `executing` forever. `maximum_concurrency: 2`
+/// keeps this consumer polling (via the free-capacity fix) so its own
+/// quarantine scan keeps running throughout. Driven entirely by
+/// `pg_stat_activity` barriers (`wait_for_commit_trigger_backend`) and a
+/// generous iteration cap, not a wall-clock sleep: if retrying were
+/// unbounded, this loop would exhaust its cap with the job still
+/// `executing`.
+pub fn postgres_automatic_ack_retry_bounded_eventually_uncertain_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_automatic_ack_retry_bounded_test(database_url)
+  }
+}
+
+fn run_automatic_ack_retry_bounded_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_auto_ack_retry_bounded")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("auto-ack-bounded-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("auto-ack-bounded-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "auto.ack.bounded",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("bounded-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("auto-ack-bounded")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "auto-ack-bounded", definition, 51)
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_lease_duration(300)
+    |> queue.with_poll_interval(50)
+    |> queue.with_maximum_concurrency(2)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+
+  let connection = pog.named_connection(pool_name)
+  let job_id = job.id_value(handle)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION grind_test_kill_ack_backend_bounded() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_id <> "
+      <> int.to_string(job_id)
+      <> " THEN RETURN NEW; END IF; PERFORM pg_sleep(30); RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER grind_test_kill_ack_backend_bounded AFTER INSERT ON grind_job_acknowledgements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION grind_test_kill_ack_backend_bounded()",
+    )
+    |> pog.execute(on: connection)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS grind_test_kill_ack_backend_bounded ON grind_job_acknowledgements",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS grind_test_kill_ack_backend_bounded()")
+      |> pog.execute(on: connection)
+    Nil
+  })
+
+  process.send(release, ReleaseAttempt)
+
+  kill_ack_backends_until_uncertain(database, handle, connection, 40)
+  |> should.equal(True)
+
+  mark_database_test_executed(
+    "automatic-ack-retry-bounded-eventually-uncertain-passed",
+  )
+}
+
+/// Repeatedly finds and kills this job's own acknowledgement backend (the
+/// deferred trigger installed by the caller sleeps every single attempt),
+/// checking the job's own state between kills, until it observes `uncertain`
+/// or exhausts `remaining_iterations`. Once the ack retry loop itself gives
+/// up (a known `QueueAckStale` once the lease lapses), no further backend
+/// ever sleeps for this job — `current_ack_rejection` reads the row instead
+/// of ever reaching the trigger's own `INSERT` once the row is no longer
+/// `executing` — so a "miss" here just means waiting for some poll's own
+/// quarantine scan to catch up, not a sign anything is wrong.
+fn kill_ack_backends_until_uncertain(
+  database: postgres.Database,
+  handle: job.JobHandle(input, output, error),
+  connection: pog.Connection,
+  remaining_iterations: Int,
+) -> Bool {
+  case postgres.state(database, handle) {
+    Ok(job.Uncertain) -> True
+    _ ->
+      case remaining_iterations > 0 {
+        False -> False
+        True ->
+          case wait_for_commit_trigger_backend(connection, 10) {
+            Ok(backend_pid) -> {
+              let _ = terminate_backend(connection, backend_pid)
+              kill_ack_backends_until_uncertain(
+                database,
+                handle,
+                connection,
+                remaining_iterations - 1,
+              )
+            }
+            Error(Nil) -> {
+              process.sleep(20)
+              kill_ack_backends_until_uncertain(
+                database,
+                handle,
+                connection,
+                remaining_iterations - 1,
+              )
+            }
+          }
+      }
+  }
 }
 
 fn wait_for_commit_trigger_backend(
@@ -8855,6 +9342,73 @@ fn run_receipt_different_input_conflict_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-receipt-different-input-conflict-passed")
 }
 
+/// `reconcile_unique` carrying a `PendingSubmission` whose fingerprint does
+/// not match the receipt actually committed under this `SubmissionId` (as if
+/// it were reconciling a different request B's `CommitUnknown` against an id
+/// request A already committed under) must report `SubmissionConflict`, the
+/// same as `submit_unique`'s own in-transaction receipt check — never
+/// `CommitUnknown`, which would tell request B's caller to keep retrying an
+/// admission that, correctly, already belongs to someone else forever.
+pub fn postgres_reconcile_unique_mismatched_pending_reports_conflict_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_reconcile_unique_mismatched_pending_test(database_url)
+  }
+}
+
+fn run_reconcile_unique_mismatched_pending_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_unique_reconcile_mismatch_" <> suffix,
+  )
+  let worker_def = unique_test_worker("unique.reconcile-mismatch-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "reconcile-mismatch-" <> suffix
+  let assert Ok(submission_id) =
+    unique.submission_id("unique-reconcile-mismatch-" <> suffix)
+
+  // Request A commits under `submission_id`.
+  let assert Ok(unique.Inserted(_)) =
+    postgres.submit_unique(
+      database,
+      test_queue,
+      submission_id,
+      worker_def,
+      1,
+      unique.Immediately,
+      policy,
+      unique.KeepExisting,
+    )
+
+  // A `PendingSubmission` standing in for a *different* request B, reusing
+  // the same `submission_id` but carrying a fingerprint that does not match
+  // what request A actually committed.
+  let mismatched_pending =
+    unique.new_pending_submission(
+      postgres.storage_owner(database),
+      submission_id,
+      worker_def,
+      <<9, 9, 9>>,
+    )
+
+  postgres.reconcile_unique(database, mismatched_pending)
+  |> should.equal(Error(unique.SubmissionConflict))
+
+  mark_database_test_executed(
+    "reconcile-unique-mismatched-pending-conflict-passed",
+  )
+}
+
 /// Increment 7(c): a replayed `Existing` decision returns the observed state
 /// recorded in the receipt at decision time, not the row's current
 /// (possibly since-progressed) state.
@@ -11565,4 +12119,3526 @@ fn run_submit_unique_selected_key_containment_test(
   mark_database_test_executed(
     "unique-selected-key-equality-not-containment-passed",
   )
+}
+
+// -- `[grind, job, acknowledged]` observation (grind/observation) ----------
+//
+// `grind/postgres` emits this event through its own `sinal/forwarder`, never
+// through a plain `sinal.emit` — see `grind/observation`'s module
+// documentation. These tests attach with plain `sinal.observe`, exactly as
+// an application would; the isolation test below is what actually proves
+// dispatch happens in the forwarder process rather than the coordinator.
+
+type AcknowledgedSignal {
+  AcknowledgedSignal(
+    measurements: observation.AcknowledgedMeasurements,
+    metadata: observation.AcknowledgedMetadata,
+  )
+}
+
+type DroppedSignal {
+  DroppedSignal(
+    measurements: forwarder.Dropped,
+    metadata: forwarder.DroppedMetadata,
+  )
+}
+
+/// Carries a release gate created *inside* a blocked handler (so it is owned
+/// by the forwarder process, which is the one that will `process.receive`
+/// it) back out to the test process, which only ever `process.send`s to it.
+type IsolationGateEntered {
+  IsolationGateEntered(process.Subject(Nil))
+}
+
+type OverflowGateEntered {
+  OverflowGateEntered(process.Subject(Nil))
+}
+
+fn attach_acknowledged_observer(
+  id_suffix: String,
+  run: fn(
+    observation.AcknowledgedMeasurements,
+    observation.AcknowledgedMetadata,
+  ) -> Nil,
+) -> sinal.Attachment {
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-observation-acknowledged-" <> id_suffix)
+  let assert Ok(attachment) = sinal.observe(id, observation.acknowledged(), run)
+  attachment
+}
+
+fn attach_dropped_observer(
+  id_suffix: String,
+  run: fn(forwarder.Dropped, forwarder.DroppedMetadata) -> Nil,
+) -> sinal.Attachment {
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-observation-dropped-" <> id_suffix)
+  let assert Ok(attachment) = sinal.observe(id, forwarder.dropped_event(), run)
+  attachment
+}
+
+/// Detach is best-effort cleanup, not part of what a test proves: native
+/// `:telemetry` can already have auto-detached a handler on its own (a
+/// raising handler is auto-detached after it raises — see the raising-handler
+/// test below), so a `NotAttached` result here is not a test failure.
+fn detach(attachment: sinal.Attachment) -> Nil {
+  let _ = sinal.detach(attachment)
+  Nil
+}
+
+/// Counts how many pending messages are already waiting on `subject`,
+/// draining them. A short per-check timeout (rather than `within: 0`) tolerates
+/// a message still in flight from a handler that just ran, without turning
+/// this into a fixed wall-clock wait for a specific count.
+fn drain_subject_count(subject: process.Subject(Nil), count: Int) -> Int {
+  case process.receive(subject, within: 50) {
+    Ok(Nil) -> drain_subject_count(subject, count + 1)
+    Error(Nil) -> count
+  }
+}
+
+/// Deterministic negative/"exactly N" check for a sentinel-observed
+/// `signal`: rather than a fixed wall-clock wait for "nothing more arrives"
+/// (fragile — either too short under load, or slow), this asserts the very
+/// *next* event received is a distinct, known-good sentinel acknowledgement
+/// run through the same consumer/producer afterward. `sinal/forwarder`
+/// guarantees per-producer FIFO delivery, so if the code under test had
+/// wrongly emitted an extra event for the original job, it would have been
+/// enqueued ahead of the sentinel's and would arrive here instead —
+/// deterministically, not racily.
+fn assert_next_observation_is_sentinel(
+  signal: process.Subject(AcknowledgedSignal),
+  sentinel_job_id: Int,
+) -> Nil {
+  let assert Ok(AcknowledgedSignal(_, metadata)) =
+    process.receive(signal, within: 5000)
+  metadata.ref.job_id |> should.equal(sentinel_job_id)
+}
+
+/// Registers a trivial, instantly-completing worker onto an existing
+/// registry (same queue), for the "run a sentinel job through the same
+/// consumer/producer afterward" pattern `assert_next_observation_is_sentinel`
+/// needs. Kept separate from whatever worker the test under negative-path
+/// scrutiny uses (which may block waiting on a release gate), so driving the
+/// sentinel to completion can never itself hang.
+fn register_sentinel_worker(
+  workers: registry.Registry,
+  id_suffix: String,
+) -> #(registry.Registry, worker.Worker(Int, String, LookupFailure)) {
+  let assert Ok(input_codec) =
+    worker.codec(
+      "observation-sentinel-" <> id_suffix <> "-input-v1",
+      json.int,
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "observation-sentinel-" <> id_suffix <> "-output-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "observation.sentinel." <> id_suffix,
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok("sentinel-" <> int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.register(workers, definition)
+  #(workers, definition)
+}
+
+/// Pure: `InvalidObservationCapacity` is rejected before any process starts.
+pub fn postgres_settings_reject_non_positive_observation_capacity_test() {
+  let pool_name = process.new_name("grind_invalid_observation_capacity")
+  postgres.settings("postgres://ignored/ignored", pool_name)
+  |> postgres.observation_capacity(0)
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidObservationCapacity))
+  postgres.settings("postgres://ignored/ignored", pool_name)
+  |> postgres.observation_capacity(-1)
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidObservationCapacity))
+}
+
+pub fn postgres_acknowledged_observation_commit_ordering_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_acknowledged_commit_ordering_test(database_url)
+  }
+}
+
+/// Commit ordering: reading `postgres.state` *from inside* the attached
+/// handler (which runs in the forwarder process) already observes the
+/// committed state — proof the observation is emitted strictly after the
+/// commit, not before it. A handler that read `Executing` here would mean
+/// the emit ran ahead of (or racing) the transaction, not after it.
+fn run_acknowledged_commit_ordering_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_ordering")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-ordering-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("observation-ordering-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "observation.ordering",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok("ordering-" <> int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("observation-ordering")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-ordering", definition, 5)
+  let job_id = job.id_value(handle)
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer("commit-ordering", fn(measurements, metadata) {
+      let observed_state = postgres.state(database, handle)
+      process.send(signal, #(
+        observed_state,
+        AcknowledgedSignal(measurements, metadata),
+      ))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(#(attempt_id, epoch)) =
+    stored_attempt_identity(connection, job_id)
+  let expected_command_id =
+    postgres.acknowledgement_command_id(job_id, attempt_id, epoch)
+
+  let assert Ok(#(observed_state, AcknowledgedSignal(measurements, metadata))) =
+    process.receive(signal, within: 5000)
+  observed_state |> should.equal(Ok(job.Succeeded))
+  measurements |> should.equal(observation.AcknowledgedMeasurements(count: 1))
+  metadata.ref.job_id |> should.equal(job_id)
+  metadata.ref.queue |> should.equal("observation-ordering")
+  metadata.ref.worker_id |> should.equal("observation.ordering")
+  metadata.ref.worker_version |> should.equal("v1")
+  metadata.attempt.attempt_id |> should.equal(attempt_id)
+  metadata.attempt.epoch |> should.equal(epoch)
+  metadata.attempt.attempt |> should.equal(1)
+  metadata.proposed |> should.equal(observation.ProposedSuccess)
+  metadata.committed_state |> should.equal(job.Succeeded)
+  metadata.failure_cause |> should.equal(None)
+  metadata.available_at_unix_ms |> should.equal(None)
+  metadata.confirmation |> should.equal(observation.Replied)
+  metadata.command_id |> should.equal(expected_command_id)
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+  mark_database_test_executed("acknowledged-observation-commit-ordering-passed")
+}
+
+pub fn postgres_acknowledged_observation_isolation_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_isolation_test(database_url)
+  }
+}
+
+/// Isolation: job A's acknowledgement observation is gate-blocked in the
+/// forwarder process while job B is still executing under the same
+/// coordinator. B's lease keeps renewing and B completes normally while A's
+/// gate stays shut — proof the coordinator was never blocked by A's
+/// observation. Named mutation: replacing `grind/postgres`'s
+/// `forwarder.emit` call with a direct `sinal.emit` call makes this test
+/// hang (the coordinator itself would run the blocked handler, starving B's
+/// renewal), which is exactly the regression this test exists to catch.
+fn run_acknowledged_observation_isolation_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_isolation")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-isolation-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("observation-isolation-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "observation.isolation",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, CapacityWorkerStarted(value, release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("isolated-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("observation-isolation")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle_a) =
+    postgres.submit(database, "observation-isolation", definition, 1)
+  let assert Ok(handle_b) =
+    postgres.submit(database, "observation-isolation", definition, 2)
+  let job_a_id = job.id_value(handle_a)
+
+  // The release gate must be created *inside* the handler (owned by the
+  // forwarder process that will `process.receive` it) and handed back to
+  // the test over `gate_entered`; a `process.Subject` created in the test
+  // process cannot be received on from a different process.
+  let gate_entered = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer("isolation", fn(_measurements, metadata) {
+      case metadata.ref.job_id == job_a_id {
+        True -> {
+          let gate = process.new_subject()
+          process.send(gate_entered, IsolationGateEntered(gate))
+          let assert Ok(Nil) = process.receive(gate, within: 10_000)
+          Nil
+        }
+        False -> Nil
+      }
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_maximum_concurrency(2)
+    |> queue.with_lease_duration(300)
+    |> queue.validate_policy
+  let assert Ok(consumer) =
+    queue.start_manual_with_policy(database, workers, policy)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let reply_a = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply_a, queue.process_one(consumer))
+    })
+  let assert Ok(CapacityWorkerStarted(_, release_a)) =
+    process.receive(started, within: 5000)
+
+  let reply_b = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply_b, queue.process_one(consumer))
+    })
+  let assert Ok(CapacityWorkerStarted(_, release_b)) =
+    process.receive(started, within: 5000)
+
+  process.send(release_a, ReleaseAttempt)
+  process.receive(reply_a, within: 5000) |> should.equal(Ok(Ok(True)))
+  // A's own acknowledged observation is now gate-blocked in the forwarder.
+  let assert Ok(IsolationGateEntered(gate)) =
+    process.receive(gate_entered, within: 5000)
+
+  // While it stays blocked, B's lease keeps renewing and B completes.
+  await_renewal_status(consumer, queue.LeaseRenewalConfirmed, 200)
+  |> should.equal(True)
+  process.send(release_b, ReleaseAttempt)
+  process.receive(reply_b, within: 5000) |> should.equal(Ok(Ok(True)))
+  postgres.state(database, handle_b) |> should.equal(Ok(job.Succeeded))
+
+  process.send(gate, Nil)
+  mark_database_test_executed("acknowledged-observation-isolation-passed")
+}
+
+pub fn postgres_acknowledged_observation_absent_on_commit_unknown_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_absent_on_commit_unknown_test(database_url)
+  }
+}
+
+/// Negative (abort/unknown, sentinel pattern): the ack's COMMIT is aborted by
+/// killing its backend mid-trigger (the same technique as
+/// `postgres_ack_commit_connection_loss_is_unknown_test`), so nothing is
+/// durably committed and `acknowledge_claim` reports `QueueAckUnknown`. No
+/// `[grind, job, acknowledged]` observation is emitted for either "abort" or
+/// "unknown" here, because in this codebase they are the exact same code
+/// path: a connection lost during `COMMIT` is unconditionally reported
+/// `QueueAckUnknown`, whether or not the transaction actually reached
+/// commit. Named mutation: emitting on this `Error(QueueAckUnknown(..))`
+/// result (instead of only ever emitting from `resolve_ack_transaction_result`'s
+/// proven-commit branches) makes this test fail.
+fn run_acknowledged_observation_absent_on_commit_unknown_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_commit_unknown")
+  let settings = postgres.settings(database_url, pool_name)
+  let assert Ok(validated) = postgres.validate(settings)
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-commit-unknown-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "observation-commit-unknown-output-v1",
+      json.string,
+      decode.string,
+    )
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "observation.commit.unknown",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        process.send(invoked, WorkerInvoked)
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("commit-unknown-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("observation-commit-unknown")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let #(workers, sentinel_worker) =
+    register_sentinel_worker(workers, "commit-unknown")
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-commit-unknown", definition, 21)
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer("commit-unknown", fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
+
+  let connection = pog.named_connection(pool_name)
+  let job_id = job.id_value(handle)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION grind_test_kill_observation_ack_backend() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.job_id <> "
+      <> int.to_string(job_id)
+      <> " THEN RETURN NEW; END IF; PERFORM pg_sleep(30); RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER grind_test_kill_observation_ack_backend AFTER INSERT ON grind_job_acknowledgements DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION grind_test_kill_observation_ack_backend()",
+    )
+    |> pog.execute(on: connection)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS grind_test_kill_observation_ack_backend ON grind_job_acknowledgements",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query(
+        "DROP FUNCTION IF EXISTS grind_test_kill_observation_ack_backend()",
+      )
+      |> pog.execute(on: connection)
+    Nil
+  })
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(backend_pid) = wait_for_commit_trigger_backend(connection, 100)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+  let assert Ok(Error(queue.QueueProcessFailed(postgres.QueueAckUnknown(_, _)))) =
+    process.receive(reply, within: 10_000)
+  postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+
+  // Deterministic absence check: a sentinel job's own commit/observation
+  // through the same consumer must be the very next event on `signal`.
+  let assert Ok(sentinel) =
+    postgres.submit(database, "observation-commit-unknown", sentinel_worker, 22)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  assert_next_observation_is_sentinel(signal, job.id_value(sentinel))
+
+  mark_database_test_executed(
+    "acknowledged-observation-absent-on-commit-unknown-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_absent_on_stale_ack_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_absent_on_stale_ack_test(database_url)
+  }
+}
+
+/// Negative (rollback/stale, sentinel pattern): a forced lease expiry makes
+/// the fenced `UPDATE` inside `acknowledge_transaction` affect zero rows,
+/// which (finding no matching receipt either) is reported as
+/// `QueueAckStale`. Any `Error(..)` returned from inside that transaction
+/// callback rolls the whole ack transaction back — "stale" and "rollback"
+/// are the same mechanism here, not two independent ones. No observation is
+/// emitted. Named mutation: moving the emit call to run unconditionally
+/// after `acknowledge_transaction` returns (instead of only after
+/// `resolve_ack_transaction_result` reports a proven commit) makes this
+/// test fail.
+fn run_acknowledged_observation_absent_on_stale_ack_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_stale")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-stale-ack-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("observation-stale-ack-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(slow_worker) =
+    worker.define(
+      "observation.stale.ack",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        process.send(invoked, WorkerInvoked)
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("stale-ack-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("observation-stale-ack")
+  let assert Ok(workers) = registry.register(workers, slow_worker)
+  let #(workers, sentinel_worker) =
+    register_sentinel_worker(workers, "stale-ack")
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-stale-ack", slow_worker, 9)
+  let job_id = job.id_value(handle)
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer("stale-ack", fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_lease_duration(30_000)
+    |> queue.validate_policy
+  let assert Ok(consumer) =
+    queue.start_manual_with_policy(database, workers, policy)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+  let reply = process.new_subject()
+  let _ =
+    process.spawn(fn() { process.send(reply, queue.process_one(consumer)) })
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
+
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(forced_expiry) =
+    pog.query(
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() WHERE id = $1 AND state = 'executing'",
+    )
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  forced_expiry.count |> should.equal(1)
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(Error(queue.QueueProcessFailed(postgres.QueueAckStale(_, _)))) =
+    process.receive(reply, within: 5000)
+  postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+
+  let assert Ok(sentinel) =
+    postgres.submit(database, "observation-stale-ack", sentinel_worker, 10)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  assert_next_observation_is_sentinel(signal, job.id_value(sentinel))
+
+  mark_database_test_executed(
+    "acknowledged-observation-absent-on-stale-ack-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_reconciled_after_lost_reply_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_reconciled_after_lost_reply_test(
+        database_url,
+      )
+  }
+}
+
+/// Lost reply (SyncRep harness, same technique as
+/// `postgres_ack_committed_reply_lost_reconciles_from_receipt_test`): the
+/// ack genuinely commits, but this call's own connection is severed while
+/// its `COMMIT` is parked in `SyncRep`, so `acknowledge` only learns the
+/// outcome via `reconcile_unknown_ack` reading the receipt back. Exactly one
+/// `[grind, job, acknowledged]` observation is emitted, and its
+/// `confirmation` is `Reconciled`, never `Replied`. Named mutation:
+/// hard-coding `Replied` for every `AckCommit` (ignoring
+/// `via_receipt_match`) makes this test fail.
+fn run_acknowledged_observation_reconciled_after_lost_reply_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_reply_lost")
+  let settings = postgres.settings(database_url, pool_name)
+  let assert Ok(validated) = postgres.validate(settings)
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  require_syncrep_cluster_configured(connection)
+  let assert Ok(input_codec) =
+    worker.codec("observation-reply-lost-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("observation-reply-lost-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let invoked = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "observation.reply.lost",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        process.send(invoked, WorkerInvoked)
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok("reply-lost-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("observation-reply-lost")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let #(workers, sentinel_worker) =
+    register_sentinel_worker(workers, "reply-lost")
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-reply-lost", definition, 33)
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer("reply-lost", fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(FirstAttemptStarted(release)) =
+    process.receive(started, within: 5000)
+  process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
+
+  let job_id = job.id_value(handle)
+  use <- exception.defer(install_syncrep_reply_trigger(
+    connection,
+    "grind_test_syncrep_observation_reply_lost",
+    "grind_job_acknowledgements",
+    "NEW.job_id = " <> int.to_string(job_id),
+  ))
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(backend_pid) = wait_for_syncrep_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  process.receive(reply, within: 10_000) |> should.equal(Ok(Ok(True)))
+  postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
+  let assert Ok(#(attempt_id, epoch)) =
+    stored_attempt_identity(connection, job_id)
+  let expected_command_id =
+    postgres.acknowledgement_command_id(job_id, attempt_id, epoch)
+
+  let assert Ok(AcknowledgedSignal(measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  measurements |> should.equal(observation.AcknowledgedMeasurements(count: 1))
+  metadata.ref.job_id |> should.equal(job_id)
+  metadata.committed_state |> should.equal(job.Succeeded)
+  metadata.confirmation |> should.equal(observation.Reconciled)
+  metadata.command_id |> should.equal(expected_command_id)
+
+  // Exactly one observation for this command — no duplicate `Replied` also
+  // arrived from the same lost-reply commit. Checked deterministically: a
+  // sentinel job's own observation, run through the same consumer, must be
+  // the very next event.
+  let assert Ok(sentinel) =
+    postgres.submit(database, "observation-reply-lost", sentinel_worker, 34)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  assert_next_observation_is_sentinel(signal, job.id_value(sentinel))
+
+  mark_database_test_executed(
+    "acknowledged-observation-reconciled-after-lost-reply-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_committed_state_overrides_proposal_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_committed_state_overrides_proposal_test(
+        database_url,
+      )
+  }
+}
+
+/// Proposed vs. committed (same cancel-while-running technique as
+/// `postgres_cancel_running_worker_overrides_proposal_on_ack_test`): the
+/// worker proposes success, but a concurrent cancellation overrides it, and
+/// the durable commit is `Cancelled`. The observation's `proposed` and
+/// `committed_state` fields diverge accordingly and `committed_state` comes
+/// from the commit, never from the proposal. Named mutation: building
+/// `committed_state` from the worker's proposed disposition instead of
+/// `AckCommit`'s own committed value makes this test fail.
+fn run_acknowledged_observation_committed_state_overrides_proposal_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_cancel_running")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-cancel-running-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "observation-cancel-running-output-v1",
+      json.string,
+      decode.string,
+    )
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "observation.cancel.running",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, LongHandlerStarted(release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) ->
+            Ok("completed-despite-cancel-" <> int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("observation-cancel-running")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let #(workers, sentinel_worker) =
+    register_sentinel_worker(workers, "cancel-running")
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-cancel-running", definition, 9)
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer("cancel-running", fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(LongHandlerStarted(release)) =
+    process.receive(started, within: 5000)
+
+  postgres.cancel(database, handle)
+  |> should.equal(Ok(postgres.CancellationRequested))
+  process.send(release, ReleaseAttempt)
+  process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
+  postgres.state(database, handle) |> should.equal(Ok(job.Cancelled))
+
+  let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  metadata.proposed |> should.equal(observation.ProposedSuccess)
+  metadata.committed_state |> should.equal(job.Cancelled)
+  metadata.confirmation |> should.equal(observation.Replied)
+
+  let assert Ok(sentinel) =
+    postgres.submit(database, "observation-cancel-running", sentinel_worker, 10)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  assert_next_observation_is_sentinel(signal, job.id_value(sentinel))
+
+  mark_database_test_executed(
+    "acknowledged-observation-committed-state-overrides-proposal-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_overflow_reports_dropped_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_overflow_reports_dropped_test(database_url)
+  }
+}
+
+/// Overflow: a `Database` started with `observation_capacity(1)` and a
+/// gate-blocked acknowledged handler holds the forwarder's single in-flight
+/// slot; job B's own `[grind, job, claimed]` and `[grind, job, acknowledged]`
+/// observations are both forwarded while that slot is still held (one
+/// `Forwarder` per `Database` carries every `[grind, job, *]` event, not one
+/// per event kind), so both exceed capacity and are dropped — coalesced into
+/// one `[sinal, forwarder, dropped]` report with `rejected: 2` — never
+/// affecting either job's committed state. Job A's own `claimed` observation
+/// is not among them: it is emitted and drained before A's `acknowledged`
+/// handler ever blocks the forwarder.
+fn run_acknowledged_observation_overflow_reports_dropped_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_overflow")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name)
+    |> postgres.observation_capacity(1)
+    |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-overflow-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("observation-overflow-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "observation.overflow",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok("overflow-" <> int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("observation-overflow")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle_a) =
+    postgres.submit(database, "observation-overflow", definition, 1)
+  let assert Ok(handle_b) =
+    postgres.submit(database, "observation-overflow", definition, 2)
+
+  // See the isolation test above: the release gate is created *inside* the
+  // handler so it is owned by the forwarder process that receives it.
+  let gate_entered = process.new_subject()
+  let acknowledged_attachment =
+    attach_acknowledged_observer("overflow", fn(_measurements, _metadata) {
+      let gate = process.new_subject()
+      process.send(gate_entered, OverflowGateEntered(gate))
+      let assert Ok(Nil) = process.receive(gate, within: 10_000)
+      Nil
+    })
+  use <- exception.defer(fn() { detach(acknowledged_attachment) })
+  let dropped_signal = process.new_subject()
+  let dropped_attachment =
+    attach_dropped_observer("overflow", fn(measurements, metadata) {
+      process.send(dropped_signal, DroppedSignal(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(dropped_attachment) })
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  // Job A occupies the forwarder's only in-flight slot and blocks there.
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  let assert Ok(OverflowGateEntered(gate)) =
+    process.receive(gate_entered, within: 5000)
+
+  // Job B's own acknowledgement still commits normally; only its forwarded
+  // observation is dropped for exceeding capacity while A's slot is held.
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  process.send(gate, Nil)
+  let assert Ok(DroppedSignal(dropped_measurements, dropped_metadata)) =
+    process.receive(dropped_signal, within: 10_000)
+  dropped_measurements.rejected |> should.equal(2)
+  dropped_metadata.forwarder |> should.not_equal("")
+
+  postgres.state(database, handle_a) |> should.equal(Ok(job.Succeeded))
+  postgres.state(database, handle_b) |> should.equal(Ok(job.Succeeded))
+  mark_database_test_executed(
+    "acknowledged-observation-overflow-reports-dropped-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_raising_handler_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_raising_handler_test(database_url)
+  }
+}
+
+/// A handler that raises never affects the job's own committed outcome:
+/// native `:telemetry` isolates the raise (detaching the faulty handler),
+/// and by the time any handler runs at all, `forwarder.emit`'s own hand-off
+/// to the forwarder has already returned, decoupled from the coordinator.
+fn run_acknowledged_observation_raising_handler_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_raising")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-raising-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("observation-raising-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "observation.raising",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok("raising-" <> int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("observation-raising")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-raising", definition, 7)
+  let attachment =
+    attach_acknowledged_observer("raising", fn(_measurements, _metadata) {
+      panic as "deliberately raising acknowledged observer"
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.Succeeded))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.SucceededWith("raising-7")))
+  mark_database_test_executed(
+    "acknowledged-observation-raising-handler-outcome-unchanged-passed",
+  )
+}
+
+pub fn postgres_forwarder_crash_loop_does_not_stop_the_pool_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_forwarder_crash_loop_test(database_url)
+  }
+}
+
+/// Isolation hole (coordinator review, round 1 follow-up): a handler that
+/// itself exits or is killed is not isolated by native `:telemetry` the way
+/// a raise is (see `sinal/forwarder`'s own module documentation) and can
+/// take the forwarder process down. Before the fix, the forwarder was a
+/// permanent sibling of the PostgreSQL pool under one `OneForOne` supervisor
+/// with the default restart intensity (2 restarts / 5 seconds); repeatedly
+/// killing the forwarder exhausted that shared supervisor's own restart
+/// budget, which then terminated *all* of its children, including the pool
+/// — acks and submits after that point failed with the pool gone. The fix
+/// (`grind/postgres.start`) nests the forwarder under its own supervisor,
+/// added to the root as a `Temporary` child: a `Temporary` child's
+/// termination is never restarted and never counts toward the parent
+/// supervisor's own restart intensity, so the forwarder subtree exhausting
+/// itself can never affect the pool. This test drives enough acknowledged
+/// events, each killing whichever forwarder incarnation handles it, to
+/// exceed the default restart intensity well within its period, then proves
+/// the pool still serves a fresh submit and ack afterward.
+fn run_forwarder_crash_loop_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_forwarder_crash_loop")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("forwarder-crash-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("forwarder-crash-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("forwarder.crash", "v1", input_codec, output_codec, fn(value) {
+      Ok("crash-" <> int.to_string(value))
+    })
+  let assert Ok(workers) = registry.new("forwarder-crash")
+  let assert Ok(workers) = registry.register(workers, definition)
+
+  let assert Ok(id) = sinal.handler_id("grind-test-forwarder-crash-loop")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.acknowledged(), fn(_measurements, _metadata) {
+      process.kill(process.self())
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  // A second, non-killing handler on the same descriptor: since both
+  // handlers run in whichever forwarder incarnation is currently live,
+  // this one is delivered exactly when the killing handler above is —
+  // giving a direct runtime count of how many `acknowledged` events the
+  // forwarder actually managed to deliver, instead of only inferring
+  // "the restart budget must be exhausted by now" from elapsed sleep time.
+  let observed = process.new_subject()
+  let assert Ok(counter_id) =
+    sinal.handler_id("grind-test-forwarder-crash-loop-counter")
+  let assert Ok(counter_attachment) =
+    sinal.observe(counter_id, observation.acknowledged(), fn(_, _) {
+      process.send(observed, Nil)
+    })
+  use <- exception.defer(fn() { detach(counter_attachment) })
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  // Six acknowledged events, each killing the forwarder incarnation that
+  // handles it, well exceeds the default restart intensity (2 restarts / 5s)
+  // while staying comfortably inside its 5-second period. A short sleep
+  // between each keeps each emit landing on a live incarnation rather than
+  // racing a mid-flight restart.
+  list.repeat(Nil, 6)
+  |> list.each(fn(_) {
+    let assert Ok(_) =
+      postgres.submit(database, "forwarder-crash", definition, 1)
+    queue.process_one(consumer) |> should.equal(Ok(True))
+    process.sleep(80)
+  })
+
+  // Degraded state actually reached, not assumed: strictly fewer than six
+  // of the loop's own acknowledgements were ever delivered to either
+  // handler, proving the nested supervisor's restart budget was genuinely
+  // exhausted partway through — every acknowledgement after that point got
+  // `ForwarderUnavailable` and never reached `:telemetry` dispatch at all.
+  let received_during_loop = drain_subject_count(observed, 0)
+  { received_during_loop < 6 } |> should.equal(True)
+
+  // The pool must still be alive and serving submit/ack after the
+  // forwarder's own restart budget is long exhausted.
+  let assert Ok(final_handle) =
+    postgres.submit(database, "forwarder-crash", definition, 99)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, final_handle) |> should.equal(Ok(job.Succeeded))
+
+  // And the degraded state is permanent, not transient: this job committed
+  // and the pool is plainly healthy, yet its own acknowledgement produced
+  // zero further deliveries — a `Temporary` child's exhausted subtree is
+  // never restarted, so observations do not quietly come back on their own.
+  drain_subject_count(observed, 0) |> should.equal(0)
+  mark_database_test_executed("forwarder-crash-loop-pool-survives-passed")
+}
+
+pub fn postgres_acknowledged_observation_available_at_for_committed_retry_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_available_at_retry_test(database_url)
+  }
+}
+
+/// `available_at_unix_ms` for a genuinely committed `retryable` outcome:
+/// `Some` and within the default backoff's bounds, read from the commit
+/// (`RETURNING`), not re-derived from the proposal.
+fn run_acknowledged_observation_available_at_retry_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_available_at_retry")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec(
+      "observation-available-at-retry-input-v1",
+      json.int,
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "observation-available-at-retry-output-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "observation.available-at.retry",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Error(AccountMissing(value)) },
+    )
+  let assert Ok(workers) = registry.new("observation-available-at-retry")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-available-at-retry", definition, 1)
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer(
+      "available-at-retry",
+      fn(measurements, metadata) {
+        process.send(signal, AcknowledgedSignal(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let connection = pog.named_connection(pool_name)
+  let before_ack_ms = database_time_milliseconds(connection)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  let after_ack_ms = database_time_milliseconds(connection)
+  postgres.state(database, handle) |> should.equal(Ok(job.Retryable))
+
+  let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  metadata.proposed |> should.equal(observation.ProposedRetryable)
+  metadata.committed_state |> should.equal(job.Retryable)
+  let assert Some(available_at_ms) = metadata.available_at_unix_ms
+  should.be_true(available_at_ms >= before_ack_ms + 15_000)
+  should.be_true(available_at_ms <= after_ack_ms + 15_000)
+  mark_database_test_executed(
+    "acknowledged-observation-available-at-committed-retry-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_available_at_for_committed_snooze_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_available_at_snooze_test(database_url)
+  }
+}
+
+/// `available_at_unix_ms` for a genuinely committed snooze (`scheduled`)
+/// outcome: `Some` and within the requested delay's bounds.
+fn run_acknowledged_observation_available_at_snooze_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_available_at_snooze")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec(
+      "observation-available-at-snooze-input-v1",
+      json.int,
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "observation-available-at-snooze-output-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(delay) = worker.retry_delay(60_000)
+  let assert Ok(ordinary) =
+    worker.define(
+      "observation.available-at.snooze",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(_) { Error(AccountMissing(1)) },
+    )
+  let snoozing =
+    worker.with_queue_handler(ordinary, fn(_) {
+      worker.WorkerSnoozed(delay, "awaiting external account")
+    })
+  let assert Ok(workers) = registry.new("observation-available-at-snooze")
+  let assert Ok(workers) = registry.register(workers, snoozing)
+  let assert Ok(handle) =
+    postgres.submit(database, "observation-available-at-snooze", snoozing, 1)
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer(
+      "available-at-snooze",
+      fn(measurements, metadata) {
+        process.send(signal, AcknowledgedSignal(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let connection = pog.named_connection(pool_name)
+  let before_ack_ms = database_time_milliseconds(connection)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  let after_ack_ms = database_time_milliseconds(connection)
+  postgres.state(database, handle) |> should.equal(Ok(job.Scheduled))
+
+  let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  metadata.proposed |> should.equal(observation.ProposedSnoozed)
+  metadata.committed_state |> should.equal(job.Scheduled)
+  let assert Some(available_at_ms) = metadata.available_at_unix_ms
+  should.be_true(available_at_ms >= before_ack_ms + 60_000)
+  should.be_true(available_at_ms <= after_ack_ms + 60_000)
+  mark_database_test_executed(
+    "acknowledged-observation-available-at-committed-snooze-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_available_at_none_when_cancel_overrides_retry_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_available_at_cancel_overrides_retry_test(
+        database_url,
+      )
+  }
+}
+
+/// `available_at_unix_ms` must come from the *committed* state, not the
+/// proposed one: a proposed retry (`ProposedRetryable`) overridden by a
+/// concurrent cancellation commits `cancelled`, whose row's `available_at`
+/// is left at its unrelated pre-ack value — this must never be surfaced as
+/// `Some`. Named mutation: gating on `proposed_state` instead of
+/// `committed_state` (the exact bug this test was written to catch) makes
+/// this test fail — see `docs/RECOVERY-EVIDENCE.md`, "Acknowledged
+/// observation".
+fn run_acknowledged_observation_available_at_cancel_overrides_retry_test(
+  database_url: String,
+) -> Nil {
+  let pool_name =
+    process.new_name("grind_ack_observation_available_at_cancel_retry")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec(
+      "observation-available-at-cancel-retry-input-v1",
+      json.int,
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "observation-available-at-cancel-retry-output-v1",
+      json.string,
+      decode.string,
+    )
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "observation.available-at.cancel-retry",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, LongHandlerStarted(release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Error(AccountMissing(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("observation-available-at-cancel-retry")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(
+      database,
+      "observation-available-at-cancel-retry",
+      definition,
+      9,
+    )
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer(
+      "available-at-cancel-retry",
+      fn(measurements, metadata) {
+        process.send(signal, AcknowledgedSignal(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(LongHandlerStarted(release)) =
+    process.receive(started, within: 5000)
+
+  postgres.cancel(database, handle)
+  |> should.equal(Ok(postgres.CancellationRequested))
+  process.send(release, ReleaseAttempt)
+  process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
+  postgres.state(database, handle) |> should.equal(Ok(job.Cancelled))
+
+  let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  metadata.proposed |> should.equal(observation.ProposedRetryable)
+  metadata.committed_state |> should.equal(job.Cancelled)
+  metadata.available_at_unix_ms |> should.equal(None)
+  mark_database_test_executed(
+    "acknowledged-observation-available-at-none-cancel-overrides-retry-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_reconciled_on_sequential_duplicate_ack_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_reconciled_sequential_duplicate_test(
+        database_url,
+      )
+  }
+}
+
+/// Coordinator review, round 1 follow-up: proves the *early* receipt-match
+/// site — the `matching_acknowledgement` check at the very top of
+/// `acknowledge_transaction`, before any `UPDATE` is attempted — is also
+/// `Reconciled`, not just `reconcile_unknown_ack`'s post-lost-reply site
+/// already proven in round 1. Reached deterministically, with no forced
+/// concurrency needed: a second, purely sequential call to
+/// `acknowledge_claim` with the exact same `ClaimedJob`/`Execution` finds
+/// the first call's own receipt already durably recorded. Named mutation:
+/// hardcoding `via_receipt_match: False` at this site makes this test fail
+/// (the second event would report `Replied`, not `Reconciled`).
+fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_ack_observation_dup_sequential")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("observation-dup-sequential-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "observation-dup-sequential-output-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "observation.dup.sequential",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("observation-dup-sequential")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let #(workers, sentinel_worker) =
+    register_sentinel_worker(workers, "dup-sequential")
+  let assert Ok(_handle) =
+    postgres.submit(database, "observation-dup-sequential", definition, 6)
+  let attempt_owner = "observation-dup-sequential-owner"
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "observation-dup-sequential",
+      workers,
+      attempt_owner,
+      30_000,
+    )
+  let execution = postgres.execute_claim(claimed)
+
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer("dup-sequential", fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.acknowledge_claim(
+    database,
+    "observation-dup-sequential",
+    attempt_owner,
+    claimed,
+    execution,
+  )
+  |> should.equal(Ok(True))
+  let assert Ok(AcknowledgedSignal(_, first_metadata)) =
+    process.receive(signal, within: 5000)
+  first_metadata.confirmation |> should.equal(observation.Replied)
+  first_metadata.committed_state |> should.equal(job.Succeeded)
+
+  // The exact same claim/execution, acknowledged a second time: this is the
+  // early receipt-match site, reached with no concurrency at all.
+  postgres.acknowledge_claim(
+    database,
+    "observation-dup-sequential",
+    attempt_owner,
+    claimed,
+    execution,
+  )
+  |> should.equal(Ok(True))
+  let assert Ok(AcknowledgedSignal(_, second_metadata)) =
+    process.receive(signal, within: 5000)
+  second_metadata.confirmation |> should.equal(observation.Reconciled)
+  second_metadata.committed_state |> should.equal(job.Succeeded)
+  second_metadata.command_id |> should.equal(first_metadata.command_id)
+
+  // Exactly two events, deterministically: a sentinel claim/ack through the
+  // same database's forwarder must be the very next event.
+  let assert Ok(_sentinel_handle) =
+    postgres.submit(database, "observation-dup-sequential", sentinel_worker, 7)
+  let assert Ok(Some(sentinel_claimed)) =
+    postgres.claim_one(
+      database,
+      "observation-dup-sequential",
+      workers,
+      attempt_owner,
+      30_000,
+    )
+  let sentinel_execution = postgres.execute_claim(sentinel_claimed)
+  let #(sentinel_job_id, _, _) = postgres.claim_identity(sentinel_claimed)
+  postgres.acknowledge_claim(
+    database,
+    "observation-dup-sequential",
+    attempt_owner,
+    sentinel_claimed,
+    sentinel_execution,
+  )
+  |> should.equal(Ok(True))
+  assert_next_observation_is_sentinel(signal, sentinel_job_id)
+
+  mark_database_test_executed(
+    "acknowledged-observation-reconciled-on-sequential-duplicate-passed",
+  )
+}
+
+pub fn postgres_acknowledged_observation_reconciled_on_concurrent_duplicate_ack_test() {
+  case repeatable_read_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_acknowledged_observation_reconciled_concurrent_duplicate_test(
+        database_url,
+      )
+  }
+}
+
+/// Coordinator review, round 1 follow-up: proves the *other* untested
+/// receipt-match site — the re-check after a 0-row fenced `UPDATE` inside
+/// `acknowledge_transaction` — is `Reconciled`. Reuses
+/// `run_ack_duplicate_repeatable_read_test`'s exact forced-overlap
+/// mechanism (a `BEFORE UPDATE` trigger parking the first acknowledgement
+/// behind a held advisory lock while a second, concurrent acknowledgement
+/// for the *same* claim genuinely waits on the row lock the first holds —
+/// confirmed via `pg_stat_activity` wait events, not inferred): A's
+/// `UPDATE` commits first (a fresh write, `Replied`); B's own `UPDATE` then
+/// affects zero rows against the now-committed row and re-checks the
+/// receipt, finding A's — this is the site under test, and only reachable
+/// this way, not sequentially. Named mutation: hardcoding
+/// `via_receipt_match: False` at this site makes this test fail (B's event
+/// would report `Replied`, not `Reconciled`, and/or a second `Replied`
+/// event would appear instead of one `Replied` and one `Reconciled`).
+fn run_acknowledged_observation_reconciled_concurrent_duplicate_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  use entries <- with_unique_databases(database_url, [
+    "grind_ack_obs_rr_a_" <> suffix,
+    "grind_ack_obs_rr_b_" <> suffix,
+  ])
+  let assert [#(database_a, connection_a), #(database_b, _)] = entries
+
+  let assert Ok(input_codec) =
+    worker.codec("ack-obs-rr-input-" <> suffix <> "-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "ack-obs-rr-output-" <> suffix <> "-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "ack.obs.rr-" <> suffix,
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("ack-obs-rr-" <> suffix)
+  let assert Ok(workers) = registry.register(workers, definition)
+  let #(workers, sentinel_worker) =
+    register_sentinel_worker(workers, "dup-concurrent-" <> suffix)
+  let test_queue = "ack-obs-rr-" <> suffix
+  let attempt_owner = "ack-obs-rr-owner-" <> suffix
+
+  let assert Ok(_handle) =
+    postgres.submit(database_a, test_queue, definition, 8)
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(database_a, test_queue, workers, attempt_owner, 30_000)
+  let execution = postgres.execute_claim(claimed)
+  let #(job_id, _, _) = postgres.claim_identity(claimed)
+
+  let signal = process.new_subject()
+  let attachment =
+    attach_acknowledged_observer(
+      "dup-concurrent-" <> suffix,
+      fn(measurements, metadata) {
+        process.send(signal, AcknowledgedSignal(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let lock_key = unique_test_lock_key(5)
+  let trigger_name = "grind_test_ack_obs_overlap_" <> suffix
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> trigger_name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = "
+      <> int.to_string(job_id)
+      <> " AND OLD.state = 'executing' AND NEW.state <> 'executing' THEN PERFORM pg_advisory_xact_lock("
+      <> int.to_string(lock_key)
+      <> "); END IF; RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection_a)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER "
+      <> trigger_name
+      <> " BEFORE UPDATE ON grind_jobs FOR EACH ROW EXECUTE FUNCTION "
+      <> trigger_name
+      <> "()",
+    )
+    |> pog.execute(on: connection_a)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query("DROP TRIGGER IF EXISTS " <> trigger_name <> " ON grind_jobs")
+      |> pog.execute(on: connection_a)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> trigger_name <> "()")
+      |> pog.execute(on: connection_a)
+    Nil
+  })
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_ack_obs_overlap_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection_a, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    postgres.acknowledge_claim(
+      database_a,
+      test_queue,
+      attempt_owner,
+      claimed,
+      execution,
+    )
+  })
+  await_lock_wait_counts(connection_a, 1, 0, 500) |> should.equal(True)
+
+  spawn_submit(result_b, fn() {
+    postgres.acknowledge_claim(
+      database_b,
+      test_queue,
+      attempt_owner,
+      claimed,
+      execution,
+    )
+  })
+  await_lock_wait_counts(connection_a, 1, 1, 500) |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 5000)
+  let assert Ok(outcome_b) = process.receive(result_b, within: 5000)
+  outcome_a |> should.equal(Ok(True))
+  outcome_b |> should.equal(Ok(True))
+  count_acknowledgements_for_job(connection_a, job_id) |> should.equal(1)
+
+  let assert Ok(AcknowledgedSignal(_, event_1)) =
+    process.receive(signal, within: 5000)
+  let assert Ok(AcknowledgedSignal(_, event_2)) =
+    process.receive(signal, within: 5000)
+
+  // Exactly two events, deterministically for `database_a`'s own producer
+  // stream (the only one anything further runs through here): a sentinel
+  // claim/ack through the same database's forwarder must be the very next
+  // event. `database_b` is not exercised again after its one duplicate-ack
+  // call above, so nothing further could arrive from it either.
+  let assert Ok(_sentinel_handle) =
+    postgres.submit(database_a, test_queue, sentinel_worker, 11)
+  let assert Ok(Some(sentinel_claimed)) =
+    postgres.claim_one(database_a, test_queue, workers, attempt_owner, 30_000)
+  let sentinel_execution = postgres.execute_claim(sentinel_claimed)
+  let #(sentinel_job_id, _, _) = postgres.claim_identity(sentinel_claimed)
+  postgres.acknowledge_claim(
+    database_a,
+    test_queue,
+    attempt_owner,
+    sentinel_claimed,
+    sentinel_execution,
+  )
+  |> should.equal(Ok(True))
+  assert_next_observation_is_sentinel(signal, sentinel_job_id)
+
+  let confirmations = [event_1.confirmation, event_2.confirmation]
+  list.contains(confirmations, observation.Replied) |> should.equal(True)
+  list.contains(confirmations, observation.Reconciled) |> should.equal(True)
+  event_1.command_id |> should.equal(event_2.command_id)
+  event_1.committed_state |> should.equal(job.Succeeded)
+  event_2.committed_state |> should.equal(job.Succeeded)
+  mark_database_test_executed(
+    "acknowledged-observation-reconciled-on-concurrent-duplicate-passed",
+  )
+}
+
+// -- Round 2 `[grind, job, *]` observations --------------------------------
+//
+// Every descriptor below is emitted through the same `sinal/forwarder` as
+// `[grind, job, acknowledged]` above; see `grind/observation`'s module
+// documentation for the shared delivery semantics. Each descriptor gets at
+// least one test proving emission (with the exact metadata a consumer would
+// read) and one proving a read-only/negative outcome emits nothing, using
+// the same "assert the very next observation on this exact channel is a
+// known sentinel" technique `assert_next_observation_is_sentinel` documents
+// above (per-producer FIFO through one Forwarder makes this deterministic,
+// not racy).
+
+pub fn postgres_admitted_observation_plain_submit_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_admitted_plain_submit_test(database_url)
+  }
+}
+
+/// Plain `submit`/`submit_at`: `committed_state` and `available_at_unix_ms`
+/// come from the insert's own `RETURNING`, `submission_id` is `None`, and
+/// `confirmation` is always `Replied` (a plain submission has no receipt
+/// concept to reconcile from).
+fn run_admitted_plain_submit_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_admitted_plain_submit")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("admitted-plain-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("admitted-plain-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("admitted.plain", "v1", input_codec, output_codec, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-admitted-plain")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(handle) =
+    postgres.submit(database, "admitted-plain", definition, 5)
+  let assert Ok(#(measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  measurements |> should.equal(observation.AdmittedMeasurements(count: 1))
+  metadata.ref.job_id |> should.equal(job.id_value(handle))
+  metadata.ref.queue |> should.equal("admitted-plain")
+  metadata.ref.worker_id |> should.equal("admitted.plain")
+  metadata.ref.worker_version |> should.equal("v1")
+  metadata.committed_state |> should.equal(job.Queued)
+  metadata.submission_id |> should.equal(None)
+  metadata.confirmation |> should.equal(observation.Replied)
+  let assert Some(immediate_available_at) = metadata.available_at_unix_ms
+  immediate_available_at |> should.not_equal(0)
+
+  let assert Ok(future) = job.available_at(immediate_available_at + 3_600_000)
+  let assert Ok(scheduled_handle) =
+    postgres.submit_at(database, "admitted-plain", definition, 6, future)
+  let assert Ok(#(_, scheduled_metadata)) =
+    process.receive(signal, within: 5000)
+  scheduled_metadata.ref.job_id
+  |> should.equal(job.id_value(scheduled_handle))
+  scheduled_metadata.committed_state |> should.equal(job.Scheduled)
+  scheduled_metadata.available_at_unix_ms
+  |> should.equal(Some(immediate_available_at + 3_600_000))
+  scheduled_metadata.confirmation |> should.equal(observation.Replied)
+
+  // A `submit_at` whose target is already in the past by the *database's*
+  // clock still commits `queued` (`grind_jobs`'s own `CASE ... <=
+  // clock_timestamp()`), not `scheduled` — proving `committed_state` is read
+  // back from that same `RETURNING`, never inferred client-side from the
+  // request's own "immediate vs. future" intent.
+  let assert Ok(past) = job.available_at(immediate_available_at - 3_600_000)
+  let assert Ok(past_handle) =
+    postgres.submit_at(database, "admitted-plain", definition, 7, past)
+  let assert Ok(#(_, past_metadata)) = process.receive(signal, within: 5000)
+  past_metadata.ref.job_id |> should.equal(job.id_value(past_handle))
+  past_metadata.committed_state |> should.equal(job.Queued)
+  mark_database_test_executed("admitted-observation-plain-submit-passed")
+}
+
+pub fn postgres_admitted_observation_unique_inserted_and_reconciled_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_admitted_unique_inserted_reconciled_test(database_url)
+  }
+}
+
+/// A fresh unique admission (`Inserted`) is `Replied`, with a known
+/// `available_at_unix_ms`. Replaying the exact same `submission_id` and
+/// request hits the receipt inside `admission_transaction` itself before any
+/// candidate row is even looked up — proven committed by that receipt read,
+/// not a fresh write — so the second observation is `Reconciled` with
+/// `available_at_unix_ms: None` (the receipt-matched path never re-derives
+/// it, the same limitation `acknowledged` documents for its own
+/// receipt-matched commits).
+fn run_admitted_unique_inserted_reconciled_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_admitted_unique_inserted",
+  )
+  let worker_def = unique_test_worker("admitted.unique.inserted-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "admitted-unique-" <> suffix
+  let submission_text = "admitted-unique-1-" <> suffix
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-admitted-unique-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      3,
+      policy,
+    )
+  let assert Ok(#(_, first_metadata)) = process.receive(signal, within: 5000)
+  first_metadata.ref.job_id |> should.equal(job.id_value(handle))
+  first_metadata.submission_id |> should.equal(Some(submission_text))
+  first_metadata.confirmation |> should.equal(observation.Replied)
+  first_metadata.committed_state |> should.equal(job.Queued)
+  let assert Some(_) = first_metadata.available_at_unix_ms
+
+  let assert Ok(unique.Inserted(replayed)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      3,
+      policy,
+    )
+  job.id_value(replayed) |> should.equal(job.id_value(handle))
+  let assert Ok(#(_, second_metadata)) = process.receive(signal, within: 5000)
+  second_metadata.ref.job_id |> should.equal(job.id_value(handle))
+  second_metadata.submission_id |> should.equal(Some(submission_text))
+  second_metadata.confirmation |> should.equal(observation.Reconciled)
+  second_metadata.available_at_unix_ms |> should.equal(None)
+  mark_database_test_executed(
+    "admitted-observation-unique-inserted-reconciled-passed",
+  )
+}
+
+pub fn postgres_admitted_observation_unique_existing_conflict_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_admitted_unique_existing_test(database_url)
+  }
+}
+
+/// A distinct `submission_id` that lands on an already-occupied uniqueness
+/// key (`Existing`) is its own fresh commit (`Replied`) — this exact
+/// submission's own receipt row is what got written, even though the job row
+/// itself is untouched.
+fn run_admitted_unique_existing_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_admitted_unique_existing",
+  )
+  let worker_def = unique_test_worker("admitted.unique.existing-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "admitted-unique-existing-" <> suffix
+
+  // Attached before any submission: `forwarder.emit` only sends the event to
+  // the forwarder process and returns — it does not wait for that process to
+  // actually run the attached handler — so a handler attached only *after* a
+  // call returns can still race that call's own not-yet-processed emission.
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-admitted-unique-existing-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "admitted-existing-1-" <> suffix,
+      worker_def,
+      3,
+      policy,
+    )
+  let assert Ok(#(_, first_metadata)) = process.receive(signal, within: 5000)
+  first_metadata.submission_id
+  |> should.equal(Some("admitted-existing-1-" <> suffix))
+  first_metadata.confirmation |> should.equal(observation.Replied)
+
+  let assert Ok(unique.Existing(conflict)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "admitted-existing-2-" <> suffix,
+      worker_def,
+      3,
+      policy,
+    )
+  let assert Ok(#(_, metadata)) = process.receive(signal, within: 5000)
+  metadata.ref.job_id |> should.equal(unique.conflict_job_id(conflict))
+  metadata.ref.job_id |> should.equal(job.id_value(handle))
+  metadata.submission_id |> should.equal(Some("admitted-existing-2-" <> suffix))
+  metadata.confirmation |> should.equal(observation.Replied)
+  metadata.committed_state |> should.equal(job.Queued)
+  mark_database_test_executed(
+    "admitted-observation-unique-existing-conflict-passed",
+  )
+}
+
+pub fn postgres_admitted_observation_existing_over_executing_available_at_none_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_admitted_existing_over_executing_test(database_url)
+  }
+}
+
+/// `available_at_unix_ms` is `Some` only when the committed/observed state
+/// is `Queued`, `Scheduled`, or `Retryable` — an `Existing` conflict can
+/// land on any other policy-eligible state too (`Incomplete` reaches as far
+/// as `Executing`), where the row's raw `available_at` is not a real
+/// next-run time and must be reported `None`.
+fn run_admitted_existing_over_executing_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_admitted_existing_executing_" <> suffix,
+  )
+  let worker_def = unique_test_worker("admitted.existing.executing-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "admitted-existing-executing-" <> suffix
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "admitted-existing-executing-1-" <> suffix,
+      worker_def,
+      9,
+      policy,
+    )
+  // Force the row into `executing` directly (no queue actor needed) so the
+  // later `Existing` conflict below lands on a non-eligibility state.
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = 1, attempt_epoch = 1, attempt_owner = 'x', lease_expires_at = clock_timestamp() + interval '1 hour' WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.execute(on: connection)
+
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-admitted-existing-executing-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(unique.Existing(conflict)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "admitted-existing-executing-2-" <> suffix,
+      worker_def,
+      9,
+      policy,
+    )
+  unique.conflict_state(conflict) |> should.equal(job.Executing)
+  let assert Ok(#(_, metadata)) = process.receive(signal, within: 5000)
+  metadata.ref.job_id |> should.equal(job.id_value(handle))
+  metadata.committed_state |> should.equal(job.Executing)
+  metadata.available_at_unix_ms |> should.equal(None)
+  mark_database_test_executed(
+    "admitted-observation-existing-over-executing-available-at-none-passed",
+  )
+}
+
+pub fn postgres_admitted_observation_absent_on_submission_conflict_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_admitted_absent_on_conflict_test(database_url)
+  }
+}
+
+/// `SubmissionConflict` (the same `submission_id` reused for a materially
+/// different request) never reaches the database's own commit, so it must
+/// never emit — proven here by a subsequent, distinct submission through the
+/// exact same producer/forwarder arriving as the very next `admitted`
+/// observation.
+fn run_admitted_absent_on_conflict_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_admitted_conflict",
+  )
+  let worker_def = unique_test_worker("admitted.conflict-" <> suffix)
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let test_queue = "admitted-conflict-" <> suffix
+  let submission_text = "admitted-conflict-1-" <> suffix
+
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-admitted-conflict-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      3,
+      policy,
+    )
+  let assert Ok(#(_, _)) = process.receive(signal, within: 5000)
+
+  submit_keep_existing(
+    database,
+    test_queue,
+    submission_text,
+    worker_def,
+    4,
+    policy,
+  )
+  |> should.equal(Error(unique.SubmissionConflict))
+
+  let assert Ok(unique.Inserted(sentinel_handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "admitted-conflict-sentinel-" <> suffix,
+      worker_def,
+      5,
+      policy,
+    )
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(sentinel_handle))
+  mark_database_test_executed(
+    "admitted-observation-absent-on-submission-conflict-passed",
+  )
+}
+
+pub fn postgres_admitted_observation_absent_from_reconcile_unique_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_admitted_absent_from_reconcile_unique_test(database_url)
+  }
+}
+
+/// Public `reconcile_unique` follows round 1's decision for
+/// `reconcile_acknowledgement`: it never emits, even though it can recover a
+/// genuine committed outcome (`Inserted`) from a `CommitUnknown` command —
+/// reusing the exact "(d) committed, reply lost, pool closed" scenario from
+/// `run_unique_committed_reply_lost_store_unavailable_test` above. Both are
+/// pure receipt reads offered for a caller to recover its own return value
+/// after a lost reply, not a fresh proof of commit tied to a call this
+/// module owns end to end — `submit_unique` itself already emits
+/// `Reconciled` for the equivalent in-call recovery (see the
+/// inserted-and-reconciled test above); a separate, possibly much later
+/// `reconcile_unique` call must not double-report the same commit.
+fn run_admitted_absent_from_reconcile_unique_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-admitted-reconcile-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let pool_name = process.new_name("grind_admitted_reconcile_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let observer_pool_name =
+    process.new_name("grind_admitted_reconcile_observer_" <> suffix)
+  let observer_settings =
+    postgres.settings(database_url, observer_pool_name)
+    |> postgres.pool_size(1)
+  let assert Ok(observer_validated) = postgres.validate(observer_settings)
+  let assert Ok(observer) = postgres.start(observer_validated)
+  use <- exception.defer(fn() { postgres.close(observer) })
+  let observer_connection = pog.named_connection(observer_pool_name)
+  require_syncrep_cluster_configured(observer_connection)
+
+  let worker_def = unique_test_worker("admitted.reconcile-" <> suffix)
+  let test_queue = "admitted-reconcile-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let submission_text = "admitted-reconcile-" <> suffix
+
+  use <- exception.defer(install_syncrep_reply_trigger(
+    observer_connection,
+    "grind_test_admitted_reconcile_" <> suffix,
+    "grind_unique_submissions",
+    "NEW.submission_id = '" <> submission_text <> "'",
+  ))
+
+  let reply = process.new_subject()
+  spawn_submit(reply, fn() {
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  })
+  let assert Ok(backend_pid) =
+    wait_for_syncrep_trigger_backend(observer_connection, 300)
+
+  postgres.close(database)
+  let assert Ok(Error(unique.CommitUnknown(pending))) =
+    process.receive(reply, within: 10_000)
+  // No `admitted` observation for the `CommitUnknown` outcome itself.
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  let assert Ok(reopened_validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(reopened) = postgres.start(reopened_validated)
+  use <- exception.defer(fn() { postgres.close(reopened) })
+
+  // Zombie still parked: a pure receipt lookup still finds nothing.
+  let assert Error(unique.CommitUnknown(_)) =
+    postgres.reconcile_unique(reopened, pending)
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  terminate_backend(observer_connection, backend_pid) |> should.equal(True)
+  let assert Ok(Nil) =
+    wait_for_backend_gone(observer_connection, backend_pid, 300)
+
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.reconcile_unique(reopened, pending)
+  postgres.arguments(reopened, handle) |> should.equal(Ok(1))
+  // Still nothing on the `admitted` channel from `reconcile_unique` itself,
+  // even though it just recovered a genuinely committed `Inserted` outcome.
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  // Sentinel: the producer/forwarder itself is still alive and correctly
+  // wired for a genuine fresh admission afterward.
+  let assert Ok(unique.Inserted(sentinel_handle)) =
+    submit_keep_existing(
+      reopened,
+      test_queue,
+      "admitted-reconcile-sentinel-" <> suffix,
+      worker_def,
+      2,
+      policy,
+    )
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(sentinel_handle))
+  mark_database_test_executed(
+    "admitted-observation-absent-from-reconcile-unique-passed",
+  )
+}
+
+pub fn postgres_admitted_observation_in_call_post_commit_unknown_reconciled_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_admitted_in_call_reconciled_test(database_url)
+  }
+}
+
+/// The other `Reconciled` path, distinct from the in-transaction receipt hit
+/// the inserted-and-reconciled test above proves: `submit_unique`'s own
+/// commit reply is lost (the `SyncRep`-park-then-terminate harness), so its
+/// transaction result comes back as `pog.TransactionQueryError` — but
+/// `run`'s own follow-up `reconcile_from_receipt` call, made within this
+/// exact same `submit_unique` call before it ever returns, finds the
+/// now-visible receipt and resolves `Ok(Inserted(handle))` transparently
+/// (`run_unique_committed_reply_lost_test`'s own scenario). This is proven
+/// committed by a receipt read, not a fresh write, so exactly one `admitted`
+/// event is emitted, `Reconciled`, with `available_at_unix_ms: None`.
+fn run_admitted_in_call_reconciled_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-admitted-in-call-reconciled-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let pool_name =
+    process.new_name("grind_admitted_in_call_reconciled_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  require_syncrep_cluster_configured(connection)
+
+  let worker_def = unique_test_worker("admitted.in-call-reconciled-" <> suffix)
+  let test_queue = "admitted-in-call-reconciled-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let submission_text = "admitted-in-call-reconciled-" <> suffix
+
+  use <- exception.defer(install_syncrep_reply_trigger(
+    connection,
+    "grind_test_admitted_in_call_reconciled_" <> suffix,
+    "grind_unique_submissions",
+    "NEW.submission_id = '" <> submission_text <> "'",
+  ))
+
+  let reply = process.new_subject()
+  spawn_submit(reply, fn() {
+    submit_keep_existing(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      7,
+      policy,
+    )
+  })
+
+  let assert Ok(backend_pid) = wait_for_syncrep_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  let assert Ok(Ok(unique.Inserted(handle))) =
+    process.receive(reply, within: 10_000)
+  backend_pid_is_alive(connection, backend_pid) |> should.equal(False)
+
+  let assert Ok(#(_, metadata)) = process.receive(signal, within: 5000)
+  metadata.ref.job_id |> should.equal(job.id_value(handle))
+  metadata.submission_id |> should.equal(Some(submission_text))
+  metadata.confirmation |> should.equal(observation.Reconciled)
+  metadata.available_at_unix_ms |> should.equal(None)
+
+  // Exactly one: the sentinel through the exact same producer is the very
+  // next observation on this channel.
+  let assert Ok(unique.Inserted(sentinel_handle)) =
+    submit_keep_existing(
+      database,
+      test_queue,
+      "admitted-in-call-reconciled-sentinel-" <> suffix,
+      worker_def,
+      8,
+      policy,
+    )
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(sentinel_handle))
+  mark_database_test_executed(
+    "admitted-observation-in-call-post-commit-unknown-reconciled-passed",
+  )
+}
+
+pub fn postgres_claimed_observation_emission_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_claimed_observation_emission_test(database_url)
+  }
+}
+
+/// The claim itself autocommits as a single fenced `UPDATE ... RETURNING`,
+/// so a returned row is already the proof of commit: `attempt_id`/`epoch`
+/// come from that same row, `attempt` is the row's own `attempt_count`, and
+/// `previous_state` is what the row held immediately before this claim.
+fn run_claimed_observation_emission_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_claimed_emission")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("claimed-emission-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("claimed-emission-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "claimed.emission",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("claimed-emission")
+  let assert Ok(workers) = registry.register(workers, definition)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-claimed-emission")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.claimed(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(handle) =
+    postgres.submit(database, "claimed-emission", definition, 5)
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "claimed-emission",
+      workers,
+      "claimed-emission-owner",
+      30_000,
+    )
+  let #(claimed_id, attempt_id, epoch) = postgres.claim_identity(claimed)
+  claimed_id |> should.equal(job.id_value(handle))
+
+  let assert Ok(#(measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  measurements |> should.equal(observation.ClaimedMeasurements(count: 1))
+  metadata.ref.job_id |> should.equal(claimed_id)
+  metadata.ref.queue |> should.equal("claimed-emission")
+  metadata.ref.worker_id |> should.equal("claimed.emission")
+  metadata.ref.worker_version |> should.equal("v1")
+  metadata.attempt.attempt_id |> should.equal(attempt_id)
+  metadata.attempt.epoch |> should.equal(epoch)
+  metadata.attempt.attempt |> should.equal(1)
+  metadata.previous_state |> should.equal(job.Queued)
+  mark_database_test_executed("claimed-observation-emission-passed")
+}
+
+pub fn postgres_claimed_observation_absent_when_nothing_due_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_claimed_observation_absent_when_nothing_due_test(database_url)
+  }
+}
+
+/// `claim_one` returning `Ok(None)` (nothing due) never calls the emit path
+/// at all — proven here by a real claim through the exact same producer
+/// arriving as the very next `claimed` observation.
+fn run_claimed_observation_absent_when_nothing_due_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_claimed_absent")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("claimed-absent-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("claimed-absent-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("claimed.absent", "v1", input_codec, output_codec, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let assert Ok(workers) = registry.new("claimed-absent")
+  let assert Ok(workers) = registry.register(workers, definition)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-claimed-absent")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.claimed(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.claim_one(
+    database,
+    "claimed-absent",
+    workers,
+    "claimed-absent-owner",
+    30_000,
+  )
+  |> should.equal(Ok(None))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  let assert Ok(sentinel_handle) =
+    postgres.submit(database, "claimed-absent", definition, 6)
+  let assert Ok(Some(sentinel_claimed)) =
+    postgres.claim_one(
+      database,
+      "claimed-absent",
+      workers,
+      "claimed-absent-owner",
+      30_000,
+    )
+  let #(sentinel_id, _, _) = postgres.claim_identity(sentinel_claimed)
+  sentinel_id |> should.equal(job.id_value(sentinel_handle))
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(sentinel_id)
+  mark_database_test_executed(
+    "claimed-observation-absent-when-nothing-due-passed",
+  )
+}
+
+pub fn postgres_quarantined_observation_emission_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_quarantined_observation_emission_test(database_url)
+  }
+}
+
+/// The claim-time quarantine scan finds at most one abandoned attempt per
+/// call (`LIMIT 1`); this drives it twice to observe one event per row, with
+/// `cancellation_was_requested` distinguishing an ordinary abandoned attempt
+/// from one that also had a pending cancellation request.
+fn run_quarantined_observation_emission_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_quarantined_emission")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("quarantined-emission-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("quarantined-emission-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "quarantined.emission",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("quarantined-emission")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle_a) =
+    postgres.submit(database, "quarantined-emission", definition, 1)
+  let assert Ok(handle_b) =
+    postgres.submit(database, "quarantined-emission", definition, 2)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = 1, attempt_count = 1, attempt_owner = 'dead-consumer', lease_expires_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle_a)))
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = 1, attempt_count = 1, attempt_owner = 'dead-consumer', lease_expires_at = clock_timestamp(), cancel_requested_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle_b)))
+    |> pog.execute(on: connection)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-quarantined-emission")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.quarantined(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.claim_one(
+    database,
+    "quarantined-emission",
+    workers,
+    "quarantined-emission-owner",
+    30_000,
+  )
+  |> should.equal(Ok(None))
+  let assert Ok(#(measurements_a, metadata_a)) =
+    process.receive(signal, within: 5000)
+  measurements_a |> should.equal(observation.QuarantinedMeasurements(count: 1))
+  metadata_a.ref.job_id |> should.equal(job.id_value(handle_a))
+  metadata_a.ref.queue |> should.equal("quarantined-emission")
+  metadata_a.ref.worker_id |> should.equal("quarantined.emission")
+  metadata_a.attempt.epoch |> should.equal(1)
+  metadata_a.attempt.attempt |> should.equal(1)
+  metadata_a.cancellation_was_requested |> should.equal(False)
+
+  postgres.claim_one(
+    database,
+    "quarantined-emission",
+    workers,
+    "quarantined-emission-owner",
+    30_000,
+  )
+  |> should.equal(Ok(None))
+  let assert Ok(#(_, metadata_b)) = process.receive(signal, within: 5000)
+  metadata_b.ref.job_id |> should.equal(job.id_value(handle_b))
+  metadata_b.cancellation_was_requested |> should.equal(True)
+
+  postgres.state(database, handle_a) |> should.equal(Ok(job.Uncertain))
+  postgres.state(database, handle_b) |> should.equal(Ok(job.Uncertain))
+  mark_database_test_executed("quarantined-observation-emission-passed")
+}
+
+pub fn postgres_quarantined_observation_absent_when_nothing_expired_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_quarantined_observation_absent_test(database_url)
+  }
+}
+
+/// The quarantine scan runs on every `claim_one` call, whether or not
+/// anything is actually expired; an ordinary claim with nothing to quarantine
+/// must never emit — proven by a genuinely quarantined row through the exact
+/// same producer arriving as the very next `quarantined` observation.
+fn run_quarantined_observation_absent_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_quarantined_absent")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("quarantined-absent-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("quarantined-absent-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "quarantined.absent",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("quarantined-absent")
+  let assert Ok(workers) = registry.register(workers, definition)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-quarantined-absent")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.quarantined(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(handle) =
+    postgres.submit(database, "quarantined-absent", definition, 3)
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "quarantined-absent",
+      workers,
+      "quarantined-absent-owner",
+      30_000,
+    )
+  let #(claimed_id, _, _) = postgres.claim_identity(claimed)
+  claimed_id |> should.equal(job.id_value(handle))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET lease_expires_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(claimed_id))
+    |> pog.execute(on: connection)
+  postgres.claim_one(
+    database,
+    "quarantined-absent",
+    workers,
+    "quarantined-absent-owner",
+    30_000,
+  )
+  |> should.equal(Ok(None))
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(claimed_id)
+  mark_database_test_executed("quarantined-observation-absent-passed")
+}
+
+pub fn postgres_resolved_observation_replied_and_reconciled_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_resolved_observation_replied_reconciled_test(database_url)
+  }
+}
+
+/// The first audited resolution of an `uncertain` job is this call's own
+/// fresh commit (`Replied`); replaying the exact same `resolution_id` is
+/// proven by `resolution_receipt_outcome`'s own receipt read
+/// (`ResolutionAlreadyApplied`), so the second observation is `Reconciled`.
+fn run_resolved_observation_replied_reconciled_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_resolved_replied_reconciled")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("resolved-emission-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("resolved-emission-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "resolved.emission",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(handle) =
+    postgres.submit(database, "resolved-emission", definition, 12)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = 501, attempt_epoch = 3, attempt_owner = 'lost-consumer', lease_expires_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.execute(on: connection)
+  let assert Ok(workers) = registry.new("resolved-emission")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-resolved-emission")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.resolved(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.resolve_uncertain(
+    database,
+    handle,
+    "resolution-emission-1",
+    "on-call",
+    "confirm before replay",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+  let assert Ok(#(measurements, first_metadata)) =
+    process.receive(signal, within: 5000)
+  measurements |> should.equal(observation.ResolvedMeasurements(count: 1))
+  first_metadata.ref.job_id |> should.equal(job.id_value(handle))
+  first_metadata.ref.queue |> should.equal("resolved-emission")
+  first_metadata.decision |> should.equal(observation.DecisionAuthorizeReplay)
+  first_metadata.committed_state |> should.equal(job.Queued)
+  first_metadata.resolution_id |> should.equal("resolution-emission-1")
+  first_metadata.resolved_by |> should.equal("on-call")
+  first_metadata.confirmation |> should.equal(observation.Replied)
+
+  postgres.resolve_uncertain(
+    database,
+    handle,
+    "resolution-emission-1",
+    "on-call",
+    "confirm before replay",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionAlreadyApplied(job.Queued)))
+  let assert Ok(#(_, second_metadata)) = process.receive(signal, within: 5000)
+  second_metadata.ref.job_id |> should.equal(job.id_value(handle))
+  second_metadata.confirmation |> should.equal(observation.Reconciled)
+  mark_database_test_executed("resolved-observation-replied-reconciled-passed")
+}
+
+pub fn postgres_resolved_observation_absent_on_reconciliation_not_required_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_resolved_observation_absent_test(database_url)
+  }
+}
+
+/// `resolve_uncertain` against a job that is not (or no longer) `uncertain`
+/// commits nothing (`ReconciliationNotRequired`) and must never emit —
+/// proven by a genuine audited resolution through the exact same producer
+/// arriving as the very next `resolved` observation.
+fn run_resolved_observation_absent_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_resolved_absent")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("resolved-absent-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("resolved-absent-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("resolved.absent", "v1", input_codec, output_codec, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let assert Ok(queued_handle) =
+    postgres.submit(database, "resolved-absent", definition, 4)
+  let assert Ok(uncertain_handle) =
+    postgres.submit(database, "resolved-absent", definition, 5)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = 777, attempt_epoch = 2, attempt_owner = 'lost-consumer', lease_expires_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(uncertain_handle)))
+    |> pog.execute(on: connection)
+  let assert Ok(workers) = registry.new("resolved-absent")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  // The quarantine scan moves `uncertain_handle` to `uncertain`; the
+  // still-genuinely-due `queued_handle` is what this same call then claims
+  // and runs to completion.
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, queued_handle) |> should.equal(Ok(job.Succeeded))
+  postgres.state(database, uncertain_handle) |> should.equal(Ok(job.Uncertain))
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-resolved-absent")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.resolved(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.resolve_uncertain(
+    database,
+    queued_handle,
+    "resolution-absent-1",
+    "on-call",
+    "not actually uncertain",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Error(postgres.ReconciliationNotRequired))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  postgres.resolve_uncertain(
+    database,
+    uncertain_handle,
+    "resolution-absent-2",
+    "on-call",
+    "genuinely uncertain",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(uncertain_handle))
+  mark_database_test_executed("resolved-observation-absent-passed")
+}
+
+pub fn postgres_resolved_observation_absent_on_commit_unknown_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_resolved_observation_commit_unknown_test(database_url)
+  }
+}
+
+/// A genuinely aborted commit (a deferred trigger's `pg_sleep` fires during
+/// `resolve_uncertain`'s own transaction `COMMIT`; killing that backend
+/// aborts the whole transaction — nothing committed) reports
+/// `ResolutionCommitUnknown` and must never emit — the same "commit
+/// genuinely unknown" case `postgres_submit_unique_aborted_commit_is_commit_unknown_test`
+/// proves for admission. Once the trigger is dropped, retrying the exact
+/// same `resolution_id` against the still-`uncertain` job (the aborted
+/// transaction rolled back its own `grind_jobs` update too) is the sentinel
+/// through the same producer.
+fn run_resolved_observation_commit_unknown_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_resolved_commit_unknown_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("resolved-commit-unknown-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "resolved-commit-unknown-output-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "resolved.commit.unknown",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(handle) =
+    postgres.submit(database, "resolved-commit-unknown", definition, 3)
+  let assert Ok(sentinel_handle) =
+    postgres.submit(database, "resolved-commit-unknown", definition, 4)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = 909, attempt_epoch = 4, attempt_owner = 'lost-consumer', lease_expires_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle)))
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = 910, attempt_epoch = 4, attempt_owner = 'lost-consumer', lease_expires_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(sentinel_handle)))
+    |> pog.execute(on: connection)
+  let assert Ok(workers) = registry.new("resolved-commit-unknown")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
+  postgres.state(database, sentinel_handle) |> should.equal(Ok(job.Uncertain))
+
+  let resolution_id = "resolution-commit-unknown-" <> suffix
+  let trigger_name = "grind_test_resolved_commit_unknown_" <> suffix
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> trigger_name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NOT (NEW.resolution_id = '"
+      <> resolution_id
+      <> "') THEN RETURN NEW; END IF; PERFORM pg_sleep(30); RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER "
+      <> trigger_name
+      <> " AFTER INSERT ON grind_job_resolutions DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+      <> trigger_name
+      <> "()",
+    )
+    |> pog.execute(on: connection)
+  let drop_trigger = fn() {
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS " <> trigger_name <> " ON grind_job_resolutions",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> trigger_name <> "()")
+      |> pog.execute(on: connection)
+    Nil
+  }
+  use <- exception.defer(drop_trigger)
+
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-resolved-commit-unknown-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.resolved(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(
+        reply,
+        postgres.resolve_uncertain(
+          database,
+          handle,
+          resolution_id,
+          "on-call",
+          "aborted commit proof",
+          postgres.AuthorizeReplay,
+        ),
+      )
+    })
+  let assert Ok(backend_pid) = wait_for_commit_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+  let assert Ok(Error(postgres.ResolutionCommitUnknown(returned_resolution_id))) =
+    process.receive(reply, within: 10_000)
+  returned_resolution_id |> should.equal(resolution_id)
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+  drop_trigger()
+
+  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
+
+  // Sentinel: a distinct job/resolution through the exact same producer, so
+  // a stray event wrongly emitted for the commit-unknown job above (which
+  // would carry *that* job's id) is caught as a mismatch here rather than
+  // coincidentally matching.
+  postgres.resolve_uncertain(
+    database,
+    sentinel_handle,
+    "resolution-commit-unknown-sentinel-" <> suffix,
+    "on-call",
+    "aborted commit proof",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(sentinel_handle))
+  sentinel_metadata.confirmation |> should.equal(observation.Replied)
+  mark_database_test_executed(
+    "resolved-observation-absent-on-commit-unknown-passed",
+  )
+}
+
+pub fn postgres_cancellation_observation_before_run_and_requested_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_cancellation_observation_emission_test(database_url)
+  }
+}
+
+/// `CancelledBeforeRun` (a queued job cancelled before any attempt) and
+/// `CancellationRequested` (an executing job) are the only two genuine
+/// writes; `CancellationRequested` can repeat verbatim for an idempotent
+/// re-request (`cancel_executing`'s own `COALESCE` re-affirms rather than
+/// rejects), proven here by cancelling the same executing job twice.
+fn run_cancellation_observation_emission_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_cancellation_emission")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("cancellation-emission-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("cancellation-emission-output-v1", json.string, decode.string)
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define(
+      "cancellation.emission",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(started, LongHandlerStarted(release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Ok(int.to_string(value))
+          Error(Nil) -> Error(AccountMissing(value))
+        }
+      },
+    )
+  let assert Ok(workers) = registry.new("cancellation-emission")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(queued_handle) =
+    postgres.submit(database, "cancellation-emission", definition, 1)
+  let assert Ok(executing_handle) =
+    postgres.submit(database, "cancellation-emission", definition, 2)
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-cancellation-emission")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.cancellation(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.cancel(database, queued_handle)
+  |> should.equal(Ok(postgres.CancelledBeforeRun))
+  let assert Ok(#(measurements, before_run_metadata)) =
+    process.receive(signal, within: 5000)
+  measurements |> should.equal(observation.CancellationMeasurements(count: 1))
+  before_run_metadata.ref.job_id |> should.equal(job.id_value(queued_handle))
+  before_run_metadata.ref.queue |> should.equal("cancellation-emission")
+  before_run_metadata.previous_state |> should.equal(job.Queued)
+  before_run_metadata.outcome
+  |> should.equal(observation.CancelledBeforeRunOutcome)
+
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(LongHandlerStarted(release)) =
+    process.receive(started, within: 5000)
+  use <- exception.defer(fn() { process.send(release, ReleaseAttempt) })
+
+  postgres.cancel(database, executing_handle)
+  |> should.equal(Ok(postgres.CancellationRequested))
+  let assert Ok(#(_, requested_metadata_1)) =
+    process.receive(signal, within: 5000)
+  requested_metadata_1.ref.job_id
+  |> should.equal(job.id_value(executing_handle))
+  requested_metadata_1.previous_state |> should.equal(job.Executing)
+  requested_metadata_1.outcome
+  |> should.equal(observation.CancellationRequestedOutcome)
+
+  // Idempotent re-request: the same outcome, delivered again.
+  postgres.cancel(database, executing_handle)
+  |> should.equal(Ok(postgres.CancellationRequested))
+  let assert Ok(#(_, requested_metadata_2)) =
+    process.receive(signal, within: 5000)
+  requested_metadata_2.outcome
+  |> should.equal(observation.CancellationRequestedOutcome)
+
+  process.send(release, ReleaseAttempt)
+  let assert Ok(_) = process.receive(reply, within: 5000)
+  postgres.state(database, executing_handle) |> should.equal(Ok(job.Cancelled))
+  mark_database_test_executed("cancellation-observation-emission-passed")
+}
+
+pub fn postgres_cancellation_observation_absent_on_already_cancelled_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_cancellation_observation_absent_test(database_url)
+  }
+}
+
+/// The read-only outcomes (`AlreadyCancelled`, `AlreadyUncertain`,
+/// `AlreadyFinished`) commit nothing and must never emit — proven here by
+/// cancelling an already-cancelled job, then a genuine cancellation through
+/// the exact same producer arriving as the very next `cancellation`
+/// observation.
+fn run_cancellation_observation_absent_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_cancellation_absent")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("cancellation-absent-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("cancellation-absent-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "cancellation.absent",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(handle) =
+    postgres.submit(database, "cancellation-absent", definition, 1)
+  let assert Ok(other_handle) =
+    postgres.submit(database, "cancellation-absent", definition, 2)
+  postgres.cancel(database, handle)
+  |> should.equal(Ok(postgres.CancelledBeforeRun))
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-cancellation-absent")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.cancellation(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.cancel(database, handle)
+  |> should.equal(Ok(postgres.AlreadyCancelled))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  postgres.cancel(database, other_handle)
+  |> should.equal(Ok(postgres.CancelledBeforeRun))
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(other_handle))
+  mark_database_test_executed("cancellation-observation-absent-passed")
+}
+
+pub fn postgres_cancellation_observation_absent_on_commit_unknown_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_cancellation_observation_commit_unknown_test(database_url)
+  }
+}
+
+/// A genuinely aborted commit (a deferred trigger's `pg_sleep` fires during
+/// `cancel`'s own transaction `COMMIT`; killing that backend aborts the
+/// whole transaction, including its own `grind_jobs` update) reports
+/// `CancellationCommitUnknown` and must never emit. Once the trigger is
+/// dropped, cancelling the same still-`queued` job for real is the sentinel
+/// through the same producer.
+fn run_cancellation_observation_commit_unknown_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name =
+    process.new_name("grind_cancellation_commit_unknown_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("cancellation-commit-unknown-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec(
+      "cancellation-commit-unknown-output-v1",
+      json.string,
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "cancellation.commit.unknown",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(handle) =
+    postgres.submit(database, "cancellation-commit-unknown", definition, 1)
+  let assert Ok(sentinel_handle) =
+    postgres.submit(database, "cancellation-commit-unknown", definition, 2)
+  let connection = pog.named_connection(pool_name)
+  let job_id = job.id_value(handle)
+
+  let trigger_name = "grind_test_cancellation_commit_unknown_" <> suffix
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> trigger_name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NOT (NEW.id = "
+      <> int.to_string(job_id)
+      <> ") THEN RETURN NEW; END IF; PERFORM pg_sleep(30); RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER "
+      <> trigger_name
+      <> " AFTER UPDATE ON grind_jobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION "
+      <> trigger_name
+      <> "()",
+    )
+    |> pog.execute(on: connection)
+  let drop_trigger = fn() {
+    let _ =
+      pog.query("DROP TRIGGER IF EXISTS " <> trigger_name <> " ON grind_jobs")
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> trigger_name <> "()")
+      |> pog.execute(on: connection)
+    Nil
+  }
+  use <- exception.defer(drop_trigger)
+
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-cancellation-commit-unknown-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.cancellation(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, postgres.cancel(database, handle))
+    })
+  let assert Ok(backend_pid) = wait_for_commit_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+  let assert Ok(Error(postgres.CancellationCommitUnknown)) =
+    process.receive(reply, within: 10_000)
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+  drop_trigger()
+
+  postgres.state(database, handle) |> should.equal(Ok(job.Queued))
+
+  // Sentinel: a distinct job through the exact same producer, so a stray
+  // event wrongly emitted for the commit-unknown job above (which would
+  // carry *that* job's id) is caught as a mismatch here rather than
+  // coincidentally matching (cancelling the same job again would emit the
+  // same `CancelledBeforeRunOutcome` either way, which could not tell the
+  // two apart).
+  postgres.cancel(database, sentinel_handle)
+  |> should.equal(Ok(postgres.CancelledBeforeRun))
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(sentinel_handle))
+  mark_database_test_executed(
+    "cancellation-observation-absent-on-commit-unknown-passed",
+  )
+}
+
+pub fn postgres_released_observation_emission_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_released_observation_emission_test(database_url)
+  }
+}
+
+/// `release_unstarted_claim` refunds a claim whose temporary worker child
+/// never started (before `execute_claim`/`acknowledge_claim` ever run).
+/// `restored_state` is the same state the row held before this claim.
+fn run_released_observation_emission_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_released_emission")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("released-emission-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("released-emission-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "released.emission",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("released-emission")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "released-emission", definition, 1)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-released-emission")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.released(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "released-emission",
+      workers,
+      "released-emission-owner",
+      30_000,
+    )
+  let #(claimed_id, attempt_id, epoch) = postgres.claim_identity(claimed)
+  postgres.release_unstarted_claim(
+    database,
+    "released-emission",
+    "released-emission-owner",
+    claimed,
+  )
+  |> should.equal(Ok(True))
+
+  let assert Ok(#(measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  measurements |> should.equal(observation.ReleasedMeasurements(count: 1))
+  metadata.ref.job_id |> should.equal(claimed_id)
+  metadata.ref.job_id |> should.equal(job.id_value(handle))
+  metadata.attempt.attempt_id |> should.equal(attempt_id)
+  metadata.attempt.epoch |> should.equal(epoch)
+  metadata.attempt.attempt |> should.equal(1)
+  metadata.restored_state |> should.equal(job.Queued)
+  postgres.state(database, handle) |> should.equal(Ok(job.Queued))
+  mark_database_test_executed("released-observation-emission-passed")
+}
+
+pub fn postgres_released_observation_absent_when_not_unstarted_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_released_observation_absent_test(database_url)
+  }
+}
+
+/// `release_unstarted_claim` returning `Ok(False)` (the attempt fence no
+/// longer matches — here, because the claim was already acknowledged) must
+/// never emit — proven by a genuine release through the exact same producer
+/// arriving as the very next `released` observation.
+fn run_released_observation_absent_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_released_absent")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("released-absent-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("released-absent-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define("released.absent", "v1", input_codec, output_codec, fn(value) {
+      Ok(int.to_string(value))
+    })
+  let assert Ok(workers) = registry.new("released-absent")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(_) = postgres.submit(database, "released-absent", definition, 1)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-released-absent")
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.released(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(Some(claimed)) =
+    postgres.claim_one(
+      database,
+      "released-absent",
+      workers,
+      "released-absent-owner",
+      30_000,
+    )
+  let execution = postgres.execute_claim(claimed)
+  postgres.acknowledge_claim(
+    database,
+    "released-absent",
+    "released-absent-owner",
+    claimed,
+    execution,
+  )
+  |> should.equal(Ok(True))
+  postgres.release_unstarted_claim(
+    database,
+    "released-absent",
+    "released-absent-owner",
+    claimed,
+  )
+  |> should.equal(Ok(False))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  let assert Ok(sentinel_handle) =
+    postgres.submit(database, "released-absent", definition, 2)
+  let assert Ok(Some(sentinel_claimed)) =
+    postgres.claim_one(
+      database,
+      "released-absent",
+      workers,
+      "released-absent-owner",
+      30_000,
+    )
+  let #(sentinel_id, _, _) = postgres.claim_identity(sentinel_claimed)
+  sentinel_id |> should.equal(job.id_value(sentinel_handle))
+  postgres.release_unstarted_claim(
+    database,
+    "released-absent",
+    "released-absent-owner",
+    sentinel_claimed,
+  )
+  |> should.equal(Ok(True))
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(sentinel_id)
+  mark_database_test_executed("released-observation-absent-passed")
+}
+
+pub fn postgres_contract_mismatch_observation_emission_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_contract_mismatch_observation_emission_test(database_url)
+  }
+}
+
+/// A stored `output_version` that no longer matches the currently registered
+/// worker's codec (a deploy changed the codec without a worker/version bump)
+/// releases the claim as `contract_mismatch` — the same forced mismatch
+/// `run_batch_partial_error_test` uses.
+fn run_contract_mismatch_observation_emission_test(
+  database_url: String,
+) -> Nil {
+  let pool_name = process.new_name("grind_contract_mismatch_emission")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("contract-mismatch-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("contract-mismatch-output-v1", json.int, decode.int)
+  let assert Ok(definition) =
+    worker.define(
+      "contract.mismatch.emission",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(value + 1) },
+    )
+  let assert Ok(workers) = registry.new("contract-mismatch-emission")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "contract-mismatch-emission", definition, 1)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query("UPDATE grind_jobs SET output_version = $1 WHERE worker_id = $2")
+    |> pog.parameter(pog.text("contract-mismatch-output-v2"))
+    |> pog.parameter(pog.text("contract.mismatch.emission"))
+    |> pog.execute(on: connection)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-contract-mismatch-emission")
+  let assert Ok(attachment) =
+    sinal.observe(
+      id,
+      observation.contract_mismatch(),
+      fn(measurements, metadata) {
+        process.send(signal, #(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer)
+  |> should.equal(
+    Error(
+      queue.QueueProcessFailed(postgres.QueueCodecMismatch(
+        kind: "output",
+        expected: "contract-mismatch-output-v2",
+        actual: "contract-mismatch-output-v1",
+      )),
+    ),
+  )
+  postgres.state(database, handle) |> should.equal(Ok(job.ContractMismatch))
+
+  let assert Ok(#(measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  measurements
+  |> should.equal(observation.ContractMismatchMeasurements(count: 1))
+  metadata.ref.job_id |> should.equal(job.id_value(handle))
+  metadata.ref.queue |> should.equal("contract-mismatch-emission")
+  metadata.ref.worker_id |> should.equal("contract.mismatch.emission")
+  metadata.attempt.attempt |> should.equal(1)
+  metadata.kind |> should.equal(observation.OutputCodec)
+  metadata.expected_version |> should.equal("contract-mismatch-output-v2")
+  metadata.actual_version |> should.equal("contract-mismatch-output-v1")
+  mark_database_test_executed("contract-mismatch-observation-emission-passed")
+}
+
+pub fn postgres_contract_mismatch_observation_absent_on_matching_codec_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_contract_mismatch_observation_absent_test(database_url)
+  }
+}
+
+/// An ordinary claim whose stored codec versions match the registered worker
+/// never releases as `contract_mismatch` — proven by a following genuine
+/// mismatch through the exact same producer arriving as the very next
+/// `contract_mismatch` observation.
+fn run_contract_mismatch_observation_absent_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_contract_mismatch_absent")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("contract-mismatch-absent-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("contract-mismatch-absent-output-v1", json.int, decode.int)
+  let assert Ok(definition) =
+    worker.define(
+      "contract.mismatch.absent",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(value + 1) },
+    )
+  let assert Ok(workers) = registry.new("contract-mismatch-absent")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(matching_handle) =
+    postgres.submit(database, "contract-mismatch-absent", definition, 1)
+  let assert Ok(mismatched_handle) =
+    postgres.submit(database, "contract-mismatch-absent", definition, 2)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query("UPDATE grind_jobs SET output_version = $1 WHERE id = $2")
+    |> pog.parameter(pog.text("contract-mismatch-absent-output-v2"))
+    |> pog.parameter(pog.int(job.id_value(mismatched_handle)))
+    |> pog.execute(on: connection)
+
+  let signal = process.new_subject()
+  let assert Ok(id) = sinal.handler_id("grind-test-contract-mismatch-absent")
+  let assert Ok(attachment) =
+    sinal.observe(
+      id,
+      observation.contract_mismatch(),
+      fn(measurements, metadata) {
+        process.send(signal, #(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, matching_handle) |> should.equal(Ok(job.Succeeded))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  queue.process_one(consumer)
+  |> should.equal(
+    Error(
+      queue.QueueProcessFailed(postgres.QueueCodecMismatch(
+        kind: "output",
+        expected: "contract-mismatch-absent-output-v2",
+        actual: "contract-mismatch-absent-output-v1",
+      )),
+    ),
+  )
+  let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
+  sentinel_metadata.ref.job_id |> should.equal(job.id_value(mismatched_handle))
+  mark_database_test_executed("contract-mismatch-observation-absent-passed")
+}
+
+type OrderingEvent {
+  ClaimedOrderingEvent(attempt_id: Int)
+  AcknowledgedOrderingEvent(attempt_id: Int)
+}
+
+pub fn postgres_claimed_observation_precedes_acknowledged_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_claimed_precedes_acknowledged_test(database_url)
+  }
+}
+
+/// A coordinator's `[grind, job, claimed]` for one attempt always arrives
+/// before that same attempt's `[grind, job, acknowledged]`: both are emitted
+/// by the same producer (the queue actor claiming, then acknowledging, one
+/// attempt) through the one `Forwarder` a `Database` owns, and
+/// `sinal/forwarder` guarantees per-producer FIFO delivery — proven here by
+/// receiving both, tagged by their shared `attempt_id`, in that exact order.
+fn run_claimed_precedes_acknowledged_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_claimed_before_acknowledged")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec("ordering-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("ordering-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "ordering.claimed.acknowledged",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("ordering-claimed-acknowledged")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(_) =
+    postgres.submit(database, "ordering-claimed-acknowledged", definition, 7)
+
+  let signal = process.new_subject()
+  let assert Ok(claimed_id) = sinal.handler_id("grind-test-ordering-claimed")
+  let assert Ok(claimed_attachment) =
+    sinal.observe(
+      claimed_id,
+      observation.claimed(),
+      fn(_measurements, metadata) {
+        process.send(signal, ClaimedOrderingEvent(metadata.attempt.attempt_id))
+      },
+    )
+  use <- exception.defer(fn() { detach(claimed_attachment) })
+  let assert Ok(acknowledged_id) =
+    sinal.handler_id("grind-test-ordering-acknowledged")
+  let assert Ok(acknowledged_attachment) =
+    sinal.observe(
+      acknowledged_id,
+      observation.acknowledged(),
+      fn(_measurements, metadata) {
+        process.send(
+          signal,
+          AcknowledgedOrderingEvent(metadata.attempt.attempt_id),
+        )
+      },
+    )
+  use <- exception.defer(fn() { detach(acknowledged_attachment) })
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  let assert Ok(ClaimedOrderingEvent(claimed_attempt_id)) =
+    process.receive(signal, within: 5000)
+  let assert Ok(AcknowledgedOrderingEvent(acknowledged_attempt_id)) =
+    process.receive(signal, within: 5000)
+  claimed_attempt_id |> should.equal(acknowledged_attempt_id)
+  mark_database_test_executed("claimed-precedes-acknowledged-ordering-passed")
 }

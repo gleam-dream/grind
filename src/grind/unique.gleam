@@ -293,13 +293,21 @@ pub type SubmitError(input, output, error) {
   /// decodes, but handled the same fail-closed way rather than trusted.
   SubmissionConflict
   /// The admission did not commit. Reported only when that is knowable
-  /// directly — the store could not even hand out a connection to attempt
-  /// the admission at all (`pog.ConnectionUnavailable`), before its
-  /// transaction ever began — never for a fault that reached the database
-  /// and left the true outcome genuinely uncertain (see `CommitUnknown`).
-  /// Safe to retry the same `SubmissionId` once the store is reachable; no
-  /// `PendingSubmission` is retained because there is nothing to reconcile
-  /// from.
+  /// directly: either the store could not even hand out a connection to
+  /// attempt the admission at all (`pog.ConnectionUnavailable`, before its
+  /// transaction ever began), or any query inside the admission transaction
+  /// itself failed (any `pog.QueryError` other than the `55P03` lock-timeout
+  /// code, which is `AdmissionContended` instead) — the transaction callback
+  /// failed, so `COMMIT` was never sent, and therefore it cannot have
+  /// committed. This is not the same claim as "PostgreSQL rolled it back and
+  /// confirmed that": the resulting `ROLLBACK` may itself never reach the
+  /// server if the connection was already lost, but a `COMMIT` that this
+  /// code never sent still cannot have made anything durable either way.
+  /// Never reported for a fault that left the true outcome genuinely
+  /// uncertain (a lost connection mid-transaction with no such
+  /// never-sent-`COMMIT` guarantee; see `CommitUnknown`). Safe to retry the
+  /// same `SubmissionId` once the store is reachable; no `PendingSubmission`
+  /// is retained because there is nothing to reconcile from.
   AdmissionFailed(pog.QueryError)
   /// The admission transaction reached the database (its own connection was
   /// checked out and `BEGIN` ran) and its outcome could not be established

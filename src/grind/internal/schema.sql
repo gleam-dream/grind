@@ -1,0 +1,26 @@
+-- Grind's fresh-install schema DDL, kept byte-identical (statement text) to
+-- the list `grind/postgres.schema_ddl_statements` returns and
+-- `create_fresh_schema` executes, statement by statement, inside one
+-- transaction. `postgres_schema_ddl_matches_sql_file_test`
+-- (test/grind_test.gleam) proves the two stay equal.
+--
+-- This file exists for tooling, not for Grind itself to load at runtime:
+-- scripts/generate-sql.sh applies it with `psql` so a disposable database has
+-- Grind's schema before `gleam run -m squirrel` inspects real query types
+-- against it.
+
+CREATE TABLE grind_schema_migrations (version integer PRIMARY KEY, installed_at timestamptz NOT NULL DEFAULT clock_timestamp());
+
+CREATE TABLE grind_jobs (id bigserial PRIMARY KEY, storage_owner text NOT NULL, queue text NOT NULL, worker_id text NOT NULL, worker_version text NOT NULL, input_version text NOT NULL, input jsonb NOT NULL, output_version text NOT NULL, output jsonb, error_version text, error jsonb, state text NOT NULL CONSTRAINT grind_jobs_state_check CHECK (state IN ('queued', 'scheduled', 'retryable', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled')), available_at timestamptz NOT NULL, inserted_at timestamptz NOT NULL DEFAULT clock_timestamp(), attempt_id bigint, attempt_epoch bigint NOT NULL DEFAULT 0, attempt_owner text, lease_expires_at timestamptz, attempt_count bigint NOT NULL DEFAULT 0, max_attempts bigint NOT NULL DEFAULT 20, delivery_count bigint NOT NULL DEFAULT 0, snooze_count bigint NOT NULL DEFAULT 0, failure_description text, failure_cause text, uncertain_at timestamptz, cancel_requested_at timestamptz, unique_key_contract text, unique_key_sha256 bytea, CONSTRAINT grind_jobs_max_attempts_check CHECK (max_attempts > 0), CONSTRAINT grind_jobs_unique_key_check CHECK ((unique_key_contract IS NULL) = (unique_key_sha256 IS NULL) AND (unique_key_sha256 IS NULL OR octet_length(unique_key_sha256) = 32)));
+
+CREATE INDEX grind_jobs_unique_candidate_idx ON grind_jobs (storage_owner, worker_id, worker_version, unique_key_contract, unique_key_sha256) WHERE unique_key_sha256 IS NOT NULL;
+
+CREATE TABLE grind_job_resolutions (storage_owner text NOT NULL, queue text NOT NULL, job_id bigint NOT NULL, worker_id text, worker_version text, resolution_id text NOT NULL, attempt_id bigint NOT NULL, attempt_epoch bigint NOT NULL, attempt_owner text NOT NULL, lease_expires_at timestamptz NOT NULL, decision text NOT NULL CONSTRAINT grind_job_resolutions_decision_check CHECK (decision IN ('confirm_success', 'confirm_business_failure', 'authorize_replay')), target_state text NOT NULL CONSTRAINT grind_job_resolutions_target_state_check CHECK (target_state IN ('queued', 'succeeded', 'business_failed')), payload_version text, payload jsonb, resolved_by text NOT NULL, details text NOT NULL, resolved_at timestamptz NOT NULL DEFAULT clock_timestamp(), CONSTRAINT grind_job_resolutions_pkey PRIMARY KEY (storage_owner, resolution_id));
+
+CREATE TABLE grind_job_acknowledgements (storage_owner text NOT NULL, command_id text NOT NULL, queue text NOT NULL, job_id bigint NOT NULL, worker_id text NOT NULL, worker_version text NOT NULL, attempt_id bigint NOT NULL, attempt_epoch bigint NOT NULL, attempt_owner text NOT NULL, committed_state text NOT NULL CONSTRAINT grind_job_acknowledgements_committed_state_check CHECK (committed_state IN ('succeeded', 'business_failed', 'retryable', 'runtime_failed', 'scheduled', 'discarded', 'cancelled', 'uncertain')), failure_cause text CONSTRAINT grind_job_acknowledgements_failure_cause_check CHECK (failure_cause IS NULL OR failure_cause IN ('budget_exhausted', 'retry_declined')), proposal_sha256 bytea NOT NULL CONSTRAINT grind_job_acknowledgements_proposal_sha256_check CHECK (octet_length(proposal_sha256) = 32), committed_at timestamptz NOT NULL DEFAULT clock_timestamp(), CONSTRAINT grind_job_acknowledgements_pkey PRIMARY KEY (storage_owner, command_id), CONSTRAINT grind_job_acknowledgements_attempt_key UNIQUE (storage_owner, job_id, attempt_id, attempt_epoch));
+
+CREATE SEQUENCE grind_attempts_id_seq AS bigint START WITH 1 INCREMENT BY 1 MINVALUE 1 CACHE 1 NO CYCLE;
+
+CREATE TABLE grind_unique_submissions (storage_owner text NOT NULL, submission_id text NOT NULL, queue text NOT NULL, worker_id text NOT NULL, worker_version text NOT NULL, request_sha256 bytea NOT NULL CONSTRAINT grind_unique_submissions_request_sha256_check CHECK (octet_length(request_sha256) = 32), decision text NOT NULL CONSTRAINT grind_unique_submissions_decision_check CHECK (decision IN ('inserted', 'existing', 'rescheduled')), job_id bigint NOT NULL, job_queue text NOT NULL, observed_state text NOT NULL CONSTRAINT grind_unique_submissions_observed_state_check CHECK (observed_state IN ('queued', 'scheduled', 'retryable', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled')), decided_at timestamptz NOT NULL DEFAULT clock_timestamp(), rescheduled_from timestamptz, rescheduled_to timestamptz, CONSTRAINT grind_unique_submissions_pkey PRIMARY KEY (storage_owner, submission_id));
+
+INSERT INTO grind_schema_migrations (version) VALUES (11);

@@ -1,11 +1,27 @@
 -module(grind_postgres_ffi).
 -export([
+    call_safely/1,
     execute_safely/2,
     stop_consumer_supervisor/1,
     stop_supervisor/1,
     transaction_safely/2,
     transaction_or_checkout_failure/2
 ]).
+
+%% Generic form of execute_safely/2: runs any zero-arity fun and catches the
+%% same pgo_pool checkout exit, reporting it as the same `connection_unavailable`
+%% error `pog.QueryError` carries. Squirrel-generated query functions
+%% (`grind/internal/sql`) call `pog:execute/2` directly rather than going
+%% through `execute_safely/2`, so callers wrap those calls in `call_safely`
+%% to keep Grind's no-crash-on-checkout-failure behavior without Grind having
+%% to hand-write (and keep in sync with) a query-shaped wrapper per generated
+%% function.
+call_safely(Fun) ->
+    try Fun()
+    catch
+        exit:{_Reason, {pgo_pool, checkout, _Details}} ->
+            {error, connection_unavailable}
+    end.
 
 execute_safely(Query, Connection) ->
     try pog:execute(Query, Connection)

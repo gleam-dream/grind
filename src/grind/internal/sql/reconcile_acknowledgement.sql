@@ -1,0 +1,1 @@
+SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, committed_state, failure_cause, to_char(committed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2
