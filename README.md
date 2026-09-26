@@ -45,6 +45,31 @@ result.
 See [implementation scope](docs/IMPLEMENTATION-SCOPE.md) for the delivered
 boundary and complete retained backlog.
 
+## Starting a consumer
+
+The ordinary path needs no policy customization —
+`queue.default_policy_validated()` is `queue.default_policy() |> queue
+.validate_policy`, already unwrapped, since the shipped defaults are always
+valid:
+
+```gleam
+import grind/postgres
+import grind/queue
+import grind/registry
+
+let assert Ok(settings) =
+  postgres.settings(database_url) |> postgres.validate
+let assert Ok(database) = postgres.start(settings)
+let assert Ok(workers) = registry.new("payments")
+let assert Ok(workers) = registry.register(workers, payment_worker)
+let assert Ok(consumer) =
+  queue.start(database, workers, queue.default_policy_validated())
+```
+
+Customize polling, concurrency, or lease duration by building a `QueuePolicy`
+instead (`queue.default_policy() |> queue.with_poll_interval(...) |> ... |>
+queue.validate_policy`) and passing its `ValidatedPolicy` to `queue.start`.
+
 ## Observations
 
 `grind/observation` exposes Grind's own [Sinal](https://github.com/gleam-dream/sinal)
@@ -78,15 +103,15 @@ The events currently published, one per durable job-lifecycle transition:
   registers.
 - `[grind, job, resolved]` — an audited operator decision committed against
   an `uncertain` job (`resolve_uncertain`).
-- `[grind, job, cancellation]` — a cancellation request that changed
-  something durable (`CancelledBeforeRun` or `CancellationRequested`); the
+- `[grind, job, cancellation_decided]` — a cancellation request that changed
+  something durable (`CancellationDecidedBeforeRun` or `CancellationDecidedWhileRunning`); the
   read-only outcomes (`AlreadyCancelled`, `AlreadyUncertain`,
-  `AlreadyFinished`) never emit. `CancellationRequested` can be delivered
+  `AlreadyFinished`) never emit. `CancellationDecidedWhileRunning` can be delivered
   again for an idempotent re-request against an already-executing job.
 - `[grind, job, released]` — a claimed attempt refunded before its worker
   ever ran (the temporary worker child failed to start).
-- `[grind, job, contract_mismatch]` — a claimed attempt parked in the
-  terminal, nonclaimable `contract_mismatch` state because a registered
+- `[grind, job, contract_mismatch_recorded]` — a claimed attempt parked in
+  the terminal, nonclaimable `contract_mismatch` state because a registered
   worker's codec contract no longer matches what was persisted at admission;
   unlike `released` above, this job does not go back to `queued`.
 - `[grind, job, acknowledged]` — one committed disposition for one claimed
@@ -94,7 +119,7 @@ The events currently published, one per durable job-lifecycle transition:
   `grind/observation` for the full detail this section summarizes below).
 
 Every Grind observation is emitted through a `Database`'s own
-`sinal/forwarder.Forwarder` (sized by `postgres.observation_capacity`, default
+`sinal/forwarder.Forwarder` (sized by `postgres.with_observation_capacity`, default
 1024, shared across every `[grind, job, *]` event above — one `Forwarder` per
 `Database`, not one per event kind), never through a plain `sinal.emit`, so a
 slow or raising attached handler stalls only the forwarder process — never
@@ -199,15 +224,25 @@ real external effect:
   never relying on Grind's attempt/delivery counts alone.
 - **The coordinator runs claim and acknowledgement SQL synchronously, bounded
   by a Grind-owned checkout deadline — for a connection already in hand.**
-  `postgres.statement_deadline` (default 4000ms, `D`, validated positive)
-  bounds every Grind storage call _once a pooled connection is checked out_ —
-  inline SQL, every Squirrel-generated call, and a whole transaction
-  including its own `BEGIN`/`COMMIT` — against a stalled or half-open
-  connection: a real TCP fault-proxy test proves a dropped `COMMIT` reply, a
-  dropped `BEGIN` reply, a request that never reaches PostgreSQL at all, and
-  a stalled lease-renewal `UPDATE` all resolve within roughly this bound
-  instead of hanging indefinitely (`docs/RECOVERY-EVIDENCE.md`,
-  "Acknowledgement deadline"). It does not bound the pool's own _initial_
+  `postgres.with_statement_deadline` (default 4000ms, `D`, validated positive) is
+  enforced by Grind's own `grind_postgres_ffi.erl`, which checks out a
+  connection from pog's own pool itself (`pgo:checkout/2`, an explicit
+  `timeout` option) and runs the call against that single checked-out
+  connection, rather than letting pog re-checkout with its own
+  unconfigurable, hardcoded default — for every Grind storage call: inline
+  SQL, every Squirrel-generated call, and a whole `pog.transaction` including
+  its own `BEGIN`/`COMMIT`. A real TCP fault-proxy test proves a dropped
+  `COMMIT` reply, a dropped `BEGIN` reply, a request that never reaches
+  PostgreSQL at all, and a stalled lease-renewal `UPDATE` all resolve within
+  roughly this bound instead of hanging indefinitely
+  (`docs/RECOVERY-EVIDENCE.md`, "Acknowledgement deadline"). Grind depends on
+  vanilla `pog` from Hex, pinned to a tight range (`gleam.toml`) because this
+  couples Grind directly to pog's private `Connection` shape and to `pgo`'s
+  own checkout/checkin/break API — a deliberate decision (no fork), guarded
+  by that pin plus `pog_connection_pool_shape_test`
+  (`test/grind_test.gleam`), which fails loudly if a pog/pgo upgrade ever
+  changes either shape instead of this silently mismatching it. This
+  deadline does not bound the pool's own _initial_
   connect (a `gen_tcp:connect` to an unresponsive, not
   connection-refusing, host has no deadline of its own either way), and a
   checkout that has to _queue_ behind other contended callers is bounded by
@@ -225,7 +260,7 @@ real external effect:
   every other active attempt's own lease-renewal tick under the same
   `maximum_concurrency > 1` consumer, since one coordinator process serves
   all of them.
-  `queue.start`/`queue.start_with_policy` reject a lease that does not
+  `queue.start` rejects a lease that does not
   clear a multiple of this deadline before starting any process
   (`queue.LeaseTooShortForDeadline`: `6 × D` at `maximum_concurrency > 1`,
   `1.5 × D` at `maximum_concurrency` of exactly 1 — both derived with zero
@@ -255,7 +290,7 @@ real external effect:
   anything that must not be lost or double-counted on an attached handler.
 - **Plain `submit`/`submit_at` may have committed even when they return an
   error.** Neither has a request identity to deduplicate against, so a
-  `SubmitQueryFailed` reply does not mean the row was never inserted — the
+  `CommitUnknownWithoutId` reply does not mean the row was never inserted — the
   connection can be lost after PostgreSQL already committed it. Do not
   blindly retry either one; use `submit_with_id` (a caller-supplied
   `SubmissionId`, no uniqueness policy) or `submit_unique` (a uniqueness
@@ -316,6 +351,23 @@ byte-for-byte in lockstep with `migrations()`, and that every released file
 (every one but the newest, which may still be under active development)
 has a pinned sha256 that matches — so the two can never silently drift
 apart.
+
+Each step's transaction also sets a constant, transaction-local
+`lock_timeout` (2000ms) right after acquiring its own advisory lock — a
+DDL/DML statement that cannot acquire whatever lock it needs (typically an
+`ALTER`/`CREATE INDEX` against a large, actively used table under
+concurrent access) within that bound fails the step with
+`postgres.MigrationLockUnavailable(version)` instead of blocking for up to
+the full `migration_deadline_ms`; safe to retry `migrate` once the
+conflicting lock clears, exactly like `MigrationStepFailed`. Run
+`postgres.migrate`/`migrate_with` as an explicit deploy step, not at
+application/node boot, once a table this large is in play, so a slow or
+contended migration does not block every node's own startup. This
+`lock_timeout` is set only inside `postgres.migrate`'s own transaction, not
+inside `priv/migrations/*.sql` itself — an application applying those files
+directly through cigogne does not get it automatically and should set its
+own `lock_timeout` first if it wants the same fast-fail behavior instead of
+waiting out cigogne's own default.
 
 See `docs/RELEASE-READINESS.md` ("Migration mechanism") and
 `docs/RECOVERY-EVIDENCE.md` for the mutation- and concurrency-proven

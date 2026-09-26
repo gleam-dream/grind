@@ -9,6 +9,8 @@ import gleam/otp/static_supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import grind/internal/attempt
+import grind/internal/consumer_hooks.{type Hooks}
 import grind/postgres.{type Database}
 import grind/registry.{type Registry}
 import grind/worker
@@ -25,10 +27,18 @@ pub opaque type Consumer {
   )
 }
 
+/// How a consumer discovers newly-due work: `PollEvery` schedules its own
+/// recurring `Poll` message on this timer; `Manual` schedules none, and a
+/// caller drives each attempt through `process_one`/`process_batch` instead.
+pub type Polling {
+  PollEvery(interval_ms: Int)
+  Manual
+}
+
 /// Queue-local polling, lease, and execution-capacity settings.
 pub type QueuePolicy {
   QueuePolicy(
-    poll_interval_ms: Int,
+    polling: Polling,
     maximum_jobs_per_poll: Int,
     maximum_concurrency: Int,
     lease_duration_ms: Int,
@@ -38,12 +48,21 @@ pub type QueuePolicy {
 
 pub fn default_policy() -> QueuePolicy {
   QueuePolicy(
-    poll_interval_ms: 250,
+    polling: PollEvery(250),
     maximum_jobs_per_poll: 1,
     maximum_concurrency: 1,
     lease_duration_ms: 30_000,
     shutdown_grace_ms: 5000,
   )
+}
+
+/// `default_policy() |> validate_policy`, already unwrapped: the shipped
+/// defaults are always valid, so this never fails. Lets `queue.start`'s
+/// ordinary, no-customization path skip both the intermediate `QueuePolicy`
+/// and the `let assert` its own `validate_policy` call would otherwise need.
+pub fn default_policy_validated() -> ValidatedPolicy {
+  let assert Ok(policy) = validate_policy(default_policy())
+  policy
 }
 
 /// Reports whether a renewal timer still belongs to the active attempt.
@@ -74,7 +93,14 @@ pub fn with_poll_interval(
   policy: QueuePolicy,
   poll_interval_ms: Int,
 ) -> QueuePolicy {
-  QueuePolicy(..policy, poll_interval_ms:)
+  QueuePolicy(..policy, polling: PollEvery(poll_interval_ms))
+}
+
+/// Disables automatic polling: the started consumer schedules no `Poll`
+/// timer of its own, and a caller must drive each attempt through
+/// `process_one`/`process_batch` instead.
+pub fn with_manual_polling(policy: QueuePolicy) -> QueuePolicy {
+  QueuePolicy(..policy, polling: Manual)
 }
 
 pub fn with_maximum_jobs_per_poll(
@@ -121,7 +147,7 @@ pub type PolicyError {
 
 pub opaque type ValidatedPolicy {
   ValidatedPolicy(
-    poll_interval_ms: Int,
+    polling: Polling,
     maximum_jobs_per_poll: Int,
     maximum_concurrency: Int,
     lease_duration_ms: Int,
@@ -134,13 +160,17 @@ pub fn validate_policy(
   policy: QueuePolicy,
 ) -> Result(ValidatedPolicy, PolicyError) {
   let QueuePolicy(
-    poll_interval_ms:,
+    polling:,
     maximum_jobs_per_poll:,
     maximum_concurrency:,
     lease_duration_ms:,
     shutdown_grace_ms:,
   ) = policy
-  case poll_interval_ms > 0 {
+  let polling_ok = case polling {
+    PollEvery(interval_ms) -> interval_ms > 0
+    Manual -> True
+  }
+  case polling_ok {
     False -> Error(PollIntervalMustBePositive)
     True ->
       case maximum_jobs_per_poll > 0 {
@@ -156,7 +186,7 @@ pub fn validate_policy(
                     False -> Error(ShutdownGraceMustBeNonNegative)
                     True ->
                       Ok(ValidatedPolicy(
-                        poll_interval_ms:,
+                        polling:,
                         maximum_jobs_per_poll:,
                         maximum_concurrency:,
                         lease_duration_ms:,
@@ -170,7 +200,6 @@ pub fn validate_policy(
 }
 
 pub type StartError {
-  RegistryQueueMismatch
   NoRegisteredWorkers
   QueueActorStartFailed(actor.StartError)
   QueueSupervisorStartFailed(actor.StartError)
@@ -180,10 +209,11 @@ pub type StartError {
   /// `postgres.Settings.statement_deadline_ms` (`D`) for the coordinator's
   /// own recovery machinery to have a real chance to act before the lease
   /// lapses. Derivation: a live attempt's own renewal timer fires every
-  /// `L / 3` (`renewal_interval_ms`, `start_with_policy`), so after a
-  /// renewal succeeds there is `L - L / 3 = (2 / 3) * L` of slack before
-  /// that same lease would otherwise expire. The coordinator's single
-  /// message loop can block for up to roughly `3 * D` retrying one pending
+  /// `L / 3` (`renewal_interval_ms`, computed once when the consumer
+  /// starts), so after a renewal succeeds there is `L - L / 3 = (2 / 3) * L`
+  /// of slack before that same lease would otherwise expire. The
+  /// coordinator's single message loop can block for up to roughly `3 * D`
+  /// retrying one pending
   /// acknowledgement (`ConsumerState.pending_ack_retry_budget`, ~3 ticks),
   /// during which a *sibling* attempt's own renewal tick sits queued behind
   /// it before it can even start; that renewal call is itself now bounded
@@ -194,7 +224,7 @@ pub type StartError {
   /// lease's own expiry). At `maximum_concurrency` of exactly 1 there is no
   /// sibling to queue behind anything, so only the renewal's own `D` needs
   /// to fit: `(2 / 3) * L >= D` gives `L >= 1.5 * D`, again with zero margin
-  /// at that minimum. `attempted` is the lease this call was given;
+  /// at that minimum. `attempted_ms` is the lease this call was given;
   /// `minimum_ms` is the smallest lease that would have passed. Neither
   /// bound carries any margin beyond exact algebraic sufficiency — a real
   /// deployment should clear it with real headroom (the shipped
@@ -210,7 +240,7 @@ pub type StartError {
   /// `3 * D + D` this rule accounts for. The real fix is moving renewals off
   /// the coordinator's own loop entirely (tracked in
   /// `docs/RELEASE-READINESS.md`, "Decide on per-attempt storage calls").
-  LeaseTooShortForDeadline(attempted: Int, minimum_ms: Int)
+  LeaseTooShortForDeadline(attempted_ms: Int, minimum_ms: Int)
 }
 
 /// The lease-rule minimum for `maximum_concurrency` and a storage deadline
@@ -229,7 +259,6 @@ pub fn minimum_lease_for_deadline(
 pub type StopError {
   ConsumerOwnedByAnotherProcess
   ConsumerStopTimedOut
-  ConsumerDrainTimedOut
 }
 
 pub type StopOutcome {
@@ -240,7 +269,18 @@ pub type StopOutcome {
   /// through lease expiry moving it to `Uncertain` and an audited
   /// resolution, independent of what any later `stop` call reports.
   StoppedCleanly
-  StoppedWithActiveWork(Int)
+  StoppedWithActiveWork(active_attempts: Int)
+  /// The supervisor teardown itself succeeded (this consumer's whole
+  /// process tree is gone), but the coordinator never confirmed whether its
+  /// own drain finished cleanly or was forced with active work still
+  /// outstanding before that teardown — the shutdown-confirmation request
+  /// this call also made timed out first. Not an error: the consumer is
+  /// stopped either way. Any attempt this incarnation still owned when its
+  /// supervisor came down is recovered the same way an abandoned attempt
+  /// always is — lease expiry to `Uncertain`, then an audited resolution —
+  /// regardless of which of `StoppedCleanly`/`StoppedWithActiveWork` it
+  /// would otherwise have been.
+  StoppedDrainUnconfirmed
   /// No coordinator was reachable under this consumer's name at all — for
   /// example a repeated `stop` on an already-stopped consumer, or a
   /// coordinator that crashed and was not, or not yet, restarted. The
@@ -285,8 +325,6 @@ type Message {
   ReadShutdownState(process.Subject(Bool))
   Renew(attempt_id: Int, epoch: Int, generation: Int)
   ReadRenewalStatus(reply: process.Subject(Option(RenewalStatus)))
-  InjectWorkerStartFailure(reply: process.Subject(Nil))
-  KillNextWorkerBeforeMonitor(reply: process.Subject(Nil))
   ProcessOne(reply: process.Subject(Result(Bool, ProcessError)))
   AttemptReturned(
     id: Int,
@@ -314,12 +352,12 @@ type WorkerMessage {
 type WorkerRequest {
   WorkerRequest(
     queue_subject: process.Subject(Message),
-    claimed: postgres.ClaimedJob,
+    claimed: attempt.ClaimedJob,
   )
 }
 
 type Completion {
-  Manual(reply: process.Subject(Result(Bool, ProcessError)))
+  ManualCompletion(reply: process.Subject(Result(Bool, ProcessError)))
   Automatic
 }
 
@@ -333,7 +371,7 @@ type ActiveAttempt {
     id: Int,
     attempt_id: Int,
     epoch: Int,
-    claimed: postgres.ClaimedJob,
+    claimed: attempt.ClaimedJob,
     worker_subject: process.Subject(WorkerMessage),
     monitor: process.Monitor,
     completion: Completion,
@@ -346,14 +384,14 @@ type ActiveAttempt {
     /// a clean shutdown drain, but its `worker_subject`/`monitor` are
     /// already stale (the worker was stopped and demonitored before the ack
     /// was ever attempted). This incarnation's own renewal timer retries the
-    /// exact same `acknowledge_claim` call (`postgres.acknowledgement_command_id`
+    /// exact same `acknowledge` call (`attempt.acknowledgement_command_id`
     /// is deterministic in job id, attempt id, and epoch, so the retry is
     /// idempotent), renewing the lease first on each tick while within
     /// `ConsumerState.pending_ack_retry_budget` — see `retry_pending_ack`'s
     /// and `retry_ack_until_known`'s doc comments for the full mechanism and
     /// why renewing (bounded) is the safe choice, not the lease-independence
     /// an earlier version of this fix wrongly assumed. Always `None` for a
-    /// `Manual` completion — a `process_one` caller already gets
+    /// `ManualCompletion` — a `process_one` caller already gets
     /// `QueueAckUnknown` back synchronously and can retry itself — and for
     /// an attempt whose worker is still running normally.
     pending_ack: Option(worker.Execution),
@@ -439,68 +477,38 @@ type ConsumerState {
     /// attempts are still running never accumulates more than one pending
     /// timer — see its doc comment.
     poll_scheduled: Bool,
-    fail_next_worker_start: Bool,
-    kill_next_worker_before_monitor: Bool,
+    hooks: Hooks,
     shutting_down: Bool,
     shutdown_generation: Int,
     shutdown_replies: List(process.Subject(ShutdownReply)),
   )
 }
 
-/// Starts a supervised, serial consumer. Serial execution is its concurrency
-/// bound, and an OTP child owns the process until `stop` is called.
-/// Allocates one atom-backed coordinator name (see `process.new_name`);
-/// bounded per call, reused rather than recreated across any internal
-/// restart.
+/// Starts a supervised, serial consumer under `policy`. Serial execution is
+/// its concurrency bound, and an OTP child owns the process until `stop` is
+/// called. `policy.polling` decides whether the consumer schedules its own
+/// `Poll` timer (`PollEvery`) or waits for a caller to drive each attempt
+/// through `process_one`/`process_batch` (`Manual`). Allocates one
+/// atom-backed coordinator name (see `process.new_name`); bounded per call,
+/// reused rather than recreated across any internal restart.
 pub fn start(
   database: Database,
   workers: Registry,
+  policy: ValidatedPolicy,
 ) -> Result(Consumer, StartError) {
-  let assert Ok(policy) = validate_policy(default_policy())
-  start_consumer(database, workers, policy, True)
+  start_with_hooks(database, workers, policy, consumer_hooks.none())
 }
 
-/// Starts an automatically polling queue with a validated local policy.
-/// Allocates one atom-backed coordinator name (see `process.new_name`);
-/// bounded per call, reused rather than recreated across any internal
-/// restart.
-pub fn start_with_policy(
+/// `start`'s own implementation, plus test-only `Hooks` into one consumer's
+/// worker-start sequence — see `consumer_hooks.Hooks`'s doc comment. Not
+/// part of the public API: every publicly-started consumer runs under
+/// `consumer_hooks.none()`.
+@internal
+pub fn start_with_hooks(
   database: Database,
   workers: Registry,
   policy: ValidatedPolicy,
-) -> Result(Consumer, StartError) {
-  start_consumer(database, workers, policy, True)
-}
-
-/// Starts a supervised consumer without a timer; callers drive each attempt
-/// through `process_one`. This is useful for deterministic operations and
-/// tests. Allocates one atom-backed coordinator name (see
-/// `process.new_name`); bounded per call, reused rather than recreated
-/// across any internal restart.
-pub fn start_manual(
-  database: Database,
-  workers: Registry,
-) -> Result(Consumer, StartError) {
-  let assert Ok(policy) = validate_policy(default_policy())
-  start_consumer(database, workers, policy, False)
-}
-
-/// Starts a manually polled queue with a validated local policy. Allocates
-/// one atom-backed coordinator name (see `process.new_name`); bounded per
-/// call, reused rather than recreated across any internal restart.
-pub fn start_manual_with_policy(
-  database: Database,
-  workers: Registry,
-  policy: ValidatedPolicy,
-) -> Result(Consumer, StartError) {
-  start_consumer(database, workers, policy, False)
-}
-
-fn start_consumer(
-  database: Database,
-  workers: Registry,
-  policy: ValidatedPolicy,
-  auto_poll: Bool,
+  hooks: Hooks,
 ) -> Result(Consumer, StartError) {
   let queue_name = registry.queue(workers)
   let ValidatedPolicy(maximum_concurrency:, lease_duration_ms:, ..) = policy
@@ -509,23 +517,12 @@ fn start_consumer(
       maximum_concurrency,
       postgres.statement_deadline_ms(database),
     )
-  case
-    queue_name == "",
-    registry.identities(workers),
-    lease_duration_ms < minimum_lease_ms
-  {
-    True, _, _ -> Error(RegistryQueueMismatch)
-    False, [], _ -> Error(NoRegisteredWorkers)
-    False, _, True ->
+  case registry.identities(workers), lease_duration_ms < minimum_lease_ms {
+    [], _ -> Error(NoRegisteredWorkers)
+    _, True ->
       Error(LeaseTooShortForDeadline(lease_duration_ms, minimum_lease_ms))
-    False, _, False ->
-      start_configured_consumer(
-        database,
-        workers,
-        queue_name,
-        policy,
-        auto_poll,
-      )
+    _, False ->
+      start_configured_consumer(database, workers, queue_name, policy, hooks)
   }
 }
 
@@ -534,7 +531,7 @@ fn start_configured_consumer(
   workers: Registry,
   queue_name: String,
   policy: ValidatedPolicy,
-  auto_poll: Bool,
+  hooks: Hooks,
 ) -> Result(Consumer, StartError) {
   // Created once per consumer, never inside the child start function: a
   // restarted coordinator incarnation re-registers this same name (the prior
@@ -555,7 +552,7 @@ fn start_configured_consumer(
         workers,
         queue_name,
         policy,
-        auto_poll,
+        hooks,
         coordinator_name,
         handoff_reply,
         handoff_pid,
@@ -574,7 +571,7 @@ fn start_configured_consumer_with_handoff(
   workers: Registry,
   queue_name: String,
   policy: ValidatedPolicy,
-  auto_poll: Bool,
+  hooks: Hooks,
   coordinator_name: process.Name(Message),
   handoff_reply: process.Subject(QueueActorHandoffMessage),
   handoff_pid: process.Pid,
@@ -582,12 +579,16 @@ fn start_configured_consumer_with_handoff(
   stop_handoff: process.Subject(Nil),
 ) -> Result(Consumer, StartError) {
   let ValidatedPolicy(
-    poll_interval_ms: _,
+    polling:,
     maximum_jobs_per_poll:,
     maximum_concurrency: _,
     lease_duration_ms:,
     shutdown_grace_ms:,
   ) = policy
+  let auto_poll = case polling {
+    PollEvery(_) -> True
+    Manual -> False
+  }
   let renewal_interval_ms = case lease_duration_ms / 3 > 0 {
     True -> lease_duration_ms / 3
     False -> 1
@@ -608,8 +609,8 @@ fn start_configured_consumer_with_handoff(
       // supervised restart both run this closure), so each incarnation has
       // its own distinct owner label. attempt_owner is itself part of the
       // SQL fence checked alongside attempt_id and epoch on renewal,
-      // release, and resolution (postgres.gleam's `renew_claim`,
-      // `release_unstarted_claim`, `acknowledge`, and the resolution
+      // release, and resolution (grind/internal/attempt's `renew`,
+      // `release_unstarted`, `acknowledge`, and the resolution
       // route); attempt_id is already globally unique on its own (a
       // noncycling sequence), so this label does not change which row a
       // correct claim can match, but a distinct label per incarnation means
@@ -648,8 +649,7 @@ fn start_configured_consumer_with_handoff(
                 active: [],
                 poll_remaining_jobs: 0,
                 poll_scheduled: auto_poll,
-                fail_next_worker_start: False,
-                kill_next_worker_before_monitor: False,
+                hooks:,
                 shutting_down: False,
                 shutdown_generation: 0,
                 shutdown_replies: [],
@@ -931,7 +931,7 @@ pub fn stop(consumer: Consumer) -> Result(StopOutcome, StopError) {
             ShutdownReceived(ShutdownForced(active)) ->
               Ok(StoppedWithActiveWork(active))
             ShutdownAbsent -> Ok(StoppedWithoutDrain)
-            ShutdownTimedOut -> Error(ConsumerDrainTimedOut)
+            ShutdownTimedOut -> Ok(StoppedDrainUnconfirmed)
           }
       }
     }
@@ -986,20 +986,6 @@ pub fn renewal_status(
   consumer: Consumer,
 ) -> Result(Option(RenewalStatus), ProcessError) {
   call_coordinator(consumer, ReadRenewalStatus)
-}
-
-@internal
-pub fn fail_next_worker_start(consumer: Consumer) -> Result(Nil, ProcessError) {
-  call_coordinator(consumer, InjectWorkerStartFailure)
-}
-
-/// Test hook that kills the next idle worker after start_child but before its
-/// owner installs a monitor. It exercises OTP's already-dead monitor edge.
-@internal
-pub fn kill_next_worker_before_monitor(
-  consumer: Consumer,
-) -> Result(Nil, ProcessError) {
-  call_coordinator(consumer, KillNextWorkerBeforeMonitor)
 }
 
 /// Returns the coordinator incarnation owned by this consumer handle.
@@ -1075,16 +1061,6 @@ fn handle_message(
       process.send(reply, status)
       actor.continue(state)
     }
-    InjectWorkerStartFailure(reply) -> {
-      process.send(reply, Nil)
-      actor.continue(ConsumerState(..state, fail_next_worker_start: True))
-    }
-    KillNextWorkerBeforeMonitor(reply) -> {
-      process.send(reply, Nil)
-      actor.continue(
-        ConsumerState(..state, kill_next_worker_before_monitor: True),
-      )
-    }
     ProcessOne(reply) -> {
       let ValidatedPolicy(maximum_concurrency:, ..) = state.policy
       case state.shutting_down {
@@ -1098,7 +1074,7 @@ fn handle_message(
               process.send(reply, Error(QueueBusy))
               actor.continue(state)
             }
-            False -> start_attempt(state, Manual(reply))
+            False -> start_attempt(state, ManualCompletion(reply))
           }
       }
     }
@@ -1182,12 +1158,11 @@ fn start_attempt(
     incarnation_subject:,
     lease_duration_ms:,
     renewal_interval_ms:,
-    fail_next_worker_start:,
-    kill_next_worker_before_monitor:,
+    hooks:,
     ..,
   ) = state
   case
-    postgres.claim_one(
+    attempt.claim_one(
       database,
       queue,
       workers,
@@ -1199,30 +1174,17 @@ fn start_attempt(
       finish_without_claim(state, completion, Error(QueueProcessFailed(error)))
     Ok(None) -> finish_without_claim(state, completion, Ok(False))
     Ok(Some(claimed)) -> {
-      let #(id, attempt_id, epoch) = postgres.claim_identity(claimed)
+      let #(id, attempt_id, epoch) = attempt.claim_identity(claimed)
       let request = WorkerRequest(incarnation_subject, claimed)
-      let state =
-        ConsumerState(
-          ..state,
-          fail_next_worker_start: False,
-          kill_next_worker_before_monitor: False,
-        )
-      let start_result = case fail_next_worker_start {
-        True -> Error(actor.InitFailed("injected start failure"))
-        False -> factory_supervisor.start_child(worker_factory, request)
+      let start_result = case hooks.before_worker_start() {
+        Error(reason) -> Error(actor.InitFailed(reason))
+        Ok(Nil) -> factory_supervisor.start_child(worker_factory, request)
       }
       case start_result {
         Error(error) ->
           release_failed_worker_start(state, completion, claimed, error)
         Ok(started) -> {
-          case kill_next_worker_before_monitor {
-            True -> {
-              process.kill(started.pid)
-              wait_for_worker_exit(started.pid, 1000)
-              Nil
-            }
-            False -> Nil
-          }
+          hooks.after_worker_start(started.pid)
           let monitor = process.monitor(started.pid)
           case process.is_alive(started.pid) {
             False -> {
@@ -1257,7 +1219,7 @@ fn start_attempt(
                   active: list.prepend(state.active, active),
                 )
               let state = case completion {
-                Manual(_) -> state
+                ManualCompletion(_) -> state
                 Automatic ->
                   ConsumerState(
                     ..state,
@@ -1276,10 +1238,10 @@ fn start_attempt(
 fn release_dead_worker_before_activation(
   state: ConsumerState,
   completion: Completion,
-  claimed: postgres.ClaimedJob,
+  claimed: attempt.ClaimedJob,
 ) -> actor.Next(ConsumerState, Message) {
   case
-    postgres.release_unstarted_claim(
+    attempt.release_unstarted(
       state.database,
       state.queue,
       state.attempt_owner,
@@ -1307,7 +1269,12 @@ fn release_dead_worker_before_activation(
   }
 }
 
-fn wait_for_worker_exit(pid: process.Pid, checks_remaining: Int) -> Nil {
+/// Polls (1ms apiece) until `pid` is no longer alive or `checks_remaining`
+/// is spent. Exposed only so a test's own `Hooks.after_worker_start` can
+/// wait out a worker it just killed before this coordinator's own
+/// `process.monitor` call — see `consumer_hooks.Hooks`.
+@internal
+pub fn wait_for_worker_exit(pid: process.Pid, checks_remaining: Int) -> Nil {
   case process.is_alive(pid), checks_remaining > 0 {
     False, _ -> Nil
     True, False -> Nil
@@ -1321,11 +1288,11 @@ fn wait_for_worker_exit(pid: process.Pid, checks_remaining: Int) -> Nil {
 fn release_failed_worker_start(
   state: ConsumerState,
   completion: Completion,
-  claimed: postgres.ClaimedJob,
+  claimed: attempt.ClaimedJob,
   start_error: actor.StartError,
 ) -> actor.Next(ConsumerState, Message) {
   case
-    postgres.release_unstarted_claim(
+    attempt.release_unstarted(
       state.database,
       state.queue,
       state.attempt_owner,
@@ -1359,7 +1326,7 @@ fn finish_without_claim(
   result: Result(Bool, ProcessError),
 ) -> actor.Next(ConsumerState, Message) {
   let state = case completion {
-    Manual(reply) -> {
+    ManualCompletion(reply) -> {
       process.send(reply, result)
       state
     }
@@ -1382,7 +1349,7 @@ fn finish_attempt(
       process.demonitor_process(monitor)
       process.send(worker_subject, StopWorker)
       let result =
-        postgres.acknowledge_claim(
+        attempt.acknowledge(
           state.database,
           state.queue,
           state.attempt_owner,
@@ -1400,18 +1367,18 @@ fn finish_attempt(
 /// another retry. A retry already in flight (`pending_ack: Some`) also
 /// retries on a plain `QueueAckFailed` — the transaction callback failed so
 /// `COMMIT` was never sent (the same "genuinely did not commit" reasoning
-/// `unique.AdmissionFailed`'s doc comment gives), but surfacing that here
+/// `submission.NotCommitted`'s doc comment gives), but surfacing that here
 /// would silently drop the claim in `Automatic` mode exactly like an
 /// unhandled `QueueAckUnknown` would, and retrying costs nothing extra since
 /// `command_id` already makes it idempotent; a *first* attempt's own
 /// `QueueAckFailed` is unaffected and still resolves immediately, unchanged.
 /// Anything else — success, one of the ack's own known-outcome errors
 /// (`QueueAckStale`, `QueueAckCommandConflict`, ...), or any result at all
-/// under `Manual` completion — resolves it exactly like an ordinary
+/// under `ManualCompletion` — resolves it exactly like an ordinary
 /// first-attempt result always has, which for `Automatic` completion means
 /// `finish_completion` calling straight through to `fill_automatic_slots`/
 /// `continue_if_idle`, so a slot a resolved retry frees is reused promptly.
-/// `Manual` deliberately never retries: a `process_one` caller already gets
+/// `ManualCompletion` deliberately never retries: a `process_one` caller already gets
 /// `QueueAckUnknown` back synchronously today and can already call
 /// `reconcile_acknowledgement` itself; only automatic mode had no caller
 /// left to hand an unknown ack to, which is the gap this fixes.
@@ -1501,11 +1468,11 @@ fn retry_ack_until_known(
 /// live lease, exactly like an ordinary in-progress attempt's renewal — for
 /// as long as `pending_ack_ticks` stays under `ConsumerState.
 /// pending_ack_retry_budget`; a not-yet-committed retry's own acknowledgement
-/// UPDATE is *itself* fenced the same way (`postgres.live_lease_predicate`),
+/// UPDATE is *itself* fenced the same way (`lease.live_lease_predicate`),
 /// so renewing is what keeps that path retriable rather than merely
 /// "possible in principle": once the lease is gone, only a receipt-matched
 /// commit can still resolve it. If the original attempt's transaction
-/// actually committed already (a lost reply, not an abort), `renew_claim`'s
+/// actually committed already (a lost reply, not an abort), `renew`'s
 /// own fence no longer matches (the row is no longer `executing` under this
 /// attempt) and it harmlessly reports `Ok(False)`; the acknowledgement retry
 /// right after it reconciles from the now-visible receipt regardless — that
@@ -1526,7 +1493,7 @@ fn retry_pending_ack(
   case pending_ack_ticks < state.pending_ack_retry_budget {
     True -> {
       let _ =
-        postgres.renew_claim(
+        attempt.renew(
           state.database,
           state.queue,
           state.attempt_owner,
@@ -1538,7 +1505,7 @@ fn retry_pending_ack(
     False -> Nil
   }
   let result =
-    postgres.acknowledge_claim(
+    attempt.acknowledge(
       state.database,
       state.queue,
       state.attempt_owner,
@@ -1555,7 +1522,7 @@ fn finish_completion(
   result: Result(Bool, ProcessError),
 ) -> actor.Next(ConsumerState, Message) {
   case completion {
-    Manual(reply) -> {
+    ManualCompletion(reply) -> {
       process.send(reply, result)
       continue_after_completion(state)
     }
@@ -1587,7 +1554,7 @@ fn continue_after_start(
   completion: Completion,
 ) -> actor.Next(ConsumerState, Message) {
   case completion {
-    Manual(_) -> actor.continue(state)
+    ManualCompletion(_) -> actor.continue(state)
     Automatic -> fill_automatic_slots(state)
   }
 }
@@ -1771,7 +1738,7 @@ fn renew_lease(
 ) -> actor.Next(ConsumerState, Message) {
   let ActiveAttempt(attempt_id:, epoch:, renewal_generation:, ..) = active
   let result =
-    postgres.renew_claim(
+    attempt.renew(
       state.database,
       state.queue,
       state.attempt_owner,
@@ -1779,7 +1746,7 @@ fn renew_lease(
       state.lease_duration_ms,
     )
   case result {
-    Ok(True) -> {
+    Ok(attempt.Renewed) -> {
       let state =
         set_renewal_status(state, attempt_id, epoch, LeaseRenewalConfirmed)
       let _ =
@@ -1790,7 +1757,7 @@ fn renew_lease(
         )
       actor.continue(state)
     }
-    Ok(False) ->
+    Ok(attempt.LeaseLost) ->
       actor.continue(set_renewal_status(
         state,
         attempt_id,
@@ -1862,11 +1829,12 @@ fn handle_worker_down(
               active: remove_active(state.active, id, attempt_id, epoch),
             )
           case completion {
-            Manual(reply) -> process.send(reply, Error(QueueWorkerExited))
+            ManualCompletion(reply) ->
+              process.send(reply, Error(QueueWorkerExited))
             Automatic -> Nil
           }
           let state = case completion {
-            Manual(_) -> state
+            ManualCompletion(_) -> state
             Automatic -> ConsumerState(..state, poll_remaining_jobs: 0)
           }
           continue_after_completion(state)
@@ -1877,14 +1845,18 @@ fn handle_worker_down(
 }
 
 fn schedule_next_poll(state: ConsumerState) -> Nil {
-  let ValidatedPolicy(poll_interval_ms:, ..) = state.policy
+  let ValidatedPolicy(polling:, ..) = state.policy
+  let poll_interval_ms = case polling {
+    PollEvery(interval_ms) -> interval_ms
+    Manual -> 0
+  }
   schedule_poll(state.incarnation_subject, state.auto_poll, poll_interval_ms)
 }
 
 type WorkerState {
   WorkerState(
     queue_subject: process.Subject(Message),
-    claimed: postgres.ClaimedJob,
+    claimed: attempt.ClaimedJob,
   )
 }
 
@@ -1896,8 +1868,8 @@ fn worker_actor(
   |> actor.on_message(fn(state, message) {
     case message {
       StartAttempt -> {
-        let #(id, attempt_id, epoch) = postgres.claim_identity(state.claimed)
-        let execution = postgres.execute_claim(state.claimed)
+        let #(id, attempt_id, epoch) = attempt.claim_identity(state.claimed)
+        let execution = attempt.execute_claim(state.claimed)
         process.send(
           state.queue_subject,
           AttemptReturned(id, attempt_id, epoch, execution),

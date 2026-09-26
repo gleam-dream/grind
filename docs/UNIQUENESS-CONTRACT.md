@@ -1,7 +1,7 @@
 # Uniqueness contract
 
 This document records the approved contract for Grind's uniqueness admission
-(`grind/unique`, `grind/internal/unique_admission`, and
+(`grind/unique`, `grind/submission`, `grind/internal/unique_admission`, and
 `submit_unique`/`reconcile_unique` in `grind/postgres`), the decisions behind
 it, the schema v11 change it required, its failure modes, and what remains
 out of scope. It supersedes the sketch in
@@ -13,9 +13,10 @@ shape.
 
 ## Status
 
-Implemented: schema v11; the pure `grind/unique` policy module (which also
-owns the four public admission-result types — see "Module placement"); the
-admission transaction (lock, receipt lookup, time sampling, candidate
+Implemented: schema v11; the pure `grind/unique` policy module, and
+`grind/submission` for the four public admission-result types (see "Module
+placement"); the admission transaction (lock, receipt lookup, time sampling,
+candidate
 selection, decision, receipt, commit) in `grind/internal/unique_admission`,
 reached through `submit_unique`/`reconcile_unique`; sequential admission and
 identity tests, including PostgreSQL JSON-equality cases and worker identity
@@ -104,7 +105,7 @@ jobs and zero receipts, genuinely indistinguishable from a lost reply after
 a real commit — `reconcile_unique` alone can never resolve it (nothing was
 ever recorded), so the only correct recovery is a plain retry of the same
 `SubmissionId`. A pool closed before `submit_unique` ever sends anything
-gives `AdmissionFailed(ConnectionUnavailable)` — knowably not committed, no
+gives `NotCommitted(ConnectionUnavailable)` — knowably not committed, no
 `PendingSubmission`, no receipt lookup attempted — via a dedicated FFI
 wrapper (`transaction_or_checkout_failure`, `grind_postgres_ffi.erl`) that
 distinguishes a checkout failure (nothing was ever attempted) from pog's own
@@ -115,7 +116,7 @@ same `pog.TransactionQueryError` shape, and a pool closed while a commit is
 genuinely parked (and therefore possibly already committed) hit exactly
 that ambiguity — the follow-up receipt lookup this second case needs also
 failed to reach the (now fully closed) store, and the unfixed code returned
-that lookup failure as `AdmissionFailed`, silently discarding the
+that lookup failure as `NotCommitted`, silently discarding the
 `PendingSubmission` a caller would need to ever learn the zombie transaction
 later committed. Fixed in two parts: `reconcile_from_receipt` now maps a
 failed lookup to `CommitUnknown(pending)` (the same as finding no receipt
@@ -135,7 +136,7 @@ zombie is terminated and confirmed gone (`wait_for_backend_gone`),
 selection reinterpreting the row as a fresh conflict — `Inserted` with the
 original job id, one row, and the plain-retry path converges on that same
 id. Proven red before the fix (the exact bug: `submit_unique`'s reply for
-the store-unavailable fault was `AdmissionFailed(ConnectionUnavailable)`
+the store-unavailable fault was `NotCommitted(ConnectionUnavailable)`
 instead of the expected `CommitUnknown(pending)`) and by mutation after it
 (reverting either half of the fix independently reproduces the bug, or
 turns every genuinely-committed-but-reply-lost case red at once, or makes
@@ -197,7 +198,7 @@ The admission transaction lives in `grind/internal/unique_admission`, which
 has no dependency on `grind/postgres` — `grind/postgres` depends on it
 instead, one-directionally. This module owns the SQL and never appears in
 Grind's public API. Unlike an earlier draft, it has **no parallel mirror
-types**: it builds and returns `grind/unique`'s own public
+types**: it builds and returns `grind/submission`'s own public
 `Admission`/`Conflict`/`SubmitError`/`PendingSubmission` values
 directly (via a small set of `@internal` constructors and field accessors on
 the opaque ones — `new_conflict`, `new_pending_submission`, and
@@ -205,19 +206,23 @@ the opaque ones — `new_conflict`, `new_pending_submission`, and
 `pending_submission_request_sha256` — rather than an intermediate fields
 record), so
 `submit_unique`/`reconcile_unique` in `grind/postgres` are thin entry points
-that call straight through, not a second translating layer. `Availability`
-and `ConflictAction` also live in `grind/unique` rather than `grind/postgres`,
-specifically so both `grind/postgres` and `grind/internal/unique_admission`
-can depend on them without a cycle — a deliberate placement adjustment from
-an earlier draft of this contract, which had `Availability` in
-`grind/postgres`.
+that call straight through, not a second translating layer.
+
+`Admission`/`Conflict`/`SubmitError`/`PendingSubmission`, the stable
+`SubmissionId` identity, and `Availability` live in `grind/submission`
+rather than `grind/unique` — a later pass (plan commit 13) pulled them out
+of `grind/unique` into their own module, since they apply to plain
+`submit`/`submit_at` too, which never touch a uniqueness policy at all;
+`grind/unique` keeps only the policy vocabulary (`Key`, `Policy`, `States`,
+`Period`, `QueueScope`, `ConflictAction`). `ConflictAction` stays in
+`grind/unique` (it configures a _policy's_ own conflict handling), so both
+`grind/postgres` and `grind/internal/unique_admission` depend on
+`grind/submission` and `grind/unique` independently, with neither of those
+two depending on the other — no cycle.
 
 ## Public contract
 
-`src/grind/unique.gleam` (pure policy values; the admission-result types
-below are produced by `grind/internal/unique_admission`'s PostgreSQL
-transaction, but the types themselves live here too, so `grind/postgres`
-never needs its own mirrors — see "Module placement" above):
+`src/grind/unique.gleam` (pure policy values only):
 
 ```gleam
 pub type QueueScope { WithinQueue  AcrossQueues }
@@ -226,17 +231,25 @@ pub opaque type Period
 pub fn within_milliseconds(ms: Int, from: UniqueTimestamp) -> Result(Period, PolicyError)
 pub fn while_retained() -> Period
 pub type States { Incomplete  ScheduledOnly  IncompleteOrSucceeded  AllRetained }
-pub type Availability { Immediately  At(job.AvailableAt) }
 pub type ConflictAction { KeepExisting  RescheduleScheduledTo(job.AvailableAt) }
 pub opaque type Key(input)
 pub fn full_input() -> Key(input)
 pub fn selected(name: String, select: fn(input) -> key, codec: worker.Codec(key)) -> Result(Key(input), PolicyError)
 pub opaque type Policy(input)
 pub fn policy(key: Key(input), scope: QueueScope, period: Period, states: States) -> Policy(input)
+pub type PolicyError { NonPositivePeriod  PeriodAbovePrecisionBound  EmptyKeyName }
+```
+
+`src/grind/submission.gleam` (the admission vocabulary every submit path
+returns — the types themselves live here, so `grind/postgres` never needs
+its own mirrors — see "Module placement" above):
+
+```gleam
 pub opaque type SubmissionId
-pub fn submission_id(value: String) -> Result(SubmissionId, PolicyError)
+pub fn submission_id(value: String) -> Result(SubmissionId, SubmissionIdError)
 pub fn submission_id_value(id: SubmissionId) -> String
-pub type PolicyError { NonPositivePeriod  PeriodAbovePrecisionBound  EmptyKeyName  EmptySubmissionId }
+pub type SubmissionIdError { EmptySubmissionId }
+pub type Availability { Immediately  At(job.AvailableAt) }
 
 pub opaque type Conflict
 pub fn conflict_job_id(c: Conflict) -> Int
@@ -253,22 +266,23 @@ pub type SubmitError(input, output, error) {
   EmptyQueueName
   AdmissionContended
   SubmissionConflict
-  AdmissionFailed(pog.QueryError)
+  NotCommitted(pog.QueryError)
   CommitUnknown(PendingSubmission(input, output, error))
+  CommitUnknownWithoutId(pog.QueryError)
 }
 ```
 
 `src/grind/postgres.gleam` additions (thin entry points over
-`grind/internal/unique_admission`, returning `grind/unique`'s types
+`grind/internal/unique_admission`, returning `grind/submission`'s types
 unchanged):
 
 ```gleam
 pub fn submit_unique(database, queue, submission_id, worker, input, availability, policy, on_conflict)
-  -> Result(unique.Admission(i, o, e), unique.SubmitError(i, o, e))
-pub fn reconcile_unique(database, pending) -> Result(unique.Admission(i, o, e), unique.SubmitError(i, o, e))
+  -> Result(submission.Admission(i, o, e), submission.SubmitError(i, o, e))
+pub fn reconcile_unique(database, pending) -> Result(submission.Admission(i, o, e), submission.SubmitError(i, o, e))
 pub fn unique_lock_wait(settings: Settings, milliseconds: Int) -> Settings
 pub fn submit_with_id(database, queue, submission_id, worker, input, availability)
-  -> Result(unique.Admission(i, o, e), unique.SubmitError(i, o, e))
+  -> Result(submission.Admission(i, o, e), submission.SubmitError(i, o, e))
 ```
 
 `submit_with_id` (approved contract decision, 2026-09-25 — "Retry-safe plain
@@ -286,7 +300,7 @@ target" state to reject before storage, because it is not constructible.
 owner, actual queue, worker id/version, and the state observed at decision
 time (not necessarily the row's current state — it may have progressed
 since), but no codecs. Callers rebind it with the existing
-`bind_handle(database, worker, unique.conflict_job_id(conflict))` before
+`bind_handle(database, worker, submission.conflict_job_id(conflict))` before
 reading typed state — the same function used to rebind a durable id after a
 restart. There is no separate `bind_conflict`; one binding function already
 exists and does the same job.
@@ -348,7 +362,7 @@ it means" identically regardless of which call discovered it.
    backlog, not done in this slice (see "Out of scope").
 6. **A blocking, bounded lock wait**, not Oban's advisory-lock-miss-returns-
    a-conflict-with-`nil`-id. `submit_unique` sets `lock_timeout` (from
-   `unique_lock_wait`, default 5000ms, validated positive by `validate`
+   `unique_lock_wait`, default 2000ms, validated positive by `validate`
    before any pool starts) then acquires `pg_advisory_xact_lock`. Every
    query in the admission transaction — not only the lock acquisition — is
    classified through the same function, so a PostgreSQL `55P03`
@@ -553,7 +567,7 @@ pog's own transaction outcome through a dedicated FFI wrapper,
 distinguishes a checkout failure — the pool could not hand out a connection
 at all, so `BEGIN` never ran; knowably not committed — from pog's own
 `Result(a, pog.TransactionError(b))`. A checkout failure is
-`AdmissionFailed(pog.ConnectionUnavailable)` directly, with no
+`NotCommitted(pog.ConnectionUnavailable)` directly, with no
 `PendingSubmission` and no receipt lookup attempted. A `pog.TransactionQueryError`
 (the connection was lost mid-transaction — checked out fine, so its outcome
 is genuinely unknown, not knowably absent) re-reads the receipt once,
@@ -669,7 +683,7 @@ genuinely predates v11.
   lost reply with the store also unavailable) in
   `docs/RECOVERY-EVIDENCE.md`, Increment 11. Only a pool closed _before_
   `submit_unique` ever sends anything does not retain a `PendingSubmission`
-  — that fault is knowably not-committed (`AdmissionFailed(ConnectionUnavailable)`),
+  — that fault is knowably not-committed (`NotCommitted(ConnectionUnavailable)`),
   so a plain retry of the same `SubmissionId` is the only recovery needed.
   The different-key `23505` receipt-PK race (see above) also remains
   untested.
@@ -693,9 +707,9 @@ nested projected value), and public-API consumer coverage of admission,
 existing-conflict rebinding, `SubmissionId` replay, and an across-queue
 reschedule — increments 4 through 13 of the same approved plan — are now
 covered; see "Status". This milestone is otherwise complete. Converging
-plain `submit`/`submit_at` (the ID-less pair) onto `unique.Availability`
+plain `submit`/`submit_at` (the ID-less pair) onto `submission.Availability`
 instead of `Option(job.AvailableAt)` remains retained backlog, noted in
-Decision 5 — `submit_with_id` below already takes `unique.Availability`.
+Decision 5 — `submit_with_id` below already takes `submission.Availability`.
 
 ## Admission receipts (approved contract decision, 2026-09-25)
 
@@ -708,8 +722,8 @@ builds the same internal `Request` `submit_unique` does with `policy: None`,
 then runs through the identical `run`/`admission_transaction`/`insert_job`
 functions `submit_unique` uses with `policy: Some(_)` — one admission
 transaction, not a duplicated implementation. It returns the same
-`unique.Admission`/
-`unique.SubmitError` family `submit_unique` does: `Inserted` on this call's
+`submission.Admission`/
+`submission.SubmitError` family `submit_unique` does: `Inserted` on this call's
 own first commit, or on a matching replay; `SubmissionConflict` for a
 different request reusing the same id; `CommitUnknown` (recoverable with
 `reconcile_unique`, or a plain retry of the same `SubmissionId`) when this

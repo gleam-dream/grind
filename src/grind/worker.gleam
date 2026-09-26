@@ -251,17 +251,46 @@ pub fn respond(
   }
 }
 
-@internal
-pub type FailureCause {
+/// Why a worker's business failure is terminal — never retried again, either
+/// because its retry budget is spent or because the worker itself declined
+/// a retry. Carried by `Execution.ExecutedBusinessFailure.cause` and, from
+/// there, by `job.Outcome`'s `BusinessFailedWithCause`/
+/// `FailedOperationallyWithCause`; lives here rather than on `grind/job`
+/// since `grind/job` already depends on `grind/worker` (for `Codec`/
+/// `Worker`), not the other way around.
+pub type BusinessFailureCause {
   BudgetExhausted
   RetryDeclined
+}
+
+/// The stable, storage-facing string for a `BusinessFailureCause` — the one
+/// place this mapping is written. `business_failure_cause_from_string` is
+/// its inverse. Internal: only Grind's own storage/observation code needs
+/// this mapping; a caller holds a typed `BusinessFailureCause` already.
+@internal
+pub fn business_failure_cause_to_string(cause: BusinessFailureCause) -> String {
+  case cause {
+    BudgetExhausted -> "budget_exhausted"
+    RetryDeclined -> "retry_declined"
+  }
+}
+
+@internal
+pub fn business_failure_cause_from_string(
+  raw: String,
+) -> Result(BusinessFailureCause, Nil) {
+  case raw {
+    "budget_exhausted" -> Ok(BudgetExhausted)
+    "retry_declined" -> Ok(RetryDeclined)
+    _ -> Error(Nil)
+  }
 }
 
 @internal
 pub type ResolvedResponse(output, error) {
   ResolvedSucceeded(output)
   ResolvedRetryable(error, RetryDelay)
-  ResolvedBusinessFailure(error, FailureCause)
+  ResolvedBusinessFailure(error, BusinessFailureCause)
   ResolvedSnoozed(RetryDelay, String)
   ResolvedDiscarded(String)
   ResolvedCancelled(String)
@@ -304,7 +333,18 @@ pub fn resolve_response(
   }
 }
 
+/// Which of a worker's three codec contracts (input, output, error)
+/// disagreed with what was stored, or with a registered worker's declared
+/// version, when a claimed row's worker identity was resolved against the
+/// running registry.
+pub type CodecKind {
+  InputCodec
+  OutputCodec
+  ErrorCodec
+}
+
 /// The persistence metadata bound to a worker definition.
+@internal
 pub type Metadata {
   Metadata(
     id: String,
@@ -398,7 +438,7 @@ pub type Execution {
     error_version: Option(String),
     encoded_error: Option(String),
     description: String,
-    cause: String,
+    cause: BusinessFailureCause,
   )
   ExecutedRetryable(
     error_version: Option(String),
@@ -446,10 +486,6 @@ pub fn execute_encoded(
         ResolvedBusinessFailure(application_error, cause) -> {
           let #(error_version, encoded_error) =
             encode_error(worker, application_error)
-          let cause = case cause {
-            BudgetExhausted -> "budget_exhausted"
-            RetryDeclined -> "retry_declined"
-          }
           ExecutedBusinessFailure(
             error_version,
             encoded_error,

@@ -37,7 +37,8 @@
 //// cares can collapse a `Replied`/`Reconciled` pair for the same command.
 ////
 //// The events: `acknowledged`, `admitted`, `claimed`, `quarantined`,
-//// `resolved`, `cancellation`, `released`, and `contract_mismatch`.
+//// `resolved`, `cancellation_decided`, `released`, and
+//// `contract_mismatch_recorded`.
 //// `JobRef`/`AttemptRef` are the shared
 //// identity/attempt-fencing shapes every event's metadata embeds rather
 //// than redeclaring per event; embedding them in `acknowledged`'s own
@@ -50,6 +51,7 @@ import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/option.{type Option}
 import grind/job
+import grind/worker
 import sinal.{type Event}
 import sinal/fields
 
@@ -91,7 +93,7 @@ pub type JobRef {
 
 /// Shared attempt fencing fields carried by every event that is about one
 /// claimed attempt rather than the job as a whole (`acknowledged`, `claimed`,
-/// `quarantined`, `released`, `contract_mismatch`). `attempt` is the attempt
+/// `quarantined`, `released`, `contract_mismatch_recorded`). `attempt` is the attempt
 /// number (`grind_jobs.attempt_count` at the time of the event), distinct
 /// from `attempt_id` (the durable per-attempt identity) and `epoch` (this
 /// job's own attempt-fencing counter).
@@ -128,7 +130,7 @@ pub type AcknowledgedMeasurements {
 /// the commit was proven by `Reconciled` receipt-read rather than by a fresh
 /// write — the acknowledgement receipt itself does not retain a
 /// re-derivable `available_at`. `command_id` is the stable acknowledgement
-/// fence for this attempt (`grind/postgres.acknowledgement_command_id`),
+/// fence for this attempt (`grind/internal/attempt.acknowledgement_command_id`),
 /// making it this event's dedupe key across a `Replied`/`Reconciled` pair.
 pub type AcknowledgedMetadata {
   AcknowledgedMetadata(
@@ -136,7 +138,7 @@ pub type AcknowledgedMetadata {
     attempt: AttemptRef,
     proposed: Proposed,
     committed_state: job.State,
-    failure_cause: Option(job.BusinessFailureCause),
+    failure_cause: Option(worker.BusinessFailureCause),
     available_at_unix_ms: Option(Int),
     confirmation: Confirmation,
     command_id: String,
@@ -247,7 +249,7 @@ pub type ResolvedMetadata {
   )
 }
 
-/// `[grind, job, cancellation]` measurements. `count` is always `1`.
+/// `[grind, job, cancellation_decided]` measurements. `count` is always `1`.
 pub type CancellationMeasurements {
   CancellationMeasurements(count: Int)
 }
@@ -256,11 +258,11 @@ pub type CancellationMeasurements {
 /// the read-only variants (`AlreadyCancelled`, `AlreadyUncertain`,
 /// `AlreadyFinished`) never reach this type because they never emit.
 pub type CancellationOutcome {
-  CancelledBeforeRunOutcome
-  CancellationRequestedOutcome
+  CancellationDecidedBeforeRun
+  CancellationDecidedWhileRunning
 }
 
-/// `[grind, job, cancellation]` metadata. `outcome: CancellationRequestedOutcome`
+/// `[grind, job, cancellation_decided]` metadata. `outcome: CancellationDecidedWhileRunning`
 /// can be delivered more than once for the same job: cancelling an already
 /// `executing` job whose cancellation is already requested is idempotent at
 /// the storage layer (`postgres`'s `cancel_executing` re-affirms the existing
@@ -288,21 +290,12 @@ pub type ReleasedMetadata {
   ReleasedMetadata(ref: JobRef, attempt: AttemptRef, restored_state: job.State)
 }
 
-/// `[grind, job, contract_mismatch]` measurements. `count` is always `1`.
+/// `[grind, job, contract_mismatch_recorded]` measurements. `count` is always `1`.
 pub type ContractMismatchMeasurements {
   ContractMismatchMeasurements(count: Int)
 }
 
-/// Which of a worker's three codec contracts (input, output, error) disagreed
-/// with what was stored when a claimed row's worker identity was resolved
-/// against the running registry.
-pub type CodecKind {
-  InputCodec
-  OutputCodec
-  ErrorCodec
-}
-
-/// `[grind, job, contract_mismatch]` metadata: a claimed attempt parked in
+/// `[grind, job, contract_mismatch_recorded]` metadata: a claimed attempt parked in
 /// the terminal, nonclaimable `contract_mismatch` state (not returned to
 /// `queued` — contrast `released` above) because the registered worker's
 /// codec contract no longer matches what was persisted when the job was
@@ -313,7 +306,7 @@ pub type ContractMismatchMetadata {
   ContractMismatchMetadata(
     ref: JobRef,
     attempt: AttemptRef,
-    kind: CodecKind,
+    kind: worker.CodecKind,
     expected_version: String,
     actual_version: String,
   )
@@ -342,23 +335,6 @@ fn proposed_from_string(raw: String) -> Result(Proposed, Nil) {
     "discarded" -> Ok(ProposedDiscarded)
     "cancelled" -> Ok(ProposedCancelled)
     "uncertain" -> Ok(ProposedUncertain)
-    _ -> Error(Nil)
-  }
-}
-
-fn business_failure_cause_to_string(cause: job.BusinessFailureCause) -> String {
-  case cause {
-    job.BudgetExhausted -> "budget_exhausted"
-    job.RetryDeclined -> "retry_declined"
-  }
-}
-
-fn business_failure_cause_from_string(
-  raw: String,
-) -> Result(job.BusinessFailureCause, Nil) {
-  case raw {
-    "budget_exhausted" -> Ok(job.BudgetExhausted)
-    "retry_declined" -> Ok(job.RetryDeclined)
     _ -> Error(Nil)
   }
 }
@@ -399,8 +375,8 @@ fn resolution_decision_from_string(
 
 fn cancellation_outcome_to_string(outcome: CancellationOutcome) -> String {
   case outcome {
-    CancelledBeforeRunOutcome -> "cancelled_before_run"
-    CancellationRequestedOutcome -> "cancellation_requested"
+    CancellationDecidedBeforeRun -> "cancelled_before_run"
+    CancellationDecidedWhileRunning -> "cancellation_requested"
   }
 }
 
@@ -408,25 +384,25 @@ fn cancellation_outcome_from_string(
   raw: String,
 ) -> Result(CancellationOutcome, Nil) {
   case raw {
-    "cancelled_before_run" -> Ok(CancelledBeforeRunOutcome)
-    "cancellation_requested" -> Ok(CancellationRequestedOutcome)
+    "cancelled_before_run" -> Ok(CancellationDecidedBeforeRun)
+    "cancellation_requested" -> Ok(CancellationDecidedWhileRunning)
     _ -> Error(Nil)
   }
 }
 
-fn codec_kind_to_string(kind: CodecKind) -> String {
+fn codec_kind_to_string(kind: worker.CodecKind) -> String {
   case kind {
-    InputCodec -> "input"
-    OutputCodec -> "output"
-    ErrorCodec -> "error"
+    worker.InputCodec -> "input"
+    worker.OutputCodec -> "output"
+    worker.ErrorCodec -> "error"
   }
 }
 
-fn codec_kind_from_string(raw: String) -> Result(CodecKind, Nil) {
+fn codec_kind_from_string(raw: String) -> Result(worker.CodecKind, Nil) {
   case raw {
-    "input" -> Ok(InputCodec)
-    "output" -> Ok(OutputCodec)
-    "error" -> Ok(ErrorCodec)
+    "input" -> Ok(worker.InputCodec)
+    "output" -> Ok(worker.OutputCodec)
+    "error" -> Ok(worker.ErrorCodec)
     _ -> Error(Nil)
   }
 }
@@ -826,8 +802,8 @@ fn metadata_fields() -> fields.Fields(AcknowledgedMetadata) {
   let assert Ok(failure_cause_field) =
     fields.optional(closed_string_field(
       "failure_cause",
-      business_failure_cause_to_string,
-      business_failure_cause_from_string,
+      worker.business_failure_cause_to_string,
+      worker.business_failure_cause_from_string,
     ))
   let assert Ok(available_at_field) =
     fields.optional(fields.int(atom.create("available_at_unix_ms")))
@@ -975,15 +951,18 @@ pub fn resolved() -> Event(ResolvedMeasurements, ResolvedMetadata) {
   event
 }
 
-/// The `[grind, job, cancellation]` event descriptor: a cancellation request
-/// that changed something durable (`CancelledBeforeRun` or
-/// `CancellationRequested`). The three read-only outcomes
+/// The `[grind, job, cancellation_decided]` event descriptor: a cancellation request
+/// that changed something durable (`CancellationDecidedBeforeRun` or
+/// `CancellationDecidedWhileRunning`). The three read-only outcomes
 /// (`AlreadyCancelled`, `AlreadyUncertain`, `AlreadyFinished`) never emit —
 /// see `CancellationMetadata`.
-pub fn cancellation() -> Event(CancellationMeasurements, CancellationMetadata) {
+pub fn cancellation_decided() -> Event(
+  CancellationMeasurements,
+  CancellationMetadata,
+) {
   let assert Ok(event) =
     sinal.event(
-      job_event_name("cancellation"),
+      job_event_name("cancellation_decided"),
       cancellation_measurements_fields(),
       cancellation_metadata_fields(),
     )
@@ -1003,18 +982,18 @@ pub fn released() -> Event(ReleasedMeasurements, ReleasedMetadata) {
   event
 }
 
-/// The `[grind, job, contract_mismatch]` event descriptor: a claimed attempt
+/// The `[grind, job, contract_mismatch_recorded]` event descriptor: a claimed attempt
 /// parked in the terminal, nonclaimable `contract_mismatch` state because a
 /// registered worker's codec contract no longer matches what was persisted
 /// at admission. Emitted strictly after the mismatch's own fenced
 /// `UPDATE ... RETURNING` returns a row.
-pub fn contract_mismatch() -> Event(
+pub fn contract_mismatch_recorded() -> Event(
   ContractMismatchMeasurements,
   ContractMismatchMetadata,
 ) {
   let assert Ok(event) =
     sinal.event(
-      job_event_name("contract_mismatch"),
+      job_event_name("contract_mismatch_recorded"),
       contract_mismatch_measurements_fields(),
       contract_mismatch_metadata_fields(),
     )

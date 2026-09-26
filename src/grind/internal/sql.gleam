@@ -402,7 +402,7 @@ pub type ReconcileAcknowledgementRow {
     attempt_epoch: Int,
     committed_state: String,
     failure_cause: Option(String),
-    to_char: String,
+    committed_at_unix_ms: Int,
   )
 }
 
@@ -427,7 +427,7 @@ pub fn reconcile_acknowledgement(
     use attempt_epoch <- decode.field(6, decode.int)
     use committed_state <- decode.field(7, decode.string)
     use failure_cause <- decode.field(8, decode.optional(decode.string))
-    use to_char <- decode.field(9, decode.string)
+    use committed_at_unix_ms <- decode.field(9, decode.int)
     decode.success(ReconcileAcknowledgementRow(
       storage_owner:,
       queue:,
@@ -438,11 +438,11 @@ pub fn reconcile_acknowledgement(
       attempt_epoch:,
       committed_state:,
       failure_cause:,
-      to_char:,
+      committed_at_unix_ms:,
     ))
   }
 
-  "SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, committed_state, failure_cause, to_char(committed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2
+  "SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, committed_state, failure_cause, (extract(epoch FROM committed_at) * 1000)::bigint AS committed_at_unix_ms FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2
 "
   |> pog.query
   |> pog.parameter(pog.text(storage_owner))

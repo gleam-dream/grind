@@ -10,6 +10,13 @@ repository = { type = "github", user = "gleam-dream", repo = "grind" }
 gleam_stdlib = ">= 0.70.0 and < 1.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
+# Pinned tight, not the usual `>= x.y.0 and < (x+1).0.0`:
+# `src/grind_postgres_ffi.erl` matches pog's private `Connection` shape
+# (`{pool, Name} | {single_connection, Conn}`) and calls `pgo` directly
+# (`pgo:checkout/2`, `pgo:checkin/2`, `pgo:break/1`) — see that module's own
+# doc comment. Widening either range is a deliberate, reviewed decision, not
+# a routine bump; `pog_connection_pool_shape_test` (test/grind_test.gleam)
+# is the canary if one slips through anyway.
 pog = ">= 4.1.0 and < 4.2.0"
 pgo = ">= 0.20.0 and < 0.21.0"
 gleam_json = ">= 3.1.0 and < 4.0.0"

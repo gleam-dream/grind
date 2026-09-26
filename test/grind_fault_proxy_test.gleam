@@ -33,6 +33,7 @@ import gleam/list
 import gleam/option.{Some}
 import gleam/string
 import gleeunit/should
+import grind/internal/attempt
 import grind/job
 import grind/postgres
 import grind/queue
@@ -48,6 +49,16 @@ fn mark_database_test_executed(contract: String) -> Nil
 
 @external(erlang, "grind_test_env", "monotonic_ms")
 fn monotonic_ms() -> Int
+
+/// The manually-polled `ValidatedPolicy` every consumer in this suite
+/// starts under: no `Poll` timer of its own.
+fn manual_policy() -> queue.ValidatedPolicy {
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_manual_polling
+    |> queue.validate_policy
+  policy
+}
 
 /// Starts a proxy in front of `base_url`'s real host/port and returns the
 /// handle plus a database URL pointing at the proxy instead.
@@ -195,18 +206,12 @@ fn retry_ack_until(
   database: postgres.Database,
   queue_name: String,
   attempt_owner: String,
-  claimed: postgres.ClaimedJob,
+  claimed: attempt.ClaimedJob,
   execution: worker.Execution,
   remaining: Int,
 ) -> Result(Bool, postgres.QueueRunError) {
   let result =
-    postgres.acknowledge_claim(
-      database,
-      queue_name,
-      attempt_owner,
-      claimed,
-      execution,
-    )
+    attempt.acknowledge(database, queue_name, attempt_owner, claimed, execution)
   case result, remaining > 0 {
     Ok(True), _ -> result
     _, False -> result
@@ -234,9 +239,7 @@ pub fn fault_proxy_pass_through_test() {
     Ok(base_url) -> {
       let #(proxy, url) = start_proxy_for(base_url)
       use <- exception.defer(fn() { fault_proxy.stop(proxy) })
-      let pool_name = process.new_name("grind_fault_proxy_pass_through")
-      let assert Ok(validated) =
-        postgres.settings(url, pool_name) |> postgres.validate
+      let assert Ok(validated) = postgres.settings(url) |> postgres.validate
       let assert Ok(database) = postgres.start(validated)
       use <- exception.defer(fn() { postgres.close(database) })
       let assert Ok(Nil) = postgres.migrate(database)
@@ -256,7 +259,7 @@ pub fn fault_proxy_pass_through_test() {
       let assert Ok(workers) = registry.register(workers, definition)
       let assert Ok(handle) =
         postgres.submit(database, "fault-proxy-pass-through", definition, 5)
-      let assert Ok(consumer) = queue.start_manual(database, workers)
+      let assert Ok(consumer) = queue.start(database, workers, manual_policy())
       use <- exception.defer(fn() {
         let _ = queue.stop(consumer)
         Nil
@@ -271,7 +274,7 @@ pub fn fault_proxy_pass_through_test() {
 
 /// T1: `drop_reply` on a manual acknowledgement's own `COMMIT`. The request
 /// genuinely reaches PostgreSQL and commits; only the reply is lost, on a
-/// socket that is never closed. Prints how long `acknowledge_claim` actually
+/// socket that is never closed. Prints how long `acknowledge` actually
 /// took to return, then reconciles the lost reply from the durable receipt.
 pub fn fault_proxy_t1_drop_reply_test() {
   case fault_proxy_url() {
@@ -283,10 +286,9 @@ pub fn fault_proxy_t1_drop_reply_test() {
 fn run_t1(base_url: String) -> Nil {
   let #(proxy, url) = start_proxy_for(base_url)
   use <- exception.defer(fn() { fault_proxy.stop(proxy) })
-  let pool_name = process.new_name("grind_fault_proxy_t1")
   let assert Ok(validated) =
-    postgres.settings(url, pool_name)
-    |> postgres.pool_size(1)
+    postgres.settings(url)
+    |> postgres.with_pool_size(1)
     |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -306,18 +308,17 @@ fn run_t1(base_url: String) -> Nil {
     postgres.submit(database, "fault-proxy-t1", definition, 7)
   let attempt_owner = "fault-proxy-t1-owner"
   let assert Ok(Some(claimed)) =
-    postgres.claim_one(
+    attempt.claim_one(
       database,
       "fault-proxy-t1",
       workers,
       attempt_owner,
       30_000,
     )
-  let execution = postgres.execute_claim(claimed)
+  let execution = attempt.execute_claim(claimed)
   let job_id = job.id_value(handle)
-  let #(_, attempt_id, epoch) = postgres.claim_identity(claimed)
-  let command_id =
-    postgres.acknowledgement_command_id(job_id, attempt_id, epoch)
+  let #(_, attempt_id, epoch) = attempt.claim_identity(claimed)
+  let command_id = attempt.acknowledgement_command_id(job_id, attempt_id, epoch)
 
   let notify = process.new_subject()
   fault_proxy.arm(
@@ -331,7 +332,7 @@ fn run_t1(base_url: String) -> Nil {
   let _ =
     process.spawn_unlinked(fn() {
       let ack_result =
-        postgres.acknowledge_claim(
+        attempt.acknowledge(
           database,
           "fault-proxy-t1",
           attempt_owner,
@@ -354,7 +355,7 @@ fn run_t1(base_url: String) -> Nil {
     Ok(Ok(True)) -> {
       let elapsed = monotonic_ms() - start_ms
       io.println(
-        "T1 drop_reply manual ack: bounded, acknowledge_claim itself returned Ok(True) after "
+        "T1 drop_reply manual ack: bounded, acknowledge itself returned Ok(True) after "
         <> int.to_string(elapsed)
         <> " ms (no reconciliation needed)",
       )
@@ -363,7 +364,7 @@ fn run_t1(base_url: String) -> Nil {
     Ok(Error(postgres.QueueAckUnknown(returned_command_id, _))) -> {
       let elapsed = monotonic_ms() - start_ms
       io.println(
-        "T1 drop_reply manual ack: bounded, acknowledge_claim returned QueueAckUnknown after "
+        "T1 drop_reply manual ack: bounded, acknowledge returned QueueAckUnknown after "
         <> int.to_string(elapsed)
         <> " ms",
       )
@@ -377,9 +378,9 @@ fn run_t1(base_url: String) -> Nil {
       panic as { "T1: unexpected ack result " <> string.inspect(other) }
     Error(Nil) -> {
       io.println(
-        "T1 drop_reply manual ack: UNBOUNDED — acknowledge_claim did not return within 20000 ms",
+        "T1 drop_reply manual ack: UNBOUNDED — acknowledge did not return within 20000 ms",
       )
-      panic as "T1: acknowledge_claim never returned; see stdout for the unbounded finding"
+      panic as "T1: acknowledge never returned; see stdout for the unbounded finding"
     }
   }
   postgres.outcome(database, handle)
@@ -390,7 +391,7 @@ fn run_t1(base_url: String) -> Nil {
 /// T2: `drop_request` on a manual acknowledgement's own `COMMIT`. PostgreSQL
 /// never sees the statement at all and is left idle in transaction, holding
 /// the row's lock, until the server-side timeout (or this test's observer
-/// backstop) clears it. Prints how long `acknowledge_claim` itself took,
+/// backstop) clears it. Prints how long `acknowledge` itself took,
 /// confirms no receipt exists (nothing ever committed), then retries the
 /// identical acknowledgement once the lock is free.
 pub fn fault_proxy_t2_drop_request_test() {
@@ -404,19 +405,17 @@ fn run_t2(base_url: String) -> Nil {
   let #(proxy, url) = start_proxy_for(base_url)
   use <- exception.defer(fn() { fault_proxy.stop(proxy) })
 
-  let observer_pool_name = process.new_name("grind_fault_proxy_t2_observer")
   let assert Ok(observer_validated) =
-    postgres.settings(base_url, observer_pool_name)
-    |> postgres.pool_size(2)
+    postgres.settings(base_url)
+    |> postgres.with_pool_size(2)
     |> postgres.validate
   let assert Ok(observer) = postgres.start(observer_validated)
   use <- exception.defer(fn() { postgres.close(observer) })
-  let observer_connection = pog.named_connection(observer_pool_name)
+  let observer_connection = postgres.connection(observer)
 
-  let pool_name = process.new_name("grind_fault_proxy_t2")
   let assert Ok(validated) =
-    postgres.settings(url, pool_name)
-    |> postgres.pool_size(1)
+    postgres.settings(url)
+    |> postgres.with_pool_size(1)
     |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -436,18 +435,17 @@ fn run_t2(base_url: String) -> Nil {
     postgres.submit(database, "fault-proxy-t2", definition, 9)
   let attempt_owner = "fault-proxy-t2-owner"
   let assert Ok(Some(claimed)) =
-    postgres.claim_one(
+    attempt.claim_one(
       database,
       "fault-proxy-t2",
       workers,
       attempt_owner,
       30_000,
     )
-  let execution = postgres.execute_claim(claimed)
+  let execution = attempt.execute_claim(claimed)
   let job_id = job.id_value(handle)
-  let #(_, attempt_id, epoch) = postgres.claim_identity(claimed)
-  let command_id =
-    postgres.acknowledgement_command_id(job_id, attempt_id, epoch)
+  let #(_, attempt_id, epoch) = attempt.claim_identity(claimed)
+  let command_id = attempt.acknowledgement_command_id(job_id, attempt_id, epoch)
 
   let notify = process.new_subject()
   fault_proxy.arm(
@@ -461,7 +459,7 @@ fn run_t2(base_url: String) -> Nil {
   let _ =
     process.spawn_unlinked(fn() {
       let ack_result =
-        postgres.acknowledge_claim(
+        attempt.acknowledge(
           database,
           "fault-proxy-t2",
           attempt_owner,
@@ -483,7 +481,7 @@ fn run_t2(base_url: String) -> Nil {
     Ok(result) -> {
       let elapsed = monotonic_ms() - start_ms
       io.println(
-        "T2 drop_request manual ack: bounded, acknowledge_claim returned "
+        "T2 drop_request manual ack: bounded, acknowledge returned "
         <> string.inspect(result)
         <> " after "
         <> int.to_string(elapsed)
@@ -493,15 +491,15 @@ fn run_t2(base_url: String) -> Nil {
     }
     Error(Nil) -> {
       io.println(
-        "T2 drop_request manual ack: UNBOUNDED — acknowledge_claim did not return within 20000 ms",
+        "T2 drop_request manual ack: UNBOUNDED — acknowledge did not return within 20000 ms",
       )
-      panic as "T2: acknowledge_claim never returned; see stdout for the unbounded finding"
+      panic as "T2: acknowledge never returned; see stdout for the unbounded finding"
     }
   }
 
   // Nothing ever reached the server, so nothing ever committed.
   postgres.reconcile_acknowledgement(database, handle, command_id)
-  |> should.equal(Error(postgres.AckReceiptNotFound))
+  |> should.equal(Error(postgres.ReceiptNotFound))
 
   clear_stuck_backend(observer_connection)
 
@@ -531,10 +529,9 @@ pub fn fault_proxy_t4_renewal_drop_reply_test() {
 fn run_t4(base_url: String) -> Nil {
   let #(proxy, url) = start_proxy_for(base_url)
   use <- exception.defer(fn() { fault_proxy.stop(proxy) })
-  let pool_name = process.new_name("grind_fault_proxy_t4")
   let assert Ok(validated) =
-    postgres.settings(url, pool_name)
-    |> postgres.pool_size(1)
+    postgres.settings(url)
+    |> postgres.with_pool_size(1)
     |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -554,7 +551,7 @@ fn run_t4(base_url: String) -> Nil {
     postgres.submit(database, "fault-proxy-t4", definition, 3)
   let attempt_owner = "fault-proxy-t4-owner"
   let assert Ok(Some(claimed)) =
-    postgres.claim_one(
+    attempt.claim_one(
       database,
       "fault-proxy-t4",
       workers,
@@ -577,7 +574,7 @@ fn run_t4(base_url: String) -> Nil {
   let _ =
     process.spawn_unlinked(fn() {
       let renew_result =
-        postgres.renew_claim(
+        attempt.renew(
           database,
           "fault-proxy-t4",
           attempt_owner,
@@ -593,7 +590,7 @@ fn run_t4(base_url: String) -> Nil {
     Ok(result) -> {
       let elapsed = monotonic_ms() - start_ms
       io.println(
-        "T4 renewal drop_reply: bounded, renew_claim returned "
+        "T4 renewal drop_reply: bounded, renew returned "
         <> string.inspect(result)
         <> " after "
         <> int.to_string(elapsed)
@@ -601,13 +598,13 @@ fn run_t4(base_url: String) -> Nil {
       )
       { elapsed < 2 * deadline_ms } |> should.equal(True)
       result
-      |> should.equal(Error(postgres.QueueClaimFailed(pog.QueryTimeout)))
+      |> should.equal(Error(pog.QueryTimeout))
     }
     Error(Nil) -> {
       io.println(
-        "T4 renewal drop_reply: UNBOUNDED — renew_claim did not return within 20000 ms",
+        "T4 renewal drop_reply: UNBOUNDED — renew did not return within 20000 ms",
       )
-      panic as "T4: renew_claim never returned; see stdout for the unbounded finding"
+      panic as "T4: renew never returned; see stdout for the unbounded finding"
     }
   }
   mark_database_test_executed("fault-proxy-t4-observed")
@@ -628,10 +625,9 @@ pub fn fault_proxy_t5_begin_drop_reply_test() {
 fn run_t5(base_url: String) -> Nil {
   let #(proxy, url) = start_proxy_for(base_url)
   use <- exception.defer(fn() { fault_proxy.stop(proxy) })
-  let pool_name = process.new_name("grind_fault_proxy_t5")
   let assert Ok(validated) =
-    postgres.settings(url, pool_name)
-    |> postgres.pool_size(1)
+    postgres.settings(url)
+    |> postgres.with_pool_size(1)
     |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -651,18 +647,17 @@ fn run_t5(base_url: String) -> Nil {
     postgres.submit(database, "fault-proxy-t5", definition, 11)
   let attempt_owner = "fault-proxy-t5-owner"
   let assert Ok(Some(claimed)) =
-    postgres.claim_one(
+    attempt.claim_one(
       database,
       "fault-proxy-t5",
       workers,
       attempt_owner,
       30_000,
     )
-  let execution = postgres.execute_claim(claimed)
+  let execution = attempt.execute_claim(claimed)
   let job_id = job.id_value(handle)
-  let #(_, attempt_id, epoch) = postgres.claim_identity(claimed)
-  let command_id =
-    postgres.acknowledgement_command_id(job_id, attempt_id, epoch)
+  let #(_, attempt_id, epoch) = attempt.claim_identity(claimed)
+  let command_id = attempt.acknowledgement_command_id(job_id, attempt_id, epoch)
 
   let notify = process.new_subject()
   fault_proxy.arm(
@@ -676,7 +671,7 @@ fn run_t5(base_url: String) -> Nil {
   let _ =
     process.spawn_unlinked(fn() {
       let ack_result =
-        postgres.acknowledge_claim(
+        attempt.acknowledge(
           database,
           "fault-proxy-t5",
           attempt_owner,
@@ -700,7 +695,7 @@ fn run_t5(base_url: String) -> Nil {
     Ok(Error(postgres.QueueAckUnknown(returned_command_id, _))) -> {
       let elapsed = monotonic_ms() - start_ms
       io.println(
-        "T5 BEGIN drop_reply: bounded, acknowledge_claim returned QueueAckUnknown after "
+        "T5 BEGIN drop_reply: bounded, acknowledge returned QueueAckUnknown after "
         <> int.to_string(elapsed)
         <> " ms (BEGIN itself never got a reply, so the callback never ran)",
       )
@@ -711,20 +706,20 @@ fn run_t5(base_url: String) -> Nil {
       panic as { "T5: unexpected ack result " <> string.inspect(other) }
     Error(Nil) -> {
       io.println(
-        "T5 BEGIN drop_reply: UNBOUNDED — acknowledge_claim did not return within 20000 ms",
+        "T5 BEGIN drop_reply: UNBOUNDED — acknowledge did not return within 20000 ms",
       )
-      panic as "T5: acknowledge_claim never returned; see stdout for the unbounded finding"
+      panic as "T5: acknowledge never returned; see stdout for the unbounded finding"
     }
   }
   postgres.reconcile_acknowledgement(database, handle, command_id)
-  |> should.equal(Error(postgres.AckReceiptNotFound))
+  |> should.equal(Error(postgres.ReceiptNotFound))
   postgres.state(database, handle) |> should.equal(Ok(job.Executing))
 
   // The client-side forced disconnect (once armed) closes the relay's
   // upstream socket too, so the real backend's own open `BEGIN` rolls back
   // on connection loss — no observer backstop needed here. A fresh
   // acknowledgement attempt on a healthy connection now succeeds normally.
-  postgres.acknowledge_claim(
+  attempt.acknowledge(
     database,
     "fault-proxy-t5",
     attempt_owner,
@@ -759,19 +754,17 @@ fn run_t3(base_url: String) -> Nil {
   let #(proxy, url) = start_proxy_for(base_url)
   use <- exception.defer(fn() { fault_proxy.stop(proxy) })
 
-  let observer_pool_name = process.new_name("grind_fault_proxy_t3_observer")
   let assert Ok(observer_validated) =
-    postgres.settings(base_url, observer_pool_name)
-    |> postgres.pool_size(2)
+    postgres.settings(base_url)
+    |> postgres.with_pool_size(2)
     |> postgres.validate
   let assert Ok(observer) = postgres.start(observer_validated)
   use <- exception.defer(fn() { postgres.close(observer) })
-  let observer_connection = pog.named_connection(observer_pool_name)
+  let observer_connection = postgres.connection(observer)
 
-  let pool_name = process.new_name("grind_fault_proxy_t3")
   let assert Ok(validated) =
-    postgres.settings(url, pool_name)
-    |> postgres.pool_size(3)
+    postgres.settings(url)
+    |> postgres.with_pool_size(3)
     |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -834,7 +827,7 @@ fn run_t3(base_url: String) -> Nil {
     |> queue.with_poll_interval(50)
     |> queue.with_lease_duration(30_000)
     |> queue.validate_policy
-  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  let assert Ok(consumer) = queue.start(database, workers, policy)
   use <- exception.defer(fn() {
     let _ = queue.stop(consumer)
     Nil
@@ -894,17 +887,23 @@ fn run_t3(base_url: String) -> Nil {
 /// while it is still queued, before the first ever releases the connection —
 /// this is `pgo_pool`'s "connection not available because deadline reached
 /// while in queue" shape (`pgo_pool.erl`, `checkout_info/2`), a plain string
-/// `pgo_ffi:query`'s `convert_error/1` has no clause for. Before Decision 1's
-/// catch-all, that could raise `error:function_clause` inside the calling
-/// process instead of returning a typed `pog.QueryError` — crashing whatever
-/// called `postgres.state` (or any other storage function), not just failing
-/// its own request. This test monitors every contended caller and *asserts*
+/// `pog_ffi:convert_error/1` has no clause for, which would otherwise raise
+/// `error:function_clause` inside the calling process instead of returning a
+/// typed `pog.QueryError` — crashing whatever called `postgres.state` (or
+/// any other storage function), not just failing its own request. Every
+/// Grind-issued call is unaffected by that gap in the first place: Grind's
+/// own `with_deadline_ms` (`grind_postgres_ffi.erl`) checks out via
+/// `pgo:checkout/2` directly and catches any `{error, _Reason}` there —
+/// including this exact string — as its own typed `connection_unavailable`
+/// before `pog:execute`/`pog:transaction` is ever called, so `pog_ffi:
+/// convert_error/1`'s missing clause is never reached by a call that goes
+/// through `execute_safely`/`call_safely`/`transaction_safely` (every Grind
+/// storage call). This test monitors every contended caller and *asserts*
 /// none of them went down abnormally — not merely printing "CONFIRMED" and
-/// letting the test pass regardless either way — though in this environment
-/// `pgo_pool`'s own CoDel overload shedding has consistently returned the
-/// already-handled `none_available` shape before the narrower race this
-/// defect targets is ever reached (`docs/RECOVERY-EVIDENCE.md`, "DEFECT 2
-/// probe").
+/// letting the test pass regardless either way — a live regression guard in
+/// case some future call path ever bypasses Grind's own checkout and lets
+/// pog re-checkout with its own default (`docs/RECOVERY-EVIDENCE.md`,
+/// "DEFECT 2 probe").
 pub fn fault_proxy_defect2_queue_deadline_test() {
   case fault_proxy_url() {
     Error(Nil) -> Nil
@@ -913,10 +912,9 @@ pub fn fault_proxy_defect2_queue_deadline_test() {
 }
 
 fn run_defect2(base_url: String) -> Nil {
-  let pool_name = process.new_name("grind_defect2_queue_deadline")
   let assert Ok(validated) =
-    postgres.settings(base_url, pool_name)
-    |> postgres.pool_size(1)
+    postgres.settings(base_url)
+    |> postgres.with_pool_size(1)
     |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -936,7 +934,7 @@ fn run_defect2(base_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "fault-proxy-defect2", definition, 1)
 
-  let connection = pog.named_connection(pool_name)
+  let connection = postgres.connection(database)
   let holder_started = process.new_subject()
   let _ =
     process.spawn_unlinked(fn() {
@@ -1027,6 +1025,6 @@ fn observe_defect2(
 }
 
 type Defect2Event {
-  Defect2Replied(Result(job.State, postgres.StateError))
+  Defect2Replied(Result(job.State, postgres.JobReadError))
   Defect2Down(process.Down)
 }

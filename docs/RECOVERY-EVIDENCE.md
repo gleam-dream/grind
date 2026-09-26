@@ -4859,3 +4859,288 @@ a real cluster:
   harness is instead proven through a real `submit_unique` replay
   (idempotent re-admission by receipt), which is the mechanism
   `reconcile_unique` itself also reads.
+
+## Increment 17 — pog public-API migration: dropping Grind's own checkout for `pog.default_timeout`/`pog.transaction_with_timeout`
+
+Answers docs/RELEASE-READINESS.md, "2b. pog upstream": switch Grind off pog's
+internal `Connection`/checkout shape onto the fork's new public API
+(`lostbean/pog`, branch `grind/timeouts`, commit `e9089cd`), with no change
+in observable behavior. `gleam.toml` now depends on the fork via `git`/`ref`
+(squirrel's `>= 4.1.0 and < 5.0.0` and cigogne's `>= 4.0.0 and < 5.0.0`
+constraints are both satisfied by the fork's declared `4.1.0`); the direct
+`pgo` dependency is dropped (still present transitively through `pog`'s own
+`rebar.config`, since `src/grind_postgres_ffi.erl` no longer calls `pgo:*`
+functions directly).
+
+### Mechanism change
+
+`postgres.validate` now calls `pog.default_timeout(config,
+settings.statement_deadline_ms)` on the pool's own `pog.Config`, instead of
+the previous `persistent_term` deadline `postgres.start`/`close` set and
+cleared by hand. Every Grind storage call now runs through pog's public
+`pog.execute`/`pog.transaction` (bounded by that pool-wide default) or
+`pog.transaction_with_timeout(pool, migration_deadline_ms, ..)` for
+`migrate`'s own steps — no manual `pgo:checkout`/`pgo:checkin`, no pattern
+match on `{pool, Name} | {single_connection, Conn}`, and no fixed 5 s
+migration cap (a migration step is bounded by `migration_deadline_ms`, not
+by pog's old hardcoded checkout timeout, exactly as before this increment —
+see the new characterization/mutation test below).
+
+`src/grind_postgres_ffi.erl` shrank from 260 to 97 lines. Removed
+entirely: `set_deadline/2`, `clear_deadline/1`, `with_deadline/3`,
+`with_deadline_ms/4`, `guarded_query/2`, `guarded_transaction/2`,
+`execute_safely/2`, `call_safely/2`, `transaction_safely/2`,
+`transaction_or_checkout_failure/2`, `migration_transaction_safely/3` (all
+of it — Grind's own bounded `pgo_pool:checkout/2` and every pattern match on
+pog's compiled `Connection` shape). Kept: a single generic `guarded/3`
+(catches a checkout `exit` when the pool process is gone, and a
+`function_clause` crash whose own top frame is genuinely
+`pog_ffi:convert_error` — see its own module doc comment for exactly which
+two shapes and why pog's own `Result` API still does not cover them) plus
+the two unrelated supervisor-stop helpers
+(`stop_consumer_supervisor/1`/`stop_supervisor/1`, untouched). The
+equivalent wrapper functions (`execute_safely`/`call_safely`/
+`transaction_safely`/`migration_transaction_safely`) now live as plain
+Gleam functions in `src/grind/postgres.gleam` (and a `transaction_or_
+checkout_failure` counterpart in `src/grind/internal/unique_admission.gleam`)
+that call `pog.execute`/`pog.transaction`/`pog.transaction_with_timeout`
+directly and delegate only the two still-uncovered failure shapes to
+`guarded`. `unique_admission`'s checkout-vs-mid-transaction distinction
+(needed so `submit`/`submit_plain` can tell "definitely did not run" from
+"ran, outcome unknown") is reconstructed without any internals: pog's own
+`TransactionQueryError(ConnectionUnavailable)` can now only ever arise from
+a checkout failure (confirmed by reading the fork's `pog_ffi:convert_error/1`
+— only pgo's `none_available` maps to it, and `none_available` is only ever
+returned by a checkout attempt, never mid-query), so that one shape alone is
+reclassified into the outer "definitely did not run" bucket; the pool being
+entirely gone is caught the same way as everywhere else, through `guarded`.
+
+`pog_connection_pool_shape_test` (`test/grind_test.gleam`) and its
+`grind_test_env:pool_connection_atom/1` FFI probe are removed — they existed
+solely to guard the compiled `{pool, Name}` shape `grind_postgres_ffi` no
+longer inspects. `postgres_call_safely_wrapper_reports_closed_pool_test`
+(which redeclared its own `@external` binding straight to the old,
+now-removed `call_safely/2` export) is rewritten to prove the same "closed
+pool" contract through the public `postgres.arguments`, one of `call_safely`'s
+own callers — the same shape `postgres_closed_pool_renewal_recovers_without_
+rerun_test` already proves through `postgres.state`/`execute_safely`.
+
+**Accepted, documented trade-off.** Grind no longer holds the raw `pgo`
+connection/reference after the `econnreset`/`etimedout` convert-error crash
+shape, so it can no longer `pgo:break/1` it before check-in the way the old
+manual-checkout FFI did. pog's own checkin (`exception.defer`/`exception.
+on_crash` inside `pog.transaction`, or `pgo:query/3`'s own internal `after`
+cleanup for a plain `pog.execute`) still always runs — Erlang's `after`
+semantics guarantee this regardless of how many stack frames up the crash is
+eventually caught — so the connection is never leaked, only no longer
+pre-emptively invalidated after this one specific crash shape.
+
+### T1–T5 / DEFECT 2, before vs. after this increment
+
+Same fault proxy, same tests, unchanged in meaning — "before" is Increment
+15's own post-fix numbers (Grind's own manual checkout against pog 4.1
+stock); "after" is this increment (pog's public API, same fork):
+
+| Test           | Before (Increment 15, manual checkout)                                   | After (this increment, pog public API)                                   |
+| -------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| T1             | ~4011ms, `Ok(True)`                                                      | ~4013ms, `Ok(True)`                                                      |
+| T2             | ~4010ms, `Error(QueueAckUnknown(...))`                                   | ~4006ms, `Error(QueueAckUnknown(...))`                                   |
+| T3             | B ~4021ms; A ~14009ms total                                              | B ~4025ms; A ~14012ms total                                              |
+| T4             | ~4000ms, `Error(QueueClaimFailed(pog.QueryTimeout))`                     | ~4000ms, `Error(QueueClaimFailed(pog.QueryTimeout))`                     |
+| T5             | ~4011ms, `Error(QueueAckUnknown(...))`                                   | ~4013ms, `Error(QueueAckUnknown(...))`                                   |
+| DEFECT 2 probe | ~2675–2690ms, `Error(StateQueryFailed(ConnectionUnavailable))`, no crash | ~2671–2672ms, `Error(StateQueryFailed(ConnectionUnavailable))`, no crash |
+
+All within the same bound relative to `D` (`postgres.statement_deadline_ms`,
+4000ms default) as before — the public-API migration changes the mechanism,
+not the observable timing or outcome shape.
+
+### Migration deadline: characterization test, then a mutation
+
+`postgres_migration_deadline_long_step_succeeds_test` (new,
+`test/grind_test.gleam`, dedicated disposable database
+`grind_migration_deadline`) runs `migrate_with` against a synthetic step
+whose own statement legitimately blocks for 6s (`pg_sleep(6)`, wrapped in an
+outer `SELECT true FROM (...)` — `pg_types` cannot decode a bare `void`
+result, the same reason `grind/internal/unique_admission`'s own
+advisory-lock query wraps `pg_advisory_xact_lock` the same way) under a
+deliberately shortened `migration_deadline_ms` of 9000 (instead of the
+30000ms default, purely so the test does not have to wait out the full
+default). **Green today, characterizing existing behavior, not a new
+capability**: `migrate` already bounded a step by `migration_deadline_ms`
+before this increment too (via the old `migration_transaction_safely`'s own
+explicit-deadline checkout) — this increment's job was to preserve that,
+not add it. Confirmed green (`elapsed_ms` between 6000 and 9000) against a
+real cluster.
+
+**Mutation, for red evidence that this is not vacuous**: `migration_
+transaction_safely` temporarily edited (`Edit`, not a config toggle) to call
+plain `pog.transaction(connection, callback)` — the pool's own
+`pog.default_timeout` (4000ms) — instead of `pog.transaction_with_timeout
+(connection, deadline_ms, callback)`, discarding `deadline_ms` entirely.
+Against a real cluster (fresh `grind_migration_deadline` schema), the same
+test now fails: `Error(MigrationCommitUnknown(12))` — the step's own
+transaction is force-closed at the pool's shared 4000ms default before the
+6s sleep ever completes, exactly the regression this increment's own
+`pog.transaction_with_timeout` call exists to prevent. Reverted via `Edit`;
+re-confirmed green afterward against a fresh schema with the real
+`pog.transaction_with_timeout` call restored.
+
+### Full suite
+
+`scripts/test-postgres.sh`: 186 passed, no failures — unchanged from the
+186 baseline before this increment (`pog_connection_pool_shape_test`
+removed, one new migration-deadline test added: 186 − 1 + 1 = 186). Consumer
+package: 10 passed, no failures, unchanged.
+
+## Post-release-tidy name mapping (pure moves, no behavior change)
+
+A later pre-release API-tidy pass (see the release tracker) moved the
+claim/renew/acknowledge/quarantine protocol this document describes out of
+`grind/postgres` into two new internal modules, and renamed a few of its
+entry points along the way. Every mechanism, SQL statement, and test
+described above by its old name still applies unchanged; only the qualified
+name changed:
+
+| Old (`grind/postgres`)                           | New                                                                                                                                                                                         |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `postgres.claim_one`                             | `attempt.claim_one`                                                                                                                                                                         |
+| `postgres.execute_claim`                         | `attempt.execute_claim`                                                                                                                                                                     |
+| `postgres.claim_identity`                        | `attempt.claim_identity`                                                                                                                                                                    |
+| `postgres.renew_claim`                           | `attempt.renew`                                                                                                                                                                             |
+| `postgres.release_unstarted_claim`               | `attempt.release_unstarted`                                                                                                                                                                 |
+| `postgres.acknowledge_claim`                     | `attempt.acknowledge`                                                                                                                                                                       |
+| `postgres.acknowledgement_command_id`            | `attempt.acknowledgement_command_id`                                                                                                                                                        |
+| `postgres.live_lease_predicate`                  | `lease.live_lease_predicate`                                                                                                                                                                |
+| `postgres.expired_lease_predicate`               | `lease.expired_lease_predicate`                                                                                                                                                             |
+| `postgres.quarantine_expired_in_queue` (private) | `lease.quarantine_expired_in_queue` (public, now takes a raw connection/storage_owner/forwarder rather than an opaque `Database`, and returns `pog.QueryError` rather than `QueueRunError`) |
+
+`QueueRunError`, `AckRejection`, `postgres.quarantine_expired`, and
+`postgres.storage_owner` stayed on `grind/postgres`, which also gained
+`@internal` `connection`/`forwarder` accessors so the two new modules can
+read an opaque `Database` without depending on each other cyclically.
+
+A follow-up commit in the same tidy pass narrowed `attempt.renew`'s own
+return type from `Result(Bool, QueueRunError)` to
+`Result(attempt.Renewal, pog.QueryError)` (`Renewal { Renewed LeaseLost }`
+in place of `True`/`False`), so evidence above quoting a bare
+`Error(QueueClaimFailed(pog.QueryTimeout))` for a renewal fault (T4) now
+reads as plain `Error(pog.QueryTimeout)` — same fault, same bound, only the
+wrapping removed. The same pass renamed `QueueAckRejected` to
+`QueueStorageInvariantViolated` everywhere else it appears above (an
+unregistered worker at claim time, or a fenced update/select matching an
+impossible row count) — `renew`'s own single such branch, now outside
+`QueueRunError` entirely, became a `panic` instead, since a primary-key-
+fenced update matching more than one row was already provably
+unreachable, never a tested outcome.
+
+A later commit in the same pass renamed `unique.SubmitError.AdmissionFailed`
+to `NotCommitted` (evidence above quoting `AdmissionFailed(...)` reads as
+`NotCommitted(...)` now, same meaning) and deleted `postgres.SubmitError`
+entirely: plain `submit`/`submit_at` now return `unique.SubmitError`
+too, with their own uncertain-outcome case (`SubmitQueryFailed`) renamed
+`CommitUnknownWithoutId` to sit alongside `submit_unique`/`submit_with_id`'s
+`CommitUnknown` in the same unified type — the two differ only in whether a
+`PendingSubmission` exists to reconcile from. `postgres.UnexpectedInsertRows`
+(an unconditional single-row `INSERT ... RETURNING` matching zero or more
+than one row) was already unreachable and became a `panic`, the same
+treatment `renew`'s analogous impossible case got above.
+
+Three more renames from the same pass, also appearing above under their old
+names: `queue.start_manual`/`queue.start_with_policy`/`queue
+.start_manual_with_policy` are gone — every evidence mention of them above
+now reads as `queue.start(database, workers, policy)`, keyed on
+`policy.polling` (`PollEvery`/`Manual`) instead of a separate function per
+combination. `ConsumerDrainTimedOut` is `StopOutcome.StoppedDrainUnconfirmed`
+(moved out of `StopError` entirely — the supervisor teardown it describes
+had already succeeded). `queue.fail_next_worker_start`/
+`queue.kill_next_worker_before_monitor` (armed mid-flight, by message, on an
+already-running `Consumer`) are gone; the same two fault shapes are now
+supplied once at start time via `grind/internal/consumer_hooks.Hooks`'
+`before_worker_start`/`after_worker_start`.
+
+## Increment 18 — pog dependency: dropping the fork, restoring Grind's own checkout
+
+**User decision, superseding Increment 17 entirely**: drop the
+`lostbean/pog` git dependency and go back to Grind's own bounded checkout
+against vanilla `pog`/`pgo` from Hex — not a fork, and not pog's public
+`pog.default_timeout`/`pog.transaction_with_timeout` API. `gleam.toml`
+(root) now depends on `pog = ">= 4.1.0 and < 4.2.0"` and, newly, a direct
+`pgo = ">= 0.20.0 and < 0.21.0"` — pinned this tightly (not the usual
+`>= x.y.0 and < (x+1).0.0`) because `src/grind_postgres_ffi.erl` matches
+pog's private `Connection` shape and calls `pgo:checkout/2`/`pgo:checkin/2`/
+`pgo:break/1` directly, none of which either package's public contract
+promises to keep stable across a minor version. `consumer/gleam.toml` has no
+direct `pog`/`pgo` dependency (it never imports either module directly) and
+needed no change beyond its `manifest.toml` re-resolving pog from Hex
+transitively through `grind`.
+
+### Mechanism: exactly Increment 17's "before" column, restored verbatim
+
+`src/grind_postgres_ffi.erl` and `src/grind/internal/store.gleam` are back
+to Increment 17's pre-migration shape (confirmed by diffing against commit
+`49e6996`, the last commit before that migration, byte-for-byte identical
+apart from doc-comment wording): `set_deadline/2`/`clear_deadline/1`
+(`persistent_term`, keyed by the pool's atom name, set in `postgres.start`
+and cleared in `postgres.close`), `with_deadline/3`/`with_deadline_ms/4`
+(a `pgo:checkout/2` with an explicit `timeout` option, arming `pgo_pool`'s
+own absolute deadline timer), `guarded_query/2`/`guarded_transaction/2`
+(the same two failure shapes as always — a checkout `exit`, and a
+`function_clause` crash whose own top frame is genuinely
+`pog_ffi:convert_error`), and `execute_safely/2`/`call_safely/2`/
+`transaction_safely/2`/`transaction_or_checkout_failure/2`/
+`migration_transaction_safely/3`. The one structural difference from the
+pre-Increment-17 layout: all five wrapper functions are now declared as
+`@external` bindings in `grind/internal/store.gleam` (the shared module
+Increment 13's tidy pass introduced) rather than as private functions
+inside `grind/postgres.gleam` directly — `grind/postgres` and
+`grind/internal/unique_admission` both call `store.execute_safely`/etc.,
+unchanged from how they already called the (temporarily fork-based) wrappers
+Increment 17 put there. `postgres.gleam`'s `Settings`/`ValidatedSettings`/
+`Database` types, `statement_deadline`/`migration_deadline` setters,
+`statement_deadline_ms` accessor, and `validate`'s checks are all unchanged
+from before Increment 17 — Increment 17 removed `pog.default_timeout`'s
+call site and nothing else in that surface, so reverting it back out
+required no further changes there beyond removing that one call.
+`pog_connection_pool_shape_test` (`test/grind_test.gleam`) and its
+`grind_test_env:pool_connection_atom/1` FFI probe, removed by Increment 17,
+are restored too.
+
+### T1–T5 / DEFECT 2, before vs. after this increment
+
+"Before" is Increment 17's own numbers (pog's public API, the now-dropped
+fork); "after" is this increment (Grind's own checkout again, vanilla pog):
+
+| Test           | Before (Increment 17, pog public API, fork)                              | After (this increment, Grind's own checkout, vanilla pog)                                     |
+| -------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| T1             | ~4013ms, `Ok(True)`                                                      | ~4010ms, `Ok(True)`                                                                           |
+| T2             | ~4006ms, `Error(QueueAckUnknown(...))`                                   | ~4007ms, `Error(QueueAckUnknown(...))`                                                        |
+| T3             | B ~4025ms; A ~14012ms total                                              | B ~4013ms; A ~14019ms total                                                                   |
+| T4             | ~4000ms, `Error(pog.QueryTimeout)`                                       | ~4000ms, `Error(pog.QueryTimeout)`                                                            |
+| T5             | ~4013ms, `Error(QueueAckUnknown(...))`                                   | ~4009ms, `Error(QueueAckUnknown(...))`                                                        |
+| DEFECT 2 probe | ~2671–2672ms, `Error(StateQueryFailed(ConnectionUnavailable))`, no crash | ~2671ms (all 8 contended callers), `Error(StateQueryFailed(ConnectionUnavailable))`, no crash |
+
+Within noise of both Increment 17's numbers and Increment 15's original
+manual-checkout numbers (the mechanism this increment restores) — reverting
+the mechanism changes nothing observable, exactly as Increment 17 itself
+did not when it went the other direction.
+
+### Full suite
+
+`scripts/test-postgres.sh`: 187 passed, no failures (186 Increment-17
+baseline + 1: `pog_connection_pool_shape_test` restored). Consumer package:
+10 passed, no failures, unchanged. `gleam check` clean on both packages;
+`nix fmt`/`nix flake check` clean.
+
+### Remaining risk, accepted (see docs/RELEASE-READINESS.md, "2b")
+
+This choice re-couples Grind to pog's private `Connection` shape and to
+`pgo`'s own checkout/checkin/break API, which neither package's public
+contract promises to keep stable. Guarded by the tight version pins above
+and by `pog_connection_pool_shape_test` failing loudly the moment a pog/pgo
+upgrade changes either shape, rather than this module silently
+mismatching it. The trade-off Increment 17 accepted the other way — losing
+`pgo:break/1` on a post-checkout crash, since pog's public API never hands
+back the raw connection reference — no longer applies: this module holds
+the raw `pgo` connection directly again, so a `function_clause` crash whose
+top frame is `pog_ffi:convert_error` is once again `pgo:break/1`'d before
+check-in, exactly as it was before Increment 17.

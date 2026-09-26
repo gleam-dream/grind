@@ -11,6 +11,7 @@ import grind/observation
 import grind/postgres
 import grind/queue
 import grind/registry
+import grind/submission
 import grind/unique
 import grind/worker
 import grind_consumer.{
@@ -29,6 +30,16 @@ fn now_unix_ms() -> Int {
   let #(seconds, nanoseconds) =
     timestamp.system_time() |> timestamp.to_unix_seconds_and_nanoseconds
   seconds * 1000 + nanoseconds / 1_000_000
+}
+
+/// The manually-polled `ValidatedPolicy` every consumer in this suite that
+/// does not need automatic polling starts under: no `Poll` timer of its own.
+fn manual_policy() -> queue.ValidatedPolicy {
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_manual_polling
+    |> queue.validate_policy
+  policy
 }
 
 type Probe {
@@ -121,7 +132,7 @@ fn run_public_consumer_test(url: String) -> Nil {
     |> queue.with_maximum_jobs_per_poll(4)
     |> queue.validate_policy
   let assert Ok(settings) =
-    postgres.settings(url, process.new_name("external_consumer_pool"))
+    postgres.settings(url)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -165,7 +176,7 @@ fn run_public_consumer_test(url: String) -> Nil {
       PaymentRequest("missing/99", 0),
     )
 
-  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  let assert Ok(consumer) = queue.start(database, workers, policy)
   use <- exception.defer(fn() { queue.stop(consumer) })
 
   process.receive(payment_probe, within: 5000)
@@ -206,7 +217,7 @@ fn run_public_consumer_test(url: String) -> Nil {
   |> should.equal(
     Ok(job.BusinessFailedWithCause(
       PaymentRejected("missing/99"),
-      job.BudgetExhausted,
+      worker.BudgetExhausted,
     )),
   )
   mark("two-worker-consumer-passed")
@@ -221,7 +232,7 @@ pub fn public_consumer_retry_and_running_cancellation_test() {
 
 fn run_retry_and_cancellation_test(url: String) -> Nil {
   let assert Ok(settings) =
-    postgres.settings(url, process.new_name("consumer_retry_cancel_pool"))
+    postgres.settings(url)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -239,7 +250,7 @@ fn run_retry_and_cancellation_test(url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, retry_worker)
   let assert Ok(workers) = registry.register(workers, cancel_worker)
 
-  let assert Ok(consumer) = queue.start_manual(database, workers)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
 
   // --- Job 1: a definition-bound retry policy retries once, then succeeds.
@@ -318,9 +329,9 @@ pub fn public_consumer_effect_crash_uncertainty_audited_recovery_test() {
 
 fn run_effect_crash_uncertainty_test(url: String) -> Nil {
   let assert Ok(settings) =
-    postgres.settings(url, process.new_name("consumer_uncertain_pool"))
-    |> postgres.unique_lock_wait(1)
-    |> postgres.statement_deadline(1002)
+    postgres.settings(url)
+    |> postgres.with_unique_lock_wait(1)
+    |> postgres.with_statement_deadline(1002)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -363,7 +374,7 @@ fn run_effect_crash_uncertainty_test(url: String) -> Nil {
     |> queue.with_maximum_concurrency(2)
     |> queue.with_lease_duration(6100)
     |> queue.validate_policy
-  let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
+  let assert Ok(consumer) = queue.start(database, workers, policy)
   use <- exception.defer(fn() { queue.stop(consumer) })
 
   // Each worker crashes (a genuine Erlang runtime error, not a typed business
@@ -412,10 +423,12 @@ fn run_effect_crash_uncertainty_test(url: String) -> Nil {
   postgres.resolve_uncertain(
     database,
     rebound1,
-    "consumer-uncertain-resolution-1",
-    "operator@example.test",
-    "confirmed from the application's own dedup record",
-    postgres.ConfirmSuccess(receipt1),
+    postgres.ResolutionRequest(
+      "consumer-uncertain-resolution-1",
+      "operator@example.test",
+      "confirmed from the application's own dedup record",
+      postgres.ConfirmSuccess(receipt1),
+    ),
   )
   |> should.equal(Ok(postgres.ResolutionApplied(job.Succeeded)))
   postgres.state(database, rebound1) |> should.equal(Ok(job.Succeeded))
@@ -431,10 +444,12 @@ fn run_effect_crash_uncertainty_test(url: String) -> Nil {
   postgres.resolve_uncertain(
     database,
     rebound2,
-    "consumer-uncertain-resolution-2",
-    "operator@example.test",
-    "authorized replay after audited review",
-    postgres.AuthorizeReplay,
+    postgres.ResolutionRequest(
+      "consumer-uncertain-resolution-2",
+      "operator@example.test",
+      "authorized replay after audited review",
+      postgres.AuthorizeReplay,
+    ),
   )
   |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
 
@@ -685,7 +700,7 @@ pub fn storage_start_failure_is_reported_test() {
     Error(Nil) -> Nil
     Ok(url) -> {
       let assert Ok(settings) =
-        postgres.settings(url, process.new_name("consumer_storage_failure"))
+        postgres.settings(url)
         |> postgres.validate
       let failure_observed = case postgres.start(settings) {
         Error(_) -> True
@@ -733,7 +748,7 @@ pub fn public_consumer_unique_admission_existing_conflict_and_retry_test() {
 
 fn run_unique_admission_existing_conflict_and_retry_test(url: String) -> Nil {
   let assert Ok(settings) =
-    postgres.settings(url, process.new_name("consumer_unique_pool"))
+    postgres.settings(url)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -755,15 +770,15 @@ fn run_unique_admission_existing_conflict_and_retry_test(url: String) -> Nil {
   let test_queue = "consumer-unique"
 
   let assert Ok(first_submission) =
-    unique.submission_id("consumer-unique-first")
-  let assert Ok(unique.Inserted(handle)) =
+    submission.submission_id("consumer-unique-first")
+  let assert Ok(submission.Inserted(handle)) =
     postgres.submit_unique(
       database,
       test_queue,
       first_submission,
       worker_def,
       42,
-      unique.Immediately,
+      submission.Immediately,
       policy,
       unique.KeepExisting,
     )
@@ -771,43 +786,47 @@ fn run_unique_admission_existing_conflict_and_retry_test(url: String) -> Nil {
   // A second, independently identified admission with the same key hits the
   // still-queued conflict instead of inserting a new row.
   let assert Ok(second_submission) =
-    unique.submission_id("consumer-unique-second")
-  let assert Ok(unique.Existing(conflict)) =
+    submission.submission_id("consumer-unique-second")
+  let assert Ok(submission.Existing(conflict)) =
     postgres.submit_unique(
       database,
       test_queue,
       second_submission,
       worker_def,
       42,
-      unique.Immediately,
+      submission.Immediately,
       policy,
       unique.KeepExisting,
     )
-  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
+  submission.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
 
   // `Conflict` is not a handle: the caller rebinds it through the same
   // durable-id path used after a restart before reading typed state.
   let assert Ok(bound) =
-    postgres.bind_handle(database, worker_def, unique.conflict_job_id(conflict))
+    postgres.bind_handle(
+      database,
+      worker_def,
+      submission.conflict_job_id(conflict),
+    )
   postgres.state(database, bound) |> should.equal(Ok(job.Queued))
 
   // Replaying the *original* SubmissionId returns the receipt's own recorded
   // decision -- the original job id, as `Inserted` again -- rather than
   // treating the still-present row as a fresh conflict.
-  let assert Ok(unique.Inserted(replayed)) =
+  let assert Ok(submission.Inserted(replayed)) =
     postgres.submit_unique(
       database,
       test_queue,
       first_submission,
       worker_def,
       42,
-      unique.Immediately,
+      submission.Immediately,
       policy,
       unique.KeepExisting,
     )
   job.id_value(replayed) |> should.equal(job.id_value(handle))
 
-  let assert Ok(consumer) = queue.start_manual(database, workers)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
   queue.process_one(consumer) |> should.equal(Ok(True))
 
@@ -830,7 +849,7 @@ pub fn public_consumer_submit_with_id_retry_test() {
 
 fn run_submit_with_id_retry_test(url: String) -> Nil {
   let assert Ok(settings) =
-    postgres.settings(url, process.new_name("consumer_submit_with_id_pool"))
+    postgres.settings(url)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -841,28 +860,29 @@ fn run_submit_with_id_retry_test(url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, worker_def)
   let test_queue = "consumer-submit-with-id"
 
-  let assert Ok(submission_id) = unique.submission_id("consumer-with-id-once")
-  let assert Ok(unique.Inserted(handle)) =
+  let assert Ok(submission_id) =
+    submission.submission_id("consumer-with-id-once")
+  let assert Ok(submission.Inserted(handle)) =
     postgres.submit_with_id(
       database,
       test_queue,
       submission_id,
       worker_def,
       42,
-      unique.Immediately,
+      submission.Immediately,
     )
 
   // A retry with the identical `SubmissionId` and request converges on the
   // exact same job -- no second row -- rather than risking a duplicate the
   // way a plain `submit` retry could.
-  let assert Ok(unique.Inserted(retried)) =
+  let assert Ok(submission.Inserted(retried)) =
     postgres.submit_with_id(
       database,
       test_queue,
       submission_id,
       worker_def,
       42,
-      unique.Immediately,
+      submission.Immediately,
     )
   job.id_value(retried) |> should.equal(job.id_value(handle))
 
@@ -874,11 +894,11 @@ fn run_submit_with_id_retry_test(url: String) -> Nil {
     submission_id,
     worker_def,
     43,
-    unique.Immediately,
+    submission.Immediately,
   )
-  |> should.equal(Error(unique.SubmissionConflict))
+  |> should.equal(Error(submission.SubmissionConflict))
 
-  let assert Ok(consumer) = queue.start_manual(database, workers)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
   queue.process_one(consumer) |> should.equal(Ok(True))
 
@@ -898,7 +918,7 @@ pub fn public_consumer_unique_reschedule_across_queues_test() {
 
 fn run_unique_reschedule_across_queues_test(url: String) -> Nil {
   let assert Ok(settings) =
-    postgres.settings(url, process.new_name("consumer_unique_reschedule_pool"))
+    postgres.settings(url)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -923,15 +943,15 @@ fn run_unique_reschedule_across_queues_test(url: String) -> Nil {
   let far_future_ms = now_unix_ms() + 3_600_000
   let assert Ok(far_future_at) = job.available_at(far_future_ms)
   let assert Ok(seed_submission) =
-    unique.submission_id("consumer-unique-across-seed")
-  let assert Ok(unique.Inserted(handle)) =
+    submission.submission_id("consumer-unique-across-seed")
+  let assert Ok(submission.Inserted(handle)) =
     postgres.submit_unique(
       database,
       "consumer-unique-across-a",
       seed_submission,
       worker_def,
       7,
-      unique.At(far_future_at),
+      submission.At(far_future_at),
       policy,
       unique.KeepExisting,
     )
@@ -943,27 +963,32 @@ fn run_unique_reschedule_across_queues_test(url: String) -> Nil {
   let soon_ms = now_unix_ms() + 50
   let assert Ok(soon_at) = job.available_at(soon_ms)
   let assert Ok(reschedule_submission) =
-    unique.submission_id("consumer-unique-across-reschedule")
-  let assert Ok(unique.Rescheduled(conflict)) =
+    submission.submission_id("consumer-unique-across-reschedule")
+  let assert Ok(submission.Rescheduled(conflict)) =
     postgres.submit_unique(
       database,
       "consumer-unique-across-b",
       reschedule_submission,
       worker_def,
       7,
-      unique.Immediately,
+      submission.Immediately,
       policy,
       unique.RescheduleScheduledTo(soon_at),
     )
-  unique.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
+  submission.conflict_job_id(conflict) |> should.equal(job.id_value(handle))
   // The row's actual queue is the one it was originally inserted under, not
   // the rescheduling submission's own queue.
-  unique.conflict_queue(conflict) |> should.equal("consumer-unique-across-a")
+  submission.conflict_queue(conflict)
+  |> should.equal("consumer-unique-across-a")
 
   let assert Ok(bound) =
-    postgres.bind_handle(database, worker_def, unique.conflict_job_id(conflict))
+    postgres.bind_handle(
+      database,
+      worker_def,
+      submission.conflict_job_id(conflict),
+    )
 
-  let assert Ok(consumer) = queue.start_manual(database, workers)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
   await_claim(consumer, 250) |> should.equal(Ok(True))
 
@@ -987,7 +1012,7 @@ pub fn public_consumer_observes_acknowledged_test() {
 
 fn run_public_consumer_observation_test(url: String) -> Nil {
   let assert Ok(settings) =
-    postgres.settings(url, process.new_name("external_consumer_observation"))
+    postgres.settings(url)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -1021,7 +1046,7 @@ fn run_public_consumer_observation_test(url: String) -> Nil {
     Nil
   })
 
-  let assert Ok(consumer) = queue.start_manual(database, workers)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
   queue.process_one(consumer) |> should.equal(Ok(True))
 
@@ -1048,10 +1073,7 @@ pub fn public_consumer_observes_claimed_test() {
 /// application would from outside the package (public imports only).
 fn run_public_consumer_claimed_observation_test(url: String) -> Nil {
   let assert Ok(settings) =
-    postgres.settings(
-      url,
-      process.new_name("external_consumer_claimed_observation"),
-    )
+    postgres.settings(url)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -1085,7 +1107,7 @@ fn run_public_consumer_claimed_observation_test(url: String) -> Nil {
 
   let assert Ok(handle) =
     postgres.submit(database, "external-consumer-claimed", echo_worker, 41)
-  let assert Ok(consumer) = queue.start_manual(database, workers)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
   queue.process_one(consumer) |> should.equal(Ok(True))
 

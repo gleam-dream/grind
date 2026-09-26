@@ -91,6 +91,7 @@ pub fn identities(registry: Registry) -> List(#(String, String)) {
   })
 }
 
+@internal
 pub type SelectionError {
   WrongQueue(expected: String, actual: String)
   WorkerNotRegistered(id: String, version: String)

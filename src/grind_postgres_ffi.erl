@@ -12,28 +12,35 @@
 ]).
 
 %% Grind's own checkout deadline (`postgres.Settings.statement_deadline_ms`;
-%% docs/RELEASE-READINESS.md, "Acknowledgement deadline"). pog 4.1 never lets
-%% a caller configure the connection-hold deadline for a transaction or a
-%% squirrel-generated call: `pog_ffi:checkout/1` always calls `pgo:checkout/1`
-%% with pgo's own hardcoded 5000 ms (`pgo_pool.erl`'s `?TIMEOUT`), and a
-%% `pog.Query`'s own `.timeout` field is silently ignored once a connection is
-%% already checked out (`pog_ffi:query/4`'s `{single_connection, _}` branch
-%% passes no timeout at all to `pgo_handler:extended_query/4`). Every Grind
-%% storage call already funnels through `execute_safely/2`, `call_safely/2`,
-%% `transaction_safely/2` or `transaction_or_checkout_failure/2` below, so
-%% this module does its own bounded `pgo_pool:checkout/2` up front — passing
-%% an explicit `timeout` option arms `pgo_pool`'s own absolute deadline timer
-%% (`pgo_pool.erl`, `abs_timeout/2` + `start_deadline/5`), which force-closes
-%% the checked-out socket if it is *still held* when the deadline elapses,
-%% regardless of what statement is in flight. That is what actually bounds a
-%% stuck `BEGIN`/`COMMIT`/renewal `UPDATE` on a half-open socket — proven
+%% docs/RELEASE-READINESS.md, "Acknowledgement deadline"). Vanilla pog never
+%% lets a caller configure the connection-hold deadline for a transaction or
+%% a squirrel-generated call: `pog_ffi:checkout/1` always calls
+%% `pgo:checkout/1` with pgo's own hardcoded 5000 ms (`pgo_pool.erl`'s
+%% `?TIMEOUT`), and a `pog.Query`'s own `.timeout` field is silently ignored
+%% once a connection is already checked out (`pog_ffi:query/4`'s
+%% `{single_connection, _}` branch passes no timeout at all to
+%% `pgo_handler:extended_query/4`). Every Grind storage call already funnels
+%% through `execute_safely/2`, `call_safely/2`, `transaction_safely/2` or
+%% `transaction_or_checkout_failure/2` below, so this module does its own
+%% bounded `pgo:checkout/2` up front — passing an explicit `timeout` option
+%% arms `pgo_pool`'s own absolute deadline timer (`pgo_pool.erl`,
+%% `abs_timeout/2` + `start_deadline/5`), which force-closes the checked-out
+%% socket if it is *still held* when the deadline elapses, regardless of what
+%% statement is in flight. That is what actually bounds a stuck
+%% `BEGIN`/`COMMIT`/renewal `UPDATE` on a half-open socket — proven
 %% empirically against a real TCP fault proxy; see
 %% docs/RECOVERY-EVIDENCE.md, "Acknowledgement deadline". Then it runs the
 %% caller's work against the pog `Connection` shape `{single_connection,
 %% Conn}` (`pog.gleam`'s compiled representation — confirmed against
 %% build/packages/pog/src/pog.erl and pog_ffi.erl), so `pog:execute/2` and
 %% `pog:transaction/2` never re-checkout with pog's own unconfigurable
-%% default. The deadline is attached to a pool by its atom name (an
+%% default. This couples Grind directly to pog's private `Connection` shape
+%% and to `pgo`'s own checkout/checkin/break API — accepted deliberately
+%% (user decision: no fork), guarded by pinning both dependencies to a tight
+%% version range in gleam.toml and by `pog_connection_pool_shape_test`
+%% (test/grind_test.gleam), which fails loudly the moment a pog/pgo upgrade
+%% changes either shape instead of this module silently mismatching it. The
+%% deadline is attached to a pool by its atom name (an
 %% `erlang:process.Name` — itself just an atom; `gleam_erlang_ffi:new_name/1`)
 %% via `persistent_term`, set once in `postgres.start` and cleared in
 %% `postgres.close`, rather than threaded through every one of Grind's
@@ -245,15 +252,27 @@ stop_consumer_supervisor(Pid) ->
             end
     end.
 
+%% Reports whether this call itself stopped a still-live process
+%% (`{ok, true}`) or found it already gone (`{ok, false}`) — `postgres.close`
+%% uses this to decide whether erasing this pool name's `persistent_term`
+%% deadline entry is actually safe (see `set_deadline`/`clear_deadline`
+%% above and `postgres.close`'s own doc comment): a stale `Database` handle
+%% whose supervisor already stopped must not erase a *different*, currently
+%% live pool that has since reused the same registered name. `exit:timeout`
+%% (the 6000ms bound elapsed without `gen_server:stop` confirming shutdown)
+%% is reported as `{error, nil}` rather than crashing the caller and leaving
+%% the name's own deadline entry cleared out from under a pool that may
+%% still be alive.
 stop_supervisor(Pid) ->
     unlink(Pid),
     case erlang:is_process_alive(Pid) of
-        false -> nil;
+        false -> {ok, false};
         true ->
             try gen_server:stop(Pid, shutdown, 6000) of
-                _ -> nil
+                _ -> {ok, true}
             catch
-                exit:{noproc, _} -> nil;
-                exit:noproc -> nil
+                exit:{noproc, _} -> {ok, false};
+                exit:noproc -> {ok, false};
+                exit:timeout -> {error, nil}
             end
     end.

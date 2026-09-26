@@ -63,3 +63,31 @@ printf 'Disposable PostgreSQL %s at 127.0.0.1:%s (Squirrel codegen database)\n' 
   DATABASE_URL="postgres://grind@127.0.0.1:$port/grind_codegen?sslmode=disable" \
     gleam run -m squirrel
 )
+
+# Squirrel overwrites sql.gleam's own header wholesale each run, dropping the
+# hand-written note explaining the generated/hand-written SQL split (see
+# AGENTS.md). Re-prepend it right after Squirrel's own 5-line banner every
+# time, so a regeneration never silently loses it.
+generated_sql="$repo_root/src/grind/internal/sql.gleam"
+if ! grep -q "do not hand-edit" "$generated_sql"; then
+  note_file="$root/sql-header-note.txt"
+  cat >"$note_file" <<'NOTE'
+//// This file is regenerated wholesale by `scripts/generate-sql.sh` (which
+//// wraps `gleam run -m squirrel` against a disposable database) from the
+//// static `.sql` files under `./src/grind/internal/sql/`; do not hand-edit
+//// it, and re-add this note if it is ever lost to a regeneration. This is
+//// one half of a permanent split, not a migration in progress: a query
+//// belongs here only when its SQL text is fixed at compile time. Dynamic
+//// SQL — shared lease/period/lock predicate fragments spliced into more
+//// than one query, per-disposition acknowledgement SQL (the proposed state
+//// selects which columns/branches apply), nullable-parameter queries whose
+//// bound value shape varies by call, and candidate selection (its `WHERE`/
+//// `ORDER BY`/locking clause depends on scope, period, and conflict
+//// action) — stays hand-written inline in `grind/postgres` and
+//// `grind/internal/unique_admission`, where squirrel cannot generate it
+//// from a single static string. See `AGENTS.md` for the same rule.
+NOTE
+  awk 'NR==5{print; while ((getline line < note) > 0) print line; next} {print}' \
+    note="$note_file" "$generated_sql" >"$generated_sql.tmp"
+  mv "$generated_sql.tmp" "$generated_sql"
+fi

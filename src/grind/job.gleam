@@ -1,5 +1,5 @@
 import gleam/option.{type Option, None, Some}
-import grind/worker.{type Codec, type Worker}
+import grind/worker.{type BusinessFailureCause, type Codec, type Worker}
 
 /// A typed reference to a persisted job. Codecs are retained from its definition.
 pub opaque type JobHandle(input, output, error) {
@@ -115,11 +115,6 @@ pub type Outcome(output, error) {
   /// A worker declared or recovery detected an uncertain outcome needing an
   /// explicit audited resolution.
   ReconciliationRequired(String)
-}
-
-pub type BusinessFailureCause {
-  BudgetExhausted
-  RetryDeclined
 }
 
 pub fn id(handle: JobHandle(input, output, error)) -> JobId {
