@@ -3,7 +3,12 @@
 Tracks the work between the current experimental slice and a first release of
 Grind, published together with its sibling libraries. Tick an item only when
 its evidence is committed (tests, gate markers, and an entry in
-`docs/RECOVERY-EVIDENCE.md` where behavior changes).
+`docs/RECOVERY-EVIDENCE.md` where behavior changes). See
+[docs/RISKS.md](RISKS.md) for the standing risk register this checklist
+feeds into: several open items below (renewal starvation, storage-owner
+scoping, network-fault coverage, load/multi-node/soak evidence) are also
+risk-register entries with their own likelihood/impact judgment and
+mitigation status.
 
 Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
 
@@ -37,6 +42,16 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
       per-step migrations with exact declared shapes; cigogne-format files in
       `priv/migrations`; upgrade harness from a frozen v11 fixture. Evidence:
       `docs/RECOVERY-EVIDENCE.md`, Increment 16.
+- [x] **Migration step lock waits are bounded**. Each step's own transaction
+      sets a constant, transaction-local `lock_timeout` (2000ms) right after
+      its advisory lock; a step statement hitting PostgreSQL's own `55P03`
+      is now the typed, retry-safe `postgres.MigrationLockUnavailable(version)`
+      instead of blocking for up to the full `migration_deadline_ms`. Not
+      applied to `priv/migrations/*.sql` run directly through cigogne — see
+      README, "Migrations". Mutation-proven (removing the `SET` makes the
+      same scenario instead block until `migration_deadline_ms` and report
+      `MigrationCommitUnknown`). Evidence: `docs/RECOVERY-EVIDENCE.md`,
+      Increment 20.
 - [ ] Migration gaps: an end-to-end test that cigogne applies Grind's files
       and `migrate` is then a no-op; an upgrade-harness `reconcile_unique` on
       a genuine lost reply.
@@ -95,10 +110,20 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
 ## 2. Sinal release readiness
 
 - [x] Bounded emitter-side forwarder merged to Sinal `master` (355617c).
-- [ ] Sinal version, CHANGELOG, and publish metadata.
-
-- [ ] Close the forwarder test gaps: single duplicate-drop guard unobservable;
-      restart race only stress-tested.
+- [x] Sinal version, CHANGELOG, and publish metadata (f4622b6). `CHANGELOG.md`
+      documents the full unreleased feature set; `gleam.toml` carries license,
+      description, and repository metadata. The package version stays `0.1.0`
+      by deliberate decision (recorded in the changelog itself) until a
+      release is actually cut — not an open gap.
+- [x] Close the forwarder test gaps (f4622b6): the sender-side duplicate-drop
+      guard is now independently observable
+      (`concurrent_drops_queue_single_report_message_test`, which reads the
+      forwarder's own mailbox length before any message is processed). The
+      restart race stays a best-effort stress test by deliberate decision — a
+      deterministic reproduction would need a permanent test-only delay
+      inside the production initialiser for a concurrent `emit` to race
+      against, which Sinal's `forwarder_test.gleam` documents and rejects as
+      a seam not worth shipping.
 - [ ] Grind depends on a published Sinal version range instead of `../sinal`.
 
 ## 2b. pog dependency (fork dropped; Grind-owned checkout restored)
@@ -244,8 +269,16 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
 
 ## 4. Evidence still missing
 
-- [ ] Network faults through a TCP proxy (half-open socket, partition), beyond
-      backend termination.
+- [x] Half-open socket through a real TCP fault proxy, beyond backend
+      termination (Increment 15): a dropped `COMMIT` reply, a dropped
+      `BEGIN` reply, a dropped request, and a stalled lease-renewal `UPDATE`
+      all resolve within the checkout deadline. **Remaining gap, not this
+      item:** the proxy is loopback-only (no genuine network partition,
+      packet loss, or asymmetric latency), every test database connects
+      with `sslmode=disable` (TLS untested), and a connect-time hang against
+      an unresponsive host is not covered (every injected fault assumes an
+      already-established connection) — see `docs/RECOVERY-EVIDENCE.md`,
+      Increment 15, "Limits", and `docs/RISKS.md`.
 - [ ] Load: throughput/latency at concurrency > 1, several consumers per
       database, polling cost and lock contention.
 - [ ] Multi-node: two BEAM nodes on the same queues, killed mid-job.
@@ -276,9 +309,14 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
       package directories on disk. This costs a full rebuild on every gate
       run; accepted as the simplest guard that cannot itself drift from how
       `gleam` tracks its own cache.
-- [ ] Update Oversight design docs (`sinal-design.md` forwarding decision,
-      `grind-design.md` §15 observations, `API-COVERAGE.md`) — needs the
-      owner's go-ahead because Oversight is a separate repository.
+- [x] Update Oversight design docs (owner go-ahead given; Oversight is a
+      separate repository). `sinal-design.md` now records the bounded
+      emitter-side forwarder as delivered in Sinal core (not adapter-owned);
+      `grind-design.md` §5 (uniqueness), §9 (storage/migrations/retention),
+      and §15 (observations, delivered via the forwarder, post-commit only)
+      now match what was built; `API-COVERAGE.md`'s Grind and Sinal rows are
+      marked Delivered/Partial/Open accurately. See Oversight commit history
+      for the corresponding change.
 - [ ] Organise branch history for merge into `main`.
 
 ## Follow-ups outside Grind

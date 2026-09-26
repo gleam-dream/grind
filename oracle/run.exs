@@ -15,6 +15,14 @@ defmodule GrindOracle.TelemetryHandler do
   end
 end
 
+defmodule GrindOracle.PrunerTelemetryHandler do
+  def handle_event(_event, _measurements, %{plugin: Oban.Pruner} = metadata, pid) do
+    send(pid, {:oban_pruner_ran, metadata})
+  end
+
+  def handle_event(_event, _measurements, _metadata, _pid), do: :ok
+end
+
 Ecto.Migrator.up(Repo, 1, GrindOracle.ObanMigration, log: false)
 
 {:ok, oban_pid} =
@@ -150,4 +158,88 @@ IO.inspect(
 )
 
 if Process.alive?(manual_pid), do: Supervisor.stop(manual_pid)
+
+# "historic jobs are pruned when they are older than the configured age"
+# (oracle/deps/oban/test/oban/pruner_test.exs) — paired against Grind's own
+# postgres_prune_finished_deletes_old_terminal_rows_test. `Oban.Pruner` is a
+# default *service* (not a `plugins:` entry) since it superseded the
+# deprecated `Oban.Plugins.Pruner`; a plain `Oban.start_link` already runs it
+# with its own defaults (interval 30_000ms, limit 10_000, max_age 60s)
+# unless overridden here via the top-level `pruner:` option, exactly as
+# `Oban.start_link`'s own moduledoc documents.
+:ok =
+  :telemetry.attach(
+    "grind-oracle-pruner-#{System.unique_integer([:positive])}",
+    [:oban, :plugin, :stop],
+    &GrindOracle.PrunerTelemetryHandler.handle_event/4,
+    test_pid
+  )
+
+now = DateTime.utc_now()
+
+%Oban.Job{id: old_completed_id} =
+  Worker.new(%{},
+    state: "completed",
+    # `Oban.Engines.Basic.prune_jobs/3` filters a `completed` row by its
+    # `scheduled_at`, not `completed_at` (`cancelled`/`discarded` do use
+    # their own matching timestamp column) — confirmed by reading the
+    # engine directly, since the surviving/pruned rows in the upstream
+    # `pruner_test.exs` "historic jobs are pruned..." matrix only correlate
+    # with each row's own `scheduled_age`, not its `timestamp_age`. Set
+    # here as the real controlling value; `completed_at` is the decoy.
+    scheduled_at: DateTime.add(now, -61, :second),
+    completed_at: DateTime.add(now, -61, :second)
+  )
+  |> Repo.insert!()
+
+%Oban.Job{id: young_completed_id} =
+  Worker.new(%{},
+    state: "completed",
+    # Comfortably inside the 60s `max_age` (not the tighter 59s the
+    # upstream unit test itself uses): the upstream test also runs against
+    # real wall-clock time (`DateTime.utc_now()`, no mocked/virtual clock),
+    # but its own 59s/61s margin only has to survive `ExUnit`'s own
+    # near-instant plugin tick. This harness's own pruner tick includes real
+    # process and connection-pool startup latency first, so it needs a wider
+    # margin than 1s for the same reason: without it, that startup latency
+    # alone could push this job's own age past the threshold before the
+    # first real tick ever runs.
+    scheduled_at: DateTime.add(now, -10, :second),
+    completed_at: DateTime.add(now, -10, :second)
+  )
+  |> Repo.insert!()
+
+{:ok, pruner_pid} =
+  Oban.start_link(
+    name: GrindOracle.PrunerOban,
+    repo: Repo,
+    engine: Oban.Engines.Basic,
+    queues: [],
+    plugins: [],
+    pruner: [interval: 100, max_age: 60]
+  )
+
+receive do
+  {:oban_pruner_ran, %{conf: %{name: GrindOracle.PrunerOban}} = meta} ->
+    still_present = Repo.get(Oban.Job, old_completed_id) != nil
+    young_survived = Repo.get(Oban.Job, young_completed_id) != nil
+    false = still_present
+    true = young_survived
+    1 = meta.pruned_count
+
+    IO.inspect(
+      %{
+        trigger: "Oban.Pruner tick, max_age 60s",
+        pruned_count: meta.pruned_count,
+        old_job_deleted: not still_present,
+        young_job_survived: young_survived
+      },
+      label: "Oban v2.24.1 pruner observation"
+    )
+after
+  10_000 -> raise "Oban.Pruner did not tick"
+end
+
+if Process.alive?(pruner_pid), do: Supervisor.stop(pruner_pid)
+
 File.write!(System.fetch_env!("GRIND_ORACLE_MARKER"), "oban-oracle-passed\n", [:append])

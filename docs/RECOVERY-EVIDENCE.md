@@ -5144,3 +5144,735 @@ back the raw connection reference — no longer applies: this module holds
 the raw `pgo` connection directly again, so a `function_clause` crash whose
 top frame is `pog_ffi:convert_error` is once again `pgo:break/1`'d before
 check-in, exactly as it was before Increment 17.
+
+## Increment 19 — `close()` erasing a live pool's checkout deadline (independent review at `f42e6c0`)
+
+**Claim**: closing a stale `Database` handle (its own supervisor already
+stopped, e.g. by an earlier `close`) must never erase the checkout deadline
+of a different, currently live pool that has since reused the same
+registered name — `validate` gives every `start`/`close` cycle of the same
+`ValidatedSettings` the identical pool name.
+
+**Mechanism**: `postgres_close_stale_handle_does_not_erase_live_pool_deadline_test`
+(`test/grind_test.gleam`) starts a pool under a distinctive
+`with_statement_deadline(3200)`, closes it (a genuine, live stop), starts a
+second pool under the _same_ `ValidatedSettings` (reusing the same pool
+name), then closes the _first_, already-dead handle again — a no-op for a
+correct implementation. It then runs a raw `pg_sleep(4.2)` (4200ms) through
+`grind/internal/store.call_safely` against the second pool's own
+connection: 4200ms clears the configured 3200ms deadline but is
+comfortably under the FFI's own hardcoded 5000ms fallback, so the two
+outcomes are cleanly distinguishable (an error vs. a clean success),
+not just a timing window.
+
+**Red-then-green**: temporarily reverted `close` to its pre-fix shape
+(`stop_supervisor` called for its side effect only, `store.clear_deadline`
+called unconditionally on every `close` regardless of whether that call
+actually stopped a live process) and reran the test — it failed exactly as
+expected:
+
+```
+panic test/grind_test.gleam:3379
+test: grind_test.postgres_close_stale_handle_does_not_erase_live_pool_deadline_test
+info: expected the connection to be force-closed around the configured
+      3200ms statement deadline, not the FFI's own 5000ms fallback
+```
+
+i.e. the stale handle's `close` erased the live pool's deadline entry, the
+`pg_sleep(4.2)` query ran under the FFI's own 5000ms fallback instead of
+3200ms, and it completed successfully instead of erroring. Restoring the
+fix (`close` only calls `store.clear_deadline` when `stop_supervisor`
+reports it actually stopped a still-live process, via
+`grind_postgres_ffi:stop_supervisor/1` now returning `{ok, boolean()}`
+instead of a bare `nil`) makes the test pass: the `pg_sleep(4.2)` query
+errors, confirming the 3200ms deadline was still in effect. `set_deadline`
+was also moved to run before the pool's own supervisor starts (previously
+after), closing an unrelated, narrower window where an in-flight checkout
+against a brand-new pool could in principle run before any deadline was
+attached at all.
+
+**Also covered in the same commit**: `stop_supervisor` did not catch
+`exit:timeout` from `gen_server:stop/3`, so a slow shutdown would crash the
+caller and leave the pool's name registered; it now catches that case and
+`close` surfaces it as a typed `postgres.CloseError(StopTimedOut)` instead
+of crashing. No dedicated fault-injection test forces a genuine
+`gen_server:stop` timeout here (the FFI's own 6000ms bound is itself hard
+to force deterministically without a synthetic slow-stop hook); fixed on
+source-level review of the missing `catch` clause, mirroring the existing
+`stop_consumer_supervisor/1`'s own handling of the same case.
+
+## Increment 20 — migration steps' own lock waits are now bounded
+
+**Claim**: a migration step's own DDL/DML (e.g. an `ALTER TABLE` against a
+large, actively used table) should fail fast and typed under lock
+contention rather than blocking for up to the full `migration_deadline_ms`.
+
+**Mechanism**: `run_migration_step_transaction` now sets a constant,
+transaction-local `lock_timeout` (`migration_lock_timeout_ms`, 2000ms, via
+`sql.set_lock_timeout` — the same Squirrel-generated query
+`grind/internal/unique_admission` already uses for `unique_lock_wait_ms`)
+right after acquiring the migration's own advisory lock; a step statement
+that hits PostgreSQL's own `55P03 lock_not_available` is now mapped to the
+typed, retry-safe `MigrationLockUnavailable(version)` instead of
+`MigrationStepFailed`.
+`postgres_migration_step_lock_timeout_returns_lock_unavailable_test`
+(`test/grind_test.gleam`) proves this against a real conflicting lock: a
+fresh v11-only database, an observer holding
+`LOCK TABLE grind_jobs IN ACCESS SHARE MODE` in an open transaction
+(`spawn_lock_holder`), then `migrate_with([v11, synthetic-v12-ALTER])`
+against a _second_, independent pool. `main_database`'s own
+`migration_deadline_ms` is shortened to 3500ms for this test only — not
+because the default matters here, but because `spawn_lock_holder`'s
+observer uses a plain, unwrapped `pog.transaction` (not one of Grind's own
+checkout-bounded calls), so it is itself subject to pog's own hardcoded
+~5000ms checkout hold time (`docs/RECOVERY-EVIDENCE.md`, "Acknowledgement
+deadline") — the fix's own 2000ms lock timeout clears comfortably before
+that, but a 30000ms default `migration_deadline_ms` would not, since the
+observer's lock would be involuntarily released by pog's own hardcoded
+timeout before the test could observe genuine deadline-driven blocking.
+
+**Red-first / mutation** (this is also this change's own red-first
+evidence, since it is exactly the code shape before this fix): temporarily
+removed the `set_migration_lock_timeout` call and reran the test against a
+fresh database:
+
+```
+panic src/gleeunit/should.gleam:10
+test: grind_test.postgres_migration_step_lock_timeout_returns_lock_unavailable_test
+info:
+Error(MigrationCommitUnknown(12))
+should equal
+Error(MigrationLockUnavailable(12))
+```
+
+i.e. without the constant `lock_timeout`, the `ALTER TABLE` blocked on the
+observer's table lock until `main_database`'s own 3500ms
+`migration_deadline_ms` force-closed the connection (via Grind's existing
+checkout-deadline mechanism), reporting the pre-existing
+`MigrationCommitUnknown(12)` instead of the new, more precise
+`MigrationLockUnavailable(12)` — exactly the "waits until the migration
+deadline" behavior this change replaces. Restoring the call makes the
+`ALTER` fail fast (~2000ms) with the typed error instead. The test also
+confirms: the schema generation stays at 11 and the probe column is absent
+while the lock is held; releasing the lock and rerunning the identical
+steps succeeds; and `SHOW lock_timeout` on the pooled connection reports
+PostgreSQL's ordinary default (`"0"`, no limit) afterward, not the
+migration step's own constant 2000ms — `SET LOCAL` never leaks past the
+transaction that set it.
+
+**Not covered**: `priv/migrations/*.sql` applied directly through cigogne
+does not get this `lock_timeout` automatically (it is set only inside
+`postgres.migrate`'s own transaction, not in the released `.sql` files,
+deliberately — see README, "Migrations"); an application relying on cigogne
+directly should set its own `lock_timeout` if it wants the same fast-fail
+behavior.
+
+## Increment 21 — schema v12: `grind_jobs.finished_at` records when a job finished
+
+**Claim**: every `grind_jobs` row that reaches one of the six terminal
+states (`succeeded`, `business_failed`, `runtime_failed`,
+`contract_mismatch`, `discarded`, `cancelled`) has a non-null `finished_at`,
+and every row in a non-terminal state has a null one — enforced by a real
+PostgreSQL `CHECK` constraint (`grind_jobs_finished_at_check`), not merely
+by convention across the several independent write sites that set it
+(`attempt.acknowledge_transaction`'s eight per-outcome branches,
+`attempt.mark_contract_mismatch`, `sql.cancel_before_run`, and
+`postgres.write_resolution`).
+
+**Mechanism**: `grind_v12` (`priv/migrations/20260926000000-grind_v12.sql`,
+`Migration(12, ...)` in `src/grind/internal/migrations.gleam`) adds the
+column with a `DEFAULT now()` (backfilling every existing row, including
+non-terminal ones), drops the default (so a future ordinary insert of a
+non-terminal job — which never mentions this column — gets `NULL`, not
+`now()`), nulls it back out on every row whose `state` is not terminal, and
+only then adds the `CHECK` constraint validated against every row. The six
+terminal states are spliced from one shared fragment
+(`grind/internal/terminal.states_sql()`) into the constraint text, the
+backfill's own `WHERE`, and `postgres.write_resolution`'s `finished_at`
+`CASE`, so there is exactly one place that lists them. Every acknowledgement
+branch that can _only_ ever land on a terminal state either way (a
+concurrent cancellation overrides `succeeded`/`business_failed`/
+`discarded`/`runtime_failed` with `cancelled`, and the plain `cancelled`
+branch has no other outcome) sets `finished_at = clock_timestamp()`
+unconditionally; the three branches that can also land on a genuinely
+non-terminal state (`retryable`, `scheduled` via a worker snooze, and
+`uncertain`) use a bare `CASE WHEN cancel_requested_at IS NOT NULL THEN
+clock_timestamp() END` (implicit `NULL` otherwise), matching the state
+`CASE` right next to it exactly.
+
+`postgres_finished_at_check_constraint_rejects_mismatch_test`
+(`test/grind_test.gleam`) probes the constraint directly with two raw
+`INSERT`s (a non-terminal state with `finished_at` set, and a terminal one
+with it left null), asserting `pog.ConstraintViolated(constraint:
+"grind_jobs_finished_at_check", ..)` — PostgreSQL's own `23514
+check_violation`, which `pog_ffi:convert_error` reports through
+`ConstraintViolated` (it carries a `constraint` field, exactly like a
+unique violation) rather than the generic `PostgresqlError(code, ..)` shape.
+`postgres_finished_at_written_at_every_terminal_path_test` is the
+table-driven proof over every write site: nine terminal jobs (one per
+acknowledgement outcome that ends terminal, one contract-mismatch, one
+`cancel_before_run`, and one `resolve_uncertain` for each of
+`ConfirmSuccess`/`ConfirmBusinessFailure`) assert `finished_at IS NOT NULL`,
+and five non-terminal jobs (fresh `queued`, an acknowledged `scheduled`
+snooze, an acknowledged `retryable`, a forced `uncertain`, and that same job
+after `AuthorizeReplay` — the one non-terminal outcome a resolution can
+itself produce) assert it stays null. The upgrade harness
+(`postgres_migrate_upgrade_from_frozen_v11_fixture_test`) now migrates its
+frozen v11 fixture through the real `v11`+`v12` (plus a renumbered synthetic
+`v13` step, since `v12` is no longer available for that role) rather than a
+synthetic stand-in for `v12` itself, and separately asserts the backfill
+result: the fixture's pre-migration `succeeded` row (written before
+`finished_at` existed at all) picks up a `finished_at` dated from the
+migration itself, while every non-terminal seeded row's stays null.
+
+**Red-first / mutation** (two independent mutations, both reverted after
+capturing this evidence):
+
+1. Removed the `ALTER TABLE grind_jobs ADD CONSTRAINT
+grind_jobs_finished_at_check ...` statement from `v12_statements()` only
+   (deliberately _not_ from the mirrored `.sql` file, to isolate this from
+   the conformance test) and reran `scripts/test-postgres.sh`:
+   `grind_migrations_conformance_test` failed as expected (the two sources
+   no longer match — proving that test still catches a source drift even
+   here), and, isolating the constraint's own claim,
+   `postgres_finished_at_check_constraint_rejects_mismatch_test` failed:
+   ```
+   let assert Error(queued_error) =
+     pog.query(...) |> pog.execute(on: connection)
+   value: Ok(Returned(1, []))
+   info: Pattern match failed, no pattern matched the value.
+   ```
+   i.e. without the constraint, PostgreSQL silently accepted a `queued` row
+   with `finished_at` already set. Restoring the statement made both tests
+   pass again (192 passed, no failures).
+2. Removed `finished_at = clock_timestamp()` from
+   `acknowledge_transaction`'s `"discarded"` branch only (leaving the
+   constraint itself, and every other branch, untouched) and reran the
+   suite: the constraint's own defense-in-depth caught it immediately, as a
+   _commit-time_ failure rather than a silently wrong value —
+   `postgres_finished_at_written_at_every_terminal_path_test` failed with
+   `Error(QueueProcessFailed(QueueAckFailed(ConstraintViolated(.., "grind_jobs_finished_at_check", ..))))`
+   instead of `Ok(True)` for its discard scenario, and, independently, the
+   pre-existing `postgres_worker_discard_has_distinct_committed_outcome_test`
+   failed the exact same way — proving the constraint is a real safety net
+   for a write site this change did not itself add a dedicated test for,
+   not only for the new table-driven one. Exactly 2 failures (190 passed).
+   Restoring the assignment made both pass again (192 passed, no failures).
+
+**Also covered in the same commit**: the claim/quarantine hot-path partial
+indexes `grind_jobs_claim_idx`
+(`(storage_owner, queue, available_at, id) WHERE state IN ('queued',
+'scheduled', 'retryable')`) and `grind_jobs_quarantine_idx`
+(`(storage_owner, queue, lease_expires_at, id) WHERE state = 'executing'`),
+and the retention-scan indexes `grind_jobs_finished_idx`,
+`grind_unique_submissions_job_idx`, and `grind_job_resolutions_job_idx`
+(the latter two ahead of a future `prune_finished`, not yet implemented).
+No dedicated test proves these indexes are actually used by the planner
+(`EXPLAIN`-based query-plan assertions are not otherwise used in this
+suite); their shapes are derived directly from the exact predicates
+`attempt.claim_registered_job` and `grind/internal/lease`'s quarantine scans
+already use, and `read_schema_generation`'s existing exact-shape check
+(`v12_shape`) proves each index exists with the right name after a real
+`migrate`, empirically confirmed against `pg_class`/`pg_indexes` the same
+way `v11_shape`'s own doc comment describes.
+
+## Increment 22 — quarantine index shape corrected; claim eligibility is now a real index condition
+
+**Increment 21's own `grind_jobs_quarantine_idx`** —
+`(storage_owner, queue, lease_expires_at, id) WHERE state = 'executing'` —
+never actually served `postgres.quarantine_expired` (the public,
+cross-queue sweep): that query has no `queue` predicate at all and never
+sorts by `lease_expires_at` (only `id`), so the planner fell back to a
+primary-key walk across every `executing` row regardless of queue,
+measured 384ms at 2,000,000 rows. `v12` is still unreleased and unpinned
+(`AGENTS.md`), so this is a same-version edit rather than a new migration:
+`(storage_owner, id) WHERE state = 'executing'` — no `queue`, no
+`lease_expires_at`. Correct for both callers: `grind/internal
+.lease.quarantine_expired_in_queue` (the per-queue scan every consumer poll
+runs) still filters by `queue` and `lease_expires_at` as an ordinary
+post-scan `Filter`, which is cheap once `(storage_owner, id) WHERE state =
+'executing'` has already narrowed the scan to that owner's live attempts;
+`postgres.quarantine_expired` (the cross-queue sweep) needed exactly this
+shape and nothing more, since it never filters by `queue` at all. Measured
+at 2,000,000 rows: 2.6ms cross-queue, 1.3ms per-queue, no sort either way
+(`id` is already the index order). Confirmed via `pg_indexes` against a
+real `migrate`d schema (`SELECT indexdef FROM pg_indexes WHERE indexname =
+'grind_jobs_quarantine_idx'` reports exactly
+`... USING btree (storage_owner, id) WHERE (state = 'executing'::text)`).
+
+**`attempt.claim_registered_job`'s own eligibility check** — `available_at
+<= clock_timestamp()` — never let the planner use `grind_jobs_claim_idx`'s
+own `available_at` column as a real index bound, because `clock_timestamp()`
+is `VOLATILE` (PostgreSQL must assume it can return a different value on
+every row it is evaluated against, even within one statement) — index
+scans require a `STABLE` or better comparison value to use as a scan
+boundary, so this stayed a post-scan `Filter` applied after the index had
+already been walked using only `storage_owner`/`queue`. `statement_timestamp()`
+is `STABLE` for the lifetime of one statement — the exact same value
+`clock_timestamp()` would have returned for a single, non-blocking
+`UPDATE ... FROM (candidate CTE) ...` like this one (it never waits on a
+lock — `FOR UPDATE SKIP LOCKED` never blocks) — so swapping it in lets the
+planner fold `available_at <= statement_timestamp()` directly into the
+index condition. Reproduced with `EXPLAIN` against a 200,000-row
+`grind_jobs` (a realistic multi-queue distribution, `ANALYZE`d):
+
+```
+-- available_at <= clock_timestamp()
+Index Scan using grind_jobs_claim_idx on grind_jobs
+  Index Cond: ((storage_owner = 'owner') AND (queue = 'q5'))
+  Filter: (... AND (available_at <= clock_timestamp()))
+
+-- available_at <= statement_timestamp()
+Index Scan using grind_jobs_claim_idx on grind_jobs
+  Index Cond: ((storage_owner = 'owner') AND (queue = 'q5')
+               AND (available_at <= statement_timestamp()))
+  Filter: (... state check only)
+```
+
+i.e. `available_at` moves from the `Filter` line into the `Index Cond` line
+— exactly the mechanism behind the reviewer's own measured 0.92ms → 0.009ms
+at a larger scale. This is a read-eligibility check, never a lease/fencing
+comparison: `lease.live_lease_predicate` and every `lease_expires_at`
+comparison stay on `clock_timestamp()` unchanged, since a lease's liveness
+must reflect the actual instant a fenced write commits, not merely when its
+enclosing statement began.
+
+**Also from the same review**: `postgres_finished_at_written_at_every_terminal_path_test`
+now also drives the three cancel-overridable `acknowledge_transaction`
+branches (`retryable`, `scheduled`, `uncertain`) through a concurrent
+`postgres.cancel` while genuinely `executing` (reusing the
+started/release handshake `run_cancel_running_ack_test` already
+established), proving `finished_at` ends up set on their overridden
+(`cancelled`) path too, not only their ordinary one; and a new
+`terminal_states_sql_matches_every_job_state_test` ties
+`terminal.states_sql()` to `job.state_to_stored` directly, over an
+exhaustive `case` on every `job.State` variant, so a future new variant
+fails this test file to compile rather than silently drifting from
+`grind_jobs_finished_at_check`.
+
+## Increment 23 — retention: `prune_finished`, the supervised pruner, and the `FOR KEY SHARE` admission race it exposed
+
+**Claim**: `postgres.prune_finished` deletes only finished-and-old-enough
+rows (scoped to the caller's own storage owner, oldest `finished_at` first,
+`FOR UPDATE SKIP LOCKED` against a concurrent claim or another prune call),
+along with each deleted job's own acknowledgement/uniqueness/resolution
+receipts in the same autocommitted statement; `grind/pruner` is a supervised
+background process that calls it on a timer with Oban-shaped defaults
+(`interval_ms` 30000, `limit` 10000, `max_age_ms` 60000); and a concurrent
+`submit_unique` admission deciding `KeepExisting` against a candidate a
+prune call is also considering can never end up with a receipt that
+outlives its own job.
+
+**Mechanism**: `sql/prune_finished.sql` (squirrel-generated — its shape
+never varies by call, only its three bound values do) is one `WITH doomed AS
+(SELECT id FROM grind_jobs WHERE storage_owner = $1 AND finished_at IS NOT
+NULL AND state IN (<six terminal>) AND finished_at < statement_timestamp() -
+($2::bigint::double precision * interval '1 millisecond') ORDER BY
+finished_at, id LIMIT $3 FOR UPDATE SKIP LOCKED), ...` statement cascading
+into three `DELETE ... USING doomed` receipt deletes and a final `DELETE
+FROM grind_jobs`, each `RETURNING 1` counted by the closing `SELECT`. The
+cutoff uses `statement_timestamp()`, not `clock_timestamp()`, for the same
+reason Increment 22 changed the claim query: it lets `finished_at < ...`
+fold into `grind_jobs_finished_idx`'s own index condition instead of a
+post-scan filter. There is no minimum retention floor beyond `older_than_ms
+
+> 0`(matching Oban's own`max_age`, which is likewise only required to be
+positive) — a deliberate decision (superseding an earlier draft of this plan
+that proposed a 300000ms floor), documented in README, "Retention", as a
+real trade-off: a retention window shorter than a live lease can turn a
+late commit-unknown acknowledgement retry into `QueueAckStale
+> (AckRecordMissing)` instead of a clean commit.
+
+`grind/pruner` reuses `prune_finished`'s own validation (`validate_policy`
+enforces the identical `older_than_ms`/`limit` bounds under different names,
+plus a positive `interval_ms`) and, unlike Oban's own pruner plugin, has no
+leader election at all: `prune_finished`'s `FOR UPDATE SKIP LOCKED` already
+makes concurrent callers (several nodes' own supervised pruners, or a
+pruner racing an operator's manual call) safe to run at once — each simply
+skips whatever another one already holds — so there is no cluster-wide
+single-writer invariant to elect a leader for in the first place. Each tick
+loops immediately (never waiting out the rest of `interval_ms`) while its
+own batch came back exactly `limit` rows, draining a backlog within one
+scheduled tick rather than one batch per interval.
+
+**`candidate_sql`'s missing lock** (`grind/internal/unique_admission`): a
+`KeepExisting` uniqueness decision (the common case — most policies never
+reschedule) read its candidate row with a bare `SELECT`, no lock at all.
+Once `prune_finished` existed, this became a real race: `submit_unique`
+reads an old, terminal candidate, decides `KeepExisting`, and is about to
+commit its own `grind_unique_submissions` receipt naming that row's `id` —
+if a concurrent `prune_finished` call deletes that exact row and commits
+first, admission's own transaction still commits its receipt on schedule,
+now naming a job that no longer exists. Fixed by locking every
+non-reschedule candidate with `FOR KEY SHARE` (a reschedule already used
+`FOR UPDATE`) — the weakest lock mode that still conflicts with a
+`DELETE`, so `prune_finished`'s own `FOR UPDATE SKIP LOCKED` either skips
+the row outright (if admission's lock is already held) or blocks until
+admission's transaction ends, after which its own `SELECT` correctly finds
+nothing there anymore.
+
+**Red-first / mutation**, `postgres_prune_finished_admission_race_keeps_candidate_and_receipt_test`
+(`test/grind_test.gleam`): a real barrier forces the exact overlap needed —
+`install_admission_receipt_barrier` blocks `INSERT INTO
+grind_unique_submissions` (scoped to one exact `submission_id`) behind
+`pg_advisory_xact_lock`, so a background `submit_unique` call is provably
+paused strictly _after_ its own candidate lock is taken and _before_ its
+own receipt commits (`await_admission_blocked_on_receipt_insert` polls
+`pg_stat_activity` for a backend genuinely waiting on that exact lock from
+inside that exact query, rather than inferring the pause from timing).
+While paused there, the test calls the real `prune_finished` against the
+same row. With the fix: `race_prune.jobs` is `0` (skipped), the row and its
+own eventual receipt both survive. Temporarily reverted the fix (`FOR KEY
+SHARE` → `""`) and reran:
+
+```
+panic src/gleeunit/should.gleam:10
+test: grind_test.postgres_prune_finished_admission_race_keeps_candidate_and_receipt_test
+info:
+1
+should equal
+0
+```
+
+i.e. without the lock, `prune_finished`'s own `SKIP LOCKED` no longer
+skipped the contested row — it deleted it (`race_prune.jobs` came back `1`)
+while the barrier-paused admission transaction was still open, mid-way
+through committing a `KeepExisting` decision that names it. Restoring `FOR
+KEY SHARE` made the test pass again (198 passed, no failures).
+
+**Also covered in the same commit**: the state/receipt-cascade matrix
+(`postgres_prune_finished_deletes_old_terminal_rows_test` — all six terminal
+states old enough are pruned with their acknowledgement/uniqueness/
+resolution receipts counted exactly; all six young enough and all five
+non-terminal states survive; a second storage owner's own old row is
+untouched), batch size and oldest-first ordering (five rows, `limit: 2`
+four times → `2, 2, 1, 0`), `FOR UPDATE SKIP LOCKED` against an externally
+held row lock (skipped while locked, pruned once released), pure validation
+against a closed pool (`postgres_prune_finished_validates_arguments_test`),
+and the two documented post-prune behaviors that follow directly from the
+row being gone rather than needing their own fault injection:
+`state`/`outcome`/`bind_handle` report `JobNotFound`,
+`reconcile_acknowledgement` reports `ReceiptNotFound`, a `submit_with_id`
+replay of the same `SubmissionId` inserts a genuinely new row (the
+idempotency window is the retention window), and an `AllRetained`/
+`while_retained()` uniqueness key admits a fresh submission once its old
+occupant is pruned, rather than staying occupied forever.
+
+**Not covered**: `reconcile_unique` against a submission whose own
+`CommitUnknown` was never resolved before its underlying job was pruned
+(the plan's own "reconcile_unique on old pending → CommitUnknown forever")
+— reproducing a genuine lost-reply `CommitUnknown` needs the fault-proxy
+machinery `docs/RECOVERY-EVIDENCE.md`'s earlier increments already use for
+the acknowledgement deadline; layering `prune_finished` underneath that
+setup as a fourth moving part was judged not worth the added flakiness risk
+for this round. The behavior itself is a straightforward corollary of
+"the receipt row is gone" (the same shape `ReceiptNotFound`/`AckRecordMissing`
+already prove elsewhere), not a new code path.
+
+## Increment 24 — independent review of Increment 23: `ON DELETE CASCADE`, lock-mode contention, and a real timer leak
+
+**Claim 1 (correctness)**: even with Increment 23's own `FOR KEY SHARE` fix,
+a `KeepExisting` admission's receipt could still end up orphaned by a
+narrower, snapshot-timing race a per-row lock alone cannot close;
+`grind_v12`'s `ON DELETE CASCADE` foreign keys (`grind_job_acknowledgements`/
+`grind_unique_submissions`/`grind_job_resolutions`, all on `job_id`
+referencing `grind_jobs(id)`) close it, since the database itself now
+guarantees the receipt is gone whenever its job is — immune to which
+statement's own snapshot did or did not see the receipt commit.
+`postgres.prune_finished` no longer issues a second, explicit receipt
+`DELETE` of its own at all; `PruneReport` is now `jobs`-only.
+
+**Mechanism**: under `READ COMMITTED`, every CTE inside one SQL statement
+shares that one statement's own start-of-statement snapshot. A receipt
+committed by some other writer _after_ `prune_finished`'s own snapshot was
+taken, but _before_ its scan actually reaches and locks the row that
+receipt names, is invisible to that snapshot — an explicit,
+snapshot-scoped `DELETE ... WHERE job_id = d.id` against the receipt table
+(Increment 23's own shape) can never see or delete it, leaving it an orphan
+once the job itself is deleted a moment later in the very same statement.
+`ON DELETE CASCADE` fires its own fresh sub-query when the row is actually
+deleted, immune to the deleting statement's own snapshot, so it still finds
+and removes a receipt committed in exactly that window.
+
+**Red-first / mutation**, all three reverted together (removing the three
+`ADD CONSTRAINT ... FOREIGN KEY ... ON DELETE CASCADE` statements from
+`v12_statements()` only, deliberately not from the mirrored `.sql` file) and
+reran `scripts/test-postgres.sh`:
+
+```
+test: grind_test.postgres_prune_finished_deletes_old_terminal_rows_test
+info:
+[#(1, 1, 1)]
+should equal
+[#(0, 0, 0)]
+
+test: grind_test.postgres_prune_finished_cascade_survives_late_committed_receipt_test
+info:
+[False]
+should equal
+[True]
+```
+
+i.e. without the foreign keys, deleting a job left its acknowledgement,
+uniqueness-submission, and resolution receipts behind _even in the
+ordinary case_ (no snapshot race needed — `prune_finished` genuinely never
+deletes them itself anymore), and the dedicated snapshot-race test
+(`postgres_prune_finished_cascade_survives_late_committed_receipt_test`,
+below) reproduced the exact orphan the fix targets. `grind_migrations_conformance_test`
+also failed, as expected (the two sources no longer matched — confirming
+that test still catches this kind of drift even here). Restoring all three
+statements made every test pass again (200 passed, no failures, reproduced
+across three consecutive full runs both before and after this mutation
+cycle).
+
+`postgres_prune_finished_cascade_survives_late_committed_receipt_test`
+(`test/grind_test.gleam`) forces the exact interleaving deterministically:
+`install_snapshot_barrier` installs a PL/pgSQL function, called from inside
+a prune-shaped query's own `WHERE` clause once per candidate row, that
+blocks on `pg_advisory_xact_lock` only when evaluating one exact target
+row id. With that lock held externally first, a background connection runs
+`snapshot_barrier_prune_sql` (textually identical to `sql/prune_finished
+.sql`, plus that one extra barrier call — the real, squirrel-generated
+query has no injection point of its own to pause mid-scan from a test) —
+proven genuinely paused there via `pg_stat_activity`
+(`await_prune_blocked_on_snapshot_barrier`), not inferred from timing.
+While paused, a receipt is inserted and committed directly, naming the
+still-locked target row. Releasing the barrier lets the prune-shaped
+statement's own scan reach and delete that row; the fix's own `ON DELETE
+CASCADE` then removes the just-committed receipt too, even though it was
+invisible to the deleting statement's own snapshot the whole time.
+
+**Claim 2 (contention)**: `FOR KEY SHARE` (Increment 23) unlocked a new
+problem: `attempt.claim_registered_job`'s own candidate lock, `postgres
+.cancel_lock`, and `lease`'s own quarantine-scan candidate lock all used a
+plain `FOR UPDATE`, which conflicts with _everything_, including a
+read-only `FOR KEY SHARE` — so an ordinary claim, cancellation, or
+quarantine sweep racing a `KeepExisting` admission's read of the identical
+row could spuriously report `AdmissionContended` for a reason that was
+never actually a write conflict (none of those three `UPDATE`s ever touch
+`grind_jobs.id`, the only key column any unique index on that table
+covers). Fixed by switching all three to `FOR NO KEY UPDATE`, which does
+not conflict with `FOR KEY SHARE`; `prune_finished`'s own candidate lock
+stays `FOR UPDATE`, since a `DELETE` conflicts with `FOR KEY SHARE`
+regardless of the weaker mode.
+
+**Evidence**: reproduced directly at the SQL level against a disposable
+database (two `psql` sessions, no application code involved, to isolate
+the lock-mode mechanism itself from any of Grind's own machinery):
+
+```
+-- session A: FOR NO KEY UPDATE held (uncommitted)
+-- session B: FOR KEY SHARE, 500ms lock_timeout
+BEGIN
+ id | v
+----+---
+  1 | a
+(1 row)
+COMMIT                                  -- no wait at all
+
+-- session A: FOR UPDATE held (uncommitted), 2s hold
+-- session B: FOR KEY SHARE, 500ms lock_timeout
+ERROR:  canceling statement due to lock timeout
+CONTEXT:  while locking tuple (0,1) in relation "t"
+```
+
+i.e. `FOR NO KEY UPDATE` and `FOR KEY SHARE` never contend at all, while
+`FOR UPDATE` and `FOR KEY SHARE` do — exactly the mechanism behind both the
+bug (claim/cancel/quarantine using `FOR UPDATE`) and the fix (switching
+them to `FOR NO KEY UPDATE`). The full gate's own existing concurrency
+tests (overlapping claims, cancel-while-running, quarantine races) stayed
+green throughout, confirming the weaker lock mode is still exactly as safe
+for what each of those three `UPDATE`s actually needs.
+
+**Claim 3 (`grind/pruner`, a real timer leak)**: `process.send_after`
+targeting a _named_ subject resolves to whichever process currently holds
+that name at _delivery_ time, not at scheduling time. Increment 23's own
+`handle_message` scheduled its next `Tick` against `Pruner`'s own named
+subject — so a timer an old, killed incarnation scheduled for itself did
+not die with it: it still fired later and delivered to whatever new
+incarnation the supervisor had since restarted, landing as an extra,
+unaccounted-for tick on top of that new incarnation's own freshly
+scheduled one. Fixed by scheduling `Tick` against a fresh, per-incarnation
+subject created in the initialiser instead (exactly `grind/queue`'s own
+`ConsumerState.incarnation_subject` pattern) — a subject with no live
+owner left to deliver to once its own incarnation is gone.
+
+**Red-first / mutation**,
+`postgres_supervised_pruner_restart_ticks_exactly_once_test`
+(`test/grind_test.gleam`): starts a pruner, waits for its first real tick
+(confirming a fresh timer was just scheduled), kills the actor via its own
+`@internal actor_pid` (`process.subject_owner` on the named subject,
+resolved fresh, the same lookup `grind/queue.coordinator_pid` uses),
+confirms a genuinely different pid took over, then counts `[grind, prune,
+completed]` events in a bounded window sized to catch exactly one
+legitimate post-restart tick. Temporarily reintroduced the exact original
+shape (the named subject stored in `PrunerState` and used for both the
+initial and every recurring `send_after`, rather than a fresh incarnation
+subject) and reran:
+
+```
+panic src/gleeunit/should.gleam:10
+test: grind_test.postgres_supervised_pruner_restart_ticks_exactly_once_test
+info:
+2
+should equal
+1
+```
+
+i.e. exactly the predicted leak — two completed events instead of one, the
+killed incarnation's own leaked timer plus the new incarnation's own
+legitimate one, arriving close enough together to both land inside the
+same bounded window. Restoring the per-incarnation subject made the test
+pass again (200 passed, no failures).
+
+**Also covered in the same commit**: `grind/pruner` now calls
+`prune_finished` exactly once per tick (Increment 23's own internal
+drain-while-`jobs == limit` loop is gone, matching Oban's own pruner,
+which never drains within one tick either — tune `limit`/`interval_ms`
+down together instead of relying on an internal loop, documented in
+`grind/pruner`'s own module doc comment alongside the `statement_deadline_ms`
+trade-off of too large a `limit`); a failed tick emits `[grind, prune,
+failed]` with a coarse `observation.PruneFailureKind` classifying the
+underlying `pog.QueryError` (`PruneReplyLost`/`PruneResultUndecodable`/
+`PruneRejected`/`PruneNotAttempted` — see that type's own doc comment for
+which ones leave "did this actually delete anything" genuinely unknown);
+`pruner.supervised` gives an application its own child specification to
+embed directly into its own supervision tree instead of tracking the
+separate, dedicated one `pruner.start` creates; and `pruner.validate_policy`
+now calls `postgres.validate_retention_ms`/`postgres.validate_prune_limit`
+(the same `@internal` functions `prune_finished` itself calls) instead of
+maintaining an independent copy of the same two threshold checks.
+
+## Increment 25 — second independent review of Increment 24: orphan-safe `ADD CONSTRAINT`, a measured cascade, corrected contention wording, a fourth `FOR NO KEY UPDATE`, and two cleanups
+
+**Claim 1 (correctness, red-first)**: `grind_v12`'s own `ADD CONSTRAINT ...
+FOREIGN KEY` statements (Increment 24) validate every existing row by
+default, so a database that had already accumulated an orphaned receipt
+under `v11` — no foreign key was enforcing anything yet, so this needed no
+exotic scenario, just an old bug, a hand rollback, or direct SQL against
+the database at any point before this upgrade — would fail this migration
+outright with `23503 foreign_key_violation`, never reaching `v12` at all.
+Fixed by adding one `DELETE FROM <receipt table> r WHERE NOT EXISTS (SELECT
+1 FROM grind_jobs j WHERE j.id = r.job_id)` immediately before each
+receipt table's own `ADD CONSTRAINT`, in the still-unreleased `v12`
+migration (`priv/migrations/20260926000000-grind_v12.sql` and
+`migrations.v12_statements`, kept byte-identical as always).
+
+Red first, at the SQL level, against a real disposable cluster: applied a
+real `v11` install, seeded one orphaned `grind_job_acknowledgements` row
+(`job_id = 999999999`, which was never a real `grind_jobs.id`), then applied
+`v12`'s own `up` section with the three `DELETE`s removed (reproducing the
+pre-fix shape):
+
+```
+ERROR:  insert or update on table "grind_job_acknowledgements" violates foreign key constraint "grind_job_acknowledgements_job_id_fkey"
+DETAIL:  Key (job_id)=(999999999) is not present in table "grind_jobs".
+```
+
+Green, same scenario, current (fixed) `v12`: the migration's own `up`
+section completes with no error, and `SELECT count(*) FROM
+grind_job_acknowledgements WHERE job_id = 999999999` reads back `0`.
+`postgres_migrate_upgrade_from_frozen_v11_fixture_test`
+(`test/grind_test.gleam`) now seeds this same shape (one orphan per receipt
+table) as part of its own real, full upgrade harness run — through
+`postgres.migrate_with`, not raw SQL, so it also proves the Gleam-side
+`v12_statements` mirrors the priv file exactly, and asserts all three
+orphans are gone once `migrate_with` returns `Ok(Nil)`. `mark_database_test_executed("migrate-upgrade-harness-passed")`.
+
+**Claim 2 (measured, not assumed)**: whether `prune_finished`'s own cascade
+(deleting up to `limit` jobs, each cascading into up to three receipt rows)
+stays comfortably inside the pool's own default 4000ms
+`statement_deadline_ms` at Oban's own default `limit` (10,000) was an
+assumption before this round, not a measurement. Measured directly against
+a real disposable cluster: a fresh `v12` schema seeded with 10,000 finished
+(and old enough) jobs, each carrying one acknowledgement, one uniqueness
+submission, and one resolution receipt (30,000 receipt rows total, the
+worst case every one of them cascades) — the exact `prune_finished.sql`
+statement (`limit: 10000`, `older_than_ms: 60000`) ran in:
+
+```
+Time: 65.870 ms
+Time: 66.802 ms
+Time: 66.967 ms
+```
+
+— three runs, ~66ms each, about **1.7% of the 4000ms default
+`statement_deadline_ms`**, comfortably under the 50% caution threshold this
+review set. **No change to `pruner.default_policy`'s `limit` (10,000) or to
+`postgres.prune_limit_maximum` (10,000) was needed** — both stay exactly as
+Oban's own pruner defaults them. `grind_job_acknowledgements_job_idx`/
+`grind_unique_submissions_job_idx`/`grind_job_resolutions_job_idx`
+(Increment 23) are exactly why: each cascade is an index lookup on `job_id`,
+not a sequential scan, against however many receipt rows exist. This
+number is recorded here (and in `grind/pruner`'s own module doc comment) as
+the actual evidence behind "large enough `limit` risks timing out" already
+being phrased as a risk, not a certainty, for the shipped defaults — a
+much larger fan-out per job, a much slower disk, or a `limit` raised well
+past `prune_limit_maximum` by a caller who forked this bound could still
+change that conclusion; this measurement is not a guarantee for every
+deployment, only for Oban's own shipped defaults on ordinary hardware.
+
+**Claim 3 (contention wording correction)**: Increment 24's own new prose
+(`unique_admission.candidate_sql`'s doc comment,
+`docs/UNIQUENESS-CONTRACT.md` step 6) got the blocking direction backwards:
+`prune_finished` itself never blocks (its own scan is `FOR UPDATE SKIP
+LOCKED`, so a row already locked elsewhere is simply skipped); a
+`KeepExisting` admission's own `FOR KEY SHARE` read is the side that can
+block, when `prune_finished`'s `FOR UPDATE` already holds the row for the
+duration of its own `DELETE` statement — and, if that wait exceeds the
+admission's own `lock_timeout`, `AdmissionContended` is the correct result,
+not a bug. Both doc comments are corrected to state the direction
+correctly and to restate the window `FOR KEY SHARE` actually closes:
+admission committing after `prune_finished`'s statement already took its
+snapshot but before that statement's own scan reaches and locks this exact
+row. No code changed for this claim — wording only.
+
+**Claim 4 (a fourth `FOR NO KEY UPDATE`)**: `postgres.apply_uncertain_resolution`'s
+own row lock (the audited-resolution path) still used a plain `FOR UPDATE`,
+missed by Increment 24's own sweep of claim/cancel/quarantine. Its own later
+`UPDATE grind_jobs` (in `write_resolution`) never touches a key column
+(`id`, `storage_owner`, `worker_id`, `worker_version`,
+`unique_key_contract`, `unique_key_sha256` — all in that `UPDATE`'s `WHERE`,
+never its `SET`), so it moves to `FOR NO KEY UPDATE` for the same reason
+the other three did: it does not conflict with `unique_admission`'s own
+`FOR KEY SHARE`, so an audited resolution racing a `KeepExisting` read of
+the same row no longer spuriously reports `AdmissionContended`. Proven by
+the same concurrency tests Increment 24 already relied on
+(`unique-contended-lock-wait-passed` and friends) staying green with this
+fourth lock also downgraded — no new test was needed since the existing
+suite already exercises this row under real concurrent contention.
+
+**Claim 5 (cleanups)**:
+
+- `unique_admission.classify_query_error`'s dedicated `job_id` foreign-key-
+  violation branch was byte-identical in behavior to the general fallback
+  it sat above (`submission.NotCommitted(violated)` where `violated` is the
+  same value the fallback's own `submission.NotCommitted(error)` already
+  wraps) — dead code, not a distinct outcome. Removed; the doc comment
+  above `classify_query_error` now explains why the general case already
+  covers it correctly.
+- `sql/prune_finished.sql` now counts server-side (`WITH doomed AS (...),
+deleted AS (DELETE ... RETURNING 1) SELECT count(*) FROM deleted`)
+  instead of `RETURNING x.id` and `list.length`-ing the rows in
+  `postgres.run_prune` — saves transferring up to `limit` row ids over the
+  wire on a large batch just to discard them for a count. Regenerated via
+  Squirrel; `sql.PruneFinishedRow` is now `PruneFinishedRow(count: Int)`.
+- The schema compatibility check (`postgres.read_schema_generation` →
+  `validate_expected_shape`) did not check `grind_v12`'s own three `ON
+DELETE CASCADE` foreign keys at all: a plain foreign key backs no
+  `pg_class` relation of its own, so `v12_shape`'s existing relation check
+  could never have caught one being dropped by hand. `migrations.Migration`
+  gained a `foreign_keys: List(String)` field (checked against
+  `pg_constraint`, independently of `shape`); `v12_foreign_keys` lists the
+  three constraint names. Proven by a new test
+  (`postgres_migration_missing_foreign_key_shape_detected_test`,
+  `missing-foreign-key-not-repaired`): drops
+  `grind_job_acknowledgements_job_id_fkey` from an otherwise-genuine `v12`
+  install, and confirms `postgres.migrate` now reports `IncompatibleSchema`
+  rather than silently trusting the marker.
+
+Gate: 201 passed (root, one new test — `postgres_migrate_upgrade_from_frozen_v11_fixture_test`'s
+own orphan-cleanup assertions ride the existing test, adding no new count;
+`postgres_migration_missing_foreign_key_shape_detected_test` is the one new
+test function), 11 passed (consumer), `nix flake check` green, reproduced
+across multiple full runs.

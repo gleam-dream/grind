@@ -153,7 +153,7 @@ pub fn cancel_before_run(
     decode.success(CancelBeforeRunRow(id:))
   }
 
-  "UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, error_version = NULL, failure_description = 'cancelled by caller', failure_cause = NULL, uncertain_at = NULL, cancel_requested_at = NULL WHERE id = $1 AND state IN ('queued', 'scheduled', 'retryable') RETURNING id
+  "UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, error_version = NULL, failure_description = 'cancelled by caller', failure_cause = NULL, uncertain_at = NULL, cancel_requested_at = NULL, finished_at = clock_timestamp() WHERE id = $1 AND state IN ('queued', 'scheduled', 'retryable') RETURNING id
 "
   |> pog.query
   |> pog.parameter(pog.int(id))
@@ -235,7 +235,7 @@ pub fn cancel_lock(
     ))
   }
 
-  "SELECT storage_owner, queue, worker_id, worker_version, state FROM grind_jobs WHERE id = $1 FOR UPDATE
+  "SELECT storage_owner, queue, worker_id, worker_version, state FROM grind_jobs WHERE id = $1 FOR NO KEY UPDATE
 "
   |> pog.query
   |> pog.parameter(pog.int(id))
@@ -381,6 +381,43 @@ pub fn pin_read_committed(
   "SET TRANSACTION ISOLATION LEVEL READ COMMITTED
 "
   |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `prune_finished` query
+/// defined in `./src/grind/internal/sql/prune_finished.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type PruneFinishedRow {
+  PruneFinishedRow(count: Int)
+}
+
+/// Runs the `prune_finished` query
+/// defined in `./src/grind/internal/sql/prune_finished.sql`.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn prune_finished(
+  db: pog.Connection,
+  storage_owner: String,
+  arg_2: Int,
+  arg_3: Int,
+) -> Result(pog.Returned(PruneFinishedRow), pog.QueryError) {
+  let decoder = {
+    use count <- decode.field(0, decode.int)
+    decode.success(PruneFinishedRow(count:))
+  }
+
+  "WITH doomed AS (SELECT id FROM grind_jobs WHERE storage_owner = $1 AND finished_at IS NOT NULL AND state IN ('succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'discarded', 'cancelled') AND finished_at < statement_timestamp() - ($2::bigint::double precision * interval '1 millisecond') ORDER BY finished_at, id LIMIT $3 FOR UPDATE SKIP LOCKED), deleted AS (DELETE FROM grind_jobs x USING doomed d WHERE x.id = d.id RETURNING 1) SELECT count(*) FROM deleted
+"
+  |> pog.query
+  |> pog.parameter(pog.text(storage_owner))
+  |> pog.parameter(pog.int(arg_2))
+  |> pog.parameter(pog.int(arg_3))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }

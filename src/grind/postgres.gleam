@@ -12,6 +12,7 @@ import grind/internal/lease
 import grind/internal/migrations
 import grind/internal/sql
 import grind/internal/store
+import grind/internal/terminal
 import grind/internal/unique_admission
 import grind/job.{type JobHandle, type State, Queued, Scheduled}
 import grind/observation
@@ -140,6 +141,13 @@ pub type ConfigError {
   /// connection first, surfacing as `NotCommitted(QueryTimeout)` or a
   /// commit-unknown outcome instead of the typed contention outcome.
   UniqueLockWaitTooCloseToDeadline
+  /// `migration_deadline_ms` is within roughly one second of the constant
+  /// migration-step `lock_timeout` (`migration_lock_timeout_ms`, 2000ms):
+  /// PostgreSQL's own `55P03 lock_not_available` would otherwise race the
+  /// migration checkout deadline itself force-closing the connection first,
+  /// surfacing as `MigrationCommitUnknown` instead of the typed
+  /// `MigrationLockUnavailable`.
+  MigrationDeadlineTooCloseToLockTimeout
 }
 
 pub opaque type ValidatedSettings {
@@ -159,6 +167,28 @@ pub opaque type ValidatedSettings {
 /// mapped to `submission.AdmissionContended` before the checkout deadline would
 /// otherwise force-close the connection first.
 const unique_lock_wait_margin_ms = 1000
+
+/// The constant transaction-local `lock_timeout` (milliseconds) every
+/// migration step's own transaction sets, right after its advisory lock and
+/// before running that step's statements — never itself configurable
+/// (unlike `unique_lock_wait_ms`): a migration step's own failure mode
+/// should stay fast and predictable regardless of how a caller tunes
+/// `migration_deadline_ms`. Bounds a DDL statement that would otherwise wait
+/// on a conflicting lock — an `ALTER`/`CREATE INDEX` against a large,
+/// actively used table under concurrent access — for up to the full
+/// `migration_deadline_ms`, or until the pooled connection is force-closed
+/// if that elapses first; hitting it surfaces PostgreSQL's own `55P03` as
+/// the typed `MigrationLockUnavailable`, safe to retry. Not applied to
+/// `priv/migrations/*.sql` run directly through cigogne — see README,
+/// "Migrations".
+const migration_lock_timeout_ms = 2000
+
+/// The margin `validate` requires between `migration_lock_timeout_ms` and
+/// `migration_deadline_ms`, mirroring `unique_lock_wait_margin_ms`: without
+/// it, a caller-configured `migration_deadline_ms` at or below the constant
+/// lock timeout would force-close the connection before PostgreSQL's own
+/// `55P03` ever has a chance to surface as `MigrationLockUnavailable`.
+const migration_lock_timeout_margin_ms = 1000
 
 /// Checks the URL and pool bound before any PostgreSQL process is started.
 /// Each successful call creates one new Erlang atom for the pool's own name
@@ -197,15 +227,20 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
     settings.unique_lock_wait_ms > 0,
     settings.unique_lock_wait_ms + unique_lock_wait_margin_ms
     < settings.statement_deadline_ms,
-    settings.observation_capacity > 0
+    settings.observation_capacity > 0,
+    migration_lock_timeout_ms + migration_lock_timeout_margin_ms
+    < settings.migration_deadline_ms
   {
-    False, _, _, _, _, _ -> Error(InvalidPoolSize)
-    True, False, _, _, _, _ -> Error(InvalidStatementDeadline)
-    True, True, False, _, _, _ -> Error(InvalidMigrationDeadline)
-    True, True, True, False, _, _ -> Error(InvalidUniqueLockWait)
-    True, True, True, True, False, _ -> Error(UniqueLockWaitTooCloseToDeadline)
-    True, True, True, True, True, False -> Error(InvalidObservationCapacity)
-    True, True, True, True, True, True ->
+    False, _, _, _, _, _, _ -> Error(InvalidPoolSize)
+    True, False, _, _, _, _, _ -> Error(InvalidStatementDeadline)
+    True, True, False, _, _, _, _ -> Error(InvalidMigrationDeadline)
+    True, True, True, False, _, _, _ -> Error(InvalidUniqueLockWait)
+    True, True, True, True, False, _, _ ->
+      Error(UniqueLockWaitTooCloseToDeadline)
+    True, True, True, True, True, False, _ -> Error(InvalidObservationCapacity)
+    True, True, True, True, True, True, False ->
+      Error(MigrationDeadlineTooCloseToLockTimeout)
+    True, True, True, True, True, True, True ->
       // The pool's own name, created here rather than accepted from the
       // caller (`Settings` carries no pog type of its own) — and created
       // once, here, rather than fresh on every `start`: a `ValidatedSettings`
@@ -412,10 +447,12 @@ pub fn close(database: Database) -> Result(Nil, CloseError) {
 }
 
 pub type StorageError {
-  /// A storage call made while reading the schema's current generation, or
-  /// while acquiring the migration advisory lock or pinning `READ
-  /// COMMITTED` — never one of a migration step's own DDL/DML statements,
-  /// see `MigrationStepFailed` for those — failed or its reply was lost.
+  /// A storage call made while reading the schema's current generation,
+  /// while acquiring the migration advisory lock, pinning `READ COMMITTED`,
+  /// or setting this transaction's own constant `lock_timeout` — never one
+  /// of a migration step's own DDL/DML statements, see `MigrationStepFailed`
+  /// and `MigrationLockUnavailable` for those — failed or its reply was
+  /// lost.
   MigrationQueryFailed(pog.QueryError)
   IncompatibleSchema
   UnsupportedSchemaVersion(Int)
@@ -424,6 +461,14 @@ pub type StorageError {
   /// transaction and stays applied; this step and every later one did not
   /// run. Safe to fix the underlying cause and re-run `migrate`.
   MigrationStepFailed(Int, pog.QueryError)
+  /// A migration step's own DDL/DML hit PostgreSQL's `55P03
+  /// lock_not_available` after this transaction's own constant
+  /// `lock_timeout` (`migration_lock_timeout_ms`, 2000ms) elapsed waiting on
+  /// a conflicting lock — typically an `ALTER`/`CREATE INDEX` against a
+  /// large, actively used table under concurrent access. This step's own
+  /// transaction rolled back cleanly, exactly like `MigrationStepFailed`;
+  /// safe to retry `migrate` once the conflicting lock clears.
+  MigrationLockUnavailable(Int)
   /// A migration step may or may not have committed. Covers three distinct
   /// shapes, all safe to resolve the same way: a checkout failure before
   /// `BEGIN` ever ran (definitely not committed, reported here anyway since
@@ -854,9 +899,24 @@ fn apply_uncertain_resolution(
   case database_owner == handle_owner {
     False -> Error(ResolutionRouteMismatch)
     True -> {
+      // `FOR NO KEY UPDATE`, not `FOR UPDATE`: this row lock's own later
+      // `UPDATE grind_jobs` (in `write_resolution`, below) never touches a
+      // key column (`id`, `storage_owner`, `worker_id`, `worker_version`,
+      // `unique_key_contract`, `unique_key_sha256` — the columns any unique
+      // index on `grind_jobs` covers, all of which stay in that `UPDATE`'s
+      // `WHERE`, never its `SET`), so the weaker mode is exactly as safe and
+      // does not conflict with `unique_admission.candidate_sql`'s own
+      // `FOR KEY SHARE` on a `KeepExisting` uniqueness candidate — a plain
+      // `FOR UPDATE` here would otherwise make an audited resolution
+      // spuriously contend (`AdmissionContended`) with an unrelated
+      // admission reading the exact same row for a reason that was never
+      // actually incompatible with this resolution's own write. See
+      // `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" step 6, for
+      // the full contention picture across claim, cancel, quarantine, and
+      // now resolution.
       let select =
         pog.query(
-          "SELECT storage_owner, queue, worker_id, worker_version, state, attempt_id, attempt_epoch, attempt_owner, lease_expires_at::text, output_version, error_version, cancel_requested_at IS NOT NULL FROM grind_jobs WHERE id = $1 FOR UPDATE",
+          "SELECT storage_owner, queue, worker_id, worker_version, state, attempt_id, attempt_epoch, attempt_owner, lease_expires_at::text, output_version, error_version, cancel_requested_at IS NOT NULL FROM grind_jobs WHERE id = $1 FOR NO KEY UPDATE",
         )
         |> pog.parameter(pog.int(id))
         |> pog.returning({
@@ -1048,7 +1108,9 @@ fn write_resolution(
   })
   let update =
     pog.query(
-      "UPDATE grind_jobs SET state = $1, output = $2::jsonb, output_version = $3, error = $4::jsonb, error_version = $5, failure_description = $6, attempt_id = CASE WHEN $1 = 'queued' THEN NULL ELSE attempt_id END, attempt_owner = NULL, lease_expires_at = NULL, available_at = CASE WHEN $1 = 'queued' THEN clock_timestamp() ELSE available_at END WHERE id = $7 AND storage_owner = $8 AND queue = $9 AND worker_id = $10 AND worker_version = $11 AND state = 'uncertain' AND attempt_id = $12 AND attempt_epoch = $13 AND attempt_owner = $14 RETURNING state",
+      "UPDATE grind_jobs SET state = $1, output = $2::jsonb, output_version = $3, error = $4::jsonb, error_version = $5, failure_description = $6, attempt_id = CASE WHEN $1 = 'queued' THEN NULL ELSE attempt_id END, attempt_owner = NULL, lease_expires_at = NULL, available_at = CASE WHEN $1 = 'queued' THEN clock_timestamp() ELSE available_at END, finished_at = CASE WHEN $1 IN ("
+      <> terminal.states_sql()
+      <> ") THEN clock_timestamp() ELSE NULL END WHERE id = $7 AND storage_owner = $8 AND queue = $9 AND worker_id = $10 AND worker_version = $11 AND state = 'uncertain' AND attempt_id = $12 AND attempt_epoch = $13 AND attempt_owner = $14 RETURNING state",
     )
     |> pog.parameter(pog.text(target_state))
     |> pog.parameter(pog.nullable(pog.text, encoded_output))
@@ -1202,6 +1264,7 @@ fn run_migration_step_transaction(
 ) -> Result(Nil, StorageError) {
   use _ <- result.try(pin_read_committed(connection))
   use _ <- result.try(acquire_migration_lock(connection))
+  use _ <- result.try(set_migration_lock_timeout(connection))
   use generation <- result.try(read_schema_generation(connection, steps))
   case generation_at_least(generation, step.version) {
     True -> Ok(Nil)
@@ -1210,6 +1273,8 @@ fn run_migration_step_transaction(
         list.try_each(step.statements, fn(statement) {
           case store.execute_safely(pog.query(statement), on: connection) {
             Ok(_) -> Ok(Nil)
+            Error(pog.PostgresqlError("55P03", _, _)) ->
+              Error(MigrationLockUnavailable(step.version))
             Error(query_error) ->
               Error(MigrationStepFailed(step.version, query_error))
           }
@@ -1265,6 +1330,26 @@ fn acquire_migration_lock(
       decode.success(locked)
     })
   case store.execute_safely(query, on: connection) {
+    Error(error) -> Error(MigrationQueryFailed(error))
+    Ok(_) -> Ok(Nil)
+  }
+}
+
+/// Sets this step's transaction to the constant `migration_lock_timeout_ms`
+/// (2000ms), transaction-local (`SET LOCAL`, via the same
+/// `grind/internal/unique_admission` uses for `unique_lock_wait_ms`) and
+/// therefore never leaking onto the pooled connection once this transaction
+/// commits or rolls back. Run after `acquire_migration_lock` so the wait for
+/// that advisory lock itself is unaffected — only this step's own
+/// statements are bounded by it.
+fn set_migration_lock_timeout(
+  connection: pog.Connection,
+) -> Result(Nil, StorageError) {
+  case
+    store.call_safely(connection, fn(connection) {
+      sql.set_lock_timeout(connection, int.to_string(migration_lock_timeout_ms))
+    })
+  {
     Error(error) -> Error(MigrationQueryFailed(error))
     Ok(_) -> Ok(Nil)
   }
@@ -1446,7 +1531,12 @@ fn validate_expected_shape(
       use shape_ok <- result.try(relation_shape_matches(connection, step.shape))
       case shape_ok {
         False -> Error(IncompatibleSchema)
-        True -> Ok(AtVersion(version))
+        True ->
+          case relation_foreign_keys_match(connection, step.foreign_keys) {
+            Error(error) -> Error(error)
+            Ok(False) -> Error(IncompatibleSchema)
+            Ok(True) -> Ok(AtVersion(version))
+          }
       }
     }
   }
@@ -1514,6 +1604,45 @@ fn relation_has_columns(
         [present] -> Ok(present == list.length(columns))
         _ -> Error(IncompatibleSchema)
       }
+  }
+}
+
+/// Every one of `foreign_keys` (constraint names) must exist as a real
+/// foreign key (`pg_constraint.contype = 'f'`) in the current schema — a
+/// step whose `foreign_keys` is `[]` (every version before `grind_v12`)
+/// always matches without a query. `pg_constraint`, never `pg_class`: a
+/// plain foreign key creates no relation of its own (unlike a `PRIMARY
+/// KEY`/`UNIQUE` constraint's backing index, already covered by `shape`
+/// itself), so it would otherwise never be checked at all — a database
+/// missing one of `grind_v12`'s three `ON DELETE CASCADE` constraints (say,
+/// dropped by hand) must fail closed exactly like a missing relation or
+/// column does, not silently pass as if the receipt-orphan backstop
+/// `docs/RECOVERY-EVIDENCE.md` Increment 24 describes were still in place.
+fn relation_foreign_keys_match(
+  connection: pog.Connection,
+  foreign_keys: List(String),
+) -> Result(Bool, StorageError) {
+  case foreign_keys {
+    [] -> Ok(True)
+    _ -> {
+      let query =
+        pog.query(
+          "SELECT count(*) FROM pg_constraint WHERE connamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()) AND contype = 'f' AND conname = ANY($1)",
+        )
+        |> pog.parameter(pog.array(pog.text, foreign_keys))
+        |> pog.returning({
+          use present <- decode.field(0, decode.int)
+          decode.success(present)
+        })
+      case store.execute_safely(query, on: connection) {
+        Error(error) -> Error(MigrationQueryFailed(error))
+        Ok(returned) ->
+          case returned.rows {
+            [present] -> Ok(present == list.length(foreign_keys))
+            _ -> Error(IncompatibleSchema)
+          }
+      }
+    }
   }
 }
 
@@ -2261,11 +2390,13 @@ pub fn quarantine_expired(
     False -> Error(NonPositiveLimit)
     True -> {
       let Database(connection:, storage_owner:, forwarder:, ..) = database
+      // `FOR NO KEY UPDATE`: see `lease.quarantine_expired_in_queue`'s
+      // identical reasoning for its own candidate lock.
       let sql =
         lease.quarantine_update_sql(
           "SELECT id FROM grind_jobs WHERE storage_owner = $1 AND state = 'executing' AND "
           <> lease.expired_lease_predicate("clock_timestamp()")
-          <> " ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $2",
+          <> " ORDER BY id FOR NO KEY UPDATE SKIP LOCKED LIMIT $2",
         )
       let query =
         pog.query(sql)
@@ -2283,6 +2414,185 @@ pub fn quarantine_expired(
       }
     }
   }
+}
+
+/// The upper bound `prune_finished`'s own `limit` argument accepts per call
+/// — matched to Oban's own pruner default (`limit: 10_000`); this package's
+/// documentation recommends starting closer to 1,000 and looping while
+/// `report.jobs == limit` rather than reaching for this ceiling directly.
+pub fn prune_limit_maximum() -> Int {
+  10_000
+}
+
+pub type PruneReport {
+  /// One `prune_finished` call's own count of rows deleted from
+  /// `grind_jobs`. Each deleted job's own acknowledgement, uniqueness-
+  /// submission, and resolution receipts are deleted alongside it too, via
+  /// each receipt table's own `ON DELETE CASCADE` foreign key
+  /// (`grind_v12`) — not counted here, and not counted separately anywhere,
+  /// since a single `DELETE ... RETURNING` naming only `grind_jobs` cannot
+  /// see rows a cascade removes as a side effect of the same statement.
+  PruneReport(jobs: Int)
+}
+
+pub type PruneError {
+  /// `older_than_ms` was not positive; nothing was touched. There is no
+  /// minimum retention floor beyond this (matching Oban's own `max_age`,
+  /// which is likewise only required to be positive) — see README,
+  /// "Retention", for what a very short retention window can do to a late
+  /// commit-unknown reconciliation.
+  NonPositiveRetention
+  /// `older_than_ms` exceeds `worker.retry_delay_maximum_milliseconds()`,
+  /// the same millisecond-to-microsecond precision bound every other
+  /// Grind-owned duration enforces (it is converted the same way, via
+  /// `* interval '1 millisecond'`).
+  RetentionAbovePrecisionBound
+  /// `limit` was not positive; nothing was touched.
+  NonPositivePruneLimit
+  /// `limit` exceeds `prune_limit_maximum()`; nothing was touched.
+  PruneLimitTooLarge
+  PruneQueryFailed(pog.QueryError)
+}
+
+/// Deletes up to `limit` rows from this database's storage owner that
+/// finished (reached one of the six terminal states — see
+/// `grind/internal/terminal`) more than `older_than_ms` milliseconds ago.
+/// Each deleted job's own acknowledgement, uniqueness-submission, and
+/// resolution receipts are removed by the database itself, via each receipt
+/// table's own `ON DELETE CASCADE` foreign key on `job_id` (`grind_v12`) —
+/// not by a second, explicit delete this function also issues. Scoped only
+/// by storage owner, never by queue: a retention policy is a property of
+/// the whole database, not of any one queue.
+///
+/// One call is one bounded batch, never an unbounded sweep: `report.jobs`
+/// can be fewer than `limit` (nothing else was old enough) but never more.
+/// A caller wanting to drain everything currently prunable loops while
+/// `report.jobs == limit`:
+///
+/// ```gleam
+/// fn prune_until_caught_up(database, older_than_ms, limit) {
+///   case postgres.prune_finished(database, older_than_ms:, limit:) {
+///     Ok(postgres.PruneReport(jobs:)) if jobs == limit ->
+///       prune_until_caught_up(database, older_than_ms, limit)
+///     result -> result
+///   }
+/// }
+/// ```
+///
+/// Candidates are selected oldest-`finished_at`-first
+/// (`grind_jobs_finished_idx`) under `FOR UPDATE SKIP LOCKED`, so a
+/// concurrently claiming consumer or another concurrent `prune_finished`
+/// call never blocks this one (or is blocked by it) — each simply skips
+/// whatever the other already holds. There is no leader election and no
+/// single designated pruner process: unlike Oban's own plugin (which only
+/// ever prunes from its cluster's elected leader), it is always safe to run
+/// this — or the supervised pruner that calls it — on every node at once.
+/// Emits one aggregate `[grind, prune, completed]` observation per
+/// successful call (through the database's own forwarder) once the delete
+/// has committed, carrying the same count as the returned `PruneReport` —
+/// never one observation per deleted job. This function itself never emits
+/// on its own `Error` path — a direct caller already gets `PruneError`
+/// synchronously; `grind/pruner`, which has no caller to return it to,
+/// emits `[grind, prune, failed]` instead when the call it drives fails.
+///
+/// **Once a job is pruned, everything about it is gone, not merely
+/// hidden**: `state`/`outcome`/`bind_handle`/`arguments` all report not
+/// found, `reconcile_acknowledgement` reports `ReceiptNotFound`, a
+/// `submit_with_id` replay of the same `SubmissionId` inserts a genuinely
+/// new row (the idempotency window is exactly the retention window), a
+/// pending `reconcile_unique` call for a since-pruned submission id can
+/// never resolve, and an automatic acknowledgement retry that reaches the
+/// server after its job was pruned reports `QueueAckStale(AckRecordMissing)`
+/// — the same shape an ordinary lost/reassigned row already produces, not a
+/// new failure mode. See README, "Retention", for the full list.
+pub fn prune_finished(
+  database: Database,
+  older_than_ms older_than_ms: Int,
+  limit limit: Int,
+) -> Result(PruneReport, PruneError) {
+  use _ <- result.try(validate_retention_ms(older_than_ms))
+  use _ <- result.try(validate_prune_limit(limit))
+  run_prune(database, older_than_ms, limit)
+}
+
+/// The `older_than_ms` half of `prune_finished`'s own validation, factored
+/// out so `grind/pruner.validate_policy` can enforce the identical bounds
+/// on its own `max_age_ms` field without a second, independently
+/// maintained copy of them.
+@internal
+pub fn validate_retention_ms(older_than_ms: Int) -> Result(Nil, PruneError) {
+  case older_than_ms <= 0 {
+    True -> Error(NonPositiveRetention)
+    False ->
+      case older_than_ms > worker.retry_delay_maximum_milliseconds() {
+        True -> Error(RetentionAbovePrecisionBound)
+        False -> Ok(Nil)
+      }
+  }
+}
+
+/// The `limit` half of `prune_finished`'s own validation — see
+/// `validate_retention_ms`'s own doc comment for why this is `@internal`
+/// and shared with `grind/pruner`.
+@internal
+pub fn validate_prune_limit(limit: Int) -> Result(Nil, PruneError) {
+  case limit <= 0 {
+    True -> Error(NonPositivePruneLimit)
+    False ->
+      case limit > prune_limit_maximum() {
+        True -> Error(PruneLimitTooLarge)
+        False -> Ok(Nil)
+      }
+  }
+}
+
+/// `sql.prune_finished` (`WITH doomed AS (...), deleted AS (DELETE ...
+/// RETURNING 1) SELECT count(*) FROM deleted`) counts server-side rather
+/// than `RETURNING x.id` and `list.length`-ing the rows here: the report
+/// only ever needs a count, never the ids themselves, so this saves
+/// transferring up to `limit` rows over the wire on a large batch just to
+/// throw the values away. `deleted` always returns exactly one row (`0` for
+/// an empty batch, never no rows at all), so decoding it is an `assert`,
+/// not a fallible match.
+fn run_prune(
+  database: Database,
+  older_than_ms: Int,
+  limit: Int,
+) -> Result(PruneReport, PruneError) {
+  let Database(connection:, storage_owner:, forwarder:, ..) = database
+  case
+    store.call_safely(connection, fn(connection) {
+      sql.prune_finished(connection, storage_owner, older_than_ms, limit)
+    })
+  {
+    Error(error) -> Error(PruneQueryFailed(error))
+    Ok(returned) -> {
+      let assert [sql.PruneFinishedRow(count:)] = returned.rows
+      let report = PruneReport(jobs: count)
+      emit_prune_completed(forwarder, report, older_than_ms, limit)
+      Ok(report)
+    }
+  }
+}
+
+/// Builds and forwards `[grind, prune, completed]` for one committed
+/// `prune_finished` call. Called only after `run_prune`'s own autocommitted
+/// statement already returned its rows.
+fn emit_prune_completed(
+  fwd: Forwarder,
+  report: PruneReport,
+  older_than_ms: Int,
+  limit: Int,
+) -> Nil {
+  let PruneReport(jobs:) = report
+  let _ =
+    forwarder.emit(
+      fwd,
+      observation.prune_completed(),
+      observation.PruneCompletedMeasurements(jobs:),
+      observation.PruneCompletedMetadata(older_than_ms:, limit:),
+    )
+  Nil
 }
 
 /// May return `JobReadQueryFailed`, `JobNotFound`, `StorageOwnerMismatch`,

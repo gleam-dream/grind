@@ -15,6 +15,8 @@
 //// See AGENTS.md, "Adding a migration", for the steps to add a new version
 //// here.
 
+import grind/internal/terminal
+
 /// A relation kind as PostgreSQL's own `pg_class.relkind` distinguishes them
 /// (`r`/`S`/`i`) — never a bare string, so a typo can't silently widen or
 /// narrow a shape check.
@@ -38,14 +40,20 @@ pub type ExpectedRelation {
 
 /// One released schema version: its own statements (in the order
 /// `postgres.migrate_with` runs them, including the trailing
-/// `grind_schema_migrations` marker `INSERT`) and its cumulative expected
-/// shape, checked by `postgres.read_schema_generation` before trusting a
-/// marker claiming this version is genuinely installed.
+/// `grind_schema_migrations` marker `INSERT`), its cumulative expected
+/// relation shape, and its cumulative expected foreign-key constraint set
+/// (by name — `pg_constraint`, not `pg_class`, so these never appear in
+/// `shape` itself), all checked by `postgres.read_schema_generation` before
+/// trusting a marker claiming this version is genuinely installed. A
+/// database missing one of `foreign_keys` (an `ON DELETE CASCADE` dropped
+/// by hand, say) fails this check exactly like a missing relation or a
+/// missing `key_columns` entry does — closed, not silently tolerated.
 pub type Migration {
   Migration(
     version: Int,
     statements: List(String),
     shape: List(ExpectedRelation),
+    foreign_keys: List(String),
   )
 }
 
@@ -66,7 +74,10 @@ pub fn advisory_lock_statement() -> String {
 /// never part of the public API.
 @internal
 pub fn migrations() -> List(Migration) {
-  [Migration(11, v11_statements(), v11_shape())]
+  [
+    Migration(11, v11_statements(), v11_shape(), []),
+    Migration(12, v12_statements(), v12_shape(), v12_foreign_keys()),
+  ]
 }
 
 fn v11_statements() -> List(String) {
@@ -149,5 +160,118 @@ fn v11_shape() -> List(ExpectedRelation) {
     ExpectedRelation("grind_attempts_id_seq", Sequence, []),
     ExpectedRelation("grind_unique_submissions", Table, []),
     ExpectedRelation("grind_unique_submissions_pkey", Index, []),
+  ]
+}
+
+/// `grind_jobs_quarantine_idx` deliberately omits `queue` and
+/// `lease_expires_at` from its columns, even though both the per-queue scan
+/// (`grind/internal/lease.quarantine_expired_in_queue`) and the public
+/// cross-queue sweep (`postgres.quarantine_expired`) filter on them: neither
+/// query's own `ORDER BY id` needs `lease_expires_at` in the index at all
+/// (it is only ever a range filter, applied against however many rows the
+/// leading columns already narrowed down to), and `queue` narrows the wrong
+/// direction for the cross-queue sweep, which does not filter by it —
+/// `(storage_owner, id) WHERE state = 'executing'` measured 2.6ms for the
+/// cross-queue sweep and 1.3ms per-queue against a 2M-row `grind_jobs` (no
+/// sort either way, since `id` is already the index order), against 384ms
+/// for `(storage_owner, queue, lease_expires_at, id)` — that shape forces
+/// the cross-queue sweep (no `queue` predicate to seek on) to walk the
+/// primary key across every row instead.
+///
+/// Each receipt table's own `DELETE ... WHERE NOT EXISTS (SELECT 1 FROM
+/// grind_jobs ...)`, immediately before that table's own `ADD CONSTRAINT
+/// ... FOREIGN KEY`, removes any already-orphaned receipt row (one whose
+/// `job_id` no longer exists in `grind_jobs`, however that happened) before
+/// the constraint is added — an existing orphan would otherwise make the
+/// `ADD CONSTRAINT` itself fail with `23503 foreign_key_violation` on a
+/// database that has been running a while, since `ALTER TABLE ... ADD
+/// CONSTRAINT` validates every existing row by default. See
+/// `docs/RECOVERY-EVIDENCE.md`, Increment 25, for the red-first proof (a
+/// seeded orphan in the frozen v11 upgrade fixture makes this migration
+/// fail with `23503` without these three `DELETE`s, and succeed with the
+/// orphan gone once they run).
+fn v12_statements() -> List(String) {
+  [
+    advisory_lock_statement(),
+    "ALTER TABLE grind_jobs ADD COLUMN finished_at timestamptz DEFAULT now()",
+    "ALTER TABLE grind_jobs ALTER COLUMN finished_at DROP DEFAULT",
+    "UPDATE grind_jobs SET finished_at = NULL WHERE state NOT IN ("
+      <> terminal.states_sql()
+      <> ")",
+    "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_finished_at_check CHECK ((state IN ("
+      <> terminal.states_sql()
+      <> ")) = (finished_at IS NOT NULL))",
+    "CREATE INDEX grind_jobs_finished_idx ON grind_jobs (storage_owner, finished_at, id) WHERE finished_at IS NOT NULL",
+    "CREATE INDEX grind_jobs_claim_idx ON grind_jobs (storage_owner, queue, available_at, id) WHERE state IN ('queued', 'scheduled', 'retryable')",
+    "CREATE INDEX grind_jobs_quarantine_idx ON grind_jobs (storage_owner, id) WHERE state = 'executing'",
+    "CREATE INDEX grind_job_acknowledgements_job_idx ON grind_job_acknowledgements (job_id)",
+    "CREATE INDEX grind_unique_submissions_job_idx ON grind_unique_submissions (job_id)",
+    "CREATE INDEX grind_job_resolutions_job_idx ON grind_job_resolutions (job_id)",
+    "DELETE FROM grind_job_acknowledgements r WHERE NOT EXISTS (SELECT 1 FROM grind_jobs j WHERE j.id = r.job_id)",
+    "DELETE FROM grind_unique_submissions r WHERE NOT EXISTS (SELECT 1 FROM grind_jobs j WHERE j.id = r.job_id)",
+    "DELETE FROM grind_job_resolutions r WHERE NOT EXISTS (SELECT 1 FROM grind_jobs j WHERE j.id = r.job_id)",
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_job_id_fkey FOREIGN KEY (job_id) REFERENCES grind_jobs (id) ON DELETE CASCADE",
+    "ALTER TABLE grind_unique_submissions ADD CONSTRAINT grind_unique_submissions_job_id_fkey FOREIGN KEY (job_id) REFERENCES grind_jobs (id) ON DELETE CASCADE",
+    "ALTER TABLE grind_job_resolutions ADD CONSTRAINT grind_job_resolutions_job_id_fkey FOREIGN KEY (job_id) REFERENCES grind_jobs (id) ON DELETE CASCADE",
+    "INSERT INTO grind_schema_migrations (version) VALUES (12)",
+  ]
+}
+
+/// `grind_v12`'s own cumulative shape: every v11 relation, `grind_jobs`'s
+/// `key_columns` extended with the new `finished_at` column, plus the claim
+/// and quarantine hot-path partial indexes
+/// (`grind_jobs_claim_idx`/`grind_jobs_quarantine_idx`) and one bare
+/// `(job_id)` index per receipt table (`grind_job_acknowledgements_job_idx`,
+/// `grind_unique_submissions_job_idx`, `grind_job_resolutions_job_idx`) —
+/// deliberately *not* `(storage_owner, job_id)`: the only query that ever
+/// seeks these tables by `job_id` alone is the `ON DELETE CASCADE` from
+/// `grind_jobs(id)` each receipt table's own foreign key declares, which
+/// never has a `storage_owner` to filter by, so `storage_owner` leading
+/// would only get in the way. `postgres.prune_finished` deletes only from
+/// `grind_jobs`; every receipt row cascades, by the database itself, rather
+/// than by a second explicit `DELETE` this module used to also generate —
+/// see `docs/RECOVERY-EVIDENCE.md`, Increment 24, for why an explicit,
+/// same-statement receipt `DELETE` was not enough on its own. Confirmed
+/// empirically the same way `v11_shape`'s own doc comment describes, against
+/// a real freshly `migrate`d v12 schema.
+fn v12_shape() -> List(ExpectedRelation) {
+  [
+    ExpectedRelation("grind_schema_migrations", Table, []),
+    ExpectedRelation("grind_schema_migrations_pkey", Index, []),
+    ExpectedRelation("grind_jobs", Table, [
+      "unique_key_contract", "unique_key_sha256", "finished_at",
+    ]),
+    ExpectedRelation("grind_jobs_id_seq", Sequence, []),
+    ExpectedRelation("grind_jobs_pkey", Index, []),
+    ExpectedRelation("grind_jobs_unique_candidate_idx", Index, []),
+    ExpectedRelation("grind_jobs_finished_idx", Index, []),
+    ExpectedRelation("grind_jobs_claim_idx", Index, []),
+    ExpectedRelation("grind_jobs_quarantine_idx", Index, []),
+    ExpectedRelation("grind_job_resolutions", Table, []),
+    ExpectedRelation("grind_job_resolutions_pkey", Index, []),
+    ExpectedRelation("grind_job_resolutions_job_idx", Index, []),
+    ExpectedRelation("grind_job_acknowledgements", Table, []),
+    ExpectedRelation("grind_job_acknowledgements_pkey", Index, []),
+    ExpectedRelation("grind_job_acknowledgements_attempt_key", Index, []),
+    ExpectedRelation("grind_job_acknowledgements_job_idx", Index, []),
+    ExpectedRelation("grind_attempts_id_seq", Sequence, []),
+    ExpectedRelation("grind_unique_submissions", Table, []),
+    ExpectedRelation("grind_unique_submissions_pkey", Index, []),
+    ExpectedRelation("grind_unique_submissions_job_idx", Index, []),
+  ]
+}
+
+/// `grind_v12`'s own cumulative foreign-key set: the three `ON DELETE
+/// CASCADE` constraints backstopping `postgres.prune_finished` against the
+/// snapshot-timing race `docs/RECOVERY-EVIDENCE.md` Increment 24 describes.
+/// Checked by name against `pg_constraint`, independently of `v12_shape`'s
+/// own `pg_class` relation check, since a plain foreign key (no backing
+/// index of its own beyond whatever `v12_shape` already lists) never
+/// appears in `pg_class` at all.
+fn v12_foreign_keys() -> List(String) {
+  [
+    "grind_job_acknowledgements_job_id_fkey",
+    "grind_unique_submissions_job_id_fkey",
+    "grind_job_resolutions_job_id_fkey",
   ]
 }

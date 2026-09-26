@@ -36,14 +36,56 @@ polls, not only the ones it currently registers, so an executing row a
 retired worker version left behind is still quarantined once its lease
 expires; a separate public `postgres.quarantine_expired(database, limit:)`
 sweeps expired executing rows across every queue in a storage owner, for a
-queue no consumer polls at all. The experimental
-v11 schema installs only into an empty schema; earlier experimental markers
-(including v10) and partial Grind schemas fail closed without repair.
+queue no consumer polls at all. Grind's schema (baseline v11, current v12
+via `migrate` — see "Migrations" below) installs fresh only into an empty
+schema; a pre-baseline marker (including the prior experimental v10) and a
+partial or tampered Grind schema both fail closed without repair.
 Acknowledgement receipts retain committed attribution and a proposal fingerprint,
 not typed historical proposals. Typed outcome reads return the job's current
-result.
+result. `postgres.prune_finished` deletes finished, old-enough jobs and
+their own receipts, scoped to one storage owner and bounded per call;
+`grind/pruner` is a supervised background process that calls it on a timer
+with Oban-shaped defaults — see "Retention" below.
 See [implementation scope](docs/IMPLEMENTATION-SCOPE.md) for the delivered
-boundary and complete retained backlog.
+boundary and complete retained backlog, and [docs/RISKS.md](docs/RISKS.md)
+for the standing risk register (known gaps, their mitigations, and what
+covers them).
+
+## Public API
+
+One package, `grind`, with the storage backend split into its own module so
+a future backend does not touch the rest:
+
+| Module              | Holds                                                                                                                                                                                                                                                                 |
+| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `grind/worker`      | `Worker(input, output, error)` definitions, codecs, retry policy, business failure causes.                                                                                                                                                                            |
+| `grind/job`         | `JobHandle`, `State`, `AvailableAt`, and the typed outcome vocabulary.                                                                                                                                                                                                |
+| `grind/registry`    | Heterogeneous worker registration for one queue.                                                                                                                                                                                                                      |
+| `grind/queue`       | `QueuePolicy`, the supervised consumer (`start`/`stop`/manual stepping).                                                                                                                                                                                              |
+| `grind/postgres`    | The PostgreSQL storage backend: `settings`/`validate`/`start`/`close`, `migrate`, `submit`/`submit_at`/`submit_with_id`, `submit_unique`/`reconcile_unique`, `bind_handle`, `state`/`outcome`, `cancel`, `resolve_uncertain`, `quarantine_expired`, `prune_finished`. |
+| `grind/unique`      | The pure uniqueness policy vocabulary (`Key`, `Policy`, `States`, `Period`, `QueueScope`, `ConflictAction`) — see "Uniqueness" below.                                                                                                                                 |
+| `grind/submission`  | The admission vocabulary every submit path returns (`SubmissionId`, `Admission`, `Conflict`, `PendingSubmission`, `SubmitError`) — shared by plain, `submit_with_id`, and `submit_unique` admission.                                                                  |
+| `grind/pruner`      | The supervised retention pruner (`start`/`supervised`/`stop`) — see "Retention" below.                                                                                                                                                                                |
+| `grind/observation` | Grind's Sinal event descriptors — see "Observations" below.                                                                                                                                                                                                           |
+
+Everything under `grind/internal/*` is implementation detail with no
+stability contract; only the modules above are public API.
+
+## Getting started
+
+The fastest way to see Grind end to end is the separate
+[consumer package](consumer/README.md) (`consumer/`), a complete, runnable
+example built entirely on this public API: it depends on Grind by local path
+and imports only its public modules, registers two differently typed
+workers, admits jobs through their definitions, and runs them from a
+supervised automatic queue — including a definition-bound retry policy
+reaching a second delivery, cooperative cancellation of a genuinely running
+attempt, a worker crash recovering through `Uncertain` and an audited
+resolution, uniqueness admission, and `submit_with_id` retries. Read
+`consumer/src/grind_consumer.gleam` and
+`consumer/test/grind_consumer_test.gleam` alongside its README for a
+working, copy-pasteable shape; the snippet below covers the same steps in
+isolation, the minimum to get a queue polling.
 
 ## Starting a consumer
 
@@ -197,6 +239,32 @@ See [docs/RECOVERY-EVIDENCE.md](docs/RECOVERY-EVIDENCE.md), "Acknowledged
 observation" and "Round 2 observations", for the full mutation-proven
 evidence.
 
+## Uniqueness
+
+`grind/unique` and `grind/submission` give `postgres.submit_unique` a typed
+policy: a full-input or selected key, a queue scope (`WithinQueue`/
+`AcrossQueues`), an occupancy period, and an eligible-states group. Admission
+runs inside one PostgreSQL transaction, serialized by a domain-wide advisory
+lock, and returns a typed handle (`Inserted`), an existing conflict
+(`Existing`), or a rescheduled conflict (`Rescheduled`). `submit_with_id`
+gives a plain admission — no uniqueness policy — the same retry safety by
+reusing the identical admission receipt, request fingerprint, and
+reconciliation machinery: a caller-supplied `SubmissionId` retry converges on
+the original `Inserted` outcome instead of risking a duplicate row.
+`reconcile_unique` recovers a caller's own return value after a lost reply,
+independently of whichever call produced the commit.
+
+Key equality is exact (PostgreSQL `jsonb::text` SHA-256), not containment;
+the uniqueness identity always includes the worker id and version, so
+cross-worker uniqueness is out of scope; only `available_at` on a `scheduled`
+row can be moved on conflict (`RescheduleScheduledTo`) — no other field
+replacement. `while_retained()` means "until pruned", not "forever" — see
+"Retention" below. See
+[docs/UNIQUENESS-CONTRACT.md](docs/UNIQUENESS-CONTRACT.md) for the full
+contract, its failure modes, and everything still out of scope (cross-worker
+uniqueness, general field replacement, unique bulk insertion, and the
+untested different-key/same-`SubmissionId` receipt race).
+
 ## Guarantees and non-guarantees
 
 Standing facts worth reading before depending on Grind for anything with a
@@ -206,7 +274,18 @@ real external effect:
   worker can perform its effect (charge a card, send an email, call an API)
   and the process, connection, or host can die before that outcome is ever
   durably recorded. Grind's tables and receipts prove what committed; they
-  never prove the negative case.
+  never prove the negative case. This extends to a pruned receipt exactly
+  the same way: `postgres.prune_finished` deletes a job's own
+  acknowledgement, uniqueness-submission, and resolution receipts alongside
+  it (see "Retention" below), so an absent receipt for an old job can also
+  simply mean it aged out of the retention window — never proof the effect
+  it recorded did not happen.
+- **Reconciliation and `SubmissionId` replay only work while the job is
+  retained.** `reconcile_acknowledgement`, `reconcile_unique`, and a
+  `submit_with_id`/`submit_unique` retry of the same request identity all
+  depend on reading back a receipt row that `prune_finished` deletes once
+  its own job is old enough — see "Retention" below for exactly what each
+  one does once that row is gone.
 - **Database ownership fencing does not make external effects exactly-once.**
   Attempt IDs, epochs, and lease expiry prevent two live claims from both
   believing they own a row, and prevent a stale claim's acknowledgement from
@@ -296,6 +375,35 @@ real external effect:
   `SubmissionId`, no uniqueness policy) or `submit_unique` (a uniqueness
   policy) for a job that might need to be resubmitted safely.
 
+## Deadlines
+
+Three validated, positive settings on `postgres.Settings` bound how long a
+storage call, a migration step, and a uniqueness lock wait may take:
+
+- **`statement_deadline`** (`with_statement_deadline`, default 4000ms) bounds
+  every storage call — inline SQL, a Squirrel-generated call, and a whole
+  transaction including its own `BEGIN`/`COMMIT` — against a half-open or
+  otherwise unresponsive connection. Enforced by Grind's own bounded checkout
+  in `grind_postgres_ffi.erl`, not by pog/pgo's own unconfigurable default;
+  see "The coordinator runs claim and acknowledgement SQL synchronously..."
+  under "Guarantees" above for the full mechanism and its limits (it does not
+  bound the pool's initial connect, and a queued checkout is bounded by
+  pgo's own overload shedding instead).
+- **`migration_deadline`** (`with_migration_deadline`, default 30000ms)
+  bounds one `migrate` step's whole transaction, separately from
+  `statement_deadline` — see "Migrations" below for why a large table can
+  still exceed it.
+- **`unique_lock_wait`** (`with_unique_lock_wait`, default 2000ms) bounds
+  every lock wait inside the uniqueness admission transaction; it must clear
+  `statement_deadline` by at least 1000ms
+  (`UniqueLockWaitTooCloseToDeadline` otherwise), so contention surfaces as
+  `AdmissionContended` rather than a raw timeout.
+
+`queue.start` rejects a lease that does not clear a multiple of
+`statement_deadline` before starting any process
+(`queue.LeaseTooShortForDeadline`) — see "Guarantees" above for the exact
+derivation and its known gap at `maximum_concurrency > 2`.
+
 ## Migrations
 
 `postgres.migrate` applies `grind/internal/migrations.migrations()` —
@@ -369,10 +477,174 @@ directly through cigogne does not get it automatically and should set its
 own `lock_timeout` first if it wants the same fast-fail behavior instead of
 waiting out cigogne's own default.
 
+`grind_v12` (`finished_at`, "Retention" below) is the first version whose own
+statements do real, size-proportional work against `grind_jobs` rather than
+only creating new, empty objects: its `ADD COLUMN ... DEFAULT now()` and its
+backfill `UPDATE` each rewrite every existing row once, and its `ADD
+CONSTRAINT` (`grind_jobs_finished_at_check`) validates every row again — all
+under the one `ACCESS EXCLUSIVE` lock `ALTER TABLE` already takes for the
+whole step, not merely while acquiring it. Measured at 2,000,000 rows,
+`grind_v12` itself takes roughly 6 seconds; that time is bounded by
+`Settings.migration_deadline_ms` (default 30000ms) for the _entire_ step,
+not by the 2000ms `lock_timeout` above (`lock_timeout` only bounds _waiting_
+to acquire a lock another session already holds; it does nothing once this
+step's own `ALTER`/`UPDATE` has acquired its lock and is doing its own
+work), and grows roughly linearly with `grind_jobs`'s row count — a
+large-enough table can exceed the default and report
+`MigrationCommitUnknown(12)` with nothing committed; re-running `migrate`
+against the same table fails the exact same way until either
+`migration_deadline_ms` is raised past the table's own measured cost, or the
+file is applied directly via cigogne/`psql` as its own deploy step outside
+Grind's deadline-bounded execution entirely. Run `postgres.migrate` (or
+apply this file) as an explicit deploy step, well before node boot, once
+`grind_jobs` is this large.
+
+`grind_v12` also requires a stop-the-world deploy, not a rolling one: it is
+not safe for old and new application code to run against the schema on
+either side of this migration. Old, pre-`finished_at` code acknowledging a
+job to a terminal state writes no `finished_at` at all, which
+`grind_jobs_finished_at_check` rejects with `23514` the moment `grind_v12`
+has committed; new, `finished_at`-aware code (this release) writing that
+same column against the still-`v11` schema hits an undefined-column error
+the moment it runs _before_ `grind_v12` has committed. Migrate first, with
+every writer stopped, then deploy the new code — never both versions
+writing concurrently across the migration.
+
+`grind_v12`'s own `ADD CONSTRAINT ... FOREIGN KEY` statements (adding
+`ON DELETE CASCADE` from each receipt table to `grind_jobs`, "Retention"
+below) validate every existing row in that receipt table by default, which
+would fail the whole step with `23503 foreign_key_violation` on a database
+that had already accumulated an orphaned receipt row under `v11` (no
+foreign key was enforcing anything there yet) for any reason — an old bug,
+a hand rollback, direct SQL. Each `ADD CONSTRAINT` is preceded by its own
+`DELETE FROM <receipt table> WHERE NOT EXISTS (SELECT 1 FROM grind_jobs
+...)`, removing any such orphan first rather than letting the migration
+itself fail closed on one — see `docs/RECOVERY-EVIDENCE.md`, Increment 25,
+for the red-first proof against a seeded orphan.
+
 See `docs/RELEASE-READINESS.md` ("Migration mechanism") and
 `docs/RECOVERY-EVIDENCE.md` for the mutation- and concurrency-proven
 evidence, and `AGENTS.md` ("Adding a migration") for the steps to add a new
 version.
+
+## Retention
+
+A job is prunable once it has finished (reached one of the six terminal
+states — `succeeded`, `business_failed`, `runtime_failed`,
+`contract_mismatch`, `discarded`, `cancelled`) and stayed that way for at
+least a configured age; `postgres.prune_finished` deletes it, scoped to the
+caller's own storage owner (never by queue — retention is a property of the
+whole database):
+
+```gleam
+postgres.prune_finished(database, older_than_ms: 60_000, limit: 1_000)
+// -> Ok(postgres.PruneReport(jobs: 842))
+```
+
+Deleting a job's own row also removes its acknowledgement, uniqueness-
+submission, and resolution receipts — via `grind_v12`'s own `ON DELETE
+CASCADE` foreign keys on `job_id`, not a second delete `prune_finished`
+issues itself, so only `jobs` is counted.
+
+One call is one bounded batch, never an unbounded sweep — `report.jobs` can
+be fewer than `limit` but never more. A caller wanting to drain everything
+currently prunable loops while `report.jobs == limit`:
+
+```gleam
+fn prune_until_caught_up(database, older_than_ms, limit) {
+  case postgres.prune_finished(database, older_than_ms:, limit:) {
+    Ok(postgres.PruneReport(jobs:)) if jobs == limit ->
+      prune_until_caught_up(database, older_than_ms, limit)
+    result -> result
+  }
+}
+```
+
+`grind/pruner` is a supervised timer process wrapping one `prune_finished`
+call per tick — unlike the loop above, it never drains a backlog within one
+tick (matching Oban's own pruner, which does not either); a batch that
+comes back exactly `limit` rows is picked up again on the next scheduled
+tick instead. Its first tick fires `interval_ms` after it starts, not
+immediately. Defaults match Oban's own pruner (`interval_ms` 30000,
+`limit` 10000, `max_age_ms` 60000):
+
+```gleam
+import grind/pruner
+
+let assert Ok(running) = pruner.start(database, pruner.default_policy_validated())
+// pruner.stop(running) when the owning process is done with it.
+```
+
+`pruner.start` links its own dedicated supervisor to the calling process:
+a crash loop that exhausts that supervisor's restart budget exits the
+supervisor, and, being linked, the caller along with it (unless the caller
+traps exits).
+
+`pruner.supervised(database, policy)` gives a `supervision.ChildSpecification`
+instead, to embed directly into an application's own supervision tree
+(`static_supervisor.add`) rather than tracking the separate, dedicated
+supervisor `start` creates and returns as part of its own `Pruner` value —
+stopping it then means stopping or reconfiguring that child in the
+caller's own tree, the same as any other supervised worker there. A crash
+loop past budget here instead escalates into that tree the normal OTP way
+(the immediate supervisor is itself restarted or terminated by its own
+parent, and so on upward), rather than exiting an unrelated caller process
+the way `start`'s linked supervisor does.
+
+Customize with `pruner.default_policy() |> pruner.with_interval(...) |> ...
+|> pruner.validate_policy`, the same builder shape `grind/queue.QueuePolicy`
+uses. Unlike Oban's own plugin, there is **no leader election**: it is safe
+to run a supervised pruner (or call `prune_finished` directly) on every
+node in a cluster at once, since candidates are selected `FOR UPDATE SKIP
+LOCKED` — a concurrent pruner (another node's, or a concurrent manual call)
+simply skips whatever this one already holds, rather than either blocking
+or double-deleting. Every `prune_finished` call — whether from a supervised
+pruner's own tick or called directly — emits `[grind, prune, completed]` on
+success (the count deleted) or `[grind, prune, failed]` on error (see
+`grind/observation`), with a coarse classification of the underlying error
+for the failed case, since a supervised pruner has no direct caller to
+return a `PruneError` to.
+
+There is no minimum retention floor beyond `older_than_ms`/`max_age_ms`
+being positive — matching Oban's own `max_age`, which is likewise only
+required to be positive. This is a real trade-off, not a free lunch:
+
+- **A retention window shorter than a live lease risks turning a late,
+  otherwise-recoverable commit-unknown acknowledgement retry into a stale
+  one.** If a job's own row is pruned while an old, abandoned attempt's
+  automatic ack retry is still in flight against it (see "Guarantees",
+  "an acknowledgement that comes back `QueueAckUnknown`..."), that retry
+  finds no row at all and reports `QueueAckStale(AckRecordMissing)` — the
+  same shape an ordinary lost/reassigned row already produces, not a new
+  failure mode, but one you can cause yourself by pruning too aggressively
+  relative to `queue.QueuePolicy.lease_duration_ms`.
+- **`reconcile_acknowledgement` reports `ReceiptNotFound`** once a job's own
+  acknowledgement receipt is pruned — read it before the retention window
+  closes if you need to recover a return value after a lost reply.
+- **A `submit_with_id`/`submit_unique` retry of the same request identity
+  after its original receipt is pruned is indistinguishable from a genuinely
+  new request**: it inserts a fresh row with a new job id instead of
+  returning the original one. The idempotency window `SubmissionId` gives
+  you is exactly the retention window, not forever.
+- **A pending `reconcile_unique` call for a submission whose underlying job
+  was pruned before its own `CommitUnknown` was ever resolved can never
+  recover that decision** — the receipt it would have read back is gone.
+- **An `AllRetained`/`while_retained()` uniqueness key reopens once its
+  occupying row is pruned**, not "forever": `while_retained()` means "until
+  pruned", never "permanently". A finite period (`unique.within_milliseconds`)
+  already has its own expiry independent of pruning; choose a retention
+  window at least as long as the period if you need the occupancy guarantee
+  itself to hold for the period's full duration regardless of when pruning
+  runs — see `docs/UNIQUENESS-CONTRACT.md`.
+- **`grind_jobs_finished_idx`/`grind_unique_submissions_job_idx`/
+  `grind_job_resolutions_job_idx`** (`grind_v12`) back this: the candidate
+  scan orders by `(storage_owner, finished_at, id)`, and each receipt delete
+  seeks its own table by `job_id` rather than scanning it.
+
+See `docs/UNIQUENESS-CONTRACT.md` for the full interaction with uniqueness
+policies, and `docs/RECOVERY-EVIDENCE.md` ("Increment 23") for the
+mutation-proven admission-race fix `prune_finished` required
+(`grind/internal/unique_admission`'s candidate lock).
 
 ## Development and integration checks
 

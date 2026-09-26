@@ -192,6 +192,14 @@ cross-queue conflict) — reverted immediately, `gleam check` recompiled
 clean and `git diff` showed no trace of the mutated lines. See
 `docs/RECOVERY-EVIDENCE.md`, Increments 12 and 13.
 
+Also proven (Increment 23, alongside `postgres.prune_finished`/
+`grind/pruner`): a `KeepExisting` candidate is now locked with `FOR KEY
+SHARE` (previously unlocked; a `RescheduleScheduledTo` candidate's own `FOR
+UPDATE` is unchanged), closing a real race against a concurrent
+`prune_finished` call — see "Admission transaction" step 6 and "Decisions"
+item 10 above, and `docs/RECOVERY-EVIDENCE.md`, Increment 23, for the
+barrier-forced overlap and its mutation.
+
 ## Module placement
 
 The admission transaction lives in `grind/internal/unique_admission`, which
@@ -400,6 +408,29 @@ it means" identically regardless of which call discovered it.
    differ from those it was originally admitted under** — a worker
    redefinition that changes either codec version makes a retried
    `SubmissionId` a conflict, not a silently-returned stale-typed handle.
+10. **`while_retained()` means "until pruned"**, not "forever" — `unique
+.while_retained()`'s occupancy is bounded by whatever retention window
+    `postgres.prune_finished`/`grind/pruner` runs against this database (see
+    README, "Retention"): once a row occupying an `AllRetained`/
+    `IncompleteOrSucceeded` key is pruned, the key reopens, even though
+    `while_retained()` itself carries no time boundary of its own. A finite
+    `within_milliseconds` period is unaffected by pruning in the common
+    case — its own expiry almost always arrives first — but is not
+    formally independent of it: for `IncompleteOrSucceeded`/`AllRetained`
+    with a finite `FromInsertion` period, a retention window at least as
+    long as the period guarantees the occupying row survives for the
+    period's own full duration regardless of when pruning runs (the
+    candidate can only become old enough to prune after `inserted_at +
+period` has already elapsed, and `inserted_at` never changes). The one
+    documented exception is `FromSchedule`: a job cancelled before its own
+    scheduled time reaches `finished_at` (`cancelled`, terminal) using its
+    _actual_ cancellation time, which can be arbitrarily earlier than its
+    now-moot `available_at` — so a period measured `FromSchedule` against a
+    job that never ran offers no equivalent retention-window guarantee.
+    This is documented behavior, not validated: `postgres.prune_finished`
+    and `unique.within_milliseconds` are independent APIs with no
+    cross-check between a chosen retention window and any policy's own
+    period.
 
 ## Admission transaction
 
@@ -530,12 +561,65 @@ grind_unique_lock`.
    policy's eligible states (a `pog.array` parameter — Grind's own closed
    vocabulary, never caller-supplied text, but bound rather than spliced);
    `AND queue = $q` only under `WithinQueue`; the period predicate (below)
-   unless `WhileRetained`; `ORDER BY id LIMIT 1`; `FOR UPDATE` only when the
-   action is `RescheduleScheduledTo` (the row lock is only needed to
-   re-check `state = 'scheduled'` immediately before updating it; contended
-   by a concurrently held row lock, this reports `AdmissionContended` the
-   same as step 3 — proven under a real held row lock, `docs/RECOVERY-
-EVIDENCE.md`, Increment 9).
+   unless `WhileRetained`; `ORDER BY id LIMIT 1`; every candidate is locked,
+   never merely read — `FOR UPDATE` when the action is
+   `RescheduleScheduledTo` (the row lock is needed to re-check `state =
+'scheduled'` immediately before updating it; contended by a concurrently
+   held row lock, this reports `AdmissionContended` the same as step 3 —
+   proven under a real held row lock, `docs/RECOVERY-EVIDENCE.md`,
+   Increment 9), `FOR KEY SHARE` otherwise (`KeepExisting`, the common
+   case).
+
+   `FOR KEY SHARE` exists specifically for `postgres.prune_finished`
+   (`docs/RECOVERY-EVIDENCE.md`, Increment 23 and 24): a `KeepExisting`
+   decision is about to commit its own receipt naming this candidate's `id`,
+   and without a lock, a concurrent prune call could delete that exact row
+   first, leaving the receipt referencing a job that no longer exists.
+   `FOR KEY SHARE` is the weakest lock mode that still conflicts with a
+   `DELETE`. `prune_finished` itself never blocks on this lock: its own
+   candidate scan is `FOR UPDATE SKIP LOCKED`, so a row this admission
+   transaction already holds is simply skipped, never waited on. The
+   direction that _can_ block is the other one — if `prune_finished`'s own
+   `FOR UPDATE` reaches and locks this row first (held for as long as that
+   one `DELETE` statement, batch and all, takes to run), this admission's
+   own `FOR KEY SHARE` read then waits behind it, and reports
+   `AdmissionContended` if that wait exceeds its own `lock_timeout` — a
+   correct outcome, not a bug, bounded to however long that single prune
+   batch holds the row. The window `FOR KEY SHARE` actually closes is
+   narrower than either of those directions: admission committing (its own
+   `INSERT` and receipt) _after_ `prune_finished`'s `DELETE` statement
+   already took its snapshot but _before_ that statement's own scan reaches
+   and locks this exact row. Without this lock, `prune_finished`'s `SKIP
+LOCKED` search would find the row still unlocked at that point and delete
+   it out from under the read admission just performed — proven with a real
+   barrier-forced overlap, `docs/RECOVERY-EVIDENCE.md`, Increment 23. It
+   does **not** close every window on its own: a prune statement that had
+   already locked this exact
+   row under its own fixed `READ COMMITTED` snapshot, strictly before this
+   admission's own receipt commit becomes visible to that snapshot, can
+   still delete it — `grind_v12`'s own `ON DELETE CASCADE` foreign keys
+   (`grind_job_acknowledgements`/`grind_unique_submissions`/
+   `grind_job_resolutions`, all on `job_id` referencing `grind_jobs(id)`)
+   are the independent backstop for that narrower window, since a cascade
+   fires its own fresh query against current state rather than the deleting
+   statement's original snapshot — proven with a real snapshot-timed
+   overlap, `docs/RECOVERY-EVIDENCE.md`, Increment 24.
+
+   `FOR KEY SHARE` deliberately does not conflict with everything that
+   might touch this same row for an unrelated reason: `attempt
+.claim_registered_job`'s own candidate lock, `postgres.cancel_lock`,
+   `lease`'s own quarantine-scan candidate lock, and `postgres`'s own
+   audited-resolution row lock (`apply_uncertain_resolution`) are all
+   `FOR NO KEY UPDATE` (not `FOR UPDATE`) precisely because none of their
+   own `UPDATE`s ever touch a key column, and `FOR NO KEY UPDATE` does not
+   conflict with `FOR KEY SHARE` — so a claim, a cancellation, a quarantine
+   sweep, or a resolution racing a `KeepExisting` read of the identical row
+   never spuriously reports `AdmissionContended` for a reason that was
+   never actually a write conflict. Before `docs/RECOVERY-EVIDENCE.md`
+   Increment 24 (claim, cancel, quarantine) and Increment 25 (resolution),
+   all four used a plain `FOR UPDATE`, which conflicts with everything,
+   including a read-only `FOR KEY SHARE`.
+
 7. Decide: no candidate → `INSERT` a new job with its key columns set,
    `inserted_at = now`; a `scheduled` candidate under `RescheduleScheduledTo(at)` →
    `UPDATE ... SET available_at = to_timestamp(...) WHERE id = $id AND state = 'scheduled'`

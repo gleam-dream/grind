@@ -411,6 +411,16 @@ fn reconcile_from_receipt(
 }
 
 /// Only `55P03` (the bounded `lock_timeout` elapsing) is `AdmissionContended`.
+/// A `job_id` foreign-key violation (`grind_v12`'s `ON DELETE CASCADE`
+/// constraints on `grind_job_acknowledgements`/`grind_unique_submissions`/
+/// `grind_job_resolutions`) should be unreachable from here — `FOR KEY
+/// SHARE` on every non-reschedule candidate (`FOR UPDATE` on a reschedule
+/// one) already guarantees a concurrent `prune_finished` can only ever skip
+/// a row this transaction still holds, never delete it out from under a
+/// receipt insert about to name it — and needs no dedicated branch here
+/// either way: it already falls through to the same `NotCommitted(error)`
+/// the general case below gives any other constraint violation, which is
+/// exactly the "definitely did not commit" shape it should get.
 fn classify_query_error(
   error: pog.QueryError,
 ) -> submission.SubmitError(input, output, error) {
@@ -729,10 +739,47 @@ fn is_reschedule(action: unique.ConflictAction) -> Bool {
   }
 }
 
+/// Every candidate this admission transaction reads is locked, never merely
+/// read: a `RescheduleScheduledTo` action needs `FOR UPDATE` (it is about to
+/// write `available_at`), and every other action still needs `FOR KEY
+/// SHARE` — the weakest lock mode that still conflicts with a `DELETE`
+/// (`postgres.prune_finished` locks its own candidates at `FOR UPDATE`
+/// strength). `prune_finished` itself never blocks on this: its own scan is
+/// `FOR UPDATE SKIP LOCKED`, so a row this transaction already holds is
+/// simply skipped, never waited on. The direction that *can* block is this
+/// transaction's own read, when `prune_finished` instead reaches and locks
+/// this row first — held for as long as that one `DELETE` statement, batch
+/// and all, takes to run — this read then waits behind it, and reports
+/// `AdmissionContended` if that wait exceeds this transaction's own
+/// `lock_timeout`: a correct outcome, bounded to however long that single
+/// prune batch holds the row, not a bug. `FOR KEY SHARE` deliberately does
+/// *not* conflict with `FOR NO KEY UPDATE`: `attempt.claim_registered_job`,
+/// `postgres.cancel_lock`, `lease`'s own quarantine scan, and
+/// `postgres.apply_uncertain_resolution`'s own row lock all lock this same
+/// table at that weaker strength precisely so an unrelated claim, cancel,
+/// quarantine sweep, or resolution racing a `KeepExisting` read of the
+/// identical row never spuriously contends (`AdmissionContended`) for a
+/// reason that was never actually a write conflict — see
+/// `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" step 6, for the
+/// full contention picture.
+///
+/// The window this lock actually closes: this transaction committing (its
+/// own `INSERT` and receipt) *after* `prune_finished`'s `DELETE` statement
+/// already took its snapshot but *before* that statement's own scan reaches
+/// and locks this exact row — without this lock, `prune_finished`'s `SKIP
+/// LOCKED` search would find the row still unlocked at that point and
+/// delete it out from under the read this transaction just performed.
+/// `grind_v12`'s own `ON DELETE CASCADE` foreign keys are the second,
+/// independent backstop for the one narrower window this lock alone cannot
+/// close (a prune statement that already locked this row, under its own
+/// fixed snapshot, strictly before this admission's own commit becomes
+/// visible to it) — see `docs/RECOVERY-EVIDENCE.md`, Increment 24, for why
+/// a receipt referencing an already-deleted job can still never become a
+/// permanent orphan either way.
 fn candidate_sql(
   scope: unique.QueueScope,
   period: unique.PeriodSpec,
-  lock_for_reschedule: Bool,
+  is_reschedule: Bool,
 ) -> String {
   let base =
     "SELECT id, queue, state, (extract(epoch FROM available_at) * 1000000)::bigint FROM grind_jobs WHERE storage_owner = $1 AND worker_id = $2 AND worker_version = $3 AND unique_key_contract = $4 AND unique_key_sha256 = "
@@ -755,9 +802,9 @@ fn candidate_sql(
   }
   with_period
   <> " ORDER BY id LIMIT 1"
-  <> case lock_for_reschedule {
+  <> case is_reschedule {
     True -> " FOR UPDATE"
-    False -> ""
+    False -> " FOR KEY SHARE"
   }
 }
 

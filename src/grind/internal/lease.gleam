@@ -102,11 +102,15 @@ pub fn quarantine_expired_in_queue(
   forwarder: Forwarder,
   queue: String,
 ) -> Result(Nil, pog.QueryError) {
+  // `FOR NO KEY UPDATE`: `quarantine_update_sql`'s own `UPDATE` never
+  // touches `id`, so this candidate lock does not need to conflict with a
+  // concurrent `unique_admission.candidate_sql`'s `FOR KEY SHARE` on the
+  // same row — see `attempt.claim_registered_job`'s identical reasoning.
   let sql =
     quarantine_update_sql(
       "SELECT id FROM grind_jobs WHERE storage_owner = $1 AND queue = $2 AND state = 'executing' AND "
       <> expired_lease_predicate("clock_timestamp()")
-      <> " ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1",
+      <> " ORDER BY id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1",
     )
   let query =
     pog.query(sql)

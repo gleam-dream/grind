@@ -37,8 +37,13 @@
 //// cares can collapse a `Replied`/`Reconciled` pair for the same command.
 ////
 //// The events: `acknowledged`, `admitted`, `claimed`, `quarantined`,
-//// `resolved`, `cancellation_decided`, `released`, and
-//// `contract_mismatch_recorded`.
+//// `resolved`, `cancellation_decided`, `released`,
+//// `contract_mismatch_recorded`, `prune_completed`, and `prune_failed` —
+//// the last two are the exception to nearly everything above: each is one
+//// aggregate per `postgres.prune_finished` call (`prune_completed` from
+//// `prune_finished` itself; `prune_failed` from `grind/pruner`, which has
+//// no caller to return a failed call's `PruneError` to) rather than one
+//// event per job, so neither carries a `JobRef`/`AttemptRef` at all.
 //// `JobRef`/`AttemptRef` are the shared
 //// identity/attempt-fencing shapes every event's metadata embeds rather
 //// than redeclaring per event; embedding them in `acknowledged`'s own
@@ -310,6 +315,64 @@ pub type ContractMismatchMetadata {
     expected_version: String,
     actual_version: String,
   )
+}
+
+/// `[grind, prune, completed]` measurements: how many rows one
+/// `postgres.prune_finished` call actually deleted from `grind_jobs` —
+/// mirroring `postgres.PruneReport`'s own shape (each deleted job's own
+/// acknowledgement/uniqueness-submission/resolution receipts cascade with
+/// it, via `grind_v12`'s own `ON DELETE CASCADE` foreign keys, and are not
+/// separately counted). Unlike every other event in this module, this one
+/// is not about a single job: it is one aggregate per call, the same shape
+/// Oban's own `[:oban, :plugin]` pruner span reports a single
+/// `pruned_count` for.
+pub type PruneCompletedMeasurements {
+  PruneCompletedMeasurements(jobs: Int)
+}
+
+/// `[grind, prune, completed]` metadata: the retention window and batch
+/// size this exact call was given, so a handler can tell a small
+/// exhausted-limit batch (`measurements.jobs == limit`, worth looping again
+/// immediately) from a genuinely empty one apart from the count alone.
+pub type PruneCompletedMetadata {
+  PruneCompletedMetadata(older_than_ms: Int, limit: Int)
+}
+
+/// `[grind, prune, failed]` measurements: always `count: 1`, the same
+/// "this happened once" convention every `[grind, job, *]` event's own
+/// `count` field already uses — there is no meaningful row count for a call
+/// that never committed cleanly.
+pub type PruneFailedMeasurements {
+  PruneFailedMeasurements(count: Int)
+}
+
+/// Coarsely classifies why a `grind/pruner` tick's own `prune_finished`
+/// call failed, from the `pog.QueryError` it returned — narrow enough to be
+/// useful in a handler without exposing `pog`'s own type as part of Grind's
+/// observation surface.
+pub type PruneFailureKind {
+  /// The reply was lost after the statement may have already reached
+  /// PostgreSQL and committed (`pog.QueryTimeout`) — rows may have been
+  /// deleted despite this being reported as a failure.
+  PruneReplyLost
+  /// The statement ran, returned rows, and committed, but they could not be
+  /// decoded (`pog.UnexpectedResultType`) — the delete itself already
+  /// happened; only reading its own `RETURNING` back failed.
+  PruneResultUndecodable
+  /// A real PostgreSQL-side rejection before anything could commit
+  /// (`pog.ConstraintViolated`/`pog.PostgresqlError`) — nothing was
+  /// deleted.
+  PruneRejected
+  /// The call never reached PostgreSQL at all (`pog.ConnectionUnavailable`/
+  /// `pog.UnexpectedArgumentCount`/`pog.UnexpectedArgumentType`) — nothing
+  /// was attempted.
+  PruneNotAttempted
+}
+
+/// `[grind, prune, failed]` metadata: the retention window and batch size
+/// the failed call was given, plus its own coarse failure kind.
+pub type PruneFailedMetadata {
+  PruneFailedMetadata(older_than_ms: Int, limit: Int, kind: PruneFailureKind)
 }
 
 fn proposed_to_string(proposed: Proposed) -> String {
@@ -792,6 +855,89 @@ fn contract_mismatch_metadata_fields() -> fields.Fields(
   )
 }
 
+fn prune_completed_measurements_fields() -> fields.Fields(
+  PruneCompletedMeasurements,
+) {
+  fields.imap(
+    fields.int(atom.create("jobs")),
+    PruneCompletedMeasurements,
+    fn(m) { m.jobs },
+  )
+}
+
+fn prune_completed_metadata_fields() -> fields.Fields(PruneCompletedMetadata) {
+  let assert Ok(p1) =
+    fields.pair(
+      fields.int(atom.create("older_than_ms")),
+      fields.int(atom.create("limit")),
+    )
+  fields.imap(
+    p1,
+    fn(t) {
+      let #(older_than_ms, limit) = t
+      PruneCompletedMetadata(older_than_ms:, limit:)
+    },
+    fn(m: PruneCompletedMetadata) {
+      let PruneCompletedMetadata(older_than_ms:, limit:) = m
+      #(older_than_ms, limit)
+    },
+  )
+}
+
+fn prune_failed_measurements_fields() -> fields.Fields(PruneFailedMeasurements) {
+  fields.imap(count_fields(), PruneFailedMeasurements, fn(m) { m.count })
+}
+
+fn prune_failure_kind_to_string(kind: PruneFailureKind) -> String {
+  case kind {
+    PruneReplyLost -> "reply_lost"
+    PruneResultUndecodable -> "result_undecodable"
+    PruneRejected -> "rejected"
+    PruneNotAttempted -> "not_attempted"
+  }
+}
+
+fn prune_failure_kind_from_string(
+  raw: String,
+) -> Result(PruneFailureKind, Nil) {
+  case raw {
+    "reply_lost" -> Ok(PruneReplyLost)
+    "result_undecodable" -> Ok(PruneResultUndecodable)
+    "rejected" -> Ok(PruneRejected)
+    "not_attempted" -> Ok(PruneNotAttempted)
+    _ -> Error(Nil)
+  }
+}
+
+fn prune_failed_metadata_fields() -> fields.Fields(PruneFailedMetadata) {
+  let assert Ok(p1) =
+    fields.pair(
+      fields.int(atom.create("older_than_ms")),
+      fields.int(atom.create("limit")),
+    )
+  let assert Ok(p2) =
+    fields.pair(
+      p1,
+      closed_string_field(
+        "kind",
+        prune_failure_kind_to_string,
+        prune_failure_kind_from_string,
+      ),
+    )
+  fields.imap(
+    p2,
+    fn(t) {
+      let #(p1, kind) = t
+      let #(older_than_ms, limit) = p1
+      PruneFailedMetadata(older_than_ms:, limit:, kind:)
+    },
+    fn(m: PruneFailedMetadata) {
+      let PruneFailedMetadata(older_than_ms:, limit:, kind:) = m
+      #(#(older_than_ms, limit), kind)
+    },
+  )
+}
+
 fn measurements_fields() -> fields.Fields(AcknowledgedMeasurements) {
   fields.imap(fields.int(atom.create("count")), AcknowledgedMeasurements, fn(m) {
     m.count
@@ -996,6 +1142,40 @@ pub fn contract_mismatch_recorded() -> Event(
       job_event_name("contract_mismatch_recorded"),
       contract_mismatch_measurements_fields(),
       contract_mismatch_metadata_fields(),
+    )
+  event
+}
+
+/// The `[grind, prune, completed]` event descriptor: one aggregate per
+/// `postgres.prune_finished` call, emitted strictly after that call's own
+/// autocommitted delete has already returned its counts — never one event
+/// per deleted job. Unlike every `[grind, job, *]` event above, this is not
+/// scoped to a single job at all, so it lives under its own `[grind, prune,
+/// ...]` prefix rather than reusing `job_event_name`.
+pub fn prune_completed() -> Event(
+  PruneCompletedMeasurements,
+  PruneCompletedMetadata,
+) {
+  let assert Ok(event) =
+    sinal.event(
+      [atom.create("grind"), atom.create("prune"), atom.create("completed")],
+      prune_completed_measurements_fields(),
+      prune_completed_metadata_fields(),
+    )
+  event
+}
+
+/// The `[grind, prune, failed]` event descriptor: `grind/pruner`'s own tick
+/// emits this when the `prune_finished` call it drives returns an `Error`,
+/// since a supervised background pruner has no caller to return the
+/// `PruneError` to directly. `postgres.prune_finished` itself never emits
+/// this — see its own doc comment.
+pub fn prune_failed() -> Event(PruneFailedMeasurements, PruneFailedMetadata) {
+  let assert Ok(event) =
+    sinal.event(
+      [atom.create("grind"), atom.create("prune"), atom.create("failed")],
+      prune_failed_measurements_fields(),
+      prune_failed_metadata_fields(),
     )
   event
 }

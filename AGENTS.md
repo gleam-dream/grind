@@ -55,19 +55,25 @@ exactly one new highest version at a time:
    `INSERT INTO grind_schema_migrations (version) VALUES (<N>)` last),
    `--- migration:down` with the real, reverse-order `DROP`s (delete the
    marker row first), `--- migration:end`.
-2. Add the matching `Migration(<N>, [...], [...])` entry to `migrations()` in
-   `src/grind/internal/migrations.gleam`: its `statements` list is the exact
-   same statement text (minus the trailing `;`, lock statement included) as
-   the new file's `up` section; its `shape` **declares** the version's own
-   _complete, cumulative_ set of `grind_`-prefixed relations — every table,
-   sequence, and index this version's schema has, including every implicit
-   object PostgreSQL itself creates (a `bigserial` column's own sequence, and
-   the backing index behind every `PRIMARY KEY`/`UNIQUE` constraint) — plus
-   any column-level `key_columns` a relation needs beyond its own existence.
-   `read_schema_generation` compares this list against the schema's _actual_
-   `grind_`-prefixed relations exactly: a relation this schema has that the
-   shape does not list fails closed exactly like a missing one, so **confirm
-   the real relation set empirically** (`SELECT relname, relkind FROM
+2. Add the matching `Migration(<N>, [...], [...], [...])` entry to
+   `migrations()` in `src/grind/internal/migrations.gleam`: its `statements`
+   list is the exact same statement text (minus the trailing `;`, lock
+   statement included) as the new file's `up` section; its `shape`
+   **declares** the version's own _complete, cumulative_ set of
+   `grind_`-prefixed relations — every table, sequence, and index this
+   version's schema has, including every implicit object PostgreSQL itself
+   creates (a `bigserial` column's own sequence, and the backing index behind
+   every `PRIMARY KEY`/`UNIQUE` constraint) — plus any column-level
+   `key_columns` a relation needs beyond its own existence; its
+   `foreign_keys` list names every foreign-key constraint (by name, checked
+   against `pg_constraint`, independently of `shape`'s own `pg_class` check —
+   a plain foreign key backed by no index of its own never appears in
+   `pg_class`) this version's schema cumulatively requires, empty for a
+   version that adds none. `read_schema_generation` compares `shape` against
+   the schema's _actual_ `grind_`-prefixed relations exactly: a relation this
+   schema has that the shape does not list fails closed exactly like a
+   missing one, so **confirm the real relation set empirically**
+   (`SELECT relname, relkind FROM
 pg_class WHERE relname LIKE 'grind\_%' ORDER BY relname` against a
    database this version was actually applied to) rather than deriving it
    from the DDL text alone — undercounting implicit objects here is the

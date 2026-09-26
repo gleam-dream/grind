@@ -19,10 +19,12 @@ import grind/internal/consumer_hooks
 import grind/internal/lease
 import grind/internal/migrations
 import grind/internal/store
+import grind/internal/terminal
 import grind/internal/unique_admission
 import grind/job
 import grind/observation
 import grind/postgres
+import grind/pruner
 import grind/queue
 import grind/registry
 import grind/submission
@@ -54,6 +56,53 @@ pub fn version_test() {
   |> should.equal("0.1.0")
 }
 
+/// Whether a `job.State` is one of the six terminal states
+/// `grind_jobs_finished_at_check` (`grind_v12`) requires `finished_at` to be
+/// non-null for. The exhaustive `case` (no wildcard) is the point: adding a
+/// new `job.State` variant fails this module to compile until it is placed
+/// on one side or the other, rather than silently leaving
+/// `terminal.states_sql()` behind.
+fn is_terminal_job_state(state: job.State) -> Bool {
+  case state {
+    job.Succeeded
+    | job.BusinessFailed
+    | job.RuntimeFailed
+    | job.ContractMismatch
+    | job.Discarded
+    | job.Cancelled -> True
+    job.Queued
+    | job.Scheduled
+    | job.Retryable
+    | job.Executing
+    | job.Uncertain -> False
+  }
+}
+
+/// Ties `terminal.states_sql()` to `job.state_to_stored`'s own terminal
+/// variants directly, rather than trusting the two hand-maintained lists
+/// (the SQL fragment's literal text, and `is_terminal_job_state`'s `case`
+/// above) to stay in lockstep by inspection alone.
+pub fn terminal_states_sql_matches_every_job_state_test() {
+  let all_states = [
+    job.Queued,
+    job.Scheduled,
+    job.Retryable,
+    job.Executing,
+    job.Succeeded,
+    job.BusinessFailed,
+    job.RuntimeFailed,
+    job.ContractMismatch,
+    job.Uncertain,
+    job.Discarded,
+    job.Cancelled,
+  ]
+  list.each(all_states, fn(state) {
+    let quoted = "'" <> job.state_to_stored(state) <> "'"
+    string.contains(terminal.states_sql(), quoted)
+    |> should.equal(is_terminal_job_state(state))
+  })
+}
+
 /// Canary for `grind_postgres_ffi`'s own dependency on pog's private
 /// `pog.Connection` shape: a freshly named connection must still be the
 /// `{pool, Name}` tuple `grind_postgres_ffi:with_deadline/3` matches on. The
@@ -79,7 +128,7 @@ fn pool_connection_atom(connection: pog.Connection) -> Result(a, Nil)
 /// "Adding a migration"); never recomputed from the file itself, or the pin
 /// would be meaningless. `grind_migrations_conformance_test` requires a
 /// pinned entry for every file except the newest (highest) version — that
-/// one may still be edited in this same change, as v11 currently is.
+/// one may still be edited in this same change, as v12 currently is.
 const released_migration_sha256 = [
   #(
     "20260925000000-grind_v11.sql",
@@ -1696,6 +1745,9 @@ fn schema_missing_attempt_sequence_url() -> Result(String, Nil)
 @external(erlang, "grind_test_env", "schema_missing_unique_submissions_url")
 fn schema_missing_unique_submissions_url() -> Result(String, Nil)
 
+@external(erlang, "grind_test_env", "schema_missing_fk_url")
+fn schema_missing_fk_url() -> Result(String, Nil)
+
 @external(erlang, "grind_test_env", "schema_atomic_url")
 fn schema_atomic_url() -> Result(String, Nil)
 
@@ -1895,7 +1947,13 @@ fn run_schema_v10_install_test(database_url: String) -> Nil {
     postgres.settings(database_url) |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
-  let assert Ok(Nil) = postgres.migrate(database)
+  // Only the real v11 step here: this test's own assertions below (schema
+  // shape, and a hand-inserted `succeeded` row with no `finished_at`) are
+  // specifically about the v11 baseline, not whatever `migrations()` grows
+  // into afterwards. The idempotency re-run further down deliberately calls
+  // the full `postgres.migrate` instead, so it also exercises the real v12
+  // upgrade (and its `finished_at` backfill) atop these seeded rows.
+  let assert Ok(Nil) = postgres.migrate_with(database, [real_v11_migration()])
   let connection = postgres.connection(database)
   let assert Ok(schema) =
     pog.query(
@@ -1961,11 +2019,15 @@ fn run_schema_v10_install_test(database_url: String) -> Nil {
     |> pog.execute(on: connection)
   let assert [sequence_before] = before.rows
 
+  // Upgrades the seeded-then-frozen v11 schema onto the real, current latest
+  // (v12) — twice, proving idempotency — rather than a v11-only re-run, so
+  // this also exercises the real `finished_at` backfill against the
+  // `succeeded` row seeded above under a schema that had no such column yet.
   postgres.migrate(database) |> should.equal(Ok(Nil))
   postgres.migrate(database) |> should.equal(Ok(Nil))
   let assert Ok(preserved) =
     pog.query(
-      "SELECT (SELECT count(*) = 1 AND min(version) = 11 AND max(version) = 11 FROM grind_schema_migrations), (SELECT count(*) = 1 FROM grind_jobs WHERE id = $1 AND state = 'succeeded'), (SELECT count(*) = 1 FROM grind_job_acknowledgements WHERE command_id = 'schema-command' AND job_id = $1 AND attempt_id = $2 AND proposal_sha256 = sha256(convert_to('synthetic proposal', 'UTF8'))), (SELECT last_value = $2 AND is_called FROM grind_attempts_id_seq)",
+      "SELECT (SELECT count(*) = 2 AND min(version) = 11 AND max(version) = 12 FROM grind_schema_migrations), (SELECT count(*) = 1 FROM grind_jobs WHERE id = $1 AND state = 'succeeded' AND finished_at IS NOT NULL), (SELECT count(*) = 1 FROM grind_job_acknowledgements WHERE command_id = 'schema-command' AND job_id = $1 AND attempt_id = $2 AND proposal_sha256 = sha256(convert_to('synthetic proposal', 'UTF8'))), (SELECT last_value = $2 AND is_called FROM grind_attempts_id_seq)",
     )
     |> pog.parameter(pog.int(job_id))
     |> pog.parameter(pog.int(attempt_id))
@@ -2003,7 +2065,11 @@ fn run_schema_marker_rejection_test(database_url: String) -> Nil {
     postgres.settings(database_url) |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
-  let assert Ok(Nil) = postgres.migrate(database)
+  // Only the real v11 step: the "marker=11 alone" case below re-applies the
+  // real, full `migrations()` on top of this genuinely v11-only physical
+  // schema, so it exercises an actual v11-to-v12 upgrade rather than a no-op
+  // against a schema already fully at latest.
+  let assert Ok(Nil) = postgres.migrate_with(database, [real_v11_migration()])
   let connection = postgres.connection(database)
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations")
@@ -2060,16 +2126,35 @@ fn run_schema_marker_rejection_test(database_url: String) -> Nil {
   let assert Ok(_) =
     pog.query("INSERT INTO grind_schema_migrations (version) VALUES (11)")
     |> pog.execute(on: connection)
+  // The marker claims only v11, but this call runs the real `migrations()`
+  // (v11 and v12), and the physical schema really is v11-only at this point
+  // — so this is a genuine upgrade to v12, not a no-op re-run.
   postgres.migrate(database) |> should.equal(Ok(Nil))
 
+  // The physical schema is now genuinely v12 (from the real upgrade just
+  // above). A marker set of `{12}` alone is still rejected — not because
+  // `12` is unknown (it is now the real latest), but because a valid marker
+  // set is always the contiguous range starting at the baseline (`11`): a
+  // schema can never legitimately reach `12` without a `11` marker also on
+  // record, so this is `IncompatibleSchema`, never `UnsupportedSchemaVersion`.
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations")
     |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query("INSERT INTO grind_schema_migrations (version) VALUES (12)")
     |> pog.execute(on: connection)
+  postgres.migrate(database) |> should.equal(Error(postgres.IncompatibleSchema))
+
+  // A marker genuinely beyond this build's own highest known version (`12`)
+  // is the real "future schema" case `UnsupportedSchemaVersion` exists for.
+  let assert Ok(_) =
+    pog.query("DELETE FROM grind_schema_migrations")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (13)")
+    |> pog.execute(on: connection)
   postgres.migrate(database)
-  |> should.equal(Error(postgres.UnsupportedSchemaVersion(12)))
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(13)))
 
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations")
@@ -2148,7 +2233,13 @@ fn run_missing_schema_artifact_test(
   let connection = postgres.connection(database)
   let drop_statement = case is_sequence {
     True -> "DROP SEQUENCE " <> artifact
-    False -> "DROP TABLE " <> artifact
+    // `CASCADE`: `grind_jobs` is now the referenced side of three foreign
+    // keys (`grind_v12`'s own `ON DELETE CASCADE` constraints), so a plain
+    // `DROP TABLE grind_jobs` alone fails with `2BP01
+    // dependent_objects_still_exist` instead of ever reaching the
+    // `IncompatibleSchema` check this test is about. Harmless for the other
+    // artifacts this same helper drops, since nothing references them.
+    False -> "DROP TABLE " <> artifact <> " CASCADE"
   }
   let assert Ok(_) = pog.query(drop_statement) |> pog.execute(on: connection)
   postgres.migrate(database) |> should.equal(Error(postgres.IncompatibleSchema))
@@ -2161,6 +2252,47 @@ fn run_missing_schema_artifact_test(
     })
     |> pog.execute(on: connection)
   missing.rows |> should.equal([True])
+}
+
+/// Increment 25: `v12_foreign_keys` extends the physical-shape check with a
+/// `pg_constraint` lookup independent of `v12_shape`'s own `pg_class`
+/// relation check (a plain foreign key backs no relation of its own) — a
+/// database missing one of `grind_v12`'s three `ON DELETE CASCADE`
+/// constraints (dropped by hand, here) must fail closed exactly like a
+/// missing relation does, not silently pass as though the receipt-orphan
+/// backstop `docs/RECOVERY-EVIDENCE.md` Increment 24 describes were still
+/// in place.
+pub fn postgres_migration_missing_foreign_key_shape_detected_test() {
+  case schema_missing_fk_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_missing_foreign_key_test(database_url)
+  }
+}
+
+fn run_missing_foreign_key_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = postgres.connection(database)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_job_id_fkey",
+    )
+    |> pog.execute(on: connection)
+  postgres.migrate(database) |> should.equal(Error(postgres.IncompatibleSchema))
+  let assert Ok(dropped) =
+    pog.query(
+      "SELECT count(*) = 0 FROM pg_constraint WHERE conname = 'grind_job_acknowledgements_job_id_fkey'",
+    )
+    |> pog.returning({
+      use absent <- decode.field(0, decode.bool)
+      decode.success(absent)
+    })
+    |> pog.execute(on: connection)
+  dropped.rows |> should.equal([True])
+  mark_database_test_executed("missing-foreign-key-not-repaired")
 }
 
 pub fn postgres_migration_fresh_install_is_atomic_test() {
@@ -2209,13 +2341,14 @@ fn run_schema_atomic_install_test(database_url: String) -> Nil {
 /// A marker claiming a schema version newer than this build's own
 /// `migrations()` (`UnsupportedSchemaVersion`) must be detected *before*
 /// `read_schema_generation` ever runs any per-version shape check — proven
-/// here to actually discriminate: install a real v11 schema, then *break*
-/// v11's own declared shape (drop `grind_unique_submissions`, one of its
-/// required relations) and add a `12` marker on top. A shape-first
-/// implementation would evaluate v11's now-broken shape and misreport
-/// `IncompatibleSchema` (or, worse, never notice the higher marker at all);
-/// the required version-first ordering still reports
-/// `UnsupportedSchemaVersion(12)` regardless — the version check never
+/// here to actually discriminate: install a real, current-latest (v12)
+/// schema, then *break* its own declared shape (drop
+/// `grind_unique_submissions`, one of its required relations) and add a
+/// `13` marker (one past this build's own real latest, `12`) on top. A
+/// shape-first implementation would evaluate the now-broken shape and
+/// misreport `IncompatibleSchema` (or, worse, never notice the higher
+/// marker at all); the required version-first ordering still reports
+/// `UnsupportedSchemaVersion(13)` regardless — the version check never
 /// reaches a shape check at all once `max > latest`.
 pub fn postgres_migration_future_version_precedes_shape_check_test() {
   case schema_future_foreign_url() {
@@ -2236,10 +2369,10 @@ fn run_future_version_with_foreign_objects_test(database_url: String) -> Nil {
     pog.query("DROP TABLE grind_unique_submissions")
     |> pog.execute(on: connection)
   let assert Ok(_) =
-    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (12)")
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (13)")
     |> pog.execute(on: connection)
   postgres.migrate(database)
-  |> should.equal(Error(postgres.UnsupportedSchemaVersion(12)))
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(13)))
   mark_database_test_executed("future-version-precedes-shape-check-passed")
 }
 
@@ -2338,8 +2471,30 @@ fn run_concurrent_migrators_test(database_url: String) -> Nil {
       decode.success(count)
     })
     |> pog.execute(on: connection)
-  marker.rows |> should.equal([1])
+  // One marker row per real step (11 and 12) — never a duplicate for either,
+  // which is what would show up here had the advisory lock not actually
+  // serialised the two concurrent migrators against each step.
+  marker.rows |> should.equal([2])
   mark_database_test_executed("migrate-concurrent-migrators-single-marker")
+}
+
+/// The real, released `v11` step, looked up from `migrations.migrations()`
+/// rather than hand-duplicated.
+fn real_v11_migration() -> migrations.Migration {
+  let assert Ok(step) =
+    list.find(migrations.migrations(), fn(step) { step.version == 11 })
+  step
+}
+
+/// The real, highest-numbered step `migrations.migrations()` currently
+/// defines (`v12` as of this change) — every synthetic test-only step below
+/// appends *after* this one, so its own `shape` must extend this step's own
+/// cumulative shape, not `v11`'s, or `validate_expected_shape` would see the
+/// synthetic step's declared shape omit every real relation `v12` itself
+/// added.
+fn latest_migration() -> migrations.Migration {
+  let assert Ok(step) = list.last(migrations.migrations())
+  step
 }
 
 /// A synthetic version `migrate_with`-only test appends after the real
@@ -2347,96 +2502,93 @@ fn run_concurrent_migrators_test(database_url: String) -> Nil {
 /// itself, and never released. Its own statements are deliberately trivial
 /// (one throwaway table plus the marker insert) since only the runner's
 /// step-by-step commit/skip behaviour is under test here, not any real
-/// schema change.
-fn v11_migration() -> migrations.Migration {
-  let assert Ok(step) =
-    list.find(migrations.migrations(), fn(step) { step.version == 11 })
-  step
-}
-
-fn synthetic_v12_ok_migration() -> migrations.Migration {
-  migrations.Migration(
-    12,
-    [
-      "CREATE TABLE grind_test_synthetic_v12 (id integer PRIMARY KEY)",
-      "INSERT INTO grind_schema_migrations (version) VALUES (12)",
-    ],
-    list.append(v11_migration().shape, [
-      migrations.ExpectedRelation(
-        "grind_test_synthetic_v12",
-        migrations.Table,
-        [],
-      ),
-      // `id integer PRIMARY KEY` also creates this backing index implicitly.
-      migrations.ExpectedRelation(
-        "grind_test_synthetic_v12_pkey",
-        migrations.Index,
-        [],
-      ),
-    ]),
-  )
-}
-
-/// Like `synthetic_v12_ok_migration`, but its own `CREATE TABLE` is the
-/// exact object identity `install_synthetic_v13_failure_trigger` arms an
-/// event trigger to reject.
-fn synthetic_v13_migration() -> migrations.Migration {
+/// schema change. Numbered `13` (one past the real, current highest version)
+/// rather than `12`, since `12` is now a genuine released step.
+fn synthetic_v13_ok_migration() -> migrations.Migration {
   migrations.Migration(
     13,
     [
       "CREATE TABLE grind_test_synthetic_v13 (id integer PRIMARY KEY)",
       "INSERT INTO grind_schema_migrations (version) VALUES (13)",
     ],
-    list.append(synthetic_v12_ok_migration().shape, [
+    list.append(latest_migration().shape, [
       migrations.ExpectedRelation(
         "grind_test_synthetic_v13",
         migrations.Table,
         [],
       ),
+      // `id integer PRIMARY KEY` also creates this backing index implicitly.
       migrations.ExpectedRelation(
         "grind_test_synthetic_v13_pkey",
         migrations.Index,
         [],
       ),
     ]),
+    latest_migration().foreign_keys,
+  )
+}
+
+/// Like `synthetic_v13_ok_migration`, but its own `CREATE TABLE` is the
+/// exact object identity `install_synthetic_v14_failure_trigger` arms an
+/// event trigger to reject.
+fn synthetic_v14_migration() -> migrations.Migration {
+  migrations.Migration(
+    14,
+    [
+      "CREATE TABLE grind_test_synthetic_v14 (id integer PRIMARY KEY)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
+    ],
+    list.append(synthetic_v13_ok_migration().shape, [
+      migrations.ExpectedRelation(
+        "grind_test_synthetic_v14",
+        migrations.Table,
+        [],
+      ),
+      migrations.ExpectedRelation(
+        "grind_test_synthetic_v14_pkey",
+        migrations.Index,
+        [],
+      ),
+    ]),
+    synthetic_v13_ok_migration().foreign_keys,
   )
 }
 
 /// Installs a `ddl_command_end` event trigger that raises whenever
-/// `grind_test_synthetic_v13` is created — the same fault-injection shape
+/// `grind_test_synthetic_v14` is created — the same fault-injection shape
 /// `run_schema_atomic_install_test` above uses against a real Grind table,
-/// aimed instead at the partial-failure test's own synthetic step 13.
-fn install_synthetic_v13_failure_trigger(connection: pog.Connection) -> Nil {
+/// aimed instead at the partial-failure test's own synthetic step 14.
+fn install_synthetic_v14_failure_trigger(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
     pog.query(
-      "CREATE FUNCTION fail_grind_synthetic_v13() RETURNS event_trigger LANGUAGE plpgsql AS $body$ DECLARE command record; BEGIN FOR command IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP IF command.object_identity LIKE '%grind_test_synthetic_v13' THEN RAISE EXCEPTION 'injected Grind migration failure'; END IF; END LOOP; END $body$",
+      "CREATE FUNCTION fail_grind_synthetic_v14() RETURNS event_trigger LANGUAGE plpgsql AS $body$ DECLARE command record; BEGIN FOR command IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP IF command.object_identity LIKE '%grind_test_synthetic_v14' THEN RAISE EXCEPTION 'injected Grind migration failure'; END IF; END LOOP; END $body$",
     )
     |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query(
-      "CREATE EVENT TRIGGER fail_grind_synthetic_v13 ON ddl_command_end EXECUTE FUNCTION fail_grind_synthetic_v13()",
+      "CREATE EVENT TRIGGER fail_grind_synthetic_v14 ON ddl_command_end EXECUTE FUNCTION fail_grind_synthetic_v14()",
     )
     |> pog.execute(on: connection)
   Nil
 }
 
-fn drop_synthetic_v13_failure_trigger(connection: pog.Connection) -> Nil {
+fn drop_synthetic_v14_failure_trigger(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
-    pog.query("DROP EVENT TRIGGER fail_grind_synthetic_v13")
+    pog.query("DROP EVENT TRIGGER fail_grind_synthetic_v14")
     |> pog.execute(on: connection)
   let assert Ok(_) =
-    pog.query("DROP FUNCTION fail_grind_synthetic_v13()")
+    pog.query("DROP FUNCTION fail_grind_synthetic_v14()")
     |> pog.execute(on: connection)
   Nil
 }
 
-/// `migrate_with(migrations() ++ [synthetic v12 ok, synthetic v13 failing])`
-/// on a fresh schema: step 11 and step 12 each commit in their own
-/// transaction before step 13's own transaction rolls back on its injected
-/// failure — proving a mid-run failure neither undoes earlier committed
-/// steps nor leaves the failed step's own partial work behind, and that a
-/// second `migrate_with` call (fault removed) picks up exactly where the
-/// first left off.
+/// `migrate_with(migrations() ++ [synthetic v13 ok, synthetic v14 failing])`
+/// on a fresh schema: step 11, step 12 (real), and step 13 each commit in
+/// their own transaction before step 14's own transaction rolls back on its
+/// injected failure — proving a mid-run failure neither undoes earlier
+/// committed steps nor leaves the failed step's own partial work behind, and
+/// that a second `migrate_with` call (fault removed) picks up exactly where
+/// the first left off.
 pub fn postgres_migrate_with_partial_failure_preserves_earlier_steps_test() {
   case schema_partial_url() {
     Error(Nil) -> Nil
@@ -2450,14 +2602,14 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let connection = postgres.connection(database)
-  install_synthetic_v13_failure_trigger(connection)
+  install_synthetic_v14_failure_trigger(connection)
 
   let steps =
     list.append(migrations.migrations(), [
-      synthetic_v12_ok_migration(),
-      synthetic_v13_migration(),
+      synthetic_v13_ok_migration(),
+      synthetic_v14_migration(),
     ])
-  let assert Error(postgres.MigrationStepFailed(13, _)) =
+  let assert Error(postgres.MigrationStepFailed(14, _)) =
     postgres.migrate_with(database, steps)
 
   let assert Ok(markers) =
@@ -2469,20 +2621,20 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
       decode.success(versions)
     })
     |> pog.execute(on: connection)
-  markers.rows |> should.equal([[11, 12]])
+  markers.rows |> should.equal([[11, 12, 13]])
   let assert Ok(objects) =
     pog.query(
-      "SELECT to_regclass(current_schema() || '.grind_test_synthetic_v12') IS NOT NULL, to_regclass(current_schema() || '.grind_test_synthetic_v13') IS NOT NULL",
+      "SELECT to_regclass(current_schema() || '.grind_test_synthetic_v13') IS NOT NULL, to_regclass(current_schema() || '.grind_test_synthetic_v14') IS NOT NULL",
     )
     |> pog.returning({
-      use v12_present <- decode.field(0, decode.bool)
-      use v13_present <- decode.field(1, decode.bool)
-      decode.success(#(v12_present, v13_present))
+      use v13_present <- decode.field(0, decode.bool)
+      use v14_present <- decode.field(1, decode.bool)
+      decode.success(#(v13_present, v14_present))
     })
     |> pog.execute(on: connection)
   objects.rows |> should.equal([#(True, False)])
 
-  drop_synthetic_v13_failure_trigger(connection)
+  drop_synthetic_v14_failure_trigger(connection)
   postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
   let assert Ok(resumed_markers) =
     pog.query(
@@ -2493,7 +2645,7 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
       decode.success(versions)
     })
     |> pog.execute(on: connection)
-  resumed_markers.rows |> should.equal([[11, 12, 13]])
+  resumed_markers.rows |> should.equal([[11, 12, 13, 14]])
   mark_database_test_executed("migrate-partial-failure-resumes-passed")
 }
 
@@ -2501,8 +2653,8 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
 /// relation a later version's own declared `shape` requires, after that
 /// version's marker was genuinely committed, must still be caught as
 /// `IncompatibleSchema` on the next `migrate_with` call — proven against a
-/// synthetic v12 here since the real v11 baseline's own equivalent case is
-/// already covered by `postgres_migration_refuses_missing_owned_artifacts_test`.
+/// synthetic v13 here since the real v11/v12 baseline's own equivalent case
+/// is already covered by `postgres_migration_refuses_missing_owned_artifacts_test`.
 pub fn postgres_migrate_detects_missing_relation_in_declared_shape_test() {
   case schema_shape_url() {
     Error(Nil) -> Nil
@@ -2517,10 +2669,10 @@ fn run_missing_relation_shape_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let connection = postgres.connection(database)
   let steps =
-    list.append(migrations.migrations(), [synthetic_v12_ok_migration()])
+    list.append(migrations.migrations(), [synthetic_v13_ok_migration()])
   postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
   let assert Ok(_) =
-    pog.query("DROP TABLE grind_test_synthetic_v12")
+    pog.query("DROP TABLE grind_test_synthetic_v13")
     |> pog.execute(on: connection)
   postgres.migrate_with(database, steps)
   |> should.equal(Error(postgres.IncompatibleSchema))
@@ -2529,6 +2681,15 @@ fn run_missing_relation_shape_test(database_url: String) -> Nil {
 
 @external(erlang, "grind_test_env", "migration_deadline_url")
 fn migration_deadline_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "migration_lock_url")
+fn migration_lock_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "prune_url")
+fn prune_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "prune_owner_b_url")
+fn prune_owner_b_url() -> Result(String, Nil)
 
 /// A synthetic step whose own statement (`pg_sleep(6)`) legitimately runs
 /// longer than the pool's own `statement_deadline_ms` (4000ms default) but
@@ -2541,9 +2702,9 @@ fn migration_deadline_url() -> Result(String, Nil)
 /// docs/RECOVERY-EVIDENCE.md, "Acknowledgement deadline", for the mutation
 /// this characterizes: a step run under the pool's shared deadline instead
 /// of its own times out at ~4s instead of succeeding at ~6s.
-fn synthetic_v12_slow_migration() -> migrations.Migration {
+fn synthetic_v13_slow_migration() -> migrations.Migration {
   migrations.Migration(
-    12,
+    13,
     [
       // `pg_types` cannot decode a bare `void` result (`pg_sleep`'s own
       // return type — see `grind/internal/unique_admission`'s identical
@@ -2551,9 +2712,10 @@ fn synthetic_v12_slow_migration() -> migrations.Migration {
       // its own doc comment for the full driver note), so the sleep is
       // wrapped in an outer scalar `SELECT` rather than selected directly.
       "SELECT true FROM (SELECT pg_sleep(6)) AS grind_migration_deadline_probe",
-      "INSERT INTO grind_schema_migrations (version) VALUES (12)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
     ],
-    v11_migration().shape,
+    latest_migration().shape,
+    latest_migration().foreign_keys,
   )
 }
 
@@ -2572,7 +2734,7 @@ fn run_migration_deadline_long_step_test(database_url: String) -> Nil {
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let steps =
-    list.append(migrations.migrations(), [synthetic_v12_slow_migration()])
+    list.append(migrations.migrations(), [synthetic_v13_slow_migration()])
   let start_ms = monotonic_ms()
   postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
   let elapsed_ms = monotonic_ms() - start_ms
@@ -2581,6 +2743,139 @@ fn run_migration_deadline_long_step_test(database_url: String) -> Nil {
   { elapsed_ms >= 6000 } |> should.equal(True)
   { elapsed_ms < 9000 } |> should.equal(True)
   mark_database_test_executed("migration-deadline-long-step-succeeds-passed")
+}
+
+fn migration_lock_timeout_probe_migration() -> migrations.Migration {
+  migrations.Migration(
+    13,
+    [
+      "ALTER TABLE grind_jobs ADD COLUMN grind_lock_timeout_probe text",
+      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
+    ],
+    latest_migration().shape,
+    latest_migration().foreign_keys,
+  )
+}
+
+fn migration_lock_timeout_probe_column_exists(
+  connection: pog.Connection,
+) -> Bool {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT count(*) = 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'grind_jobs' AND column_name = 'grind_lock_timeout_probe'",
+    )
+    |> pog.returning({
+      use exists <- decode.field(0, decode.bool)
+      decode.success(exists)
+    })
+    |> pog.execute(on: connection)
+  let assert [exists] = returned.rows
+  exists
+}
+
+pub fn postgres_migration_step_lock_timeout_returns_lock_unavailable_test() {
+  case migration_lock_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_migration_step_lock_timeout_test(database_url)
+  }
+}
+
+/// A migration step's own DDL/DML now runs under a constant, transaction-
+/// local `lock_timeout` (2000ms, set right after the advisory lock):
+/// PostgreSQL's own `55P03 lock_not_available` becomes the typed, retry-safe
+/// `MigrationLockUnavailable(version)` instead of blocking for up to the
+/// full `migration_deadline_ms`. `main_database`'s own `migration_deadline_ms`
+/// is shortened to 3500ms here (comfortably above the required
+/// `migration_lock_timeout_ms + margin` of 3000ms) purely so this test does
+/// not have to wait out the 30000ms default; it stays well under
+/// `spawn_lock_holder`'s own plain, unwrapped `pog.transaction` — bound by
+/// pog's own hardcoded ~5000ms checkout hold time exactly like the
+/// pre-Increment-15 acknowledgement path was (`docs/RECOVERY-EVIDENCE.md`,
+/// "Acknowledgement deadline") — which would otherwise auto-release the
+/// observer's own lock before a longer deadline ever had a chance to fire.
+/// Named mutation, also this change's own red-first evidence (this is
+/// exactly the code shape before this fix): temporarily removing
+/// `run_migration_step_transaction`'s own `set_migration_lock_timeout` call
+/// makes this exact scenario instead block on the table lock until
+/// `main_database`'s 3500ms `migration_deadline_ms` force-closes the
+/// connection, reporting `MigrationCommitUnknown(13)` instead — confirmed
+/// empirically (`docs/RECOVERY-EVIDENCE.md` has the observed timings).
+fn run_migration_step_lock_timeout_test(database_url: String) -> Nil {
+  let assert Ok(main_validated) =
+    postgres.settings(database_url)
+    |> postgres.with_migration_deadline(3500)
+    |> postgres.validate
+  let assert Ok(main_database) = postgres.start(main_validated)
+  use <- exception.defer(fn() { postgres.close(main_database) })
+  let assert Ok(Nil) =
+    postgres.migrate_with(main_database, migrations.migrations())
+
+  let assert Ok(observer_validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(observer_database) = postgres.start(observer_validated)
+  use <- exception.defer(fn() { postgres.close(observer_database) })
+  let observer_connection = postgres.connection(observer_database)
+
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(
+      observer_connection,
+      pog.query("LOCK TABLE grind_jobs IN ACCESS SHARE MODE"),
+    )
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  // Safety net: guarantees the observer's own transaction is never left
+  // open beyond this test, even if an assertion below panics first.
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let steps =
+    list.append(migrations.migrations(), [
+      migration_lock_timeout_probe_migration(),
+    ])
+  let start_ms = monotonic_ms()
+  let outcome = postgres.migrate_with(main_database, steps)
+  let elapsed_ms = monotonic_ms() - start_ms
+  outcome |> should.equal(Error(postgres.MigrationLockUnavailable(13)))
+  // Comfortably clears the 2000ms lock_timeout plus ordinary scheduling
+  // jitter, but well under the 3500ms `migration_deadline_ms` configured
+  // above (never mind the 30000ms default) a caller who removed
+  // `set_migration_lock_timeout` would otherwise have to wait out for the
+  // exact same contention.
+  { elapsed_ms < 3200 } |> should.equal(True)
+
+  // Generation is still 12 (the real, current latest): re-running the
+  // released steps alone is a no-op, and the probe column was never added.
+  postgres.migrate_with(main_database, migrations.migrations())
+  |> should.equal(Ok(Nil))
+  migration_lock_timeout_probe_column_exists(postgres.connection(main_database))
+  |> should.equal(False)
+
+  process.send(release_lock, ReleaseAttempt)
+  let assert Ok(ClaimGateReleased(True)) =
+    process.receive(lock_finished, within: 5000)
+
+  // The conflicting lock is gone: the exact same steps now succeed.
+  postgres.migrate_with(main_database, steps) |> should.equal(Ok(Nil))
+  migration_lock_timeout_probe_column_exists(postgres.connection(main_database))
+  |> should.equal(True)
+
+  // `SET LOCAL` never leaks past the transaction that set it: this pooled
+  // connection's own session-level `lock_timeout` is still PostgreSQL's
+  // ordinary default ("0", meaning no limit), not the migration step's
+  // constant 2000ms.
+  let assert Ok(returned) =
+    pog.query("SHOW lock_timeout")
+    |> pog.returning({
+      use value <- decode.field(0, decode.string)
+      decode.success(value)
+    })
+    |> pog.execute(on: postgres.connection(main_database))
+  let assert [lock_timeout_after] = returned.rows
+  lock_timeout_after |> should.equal("0")
+
+  mark_database_test_executed("migration-lock-timeout-unavailable-passed")
 }
 
 /// The frozen up-dump of the real `grind_v11` migration, applied with plain
@@ -2612,21 +2907,25 @@ fn apply_sql_statements(
   })
 }
 
-/// A synthetic `v12` used only by the upgrade harness below: adds a nullable
-/// column and an index on it to `grind_jobs`, the shape of change the design
-/// calls out (`docs/RELEASE-READINESS.md`, "Migration mechanism") as the one
-/// most likely to interact badly with rows a previous release already wrote.
-fn synthetic_v12_alter_migration() -> migrations.Migration {
+/// A synthetic `v13` (one past the real, current latest `v12`) used only by
+/// the upgrade harness below: adds a nullable column and an index on it to
+/// `grind_jobs`, the shape of change the design calls out
+/// (`docs/RELEASE-READINESS.md`, "Migration mechanism") as the one most
+/// likely to interact badly with rows a previous release already wrote —
+/// layered on top of the real `v12` (`finished_at`) this harness now also
+/// exercises for real, rather than only against a synthetic stand-in.
+fn synthetic_v13_alter_migration() -> migrations.Migration {
   migrations.Migration(
-    12,
+    13,
     [
       "ALTER TABLE grind_jobs ADD COLUMN grind_test_note text",
       "CREATE INDEX grind_test_note_idx ON grind_jobs (grind_test_note)",
-      "INSERT INTO grind_schema_migrations (version) VALUES (12)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
     ],
-    list.append(v11_migration().shape, [
+    list.append(latest_migration().shape, [
       migrations.ExpectedRelation("grind_test_note_idx", migrations.Index, []),
     ]),
+    latest_migration().foreign_keys,
   )
 }
 
@@ -2855,10 +3154,68 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
     |> pog.parameter(pog.int(succeeded_attempt_id))
     |> pog.execute(on: upgrade_connection)
 
+  // Increment 25: seeds one orphaned receipt per receipt table — a
+  // `job_id` that never existed in `grind_jobs` at all, exactly what a
+  // database that has been running a while under `v11` (no foreign key
+  // enforcing this) could already carry for reasons unrelated to this
+  // upgrade (a hand rollback, an old bug, direct SQL) — before this
+  // upgrade ever reaches `v12`'s own `ADD CONSTRAINT ... FOREIGN KEY`.
+  // Without the `DELETE ... WHERE NOT EXISTS` cleanup immediately ahead of
+  // each `ADD CONSTRAINT` in `v12_statements`, this `ADD CONSTRAINT` itself
+  // would fail closed with `23503 foreign_key_violation` against these
+  // three rows (confirmed red: temporarily commenting out the three
+  // `DELETE`s reproduces exactly that error against this fixture). Proves
+  // both halves at once below: `migrate_with` still succeeds, and the
+  // orphans are genuinely gone afterward, not merely tolerated.
+  let orphaned_job_id = 999_999_999
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_job_acknowledgements (storage_owner, command_id, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, attempt_owner, committed_state, proposal_sha256) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy-orphan-ack', 'upgrade-legacy', $1, 'upgrade.legacy-worker', 'v1', 999999998, 1, 'legacy-attempt-owner', 'succeeded', sha256(convert_to('legacy orphan proposal', 'UTF8')))",
+    )
+    |> pog.parameter(pog.int(orphaned_job_id))
+    |> pog.execute(on: upgrade_connection)
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_unique_submissions (storage_owner, submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy-orphan-submission', 'upgrade-legacy', 'upgrade.legacy-worker', 'v1', sha256(convert_to('legacy orphan request', 'UTF8')), 'inserted', $1, 'upgrade-legacy', 'succeeded')",
+    )
+    |> pog.parameter(pog.int(orphaned_job_id))
+    |> pog.execute(on: upgrade_connection)
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_job_resolutions (storage_owner, queue, job_id, worker_id, worker_version, resolution_id, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, decision, target_state, resolved_by, details) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy', $1, 'upgrade.legacy-worker', 'v1', 'upgrade-legacy-orphan-resolution', 999999998, 1, 'legacy-attempt-owner', clock_timestamp(), 'confirm_success', 'succeeded', 'legacy-on-call', 'legacy orphan resolution before this upgrade')",
+    )
+    |> pog.parameter(pog.int(orphaned_job_id))
+    |> pog.execute(on: upgrade_connection)
+
   let steps =
-    list.append(migrations.migrations(), [synthetic_v12_alter_migration()])
+    list.append(migrations.migrations(), [synthetic_v13_alter_migration()])
   postgres.migrate_with(upgrade_database, steps) |> should.equal(Ok(Nil))
   postgres.migrate_with(fresh_database, steps) |> should.equal(Ok(Nil))
+
+  // The three orphaned receipts seeded above did not survive the upgrade
+  // (removed by `v12`'s own `DELETE ... WHERE NOT EXISTS` cleanup, ahead of
+  // its own `ADD CONSTRAINT ... FOREIGN KEY`) — and, since `migrate_with`
+  // above already returned `Ok(Nil)`, that `ADD CONSTRAINT` did not fail
+  // closed against them either.
+  let assert Ok(orphans_removed) =
+    pog.query(
+      "SELECT (SELECT count(*) FROM grind_job_acknowledgements WHERE job_id = $1), (SELECT count(*) FROM grind_unique_submissions WHERE job_id = $1), (SELECT count(*) FROM grind_job_resolutions WHERE job_id = $1)",
+    )
+    |> pog.parameter(pog.int(orphaned_job_id))
+    |> pog.returning({
+      use acknowledgements <- decode.field(0, decode.int)
+      use unique_submissions <- decode.field(1, decode.int)
+      use resolutions <- decode.field(2, decode.int)
+      decode.success(#(acknowledgements, unique_submissions, resolutions))
+    })
+    |> pog.execute(on: upgrade_connection)
+  orphans_removed.rows |> should.equal([#(0, 0, 0)])
 
   // Every seeded legacy row is untouched by the upgrade.
   let assert Ok(preserved) =
@@ -2900,6 +3257,27 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
     })
     |> pog.execute(on: upgrade_connection)
   preserved.rows |> should.equal([#(1, 1, 1, 1, 1, 1, 1, 1, 1)])
+
+  // The real `v12` backfill applied by this exact upgrade: the seeded
+  // `succeeded` row (terminal, written under the pre-migration v11 schema
+  // that had no `finished_at` column at all) picked up a non-null
+  // `finished_at` dated from this migration run, while every seeded
+  // non-terminal row (queued, scheduled, retryable, executing, uncertain)
+  // was nulled back out by the backfill's own second pass.
+  let assert Ok(finished_at_backfill) =
+    pog.query(
+      "SELECT (SELECT finished_at IS NOT NULL AND finished_at > clock_timestamp() - interval '1 minute' FROM grind_jobs WHERE id = $1), (SELECT count(*) = 0 FROM grind_jobs WHERE storage_owner = '"
+      <> storage_owner
+      <> "' AND finished_at IS NOT NULL AND state NOT IN ('succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'discarded', 'cancelled'))",
+    )
+    |> pog.parameter(pog.int(succeeded_job_id))
+    |> pog.returning({
+      use succeeded_finished_recently <- decode.field(0, decode.bool)
+      use no_non_terminal_finished_at <- decode.field(1, decode.bool)
+      decode.success(#(succeeded_finished_recently, no_non_terminal_finished_at))
+    })
+    |> pog.execute(on: upgrade_connection)
+  finished_at_backfill.rows |> should.equal([#(True, True)])
 
   // The upgraded database's catalog shape is identical to a fresh install of
   // the exact same steps.
@@ -3014,6 +3392,1749 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
   receipt.business_failure_cause |> should.equal(None)
 
   mark_database_test_executed("migrate-upgrade-harness-passed")
+}
+
+/// `grind_jobs_finished_at_check` (`grind_v12`) is PostgreSQL's own
+/// enforcement of "terminal state iff `finished_at` is set" — this probes it
+/// directly with raw SQL from both directions, independent of any Grind
+/// write path, so a future write site that forgets to set `finished_at`
+/// correctly fails loudly at the database layer rather than silently
+/// drifting. `pog_ffi`'s `convert_error` reports a `pgsql_error` that
+/// carries a `constraint` field (both a check and a unique violation do) as
+/// `pog.ConstraintViolated(message, constraint, detail)` — SQLSTATE `23514`
+/// (`check_violation`) is what PostgreSQL raises here, though `pog` itself
+/// does not surface the raw code once it has already recognised the
+/// constraint name.
+pub fn postgres_finished_at_check_constraint_rejects_mismatch_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_finished_at_check_constraint_test(database_url)
+  }
+}
+
+fn run_finished_at_check_constraint_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = postgres.connection(database)
+
+  // A non-terminal state (`queued`) with `finished_at` set.
+  let assert Error(queued_error) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at, finished_at) VALUES ('finished-at-check-owner', 'finished-at-check', 'finished-at-check.worker', 'v1', 'v1', '1'::jsonb, 'v1', 'queued', clock_timestamp(), clock_timestamp())",
+    )
+    |> pog.execute(on: connection)
+  let assert pog.ConstraintViolated(constraint:, ..) = queued_error
+  constraint |> should.equal("grind_jobs_finished_at_check")
+
+  // A terminal state (`succeeded`) with `finished_at` left null.
+  let assert Error(succeeded_error) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at) VALUES ('finished-at-check-owner', 'finished-at-check', 'finished-at-check.worker', 'v1', 'v1', '1'::jsonb, 'v1', 'succeeded', clock_timestamp())",
+    )
+    |> pog.execute(on: connection)
+  let assert pog.ConstraintViolated(constraint: succeeded_constraint, ..) =
+    succeeded_error
+  succeeded_constraint |> should.equal("grind_jobs_finished_at_check")
+
+  mark_database_test_executed("finished-at-check-constraint-rejects-mismatch")
+}
+
+fn finished_at_is_set(connection: pog.Connection, id: Int) -> Bool {
+  let assert Ok(returned) =
+    pog.query("SELECT finished_at IS NOT NULL FROM grind_jobs WHERE id = $1")
+    |> pog.parameter(pog.int(id))
+    |> pog.returning({
+      use finished <- decode.field(0, decode.bool)
+      decode.success(finished)
+    })
+    |> pog.execute(on: connection)
+  let assert [finished] = returned.rows
+  finished
+}
+
+/// Drives one already-claimed, gated job (blocked on its own `started`
+/// signal) through a concurrent `postgres.cancel` while it is genuinely
+/// `executing`, then releases it and waits for the ack that follows —
+/// exactly the "cancel a running attempt" sequence
+/// `run_cancel_running_ack_test` uses, factored out so each of the three
+/// cancel-overridable acknowledge branches can reuse it without repeating
+/// the same process-spawn/handshake boilerplate.
+fn drive_cancel_while_executing(
+  database: postgres.Database,
+  consumer: queue.Consumer,
+  handle: job.JobHandle(input, output, error),
+  started: process.Subject(LongHandlerSignal),
+) -> Nil {
+  let reply = process.new_subject()
+  let _ =
+    process.spawn_unlinked(fn() {
+      process.send(reply, queue.process_one(consumer))
+    })
+  let assert Ok(LongHandlerStarted(release)) =
+    process.receive(started, within: 5000)
+  postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+  postgres.cancel(database, handle)
+  |> should.equal(Ok(postgres.CancellationRequested))
+  process.send(release, ReleaseAttempt)
+  process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
+  Nil
+}
+
+/// Table-driven proof that `finished_at` ends up non-null after every
+/// terminal write site `grind_v12` added it to — `attempt
+/// .acknowledge_transaction`'s eight per-outcome branches (`succeeded`,
+/// `business_failed`, `discarded`, `cancelled`, and `runtime_failed` are
+/// unconditional, since a concurrent cancellation only ever overrides one
+/// terminal outcome with another; `retryable`, `scheduled` (from a worker
+/// snooze), and `uncertain` are non-terminal unless that same override
+/// fires), `attempt.mark_contract_mismatch`, `sql.cancel_before_run`, and
+/// `postgres.write_resolution`'s own `UPDATE` for both of its terminal
+/// target states — and stays null after every non-terminal one, including
+/// `AuthorizeReplay`, whose target state (`queued`) is the one non-terminal
+/// outcome `resolve_uncertain` itself can produce, and the three
+/// cancel-overridden branches' own ordinary (non-cancelled) path. Every job
+/// below lives on its own queue and is driven through exactly the one path
+/// under test, so no scenario's own claim can race another's.
+pub fn postgres_finished_at_written_at_every_terminal_path_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_finished_at_paths_test(database_url)
+  }
+}
+
+fn run_finished_at_paths_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = postgres.connection(database)
+  let run_queue = "finished-at-run"
+
+  let assert Ok(plain_input) =
+    worker.codec("finished-at-plain-input-v1", json.int, decode.int)
+  let assert Ok(plain_output) =
+    worker.codec("finished-at-plain-output-v1", json.string, decode.string)
+  let assert Ok(succeeded_worker) =
+    worker.define(
+      "finished-at.succeeded",
+      "v1",
+      plain_input,
+      plain_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(error_codec) =
+    worker.codec(
+      "finished-at-error-v1",
+      encode_lookup_failure,
+      decode_lookup_failure(),
+    )
+  let assert Ok(business_failed_worker) =
+    worker.define_with_error_codec(
+      "finished-at.business-failed",
+      "v1",
+      plain_input,
+      plain_output,
+      error_codec,
+      fn(account_id) { Error(AccountMissing(account_id)) },
+    )
+  let assert Ok(business_failed_worker) =
+    worker.with_max_attempts(business_failed_worker, 1)
+  let assert Ok(discard_base) =
+    worker.define(
+      "finished-at.discard-base",
+      "v1",
+      plain_input,
+      plain_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let discard_worker =
+    worker.with_queue_handler(discard_base, fn(_) {
+      worker.WorkerDiscarded("finished-at probe")
+    })
+  let assert Ok(cancel_base) =
+    worker.define(
+      "finished-at.cancel-base",
+      "v1",
+      plain_input,
+      plain_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let cancel_worker =
+    worker.with_queue_handler(cancel_base, fn(_) {
+      worker.WorkerCancelled("finished-at probe")
+    })
+  let assert Ok(snooze_delay) = worker.retry_delay(1000)
+  let assert Ok(snooze_base) =
+    worker.define(
+      "finished-at.snooze-base",
+      "v1",
+      plain_input,
+      plain_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let snooze_worker =
+    worker.with_queue_handler(snooze_base, fn(_) {
+      worker.WorkerSnoozed(snooze_delay, "finished-at probe")
+    })
+  let assert Ok(retry_worker) =
+    worker.define("finished-at.retry", "v1", plain_input, plain_output, fn(_) {
+      Error(AccountMissing(9))
+    })
+
+  // Gated variants of the three branches that are only non-terminal in the
+  // *absence* of a concurrent cancellation (`retryable`, `scheduled`,
+  // `uncertain`): each blocks mid-execution on its own `started`/`release`
+  // handshake so a test can request cancellation while the row is genuinely
+  // `executing`, then let the worker's own proposal run into the
+  // already-cancelled row — proving the bare `CASE WHEN cancel_requested_at
+  // IS NOT NULL THEN clock_timestamp() END` in each of those three branches,
+  // not just their ordinary (uncancelled) path already covered above.
+  let gated_retry_started = process.new_subject()
+  let assert Ok(gated_retry_worker) =
+    worker.define(
+      "finished-at.retry-gated",
+      "v1",
+      plain_input,
+      plain_output,
+      fn(value) {
+        let release = process.new_subject()
+        process.send(gated_retry_started, LongHandlerStarted(release))
+        case process.receive(release, within: 10_000) {
+          Ok(ReleaseAttempt) -> Error(AccountMissing(value))
+          Error(Nil) -> Ok(int.to_string(value))
+        }
+      },
+    )
+  let gated_snooze_started = process.new_subject()
+  let assert Ok(gated_snooze_base) =
+    worker.define(
+      "finished-at.snooze-gated-base",
+      "v1",
+      plain_input,
+      plain_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let gated_snooze_worker =
+    worker.with_queue_handler(gated_snooze_base, fn(_) {
+      let release = process.new_subject()
+      process.send(gated_snooze_started, LongHandlerStarted(release))
+      case process.receive(release, within: 10_000) {
+        Ok(ReleaseAttempt) ->
+          worker.WorkerSnoozed(snooze_delay, "finished-at probe")
+        Error(Nil) -> worker.WorkerDiscarded("timed out")
+      }
+    })
+  let gated_uncertain_started = process.new_subject()
+  let assert Ok(gated_uncertain_base) =
+    worker.define(
+      "finished-at.uncertain-gated-base",
+      "v1",
+      plain_input,
+      plain_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let gated_uncertain_worker =
+    worker.with_queue_handler(gated_uncertain_base, fn(_) {
+      let release = process.new_subject()
+      process.send(gated_uncertain_started, LongHandlerStarted(release))
+      case process.receive(release, within: 10_000) {
+        Ok(ReleaseAttempt) -> worker.WorkerUncertain("finished-at probe")
+        Error(Nil) -> worker.WorkerDiscarded("timed out")
+      }
+    })
+
+  let assert Ok(workers) = registry.new(run_queue)
+  let assert Ok(workers) = registry.register(workers, succeeded_worker)
+  let assert Ok(workers) = registry.register(workers, business_failed_worker)
+  let assert Ok(workers) = registry.register(workers, discard_worker)
+  let assert Ok(workers) = registry.register(workers, cancel_worker)
+  let assert Ok(workers) = registry.register(workers, snooze_worker)
+  let assert Ok(workers) = registry.register(workers, retry_worker)
+  let assert Ok(workers) = registry.register(workers, gated_retry_worker)
+  let assert Ok(workers) = registry.register(workers, gated_snooze_worker)
+  let assert Ok(workers) = registry.register(workers, gated_uncertain_worker)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  // -- Terminal write sites: finished_at ends up non-null -------------------
+
+  // acknowledge_transaction, "succeeded" branch.
+  let assert Ok(succeeded_handle) =
+    postgres.submit(database, run_queue, succeeded_worker, 1)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, succeeded_handle) |> should.equal(Ok(job.Succeeded))
+  finished_at_is_set(connection, job.id_value(succeeded_handle))
+  |> should.equal(True)
+
+  // acknowledge_transaction, "business_failed" branch (budget exhausted).
+  let assert Ok(business_failed_handle) =
+    postgres.submit(database, run_queue, business_failed_worker, 2)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, business_failed_handle)
+  |> should.equal(Ok(job.BusinessFailed))
+  finished_at_is_set(connection, job.id_value(business_failed_handle))
+  |> should.equal(True)
+
+  // acknowledge_transaction, "discarded" branch.
+  let assert Ok(discarded_handle) =
+    postgres.submit(database, run_queue, discard_worker, 3)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, discarded_handle) |> should.equal(Ok(job.Discarded))
+  finished_at_is_set(connection, job.id_value(discarded_handle))
+  |> should.equal(True)
+
+  // acknowledge_transaction, "cancelled" branch (worker-initiated).
+  let assert Ok(cancelled_handle) =
+    postgres.submit(database, run_queue, cancel_worker, 4)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, cancelled_handle) |> should.equal(Ok(job.Cancelled))
+  finished_at_is_set(connection, job.id_value(cancelled_handle))
+  |> should.equal(True)
+
+  // acknowledge_transaction, "retryable" branch overridden by a concurrent
+  // cancellation: the bare `CASE WHEN cancel_requested_at IS NOT NULL THEN
+  // clock_timestamp() END` fires because the row committed `cancelled`, not
+  // its own ordinary (non-cancelled) `NULL` path already proven below.
+  let assert Ok(retry_cancelled_handle) =
+    postgres.submit(database, run_queue, gated_retry_worker, 14)
+  drive_cancel_while_executing(
+    database,
+    consumer,
+    retry_cancelled_handle,
+    gated_retry_started,
+  )
+  postgres.state(database, retry_cancelled_handle)
+  |> should.equal(Ok(job.Cancelled))
+  finished_at_is_set(connection, job.id_value(retry_cancelled_handle))
+  |> should.equal(True)
+
+  // acknowledge_transaction, "snoozed" branch overridden by a concurrent
+  // cancellation.
+  let assert Ok(snooze_cancelled_handle) =
+    postgres.submit(database, run_queue, gated_snooze_worker, 15)
+  drive_cancel_while_executing(
+    database,
+    consumer,
+    snooze_cancelled_handle,
+    gated_snooze_started,
+  )
+  postgres.state(database, snooze_cancelled_handle)
+  |> should.equal(Ok(job.Cancelled))
+  finished_at_is_set(connection, job.id_value(snooze_cancelled_handle))
+  |> should.equal(True)
+
+  // acknowledge_transaction, "uncertain" branch overridden by a concurrent
+  // cancellation.
+  let assert Ok(uncertain_cancelled_handle) =
+    postgres.submit(database, run_queue, gated_uncertain_worker, 16)
+  drive_cancel_while_executing(
+    database,
+    consumer,
+    uncertain_cancelled_handle,
+    gated_uncertain_started,
+  )
+  postgres.state(database, uncertain_cancelled_handle)
+  |> should.equal(Ok(job.Cancelled))
+  finished_at_is_set(connection, job.id_value(uncertain_cancelled_handle))
+  |> should.equal(True)
+
+  // acknowledge_transaction, "runtime_failed" branch: input decode fails at
+  // claim time even though the input_version still matches the registered
+  // codec exactly, since the stored JSON itself is not a valid encoded
+  // `Int`.
+  let assert Ok(runtime_failed_handle) =
+    postgres.submit(database, run_queue, succeeded_worker, 5)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET input = '\"not-an-int\"'::jsonb WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(runtime_failed_handle)))
+    |> pog.execute(on: connection)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, runtime_failed_handle)
+  |> should.equal(Ok(job.RuntimeFailed))
+  finished_at_is_set(connection, job.id_value(runtime_failed_handle))
+  |> should.equal(True)
+
+  // attempt.mark_contract_mismatch: the claim itself never runs the worker.
+  let assert Ok(contract_mismatch_handle) =
+    postgres.submit(database, run_queue, succeeded_worker, 6)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET output_version = 'finished-at-drifted' WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(contract_mismatch_handle)))
+    |> pog.execute(on: connection)
+  let assert Error(_) = queue.process_one(consumer)
+  postgres.state(database, contract_mismatch_handle)
+  |> should.equal(Ok(job.ContractMismatch))
+  finished_at_is_set(connection, job.id_value(contract_mismatch_handle))
+  |> should.equal(True)
+
+  // sql.cancel_before_run: never claimed at all.
+  let assert Ok(cancel_before_run_handle) =
+    postgres.submit(database, "finished-at-static", succeeded_worker, 7)
+  postgres.cancel(database, cancel_before_run_handle)
+  |> should.equal(Ok(postgres.CancelledBeforeRun))
+  finished_at_is_set(connection, job.id_value(cancel_before_run_handle))
+  |> should.equal(True)
+
+  // postgres.write_resolution, confirm_success target.
+  let assert Ok(resolve_success_handle) =
+    postgres.submit(database, "finished-at-resolve", succeeded_worker, 8)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'uncertain', attempt_id = 501, attempt_epoch = 1, attempt_owner = 'lost-owner', lease_expires_at = clock_timestamp(), uncertain_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(resolve_success_handle)))
+    |> pog.execute(on: connection)
+  postgres.resolve_uncertain(
+    database,
+    resolve_success_handle,
+    postgres.ResolutionRequest(
+      "finished-at-resolve-success",
+      "on-call",
+      "finished_at probe",
+      postgres.ConfirmSuccess("approved"),
+    ),
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Succeeded)))
+  finished_at_is_set(connection, job.id_value(resolve_success_handle))
+  |> should.equal(True)
+
+  // postgres.write_resolution, confirm_business_failure target.
+  let assert Ok(resolve_failure_handle) =
+    postgres.submit(database, "finished-at-resolve", business_failed_worker, 9)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'uncertain', attempt_id = 502, attempt_epoch = 1, attempt_owner = 'lost-owner', lease_expires_at = clock_timestamp(), uncertain_at = clock_timestamp(), error_version = 'finished-at-error-v1' WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(resolve_failure_handle)))
+    |> pog.execute(on: connection)
+  postgres.resolve_uncertain(
+    database,
+    resolve_failure_handle,
+    postgres.ResolutionRequest(
+      "finished-at-resolve-failure",
+      "on-call",
+      "finished_at probe",
+      postgres.ConfirmBusinessFailure(AccountMissing(9)),
+    ),
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.BusinessFailed)))
+  finished_at_is_set(connection, job.id_value(resolve_failure_handle))
+  |> should.equal(True)
+
+  // -- Non-terminal write sites: finished_at stays null ----------------------
+
+  // A freshly submitted job: never touched.
+  let assert Ok(queued_handle) =
+    postgres.submit(database, "finished-at-static", succeeded_worker, 10)
+  postgres.state(database, queued_handle) |> should.equal(Ok(job.Queued))
+  finished_at_is_set(connection, job.id_value(queued_handle))
+  |> should.equal(False)
+
+  // acknowledge_transaction, "snoozed" branch (no concurrent cancellation).
+  let assert Ok(scheduled_handle) =
+    postgres.submit(database, run_queue, snooze_worker, 11)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, scheduled_handle) |> should.equal(Ok(job.Scheduled))
+  finished_at_is_set(connection, job.id_value(scheduled_handle))
+  |> should.equal(False)
+
+  // acknowledge_transaction, "retryable" branch (no concurrent cancellation).
+  let assert Ok(retryable_handle) =
+    postgres.submit(database, run_queue, retry_worker, 12)
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, retryable_handle) |> should.equal(Ok(job.Retryable))
+  finished_at_is_set(connection, job.id_value(retryable_handle))
+  |> should.equal(False)
+
+  // A row forced into `uncertain`, before any resolution.
+  let assert Ok(uncertain_handle) =
+    postgres.submit(database, "finished-at-resolve", succeeded_worker, 13)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'uncertain', attempt_id = 503, attempt_epoch = 1, attempt_owner = 'lost-owner', lease_expires_at = clock_timestamp(), uncertain_at = clock_timestamp() WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(uncertain_handle)))
+    |> pog.execute(on: connection)
+  postgres.state(database, uncertain_handle) |> should.equal(Ok(job.Uncertain))
+  finished_at_is_set(connection, job.id_value(uncertain_handle))
+  |> should.equal(False)
+
+  // postgres.write_resolution, authorize_replay target (`queued`, the one
+  // non-terminal outcome a resolution can itself produce).
+  postgres.resolve_uncertain(
+    database,
+    uncertain_handle,
+    postgres.ResolutionRequest(
+      "finished-at-resolve-replay",
+      "on-call",
+      "finished_at probe",
+      postgres.AuthorizeReplay,
+    ),
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+  finished_at_is_set(connection, job.id_value(uncertain_handle))
+  |> should.equal(False)
+
+  mark_database_test_executed("finished-at-written-at-every-terminal-path")
+}
+
+// -- Retention (postgres.prune_finished) ------------------------------------
+
+/// Inserts one already-terminal `grind_jobs` row directly (bypassing the
+/// typed acknowledgement path entirely, the same way the upgrade harness
+/// above seeds legacy rows) with `finished_at` backdated by
+/// `finished_ago_ms` — old enough to prune, or not, entirely under the
+/// caller's control rather than depending on real wall-clock timing.
+fn seed_terminal_job(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  worker_id: String,
+  state: String,
+  finished_ago_ms: Int,
+) -> Int {
+  let assert Ok(returned) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at, finished_at) VALUES ($1, $2, $3, 'v1', 'v1', '1'::jsonb, 'v1', $4, clock_timestamp(), clock_timestamp() - ($5::bigint::double precision * interval '1 millisecond')) RETURNING id",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(state))
+    |> pog.parameter(pog.int(finished_ago_ms))
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+    |> pog.execute(on: connection)
+  let assert [id] = returned.rows
+  id
+}
+
+/// Inserts one non-terminal `grind_jobs` row directly, `finished_at` left at
+/// its natural `NULL` (never backdated — a non-terminal row's `finished_at`
+/// is never anything else, by `grind_jobs_finished_at_check`).
+fn seed_nonterminal_job(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  worker_id: String,
+  state: String,
+) -> Int {
+  let assert Ok(returned) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at) VALUES ($1, $2, $3, 'v1', 'v1', '1'::jsonb, 'v1', $4, clock_timestamp()) RETURNING id",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(state))
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+    |> pog.execute(on: connection)
+  let assert [id] = returned.rows
+  id
+}
+
+fn seed_acknowledgement_receipt(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  job_id: Int,
+  worker_id: String,
+  command_id: String,
+) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_job_acknowledgements (storage_owner, command_id, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, attempt_owner, committed_state, proposal_sha256) VALUES ($1, $2, $3, $4, $5, 'v1', 1, 1, 'prune-test-owner', 'succeeded', sha256(convert_to('prune-test-proposal', 'UTF8')))",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(command_id))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.int(job_id))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.execute(on: connection)
+  Nil
+}
+
+fn seed_unique_submission_receipt(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  job_id: Int,
+  worker_id: String,
+  submission_id: String,
+) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_unique_submissions (storage_owner, submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state) VALUES ($1, $2, $3, $4, 'v1', sha256(convert_to('prune-test-request', 'UTF8')), 'inserted', $5, $3, 'succeeded')",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(submission_id))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.int(job_id))
+    |> pog.execute(on: connection)
+  Nil
+}
+
+fn seed_resolution_receipt(
+  connection: pog.Connection,
+  storage_owner: String,
+  queue: String,
+  job_id: Int,
+  worker_id: String,
+  resolution_id: String,
+) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_job_resolutions (storage_owner, queue, job_id, worker_id, worker_version, resolution_id, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, decision, target_state, resolved_by, details) VALUES ($1, $2, $3, $4, 'v1', $5, 1, 1, 'prune-test-owner', clock_timestamp(), 'confirm_success', 'succeeded', 'prune-test', 'prune cascade probe')",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.int(job_id))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(resolution_id))
+    |> pog.execute(on: connection)
+  Nil
+}
+
+fn job_row_exists(connection: pog.Connection, id: Int) -> Bool {
+  let assert Ok(returned) =
+    pog.query("SELECT count(*) = 1 FROM grind_jobs WHERE id = $1")
+    |> pog.parameter(pog.int(id))
+    |> pog.returning({
+      use exists <- decode.field(0, decode.bool)
+      decode.success(exists)
+    })
+    |> pog.execute(on: connection)
+  let assert [exists] = returned.rows
+  exists
+}
+
+/// Pure validation runs before any query reaches the database at all: every
+/// invalid-argument case below is checked against a pool this block closes
+/// immediately after opening, the same "closed pool proves purity" pattern
+/// `run_submit_unique_pre_storage_rejection_test` already uses.
+pub fn postgres_prune_finished_validates_arguments_test() {
+  case prune_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_prune_validation_test(database_url)
+  }
+}
+
+fn run_prune_validation_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  let _ = postgres.close(database)
+
+  postgres.prune_finished(database, older_than_ms: 0, limit: 100)
+  |> should.equal(Error(postgres.NonPositiveRetention))
+  postgres.prune_finished(database, older_than_ms: -1, limit: 100)
+  |> should.equal(Error(postgres.NonPositiveRetention))
+  postgres.prune_finished(
+    database,
+    older_than_ms: worker.retry_delay_maximum_milliseconds() + 1,
+    limit: 100,
+  )
+  |> should.equal(Error(postgres.RetentionAbovePrecisionBound))
+  postgres.prune_finished(database, older_than_ms: 1000, limit: 0)
+  |> should.equal(Error(postgres.NonPositivePruneLimit))
+  postgres.prune_finished(database, older_than_ms: 1000, limit: -1)
+  |> should.equal(Error(postgres.NonPositivePruneLimit))
+  postgres.prune_finished(
+    database,
+    older_than_ms: 1000,
+    limit: postgres.prune_limit_maximum() + 1,
+  )
+  |> should.equal(Error(postgres.PruneLimitTooLarge))
+  mark_database_test_executed("prune-finished-validates-arguments")
+}
+
+pub fn postgres_prune_finished_deletes_old_terminal_rows_test() {
+  case prune_url(), prune_owner_b_url() {
+    Ok(database_url), Ok(owner_b_url) ->
+      run_prune_finished_test(database_url, owner_b_url)
+    _, _ -> Nil
+  }
+}
+
+fn run_prune_finished_test(database_url: String, owner_b_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = postgres.connection(database)
+  let storage_owner = postgres.storage_owner(database)
+
+  let assert Ok(owner_b_validated) =
+    postgres.settings(owner_b_url) |> postgres.validate
+  let assert Ok(owner_b_database) = postgres.start(owner_b_validated)
+  use <- exception.defer(fn() { postgres.close(owner_b_database) })
+  let assert Ok(Nil) = postgres.migrate(owner_b_database)
+  let owner_b_connection = postgres.connection(owner_b_database)
+  let owner_b_storage_owner = postgres.storage_owner(owner_b_database)
+
+  // -- Every terminal state, old enough to prune, one carrying real
+  // -- receipts of every kind (proving the cascade counts) -----------------
+  let old_succeeded =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-old",
+      "prune.worker",
+      "succeeded",
+      3_600_000,
+    )
+  seed_acknowledgement_receipt(
+    connection,
+    storage_owner,
+    "prune-old",
+    old_succeeded,
+    "prune.worker",
+    "prune-cascade-command",
+  )
+  seed_unique_submission_receipt(
+    connection,
+    storage_owner,
+    "prune-old",
+    old_succeeded,
+    "prune.worker",
+    "prune-cascade-submission",
+  )
+  seed_resolution_receipt(
+    connection,
+    storage_owner,
+    "prune-old",
+    old_succeeded,
+    "prune.worker",
+    "prune-cascade-resolution",
+  )
+  let old_business_failed =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-old",
+      "prune.worker",
+      "business_failed",
+      3_600_000,
+    )
+  let old_runtime_failed =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-old",
+      "prune.worker",
+      "runtime_failed",
+      3_600_000,
+    )
+  let old_contract_mismatch =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-old",
+      "prune.worker",
+      "contract_mismatch",
+      3_600_000,
+    )
+  let old_discarded =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-old",
+      "prune.worker",
+      "discarded",
+      3_600_000,
+    )
+  let old_cancelled =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-old",
+      "prune.worker",
+      "cancelled",
+      3_600_000,
+    )
+  let old_terminal_ids = [
+    old_succeeded,
+    old_business_failed,
+    old_runtime_failed,
+    old_contract_mismatch,
+    old_discarded,
+    old_cancelled,
+  ]
+
+  // Every terminal state again, but not old enough (100ms, under the 1000ms
+  // retention this test prunes with below).
+  let young_terminal_ids =
+    list.map(
+      [
+        "succeeded", "business_failed", "runtime_failed", "contract_mismatch",
+        "discarded", "cancelled",
+      ],
+      fn(state) {
+        seed_terminal_job(
+          connection,
+          storage_owner,
+          "prune-young",
+          "prune.worker",
+          state,
+          100,
+        )
+      },
+    )
+
+  // Every non-terminal state: `finished_at` is always null, so never
+  // prunable regardless of how much wall-clock time passes.
+  let nonterminal_ids =
+    list.map(
+      ["queued", "scheduled", "retryable", "executing", "uncertain"],
+      fn(state) {
+        seed_nonterminal_job(
+          connection,
+          storage_owner,
+          "prune-nonterminal",
+          "prune.worker",
+          state,
+        )
+      },
+    )
+
+  // A different storage owner's own old, terminal row: `prune_finished` is
+  // scoped to the caller's own storage owner, never cross-owner.
+  let other_owner_id =
+    seed_terminal_job(
+      owner_b_connection,
+      owner_b_storage_owner,
+      "prune-old",
+      "prune.worker",
+      "succeeded",
+      3_600_000,
+    )
+
+  let signal = process.new_subject()
+  let assert Ok(handler_id) = sinal.handler_id("grind-test-prune-completed")
+  let assert Ok(attachment) =
+    sinal.observe(
+      handler_id,
+      observation.prune_completed(),
+      fn(measurements, metadata) {
+        process.send(signal, #(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(report) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 100)
+  report.jobs |> should.equal(6)
+
+  let assert Ok(#(measurements, metadata)) =
+    process.receive(signal, within: 5000)
+  measurements |> should.equal(observation.PruneCompletedMeasurements(jobs: 6))
+  metadata
+  |> should.equal(observation.PruneCompletedMetadata(
+    older_than_ms: 1000,
+    limit: 100,
+  ))
+
+  // The six old terminal rows, and their receipts, are gone.
+  list.each(old_terminal_ids, fn(id) {
+    job_row_exists(connection, id) |> should.equal(False)
+  })
+  let assert Ok(remaining_receipts) =
+    pog.query(
+      "SELECT (SELECT count(*) FROM grind_job_acknowledgements WHERE job_id = $1), (SELECT count(*) FROM grind_unique_submissions WHERE job_id = $1), (SELECT count(*) FROM grind_job_resolutions WHERE job_id = $1)",
+    )
+    |> pog.parameter(pog.int(old_succeeded))
+    |> pog.returning({
+      use acknowledgements <- decode.field(0, decode.int)
+      use submissions <- decode.field(1, decode.int)
+      use resolutions <- decode.field(2, decode.int)
+      decode.success(#(acknowledgements, submissions, resolutions))
+    })
+    |> pog.execute(on: connection)
+  remaining_receipts.rows |> should.equal([#(0, 0, 0)])
+
+  // Everything else survives: young terminal rows, every non-terminal
+  // state, and the other storage owner's own old terminal row.
+  list.each(young_terminal_ids, fn(id) {
+    job_row_exists(connection, id) |> should.equal(True)
+  })
+  list.each(nonterminal_ids, fn(id) {
+    job_row_exists(connection, id) |> should.equal(True)
+  })
+  job_row_exists(owner_b_connection, other_owner_id) |> should.equal(True)
+
+  // -- Batch size and ordering: oldest `finished_at` first ------------------
+  let batch_ids =
+    list.map([5, 4, 3, 2, 1], fn(hours) {
+      seed_terminal_job(
+        connection,
+        storage_owner,
+        "prune-batch",
+        "prune.worker",
+        "succeeded",
+        hours * 3_600_000,
+      )
+    })
+  let assert Ok(first_batch) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 2)
+  first_batch.jobs |> should.equal(2)
+  let assert Ok(second_batch) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 2)
+  second_batch.jobs |> should.equal(2)
+  let assert Ok(third_batch) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 2)
+  third_batch.jobs |> should.equal(1)
+  let assert Ok(fourth_batch) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 2)
+  fourth_batch.jobs |> should.equal(0)
+  list.each(batch_ids, fn(id) {
+    job_row_exists(connection, id) |> should.equal(False)
+  })
+
+  // -- FOR UPDATE SKIP LOCKED: a concurrently locked candidate is skipped,
+  // -- not blocked on, and survives until the lock clears -------------------
+  let locked_id =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-locked",
+      "prune.worker",
+      "succeeded",
+      3_600_000,
+    )
+  let lock_query =
+    pog.query("SELECT id FROM grind_jobs WHERE id = $1 FOR UPDATE")
+    |> pog.parameter(pog.int(locked_id))
+  let #(lock_ready, lock_finished) = spawn_lock_holder(connection, lock_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+  let assert Ok(skipped) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 100)
+  skipped.jobs |> should.equal(0)
+  job_row_exists(connection, locked_id) |> should.equal(True)
+  process.send(release_lock, ReleaseAttempt)
+  let assert Ok(ClaimGateReleased(True)) =
+    process.receive(lock_finished, within: 5000)
+  let assert Ok(unlocked) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 100)
+  unlocked.jobs |> should.equal(1)
+  job_row_exists(connection, locked_id) |> should.equal(False)
+
+  // -- After a job is pruned: everything about it reports "not found",
+  // -- never a different, misleading error -----------------------------------
+  let assert Ok(gone_worker) =
+    worker.codec("prune-gone-input-v1", json.int, decode.int)
+  let assert Ok(gone_output) =
+    worker.codec("prune-gone-output-v1", json.string, decode.string)
+  let assert Ok(gone_worker_def) =
+    worker.define(
+      "prune.gone-worker",
+      "v1",
+      gone_worker,
+      gone_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let gone_handle =
+    job.new_handle(old_succeeded, storage_owner, "prune-old", gone_worker_def)
+  postgres.state(database, gone_handle)
+  |> should.equal(Error(postgres.JobNotFound))
+  postgres.outcome(database, gone_handle)
+  |> should.equal(Error(postgres.JobNotFound))
+  postgres.bind_handle(database, gone_worker_def, old_succeeded)
+  |> should.equal(Error(postgres.JobNotFound))
+  postgres.reconcile_acknowledgement(
+    database,
+    gone_handle,
+    "prune-cascade-command",
+  )
+  |> should.equal(Error(postgres.ReceiptNotFound))
+
+  // -- submit_with_id: idempotency only holds within the retention window --
+  let assert Ok(replay_submission) = submission.submission_id("prune-replay")
+  let assert Ok(replay_worker) =
+    worker.codec("prune-replay-input-v1", json.int, decode.int)
+  let assert Ok(replay_output) =
+    worker.codec("prune-replay-output-v1", json.string, decode.string)
+  let assert Ok(replay_worker_def) =
+    worker.define(
+      "prune.replay-worker",
+      "v1",
+      replay_worker,
+      replay_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(submission.Inserted(first_replay_handle)) =
+    postgres.submit_with_id(
+      database,
+      "prune-replay",
+      replay_submission,
+      replay_worker_def,
+      41,
+      submission.Immediately,
+    )
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'succeeded', finished_at = clock_timestamp() - interval '1 hour' WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(first_replay_handle)))
+    |> pog.execute(on: connection)
+  let assert Ok(replay_prune) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 100)
+  replay_prune.jobs |> should.equal(1)
+  let assert Ok(submission.Inserted(second_replay_handle)) =
+    postgres.submit_with_id(
+      database,
+      "prune-replay",
+      replay_submission,
+      replay_worker_def,
+      41,
+      submission.Immediately,
+    )
+  { job.id_value(second_replay_handle) != job.id_value(first_replay_handle) }
+  |> should.equal(True)
+
+  // -- Uniqueness: an `AllRetained`/`while_retained()` key is only occupied
+  // -- "until pruned", not forever -------------------------------------------
+  let assert Ok(reopen_worker) =
+    worker.define(
+      "prune.reopen-worker",
+      "v1",
+      replay_worker,
+      replay_output,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let reopen_policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      unique.while_retained(),
+      unique.AllRetained,
+    )
+  let assert Ok(submission.Inserted(reopen_first_handle)) =
+    submit_keep_existing(
+      database,
+      "prune-reopen",
+      "prune-reopen-first",
+      reopen_worker,
+      99,
+      reopen_policy,
+    )
+  let assert Ok(submission.Existing(_)) =
+    submit_keep_existing(
+      database,
+      "prune-reopen",
+      "prune-reopen-second",
+      reopen_worker,
+      99,
+      reopen_policy,
+    )
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'succeeded', finished_at = clock_timestamp() - interval '1 hour' WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(reopen_first_handle)))
+    |> pog.execute(on: connection)
+  let assert Ok(reopen_prune) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 100)
+  reopen_prune.jobs |> should.equal(1)
+  let assert Ok(submission.Inserted(reopen_third_handle)) =
+    submit_keep_existing(
+      database,
+      "prune-reopen",
+      "prune-reopen-third",
+      reopen_worker,
+      99,
+      reopen_policy,
+    )
+  { job.id_value(reopen_third_handle) != job.id_value(reopen_first_handle) }
+  |> should.equal(True)
+
+  // `young_terminal_ids` were deliberately left behind (proving they
+  // survive *this* test's own 1000ms retention window) — but `prune_url()`
+  // is a database every test in this section shares, and a terminal row
+  // seeded "100ms old" keeps aging in real wall-clock time long after this
+  // test itself returns. Removed directly (not via `prune_finished`, which
+  // would also sweep up anything else already old enough by now) so a
+  // later test's own broad `limit` can never mistake it for a row that
+  // test itself is supposed to control.
+  let assert Ok(_) =
+    pog.query(
+      "DELETE FROM grind_jobs WHERE storage_owner = $1 AND queue = 'prune-young'",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.execute(on: connection)
+
+  mark_database_test_executed("prune-finished-deletes-old-terminal-rows")
+}
+
+/// Installs a `BEFORE INSERT` trigger on `grind_unique_submissions`, scoped
+/// to one exact `submission_id`, that blocks on `pg_advisory_xact_lock`
+/// before letting that one receipt insert proceed — the same shape
+/// `install_unique_insert_barrier` uses against `grind_jobs`, aimed instead
+/// at the point in `submit_unique`'s own admission transaction that comes
+/// strictly *after* its candidate `SELECT ... FOR KEY SHARE`/`FOR UPDATE`
+/// has already run and decided `KeepExisting`, so a concurrent
+/// `prune_finished` racing the same candidate row is forced to land in
+/// exactly that window.
+fn install_admission_receipt_barrier(
+  connection: pog.Connection,
+  name: String,
+  submission_id: String,
+  lock_key: Int,
+) -> fn() -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> name
+      <> "() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.submission_id = '"
+      <> submission_id
+      <> "' THEN PERFORM pg_advisory_xact_lock("
+      <> int.to_string(lock_key)
+      <> "); END IF; RETURN NEW; END $$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER "
+      <> name
+      <> " BEFORE INSERT ON grind_unique_submissions FOR EACH ROW EXECUTE FUNCTION "
+      <> name
+      <> "()",
+    )
+    |> pog.execute(on: connection)
+  fn() {
+    let _ =
+      pog.query(
+        "DROP TRIGGER IF EXISTS " <> name <> " ON grind_unique_submissions",
+      )
+      |> pog.execute(on: connection)
+    let _ =
+      pog.query("DROP FUNCTION IF EXISTS " <> name <> "()")
+      |> pog.execute(on: connection)
+    Nil
+  }
+}
+
+/// Polls (bounded) until some other backend is genuinely blocked acquiring
+/// the barrier's own advisory lock from inside its `INSERT INTO
+/// grind_unique_submissions` — proof the admission transaction's own
+/// candidate `SELECT` has already run (and, with the fix in place, already
+/// holds its `FOR KEY SHARE` lock) and is now paused strictly before its
+/// receipt commits, rather than inferring this from timing alone.
+fn await_admission_blocked_on_receipt_insert(
+  connection: pog.Connection,
+  checks_remaining: Int,
+) -> Bool {
+  let waiting =
+    pog.query(
+      "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND state = 'active' AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE 'INSERT INTO grind_unique_submissions%')",
+    )
+    |> pog.returning({
+      use waiting <- decode.field(0, decode.bool)
+      decode.success(waiting)
+    })
+    |> pog.execute(on: connection)
+    |> result.map_error(fn(_) { Nil })
+    |> result.try(fn(returned) {
+      case returned.rows {
+        [waiting] -> Ok(waiting)
+        _ -> Error(Nil)
+      }
+    })
+  case waiting {
+    Ok(True) -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_admission_blocked_on_receipt_insert(
+            connection,
+            checks_remaining - 1,
+          )
+        }
+        False -> False
+      }
+  }
+}
+
+/// The race `candidate_sql`'s `FOR KEY SHARE` (non-reschedule candidates)
+/// exists to close: a `submit_unique` admission deciding `KeepExisting`
+/// against an old, terminal candidate, forced to overlap with a concurrent
+/// `prune_finished` call racing the exact same row. The barrier above pins
+/// admission strictly after its own candidate lock is taken (with the fix)
+/// and before its own receipt commits, which is exactly the window
+/// `prune_finished` is called from — proving `FOR UPDATE SKIP LOCKED` skips
+/// this row (rather than deleting out from under a still-open admission)
+/// and the row and its receipt both survive together. See
+/// `docs/RECOVERY-EVIDENCE.md` for the mutation (`FOR KEY SHARE` removed)
+/// that reproduces the opposite: the row deleted while admission's own
+/// still-open transaction goes on to commit a receipt that names it,
+/// leaving `grind_unique_submissions` an orphaned row pointing at nothing.
+pub fn postgres_prune_finished_admission_race_keeps_candidate_and_receipt_test() {
+  case prune_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_prune_admission_race_test(database_url)
+  }
+}
+
+fn run_prune_admission_race_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = postgres.connection(database)
+
+  let worker_def = unique_test_worker("prune.race-worker")
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.AllRetained,
+    )
+  let assert Ok(submission.Inserted(original_handle)) =
+    submit_keep_existing(
+      database,
+      "prune-race",
+      "prune-race-original",
+      worker_def,
+      7,
+      policy,
+    )
+  let original_id = job.id_value(original_handle)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'succeeded', finished_at = clock_timestamp() - interval '1 hour' WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(original_id))
+    |> pog.execute(on: connection)
+
+  let lock_key = unique_test_lock_key(100)
+  let retry_submission_id = "prune-race-retry"
+  let cleanup =
+    install_admission_receipt_barrier(
+      connection,
+      "grind_test_prune_race_barrier",
+      retry_submission_id,
+      lock_key,
+    )
+  use <- exception.defer(cleanup)
+
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(
+      connection,
+      pog.query(
+        "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_prune_race_lock",
+      )
+        |> pog.parameter(pog.int(lock_key)),
+    )
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let admission_result = process.new_subject()
+  spawn_submit(admission_result, fn() {
+    submit_keep_existing(
+      database,
+      "prune-race",
+      retry_submission_id,
+      worker_def,
+      7,
+      policy,
+    )
+  })
+
+  await_admission_blocked_on_receipt_insert(connection, 250)
+  |> should.equal(True)
+
+  // Admission's own candidate lock is already held (with the fix); the
+  // concurrent prune below must skip this exact row rather than delete it.
+  let assert Ok(race_prune) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 100)
+  race_prune.jobs |> should.equal(0)
+  job_row_exists(connection, original_id) |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  let assert Ok(ClaimGateReleased(True)) =
+    process.receive(lock_finished, within: 5000)
+  let assert Ok(Ok(submission.Existing(conflict))) =
+    process.receive(admission_result, within: 5000)
+  submission.conflict_job_id(conflict) |> should.equal(original_id)
+
+  // The candidate and its own admission receipt both survived together —
+  // no orphan.
+  job_row_exists(connection, original_id) |> should.equal(True)
+  let assert Ok(receipt_target) =
+    pog.query(
+      "SELECT job_id FROM grind_unique_submissions WHERE submission_id = $1",
+    )
+    |> pog.parameter(pog.text(retry_submission_id))
+    |> pog.returning({
+      use job_id <- decode.field(0, decode.int)
+      decode.success(job_id)
+    })
+    |> pog.execute(on: connection)
+  receipt_target.rows |> should.equal([original_id])
+
+  // `original_id` deliberately survived this test (that was the point) —
+  // but it is now a terminal, hour-old row left behind in a database this
+  // whole section shares. Pruned directly, via the real public API, so a
+  // later test's own tightly `LIMIT`ed prune call can never mistake it for
+  // that test's own intended candidate.
+  let assert Ok(_) =
+    postgres.prune_finished(database, older_than_ms: 1000, limit: 100)
+
+  mark_database_test_executed("prune-finished-admission-race-no-orphan")
+}
+
+/// Installs a PL/pgSQL function called from inside a `WHERE` clause, one
+/// candidate row at a time, that blocks on `pg_advisory_xact_lock` only
+/// when it is evaluating `target_id` — used to pause a prune-shaped query
+/// mid-scan, after PostgreSQL has already fixed that statement's own
+/// snapshot (`READ COMMITTED` takes one snapshot per statement, not per
+/// row), but before it reaches and locks one specific candidate. Returns a
+/// cleanup thunk for `exception.defer`.
+fn install_snapshot_barrier(
+  connection: pog.Connection,
+  name: String,
+) -> fn() -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION "
+      <> name
+      <> "(target_id bigint, candidate_id bigint, lock_key bigint) RETURNS boolean LANGUAGE plpgsql AS $body$ BEGIN IF candidate_id = target_id THEN PERFORM pg_advisory_xact_lock(lock_key); END IF; RETURN true; END $body$",
+    )
+    |> pog.execute(on: connection)
+  fn() {
+    let _ =
+      pog.query(
+        "DROP FUNCTION IF EXISTS " <> name <> "(bigint, bigint, bigint)",
+      )
+      |> pog.execute(on: connection)
+    Nil
+  }
+}
+
+/// The exact shape `sql/prune_finished.sql` itself selects candidates with,
+/// plus one extra `AND` clause calling the snapshot barrier above for one
+/// exact row — proving the underlying mechanism (`ON DELETE CASCADE`) reads
+/// its own fresh state when a job is deleted, not the deleting statement's
+/// own snapshot, since `postgres.prune_finished`'s real, fixed SQL text has
+/// no injection point of its own to pause mid-scan from a test.
+fn snapshot_barrier_prune_sql(barrier_name: String) -> String {
+  "WITH doomed AS (SELECT id FROM grind_jobs WHERE storage_owner = $1 AND finished_at IS NOT NULL AND state IN ('succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'discarded', 'cancelled') AND finished_at < statement_timestamp() - ($2::bigint::double precision * interval '1 millisecond') AND "
+  <> barrier_name
+  <> "($4, id, $5) ORDER BY finished_at, id LIMIT $3 FOR UPDATE SKIP LOCKED) DELETE FROM grind_jobs x USING doomed d WHERE x.id = d.id RETURNING x.id"
+}
+
+/// Polls (bounded) until some other backend is genuinely blocked acquiring
+/// the snapshot barrier's own advisory lock from inside the `WITH doomed
+/// AS (...)` query above, the same `pg_stat_activity` discipline
+/// `await_admission_blocked_on_receipt_insert` uses.
+fn await_prune_blocked_on_snapshot_barrier(
+  connection: pog.Connection,
+  checks_remaining: Int,
+) -> Bool {
+  let waiting =
+    pog.query(
+      "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND state = 'active' AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE 'WITH doomed AS (%')",
+    )
+    |> pog.returning({
+      use waiting <- decode.field(0, decode.bool)
+      decode.success(waiting)
+    })
+    |> pog.execute(on: connection)
+    |> result.map_error(fn(_) { Nil })
+    |> result.try(fn(returned) {
+      case returned.rows {
+        [waiting] -> Ok(waiting)
+        _ -> Error(Nil)
+      }
+    })
+  case waiting {
+    Ok(True) -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_prune_blocked_on_snapshot_barrier(
+            connection,
+            checks_remaining - 1,
+          )
+        }
+        False -> False
+      }
+  }
+}
+
+/// The race `grind_v12`'s `ON DELETE CASCADE` foreign keys close: under
+/// `READ COMMITTED`, every CTE of one `prune_finished`-shaped statement
+/// shares that one statement's own start-of-statement snapshot. A receipt
+/// committed by some other writer *after* that snapshot was taken, but
+/// *before* the scan actually reaches and locks the row it names, is
+/// invisible to that snapshot — an explicit, snapshot-scoped `DELETE ...
+/// WHERE job_id = d.id` against the receipt table (the shape this module
+/// used before this fix) could never see or delete it, leaving it an
+/// orphan once the job itself is deleted. `ON DELETE CASCADE` fires its own
+/// fresh query when the row is actually deleted, immune to the deleting
+/// statement's own snapshot, so it still finds and removes a receipt
+/// committed in exactly that window.
+pub fn postgres_prune_finished_cascade_survives_late_committed_receipt_test() {
+  case prune_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_prune_cascade_snapshot_race_test(database_url)
+  }
+}
+
+fn run_prune_cascade_snapshot_race_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = postgres.connection(database)
+  let storage_owner = postgres.storage_owner(database)
+
+  let target_id =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "prune-snapshot-race",
+      "prune.worker",
+      "succeeded",
+      3_600_000,
+    )
+
+  let barrier_name = "grind_test_prune_snapshot_barrier"
+  let cleanup = install_snapshot_barrier(connection, barrier_name)
+  use <- exception.defer(cleanup)
+  let lock_key = unique_test_lock_key(200)
+
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(
+      connection,
+      pog.query(
+        "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_prune_snapshot_lock",
+      )
+        |> pog.parameter(pog.int(lock_key)),
+    )
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let prune_result = process.new_subject()
+  spawn_submit(prune_result, fn() {
+    pog.query(snapshot_barrier_prune_sql(barrier_name))
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.int(1000))
+    // `LIMIT 1`, not a generous batch size: `prune_url()` is a database
+    // this whole test module shares, and another test's own deliberately
+    // "too young to prune" row can have aged well past 1000ms by the time
+    // this one runs. `target_id` is seeded a full hour old
+    // (`ORDER BY finished_at, id` sorts it first regardless), so `LIMIT 1`
+    // selects only it, never a leftover row that merely aged into
+    // eligibility in the meantime.
+    |> pog.parameter(pog.int(1))
+    |> pog.parameter(pog.int(target_id))
+    |> pog.parameter(pog.int(lock_key))
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+    |> pog.execute(on: connection)
+  })
+
+  await_prune_blocked_on_snapshot_barrier(connection, 250)
+  |> should.equal(True)
+
+  // Committed strictly after the blocked prune statement's own snapshot,
+  // strictly before it reaches and locks `target_id`.
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_job_acknowledgements (storage_owner, command_id, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, attempt_owner, committed_state, proposal_sha256) VALUES ($1, 'prune-snapshot-race-command', 'prune-snapshot-race', $2, 'prune.worker', 'v1', 1, 1, 'prune-test-owner', 'succeeded', sha256(convert_to('prune-snapshot-race-proposal', 'UTF8')))",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.int(target_id))
+    |> pog.execute(on: connection)
+
+  process.send(release_lock, ReleaseAttempt)
+  let assert Ok(ClaimGateReleased(True)) =
+    process.receive(lock_finished, within: 5000)
+  let assert Ok(Ok(pruned)) = process.receive(prune_result, within: 5000)
+  pruned.rows |> should.equal([target_id])
+
+  job_row_exists(connection, target_id) |> should.equal(False)
+  let assert Ok(orphan_check) =
+    pog.query(
+      "SELECT count(*) = 0 FROM grind_job_acknowledgements WHERE command_id = 'prune-snapshot-race-command'",
+    )
+    |> pog.returning({
+      use no_orphan <- decode.field(0, decode.bool)
+      decode.success(no_orphan)
+    })
+    |> pog.execute(on: connection)
+  orphan_check.rows |> should.equal([True])
+
+  mark_database_test_executed("prune-finished-cascade-survives-snapshot-race")
+}
+
+// -- grind/pruner (the supervised background pruner) -------------------
+
+pub fn pruner_validate_policy_rejects_out_of_range_values_test() {
+  pruner.validate_policy(pruner.PrunerPolicy(
+    interval_ms: 0,
+    limit: 10_000,
+    max_age_ms: 60_000,
+  ))
+  |> should.equal(Error(pruner.NonPositiveInterval))
+  pruner.validate_policy(pruner.PrunerPolicy(
+    interval_ms: 30_000,
+    limit: 0,
+    max_age_ms: 60_000,
+  ))
+  |> should.equal(Error(pruner.NonPositivePruneLimit))
+  pruner.validate_policy(pruner.PrunerPolicy(
+    interval_ms: 30_000,
+    limit: postgres.prune_limit_maximum() + 1,
+    max_age_ms: 60_000,
+  ))
+  |> should.equal(Error(pruner.PruneLimitTooLarge))
+  pruner.validate_policy(pruner.PrunerPolicy(
+    interval_ms: 30_000,
+    limit: 10_000,
+    max_age_ms: 0,
+  ))
+  |> should.equal(Error(pruner.NonPositiveMaxAge))
+  pruner.validate_policy(pruner.PrunerPolicy(
+    interval_ms: 30_000,
+    limit: 10_000,
+    max_age_ms: worker.retry_delay_maximum_milliseconds() + 1,
+  ))
+  |> should.equal(Error(pruner.MaxAgeAbovePrecisionBound))
+  pruner.validate_policy(pruner.default_policy()) |> should.be_ok()
+}
+
+/// Polls (bounded) until `id` no longer has a `grind_jobs` row, or gives up
+/// and reports whatever `job_row_exists` last saw — used to observe the
+/// supervised pruner's own timer doing this without the test itself calling
+/// `prune_finished`.
+fn await_job_pruned(
+  connection: pog.Connection,
+  id: Int,
+  checks_remaining: Int,
+) -> Bool {
+  case job_row_exists(connection, id) {
+    False -> True
+    True ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_job_pruned(connection, id, checks_remaining - 1)
+        }
+        // Retries exhausted and the row still exists: this must report
+        // "not pruned", not "pruned" — the opposite is a false pass that
+        // would never actually observe the timer doing anything.
+        False -> False
+      }
+  }
+}
+
+pub fn postgres_supervised_pruner_ticks_and_prunes_test() {
+  case prune_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_supervised_pruner_test(database_url)
+  }
+}
+
+fn run_supervised_pruner_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = postgres.connection(database)
+  let storage_owner = postgres.storage_owner(database)
+
+  let old_id =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "pruner-old",
+      "pruner.worker",
+      "succeeded",
+      5000,
+    )
+  // Seeded effectively "now": with a 2000ms `max_age_ms`, this row cannot
+  // cross that threshold before the test has already finished observing
+  // `old_id` disappear (typically within the first one or two 50ms ticks),
+  // giving a wide, non-flaky margin rather than a tight race between the
+  // two rows' own ages.
+  let young_id =
+    seed_terminal_job(
+      connection,
+      storage_owner,
+      "pruner-young",
+      "pruner.worker",
+      "succeeded",
+      0,
+    )
+
+  let signal = process.new_subject()
+  let assert Ok(handler_id) =
+    sinal.handler_id("grind-test-supervised-pruner-completed")
+  let assert Ok(attachment) =
+    sinal.observe(
+      handler_id,
+      observation.prune_completed(),
+      fn(measurements, _metadata) { process.send(signal, measurements) },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(policy) =
+    pruner.default_policy()
+    |> pruner.with_interval(50)
+    |> pruner.with_limit(10)
+    |> pruner.with_max_age(2000)
+    |> pruner.validate_policy()
+  let assert Ok(running) = pruner.start(database, policy)
+  use <- exception.defer(fn() { pruner.stop(running) |> should.equal(Ok(Nil)) })
+
+  // The old row (5000ms old, over the 2000ms max_age) is pruned by the
+  // supervised timer itself — this test never calls `prune_finished`.
+  await_job_pruned(connection, old_id, 250) |> should.equal(True)
+  // The young row (0ms old) never crosses `max_age_ms`, so it survives
+  // every tick this test observes.
+  job_row_exists(connection, young_id) |> should.equal(True)
+
+  // The timer path itself emits `[grind, prune, completed]`, not only a
+  // direct `prune_finished` call — the tick that pruned `old_id` must have
+  // reported at least one deleted job.
+  let assert Ok(observation.PruneCompletedMeasurements(jobs:)) =
+    process.receive(signal, within: 5000)
+  { jobs >= 1 } |> should.equal(True)
+
+  mark_database_test_executed("supervised-pruner-ticks-and-prunes")
+}
+
+/// Drains `signal` until `deadline_ms` (`monotonic_ms()`), counting however
+/// many messages arrive — used to prove a bounded window's own tick count
+/// exactly, rather than inferring it from a single `process.receive`.
+fn count_events_until(signal: process.Subject(a), deadline_ms: Int) -> Int {
+  let remaining = deadline_ms - monotonic_ms()
+  case remaining > 0 {
+    False -> 0
+    True ->
+      case process.receive(signal, within: remaining) {
+        Ok(_) -> 1 + count_events_until(signal, deadline_ms)
+        Error(Nil) -> 0
+      }
+  }
+}
+
+fn await_new_pruner_pid(
+  running: pruner.Pruner,
+  previous: process.Pid,
+  checks_remaining: Int,
+) -> Result(process.Pid, Nil) {
+  case pruner.actor_pid(running) {
+    Ok(pid) if pid != previous -> Ok(pid)
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(10)
+          await_new_pruner_pid(running, previous, checks_remaining - 1)
+        }
+        False -> Error(Nil)
+      }
+  }
+}
+
+/// The race a self-scheduled `Tick` timer targeting the *named* subject
+/// (rather than a fresh, per-incarnation one) would create: `process
+/// .send_after` against a named subject resolves to whichever process holds
+/// that name at *delivery* time, not at scheduling time, so a timer an old,
+/// killed incarnation scheduled for itself would still fire and land on
+/// whatever later incarnation is running when it does — one genuine
+/// post-restart tick plus one leaked one, arriving close together (a
+/// restart is on the order of a few ms; both timers were scheduled to fire
+/// roughly `interval_ms` after nearly the same moment). Proven by counting
+/// `[grind, prune, completed]` events in a bounded window after a real,
+/// killed-and-restarted incarnation: exactly one.
+pub fn postgres_supervised_pruner_restart_ticks_exactly_once_test() {
+  case prune_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_supervised_pruner_restart_test(database_url)
+  }
+}
+
+fn run_supervised_pruner_restart_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let signal = process.new_subject()
+  let assert Ok(handler_id) =
+    sinal.handler_id("grind-test-supervised-pruner-restart")
+  let assert Ok(attachment) =
+    sinal.observe(
+      handler_id,
+      observation.prune_completed(),
+      fn(_measurements, _metadata) { process.send(signal, Nil) },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let interval_ms = 200
+  let assert Ok(policy) =
+    pruner.default_policy()
+    |> pruner.with_interval(interval_ms)
+    |> pruner.validate_policy()
+  let assert Ok(running) = pruner.start(database, policy)
+  use <- exception.defer(fn() { pruner.stop(running) |> should.equal(Ok(Nil)) })
+
+  // The first tick, and the moment right after it a fresh timer was
+  // scheduled — killing the actor here maximises the window a leaked old
+  // timer (if the bug were present) would still be pending in.
+  let assert Ok(Nil) = process.receive(signal, within: 5000)
+  let assert Ok(first_pid) = pruner.actor_pid(running)
+  process.kill(first_pid)
+  let assert Ok(_second_pid) = await_new_pruner_pid(running, first_pid, 500)
+
+  // A window comfortably covering exactly one legitimate post-restart tick
+  // (interval_ms out from *either* the kill or the restart, they are only
+  // ever a few ms apart) without also reaching the next legitimate one.
+  let deadline_ms = monotonic_ms() + interval_ms + interval_ms / 2
+  count_events_until(signal, deadline_ms) |> should.equal(1)
+
+  mark_database_test_executed("supervised-pruner-restart-ticks-once")
 }
 
 pub fn postgres_queue_commits_typed_worker_success_test() {
@@ -9287,8 +11408,16 @@ fn force_job_state(
   job_id: Int,
   state: String,
 ) -> Nil {
+  // `grind_jobs_finished_at_check` (grind_v12) requires `finished_at` to be
+  // set iff `state` is one of the six terminal states, so a raw state flip
+  // must set it consistently too, not just leave whatever the row already
+  // had.
   let assert Ok(_) =
-    pog.query("UPDATE grind_jobs SET state = $1 WHERE id = $2")
+    pog.query(
+      "UPDATE grind_jobs SET state = $1, finished_at = CASE WHEN $1 IN ("
+      <> terminal.states_sql()
+      <> ") THEN clock_timestamp() ELSE NULL END WHERE id = $2",
+    )
     |> pog.parameter(pog.text(state))
     |> pog.parameter(pog.int(job_id))
     |> pog.execute(on: connection)
