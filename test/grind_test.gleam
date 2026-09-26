@@ -1,3 +1,6 @@
+import cigogne
+import cigogne/config
+import cigogne/migration
 import exception
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -11,6 +14,7 @@ import gleam/string
 import gleeunit
 import gleeunit/should
 import grind
+import grind/internal/migrations
 import grind/internal/unique_admission
 import grind/job
 import grind/observation
@@ -33,25 +37,144 @@ pub fn version_test() {
   |> should.equal("0.1.0")
 }
 
-/// Proves `grind/postgres.schema_ddl_statements` (what `create_fresh_schema`
-/// actually executes) stays byte-identical to the plain-SQL copy at
-/// `src/grind/internal/schema.sql` that `scripts/generate-sql.sh` applies
-/// with `psql` ahead of running Squirrel's codegen. Runs with no database.
-pub fn postgres_schema_ddl_matches_sql_file_test() {
-  let assert Ok(contents) =
-    simplifile.read(from: "src/grind/internal/schema.sql")
-  let statements_from_file =
-    contents
+/// A no-database regression guard for `src/grind_postgres_ffi.erl`'s own
+/// load-bearing, source-confirmed (never contractually documented by pog)
+/// assumption: `pog.named_connection(name)` — a `Pool(name)` `pog.Connection`
+/// — compiles to the raw tagged tuple `{pool, Name}`. If a future pog
+/// release changed that compiled shape, `grind_postgres_ffi`'s own pattern
+/// matches (`with_deadline/3`, `set_deadline/2`, `clear_deadline/1`) would
+/// silently stop recognizing a real `Pool` connection; this fails loudly
+/// here first.
+pub fn pog_connection_pool_shape_test() {
+  let name = process.new_name("grind_pool_shape_probe")
+  pog.named_connection(name)
+  |> pool_connection_atom()
+  |> should.be_ok()
+}
+
+@external(erlang, "grind_test_env", "pool_connection_atom")
+fn pool_connection_atom(connection: pog.Connection) -> Result(a, Nil)
+
+/// Cigogne's own pinned sha256 for each *released* migration file
+/// (`shasum -a 256`, uppercased to match `binary:encode_hex/1`) — a
+/// Cigogne's own pinned sha256 (`shasum -a 256`, uppercased to match
+/// `binary:encode_hex/1`) for every *released* migration file — one not
+/// still under active development in this same change. Add one entry here,
+/// computed once, whenever a migration file is released (see AGENTS.md,
+/// "Adding a migration"); never recomputed from the file itself, or the pin
+/// would be meaningless. `grind_migrations_conformance_test` requires a
+/// pinned entry for every file except the newest (highest) version — that
+/// one may still be edited in this same change, as v11 currently is.
+const released_migration_sha256 = [
+  #(
+    "20260925000000-grind_v11.sql",
+    "2B79E6CBD28A36850E31E1D69CC0C353D9CCFC4A4D8CEC688B0DC9C4ECEF17A0",
+  ),
+]
+
+/// Proves `grind/internal/migrations.migrations()` (what `postgres.migrate`
+/// actually executes) stays in lockstep with the cigogne-format files under
+/// `priv/migrations/`, using cigogne's own public parser and its own
+/// `config.get("grind")` (exercising the real `priv/cigogne.toml`) rather
+/// than Grind's own ad hoc parsing or a hand-built config — so a change to
+/// cigogne's file format, or to `priv/cigogne.toml` itself, is caught here
+/// too. Runs with no database:
+///
+/// - Every file's `up` statements (trailing `;` stripped) equal the
+///   matching `migrations()` entry, in order.
+/// - The version the file's own name encodes (`<timestamp>-grind_v<N>.sql`)
+///   equals both the `migrations()` key and the version its own trailing
+///   marker statement records — which must itself be a
+///   `INSERT INTO grind_schema_migrations` statement, not merely end with a
+///   number that happens to parse.
+/// - Every file except the newest (highest) version has a pinned sha256 in
+///   `released_migration_sha256` above, and it matches.
+/// - The frozen upgrade-harness fixture (`test/fixtures/schema/v11.sql`)
+///   equals the pinned v11 migration's own `up` section exactly — so the
+///   two can never silently drift apart.
+pub fn grind_migrations_conformance_test() {
+  let assert Ok(config) = config.get("grind")
+  let assert Ok(files) = cigogne.read_migrations(config)
+  let sorted = list.sort(files, migration.compare)
+  let defined = migrations.migrations()
+  list.length(sorted) |> should.equal(list.length(defined))
+  let newest_version =
+    list.fold(defined, 0, fn(highest, step) { int.max(highest, step.version) })
+  list.zip(sorted, defined)
+  |> list.each(fn(pair) {
+    let #(file, step) = pair
+    let file_version = version_from_migration_name(file.name)
+    file_version |> should.equal(step.version)
+    let up_statements =
+      file.queries_up
+      |> list.map(fn(statement) { drop_trailing_semicolon(statement) })
+    up_statements |> should.equal(step.statements)
+    let assert Ok(marker_statement) = list.last(up_statements)
+    string.starts_with(marker_statement, "INSERT INTO grind_schema_migrations")
+    |> should.be_true()
+    let assert Some(marker_version) = marker_insert_version(marker_statement)
+    marker_version |> should.equal(step.version)
+    let pinned_sha256 =
+      list.key_find(released_migration_sha256, filename_from_path(file.path))
+    case step.version == newest_version {
+      True ->
+        case pinned_sha256 {
+          Error(Nil) -> Nil
+          Ok(sha256) -> file.sha256 |> should.equal(sha256)
+        }
+      False -> {
+        let assert Ok(sha256) = pinned_sha256
+        file.sha256 |> should.equal(sha256)
+      }
+    }
+  })
+  let assert Ok(v11_step) = list.find(defined, fn(step) { step.version == 11 })
+  let assert Ok(fixture_contents) =
+    simplifile.read(from: "test/fixtures/schema/v11.sql")
+  let fixture_statements =
+    fixture_contents
     |> string.split("\n")
-    |> list.filter(fn(line) {
-      let trimmed = string.trim(line)
-      trimmed != "" && !string.starts_with(trimmed, "--")
-    })
+    |> list.filter(fn(line) { string.trim(line) != "" })
     |> string.join("")
     |> string.split(";")
     |> list.map(string.trim)
     |> list.filter(fn(statement) { statement != "" })
-  statements_from_file |> should.equal(postgres.schema_ddl_statements())
+  fixture_statements |> should.equal(v11_step.statements)
+}
+
+fn drop_trailing_semicolon(statement: String) -> String {
+  case string.ends_with(statement, ";") {
+    True -> string.drop_end(statement, 1)
+    False -> statement
+  }
+}
+
+fn filename_from_path(path: String) -> String {
+  path |> string.split("/") |> list.last() |> result.unwrap(path)
+}
+
+/// Parses the version out of a migration's own `name` field (the part of
+/// its filename after `<timestamp>-`), which this repository's naming
+/// convention (`grind_v<N>`) always encodes — see AGENTS.md.
+fn version_from_migration_name(name: String) -> Int {
+  let assert Ok(digits) = string.split_once(name, "grind_v")
+  let assert Ok(version) = int.parse(digits.1)
+  version
+}
+
+/// Parses the version out of the migration's own trailing marker insert
+/// (`INSERT INTO grind_schema_migrations (version) VALUES (<N>)`), so the
+/// conformance test can independently cross-check the file name against
+/// what the file's own last statement actually records.
+fn marker_insert_version(statement: String) -> Option(Int) {
+  case string.split_once(statement, "VALUES (") {
+    Error(Nil) -> None
+    Ok(#(_, rest)) ->
+      case string.split_once(rest, ")") {
+        Error(Nil) -> None
+        Ok(#(digits, _)) -> int.parse(string.trim(digits)) |> option.from_result
+      }
+  }
 }
 
 pub type LookupFailure {
@@ -807,7 +930,10 @@ fn run_forced_stop_pool_cleanup_test(database_url: String) -> Nil {
 fn run_automatic_drain_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_auto_drain")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -836,7 +962,7 @@ fn run_automatic_drain_test(database_url: String) -> Nil {
     |> queue.with_poll_interval(20)
     |> queue.with_maximum_jobs_per_poll(2)
     |> queue.with_maximum_concurrency(1)
-    |> queue.with_lease_duration(900)
+    |> queue.with_lease_duration(1600)
     |> queue.with_shutdown_grace(2000)
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
@@ -1150,7 +1276,10 @@ fn await_new_coordinator_pid(
 fn run_coordinator_loss_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_coordinator_loss")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -1565,6 +1694,27 @@ fn schema_missing_unique_submissions_url() -> Result(String, Nil)
 @external(erlang, "grind_test_env", "schema_atomic_url")
 fn schema_atomic_url() -> Result(String, Nil)
 
+@external(erlang, "grind_test_env", "schema_concurrent_url")
+fn schema_concurrent_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "schema_partial_url")
+fn schema_partial_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "schema_upgrade_url")
+fn schema_upgrade_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "schema_upgrade_fresh_url")
+fn schema_upgrade_fresh_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "schema_future_foreign_url")
+fn schema_future_foreign_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "schema_shape_url")
+fn schema_shape_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "schema_mixed_case_url")
+fn schema_mixed_case_url() -> Result(String, Nil)
+
 @external(erlang, "grind_test_env", "resolution_route_a_url")
 fn resolution_route_a_url() -> Result(String, Nil)
 
@@ -1573,6 +1723,17 @@ fn resolution_route_b_url() -> Result(String, Nil)
 
 @external(erlang, "grind_test_env", "repeatable_read_url")
 fn repeatable_read_url() -> Result(String, Nil)
+
+/// A database dedicated to the global `quarantine_expired` test: since that
+/// operation sweeps every expired `executing` row for its whole storage
+/// owner (not scoped to one queue), running it against the shared
+/// `GRIND_TEST_DATABASE_URL` database would make the test's own row counts
+/// depend on whatever other tests in this same file happen to run first and
+/// leave behind (storage owner is derived from `host:port/database`, so a
+/// dedicated database is a dedicated storage owner — see
+/// `postgres.validate`).
+@external(erlang, "grind_test_env", "quarantine_url")
+fn quarantine_url() -> Result(String, Nil)
 
 @external(erlang, "grind_test_env", "mark_database_test_executed")
 fn mark_database_test_executed(contract: String) -> Nil
@@ -2045,6 +2206,764 @@ fn run_schema_atomic_install_test(database_url: String) -> Nil {
   mark_database_test_executed("failed-fresh-install-rolled-back")
 }
 
+/// A marker claiming a schema version newer than this build's own
+/// `migrations()` (`UnsupportedSchemaVersion`) must be detected *before*
+/// `read_schema_generation` ever runs any per-version shape check — proven
+/// here to actually discriminate: install a real v11 schema, then *break*
+/// v11's own declared shape (drop `grind_unique_submissions`, one of its
+/// required relations) and add a `12` marker on top. A shape-first
+/// implementation would evaluate v11's now-broken shape and misreport
+/// `IncompatibleSchema` (or, worse, never notice the higher marker at all);
+/// the required version-first ordering still reports
+/// `UnsupportedSchemaVersion(12)` regardless — the version check never
+/// reaches a shape check at all once `max > latest`.
+pub fn postgres_migration_future_version_precedes_shape_check_test() {
+  case schema_future_foreign_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_future_version_with_foreign_objects_test(database_url)
+  }
+}
+
+fn run_future_version_with_foreign_objects_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_schema_future_foreign")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query("DROP TABLE grind_unique_submissions")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (12)")
+    |> pog.execute(on: connection)
+  postgres.migrate(database)
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(12)))
+  mark_database_test_executed("future-version-precedes-shape-check-passed")
+}
+
+/// A bare `current_schema() || '.grind_schema_migrations'` fed to
+/// `to_regclass` silently folds an unquoted, mixed-case schema name to lower
+/// case, so `to_regclass` looks up a schema that does not exist and
+/// `schema_migrations_table_exists` wrongly reports the marker table
+/// absent even once it is genuinely installed and fully functional —
+/// `quote_ident` fixes it. Proven against a real database whose default
+/// `search_path` is a quoted, mixed-case schema
+/// (`grind_schema_mixed_case_url`, set up once by
+/// `scripts/test-postgres.sh` before this pool ever connects, exactly like
+/// `grind_repeatable_read_test`'s own `default_transaction_isolation`
+/// override): the second `migrate` call must be a clean `Ok(Nil)` no-op.
+pub fn postgres_migration_quotes_mixed_case_schema_name_test() {
+  case schema_mixed_case_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_mixed_case_schema_test(database_url)
+  }
+}
+
+fn run_mixed_case_schema_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_schema_mixed_case")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  postgres.migrate(database) |> should.equal(Ok(Nil))
+  postgres.migrate(database) |> should.equal(Ok(Nil))
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(installed_in_mixed_case_schema) =
+    pog.query(
+      "SELECT current_schema() = 'MixedCase' AND to_regclass('grind_schema_migrations') IS NOT NULL",
+    )
+    |> pog.returning({
+      use present <- decode.field(0, decode.bool)
+      decode.success(present)
+    })
+    |> pog.execute(on: connection)
+  installed_in_mixed_case_schema.rows |> should.equal([True])
+  mark_database_test_executed("migrate-mixed-case-schema-no-op-passed")
+}
+
+/// Two `migrate` callers racing the exact same fresh schema. Before the
+/// advisory lock, both would run `CREATE TABLE`/the marker `INSERT`
+/// concurrently and one would fail on a duplicate-object or duplicate-key
+/// error instead of the required "both `Ok(Nil)`, one marker" outcome — an
+/// observer holds the same advisory lock key `migrate` itself uses, so both
+/// callers are provably still queued behind it when this test releases it.
+pub fn postgres_migrate_concurrent_migrators_both_apply_once_test() {
+  case schema_concurrent_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_concurrent_migrators_test(database_url)
+  }
+}
+
+fn run_concurrent_migrators_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_schema_concurrent")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let connection = pog.named_connection(pool_name)
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended('grind-migrate-v1:' || current_schema(), 0))) AS grind_test_migrate_barrier",
+    )
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() { postgres.migrate(database) })
+  spawn_submit(result_b, fn() { postgres.migrate(database) })
+  // Both migrators above are provably blocked behind the observer's held
+  // advisory lock (the only way into `migrate`'s own step transaction) for
+  // as long as this sleep runs, before the observer ever releases it.
+  process.sleep(300)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  process.receive(result_a, within: 10_000) |> should.equal(Ok(Ok(Nil)))
+  process.receive(result_b, within: 10_000) |> should.equal(Ok(Ok(Nil)))
+
+  let assert Ok(marker) =
+    pog.query("SELECT count(*)::bigint FROM grind_schema_migrations")
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+    |> pog.execute(on: connection)
+  marker.rows |> should.equal([1])
+  mark_database_test_executed("migrate-concurrent-migrators-single-marker")
+}
+
+/// A synthetic version `migrate_with`-only test appends after the real
+/// `migrations()` baseline — never part of `grind/internal/migrations`
+/// itself, and never released. Its own statements are deliberately trivial
+/// (one throwaway table plus the marker insert) since only the runner's
+/// step-by-step commit/skip behaviour is under test here, not any real
+/// schema change.
+fn v11_migration() -> migrations.Migration {
+  let assert Ok(step) =
+    list.find(migrations.migrations(), fn(step) { step.version == 11 })
+  step
+}
+
+fn synthetic_v12_ok_migration() -> migrations.Migration {
+  migrations.Migration(
+    12,
+    [
+      "CREATE TABLE grind_test_synthetic_v12 (id integer PRIMARY KEY)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (12)",
+    ],
+    list.append(v11_migration().shape, [
+      migrations.ExpectedRelation(
+        "grind_test_synthetic_v12",
+        migrations.Table,
+        [],
+      ),
+      // `id integer PRIMARY KEY` also creates this backing index implicitly.
+      migrations.ExpectedRelation(
+        "grind_test_synthetic_v12_pkey",
+        migrations.Index,
+        [],
+      ),
+    ]),
+  )
+}
+
+/// Like `synthetic_v12_ok_migration`, but its own `CREATE TABLE` is the
+/// exact object identity `install_synthetic_v13_failure_trigger` arms an
+/// event trigger to reject.
+fn synthetic_v13_migration() -> migrations.Migration {
+  migrations.Migration(
+    13,
+    [
+      "CREATE TABLE grind_test_synthetic_v13 (id integer PRIMARY KEY)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
+    ],
+    list.append(synthetic_v12_ok_migration().shape, [
+      migrations.ExpectedRelation(
+        "grind_test_synthetic_v13",
+        migrations.Table,
+        [],
+      ),
+      migrations.ExpectedRelation(
+        "grind_test_synthetic_v13_pkey",
+        migrations.Index,
+        [],
+      ),
+    ]),
+  )
+}
+
+/// Installs a `ddl_command_end` event trigger that raises whenever
+/// `grind_test_synthetic_v13` is created — the same fault-injection shape
+/// `run_schema_atomic_install_test` above uses against a real Grind table,
+/// aimed instead at the partial-failure test's own synthetic step 13.
+fn install_synthetic_v13_failure_trigger(connection: pog.Connection) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION fail_grind_synthetic_v13() RETURNS event_trigger LANGUAGE plpgsql AS $body$ DECLARE command record; BEGIN FOR command IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP IF command.object_identity LIKE '%grind_test_synthetic_v13' THEN RAISE EXCEPTION 'injected Grind migration failure'; END IF; END LOOP; END $body$",
+    )
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE EVENT TRIGGER fail_grind_synthetic_v13 ON ddl_command_end EXECUTE FUNCTION fail_grind_synthetic_v13()",
+    )
+    |> pog.execute(on: connection)
+  Nil
+}
+
+fn drop_synthetic_v13_failure_trigger(connection: pog.Connection) -> Nil {
+  let assert Ok(_) =
+    pog.query("DROP EVENT TRIGGER fail_grind_synthetic_v13")
+    |> pog.execute(on: connection)
+  let assert Ok(_) =
+    pog.query("DROP FUNCTION fail_grind_synthetic_v13()")
+    |> pog.execute(on: connection)
+  Nil
+}
+
+/// `migrate_with(migrations() ++ [synthetic v12 ok, synthetic v13 failing])`
+/// on a fresh schema: step 11 and step 12 each commit in their own
+/// transaction before step 13's own transaction rolls back on its injected
+/// failure — proving a mid-run failure neither undoes earlier committed
+/// steps nor leaves the failed step's own partial work behind, and that a
+/// second `migrate_with` call (fault removed) picks up exactly where the
+/// first left off.
+pub fn postgres_migrate_with_partial_failure_preserves_earlier_steps_test() {
+  case schema_partial_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_partial_failure_migration_test(database_url)
+  }
+}
+
+fn run_partial_failure_migration_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_schema_partial")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let connection = pog.named_connection(pool_name)
+  install_synthetic_v13_failure_trigger(connection)
+
+  let steps =
+    list.append(migrations.migrations(), [
+      synthetic_v12_ok_migration(),
+      synthetic_v13_migration(),
+    ])
+  let assert Error(postgres.MigrationStepFailed(13, _)) =
+    postgres.migrate_with(database, steps)
+
+  let assert Ok(markers) =
+    pog.query(
+      "SELECT array_agg(version ORDER BY version) FROM grind_schema_migrations",
+    )
+    |> pog.returning({
+      use versions <- decode.field(0, decode.list(decode.int))
+      decode.success(versions)
+    })
+    |> pog.execute(on: connection)
+  markers.rows |> should.equal([[11, 12]])
+  let assert Ok(objects) =
+    pog.query(
+      "SELECT to_regclass(current_schema() || '.grind_test_synthetic_v12') IS NOT NULL, to_regclass(current_schema() || '.grind_test_synthetic_v13') IS NOT NULL",
+    )
+    |> pog.returning({
+      use v12_present <- decode.field(0, decode.bool)
+      use v13_present <- decode.field(1, decode.bool)
+      decode.success(#(v12_present, v13_present))
+    })
+    |> pog.execute(on: connection)
+  objects.rows |> should.equal([#(True, False)])
+
+  drop_synthetic_v13_failure_trigger(connection)
+  postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
+  let assert Ok(resumed_markers) =
+    pog.query(
+      "SELECT array_agg(version ORDER BY version) FROM grind_schema_migrations",
+    )
+    |> pog.returning({
+      use versions <- decode.field(0, decode.list(decode.int))
+      decode.success(versions)
+    })
+    |> pog.execute(on: connection)
+  resumed_markers.rows |> should.equal([[11, 12, 13]])
+  mark_database_test_executed("migrate-partial-failure-resumes-passed")
+}
+
+/// A version's own marker being present is never trusted alone: dropping a
+/// relation a later version's own declared `shape` requires, after that
+/// version's marker was genuinely committed, must still be caught as
+/// `IncompatibleSchema` on the next `migrate_with` call — proven against a
+/// synthetic v12 here since the real v11 baseline's own equivalent case is
+/// already covered by `postgres_migration_refuses_missing_owned_artifacts_test`.
+pub fn postgres_migrate_detects_missing_relation_in_declared_shape_test() {
+  case schema_shape_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_missing_relation_shape_test(database_url)
+  }
+}
+
+fn run_missing_relation_shape_test(database_url: String) -> Nil {
+  let pool_name = process.new_name("grind_schema_shape")
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let connection = pog.named_connection(pool_name)
+  let steps =
+    list.append(migrations.migrations(), [synthetic_v12_ok_migration()])
+  postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
+  let assert Ok(_) =
+    pog.query("DROP TABLE grind_test_synthetic_v12")
+    |> pog.execute(on: connection)
+  postgres.migrate_with(database, steps)
+  |> should.equal(Error(postgres.IncompatibleSchema))
+  mark_database_test_executed("migrate-missing-relation-shape-detected")
+}
+
+/// The frozen up-dump of the real `grind_v11` migration, applied with plain
+/// `pog.execute` statement by statement — deliberately independent of
+/// `grind/internal/migrations` and `priv/migrations/`, so this test still
+/// exercises "a schema a previous Grind release actually installed" even if
+/// a future baseline's statement text ever moved on.
+fn read_sql_statements_from_file(path: String) -> List(String) {
+  let assert Ok(contents) = simplifile.read(from: path)
+  contents
+  |> string.split("\n")
+  |> list.filter(fn(line) {
+    let trimmed = string.trim(line)
+    trimmed != "" && !string.starts_with(trimmed, "--")
+  })
+  |> string.join("")
+  |> string.split(";")
+  |> list.map(string.trim)
+  |> list.filter(fn(statement) { statement != "" })
+}
+
+fn apply_sql_statements(
+  connection: pog.Connection,
+  statements: List(String),
+) -> Nil {
+  list.each(statements, fn(statement) {
+    let assert Ok(_) = pog.query(statement) |> pog.execute(on: connection)
+    Nil
+  })
+}
+
+/// A synthetic `v12` used only by the upgrade harness below: adds a nullable
+/// column and an index on it to `grind_jobs`, the shape of change the design
+/// calls out (`docs/RELEASE-READINESS.md`, "Migration mechanism") as the one
+/// most likely to interact badly with rows a previous release already wrote.
+fn synthetic_v12_alter_migration() -> migrations.Migration {
+  migrations.Migration(
+    12,
+    [
+      "ALTER TABLE grind_jobs ADD COLUMN grind_test_note text",
+      "CREATE INDEX grind_test_note_idx ON grind_jobs (grind_test_note)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (12)",
+    ],
+    list.append(v11_migration().shape, [
+      migrations.ExpectedRelation("grind_test_note_idx", migrations.Index, []),
+    ]),
+  )
+}
+
+/// One digest per catalog kind (`information_schema.columns` — including
+/// `column_default` and `ordinal_position`, so a reordered or
+/// differently-defaulted column would be caught, not only a renamed or
+/// retyped one — `pg_constraint`, `pg_indexes`, and `pg_sequences`), scoped
+/// to every `grind_`-prefixed object in the current schema,
+/// order-independent by construction (`string_agg` with an explicit
+/// `ORDER BY`) — compared between the seeded-then-upgraded database and a
+/// fresh `migrate_with` install of the exact same step list.
+fn grind_catalog_digest(
+  connection: pog.Connection,
+) -> #(String, String, String, String) {
+  let columns =
+    catalog_digest_query(
+      connection,
+      "SELECT coalesce(string_agg(table_name || ':' || ordinal_position || ':' || column_name || ':' || data_type || ':' || is_nullable || ':' || coalesce(column_default, ''), ',' ORDER BY table_name, ordinal_position), '') FROM information_schema.columns WHERE table_schema = current_schema() AND table_name ~ '^grind_'",
+    )
+  let constraints =
+    catalog_digest_query(
+      connection,
+      "SELECT coalesce(string_agg(conrelid::regclass::text || ':' || conname || ':' || contype::text || ':' || pg_get_constraintdef(oid), ',' ORDER BY conrelid::regclass::text, conname), '') FROM pg_constraint WHERE connamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()) AND conrelid::regclass::text ~ '^grind_'",
+    )
+  let indexes =
+    catalog_digest_query(
+      connection,
+      "SELECT coalesce(string_agg(indexname || ':' || indexdef, ',' ORDER BY indexname), '') FROM pg_indexes WHERE schemaname = current_schema() AND tablename ~ '^grind_'",
+    )
+  let sequences =
+    catalog_digest_query(
+      connection,
+      "SELECT coalesce(string_agg(sequencename || ':' || data_type || ':' || start_value || ':' || min_value || ':' || max_value || ':' || increment_by || ':' || cache_size || ':' || cycle, ',' ORDER BY sequencename), '') FROM pg_sequences WHERE schemaname = current_schema() AND sequencename ~ '^grind_'",
+    )
+  #(columns, constraints, indexes, sequences)
+}
+
+fn catalog_digest_query(connection: pog.Connection, sql: String) -> String {
+  let assert Ok(returned) =
+    pog.query(sql)
+    |> pog.returning({
+      use value <- decode.field(0, decode.string)
+      decode.success(value)
+    })
+    |> pog.execute(on: connection)
+  let assert [value] = returned.rows
+  value
+}
+
+/// The upgrade-harness contract: a database carrying a previous release's
+/// frozen v11 schema and real rows in queued, scheduled, retryable,
+/// executing-with-an-already-expired-lease, uncertain, and succeeded states
+/// (the last two also carrying a real acknowledgement receipt, a real
+/// uniqueness receipt with its `unique_key_*` columns populated, and a real
+/// resolution row) survives `migrate_with` onto a synthetic v12 with every
+/// seeded row intact, ends up with the exact same catalog shape a fresh
+/// `migrate_with` install of the same steps produces, and stays fully
+/// functional afterwards both for ordinary new API traffic (submit/claim/ack
+/// on a fresh job) and, specifically, against the legacy seeded rows
+/// themselves: the seeded executing lease is genuinely quarantined by a
+/// legacy-queue poll, the seeded uncertain row is resolved, the seeded
+/// acknowledgement receipt is reconciled by its own real command ID, and the
+/// seeded unique submission is replayed (its own real request hash, not a
+/// synthetic one, since it was seeded through `submit_unique` itself before
+/// migrating rather than inserted by hand).
+pub fn postgres_migrate_upgrade_from_frozen_v11_fixture_test() {
+  case schema_upgrade_url(), schema_upgrade_fresh_url() {
+    Ok(upgrade_url), Ok(fresh_url) ->
+      run_upgrade_harness_test(upgrade_url, fresh_url)
+    _, _ -> Nil
+  }
+}
+
+fn legacy_upgrade_worker() -> worker.Worker(Int, String, LookupFailure) {
+  let assert Ok(input_codec) =
+    worker.codec("upgrade-legacy-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("upgrade-legacy-output-v1", json.string, decode.string)
+  let assert Ok(worker_def) =
+    worker.define(
+      "upgrade.legacy-worker",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  worker_def
+}
+
+fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
+  let upgrade_pool = process.new_name("grind_schema_upgrade")
+  let assert Ok(upgrade_validated) =
+    postgres.settings(upgrade_url, upgrade_pool) |> postgres.validate
+  let assert Ok(upgrade_database) = postgres.start(upgrade_validated)
+  use <- exception.defer(fn() { postgres.close(upgrade_database) })
+  let upgrade_connection = pog.named_connection(upgrade_pool)
+
+  let fresh_pool = process.new_name("grind_schema_upgrade_fresh")
+  let assert Ok(fresh_validated) =
+    postgres.settings(fresh_url, fresh_pool) |> postgres.validate
+  let assert Ok(fresh_database) = postgres.start(fresh_validated)
+  use <- exception.defer(fn() { postgres.close(fresh_database) })
+  let fresh_connection = pog.named_connection(fresh_pool)
+
+  apply_sql_statements(
+    upgrade_connection,
+    read_sql_statements_from_file("test/fixtures/schema/v11.sql"),
+  )
+
+  let legacy_worker = legacy_upgrade_worker()
+  // The real storage owner this pool computes (`host:port/database`), never
+  // an arbitrary chosen string — every seeded row and constructed handle
+  // below must use this exact value or the typed API's own owner check
+  // rejects them (`StateStorageOwnerMismatch` and friends).
+  let storage_owner = postgres.storage_owner(upgrade_database)
+
+  // Seeded via `submit_unique` itself, against the pre-migration v11
+  // schema — never raw SQL — so its `request_sha256` and `unique_key_*`
+  // columns are exactly what a real caller's replay after the upgrade must
+  // still match; a hand-written hash could never do that honestly.
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let legacy_policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let assert Ok(unique.Inserted(legacy_unique_handle)) =
+    submit_keep_existing(
+      upgrade_database,
+      "upgrade-legacy",
+      "upgrade-legacy-submission",
+      legacy_worker,
+      5,
+      legacy_policy,
+    )
+
+  // Seed one row per remaining state via raw SQL, in a distinct queue from
+  // the uniqueness submission above so neither competes with the other
+  // during the legacy-consumer polls below.
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, attempt_count) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy-other', 'upgrade.legacy-worker', 'v1', 'v1', '10'::jsonb, 'v1', 'queued', clock_timestamp(), NULL, 0, NULL, NULL, 0)",
+    )
+    |> pog.execute(on: upgrade_connection)
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, attempt_count) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy-other', 'upgrade.legacy-worker', 'v1', 'v1', '11'::jsonb, 'v1', 'scheduled', clock_timestamp() + interval '1 hour', NULL, 0, NULL, NULL, 0)",
+    )
+    |> pog.execute(on: upgrade_connection)
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, attempt_count, failure_description, failure_cause) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy-other', 'upgrade.legacy-worker', 'v1', 'v1', '12'::jsonb, 'v1', 'retryable', clock_timestamp() + interval '1 minute', NULL, 1, NULL, NULL, 1, 'legacy transient failure', NULL)",
+    )
+    |> pog.execute(on: upgrade_connection)
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, attempt_count) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy', 'upgrade.legacy-worker', 'v1', 'v1', '1'::jsonb, 'v1', 'executing', clock_timestamp(), nextval('grind_attempts_id_seq'), 1, 'legacy-attempt-owner', clock_timestamp() - interval '1 hour', 1) RETURNING id",
+    )
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+    |> pog.execute(on: upgrade_connection)
+  let assert Ok(executing_job) =
+    pog.query(
+      "SELECT id FROM grind_jobs WHERE storage_owner = '"
+      <> storage_owner
+      <> "' AND queue = 'upgrade-legacy' AND state = 'executing'",
+    )
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+    |> pog.execute(on: upgrade_connection)
+  let assert [executing_job_id] = executing_job.rows
+  let assert Ok(uncertain_job) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, state, available_at, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, attempt_count, uncertain_at) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy', 'upgrade.legacy-worker', 'v1', 'v1', '2'::jsonb, 'v1', 'uncertain', clock_timestamp(), nextval('grind_attempts_id_seq'), 1, 'legacy-attempt-owner', clock_timestamp() - interval '1 hour', 1, clock_timestamp()) RETURNING id",
+    )
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      decode.success(id)
+    })
+    |> pog.execute(on: upgrade_connection)
+  let assert [uncertain_job_id] = uncertain_job.rows
+  let assert Ok(succeeded_job) =
+    pog.query(
+      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, output, state, available_at, attempt_id, attempt_epoch, attempt_owner) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy', 'upgrade.legacy-worker', 'v1', 'v1', '3'::jsonb, 'v1', '\"legacy-output\"'::jsonb, 'succeeded', clock_timestamp(), nextval('grind_attempts_id_seq'), 1, 'legacy-attempt-owner') RETURNING id, attempt_id",
+    )
+    |> pog.returning({
+      use id <- decode.field(0, decode.int)
+      use attempt_id <- decode.field(1, decode.int)
+      decode.success(#(id, attempt_id))
+    })
+    |> pog.execute(on: upgrade_connection)
+  let assert [#(succeeded_job_id, succeeded_attempt_id)] = succeeded_job.rows
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_job_acknowledgements (storage_owner, command_id, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, attempt_owner, committed_state, proposal_sha256) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy-command', 'upgrade-legacy', $1, 'upgrade.legacy-worker', 'v1', $2, 1, 'legacy-attempt-owner', 'succeeded', sha256(convert_to('legacy proposal', 'UTF8')))",
+    )
+    |> pog.parameter(pog.int(succeeded_job_id))
+    |> pog.parameter(pog.int(succeeded_attempt_id))
+    |> pog.execute(on: upgrade_connection)
+  let assert Ok(_) =
+    pog.query(
+      "INSERT INTO grind_job_resolutions (storage_owner, queue, job_id, worker_id, worker_version, resolution_id, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, decision, target_state, resolved_by, details) VALUES ('"
+      <> storage_owner
+      <> "', 'upgrade-legacy', $1, 'upgrade.legacy-worker', 'v1', 'upgrade-legacy-resolution', $2, 1, 'legacy-attempt-owner', clock_timestamp(), 'confirm_success', 'succeeded', 'legacy-on-call', 'legacy resolution before this upgrade')",
+    )
+    |> pog.parameter(pog.int(succeeded_job_id))
+    |> pog.parameter(pog.int(succeeded_attempt_id))
+    |> pog.execute(on: upgrade_connection)
+
+  let steps =
+    list.append(migrations.migrations(), [synthetic_v12_alter_migration()])
+  postgres.migrate_with(upgrade_database, steps) |> should.equal(Ok(Nil))
+  postgres.migrate_with(fresh_database, steps) |> should.equal(Ok(Nil))
+
+  // Every seeded legacy row is untouched by the upgrade.
+  let assert Ok(preserved) =
+    pog.query(
+      "SELECT (SELECT count(*) FROM grind_jobs WHERE storage_owner = '"
+      <> storage_owner
+      <> "' AND queue = 'upgrade-legacy-other' AND state = 'queued'), (SELECT count(*) FROM grind_jobs WHERE storage_owner = '"
+      <> storage_owner
+      <> "' AND state = 'scheduled'), (SELECT count(*) FROM grind_jobs WHERE storage_owner = '"
+      <> storage_owner
+      <> "' AND state = 'retryable'), (SELECT count(*) FROM grind_jobs WHERE storage_owner = '"
+      <> storage_owner
+      <> "' AND state = 'executing'), (SELECT count(*) FROM grind_jobs WHERE storage_owner = '"
+      <> storage_owner
+      <> "' AND state = 'uncertain'), (SELECT count(*) FROM grind_job_acknowledgements WHERE command_id = 'upgrade-legacy-command'), (SELECT count(*) FROM grind_unique_submissions WHERE submission_id = 'upgrade-legacy-submission'), (SELECT count(*) FROM grind_jobs WHERE id = $1 AND unique_key_contract IS NOT NULL AND unique_key_sha256 IS NOT NULL), (SELECT count(*) FROM grind_job_resolutions WHERE resolution_id = 'upgrade-legacy-resolution')",
+    )
+    |> pog.parameter(pog.int(job.id_value(legacy_unique_handle)))
+    |> pog.returning({
+      use queued <- decode.field(0, decode.int)
+      use scheduled <- decode.field(1, decode.int)
+      use retryable <- decode.field(2, decode.int)
+      use executing <- decode.field(3, decode.int)
+      use uncertain <- decode.field(4, decode.int)
+      use acknowledgement <- decode.field(5, decode.int)
+      use unique_submission <- decode.field(6, decode.int)
+      use unique_key_columns <- decode.field(7, decode.int)
+      use resolution <- decode.field(8, decode.int)
+      decode.success(#(
+        queued,
+        scheduled,
+        retryable,
+        executing,
+        uncertain,
+        acknowledgement,
+        unique_submission,
+        unique_key_columns,
+        resolution,
+      ))
+    })
+    |> pog.execute(on: upgrade_connection)
+  preserved.rows |> should.equal([#(1, 1, 1, 1, 1, 1, 1, 1, 1)])
+
+  // The upgraded database's catalog shape is identical to a fresh install of
+  // the exact same steps.
+  grind_catalog_digest(upgrade_connection)
+  |> should.equal(grind_catalog_digest(fresh_connection))
+
+  // The upgraded schema is fully functional for ordinary new traffic:
+  // submit/claim/ack on a fresh job.
+  let assert Ok(input_codec) =
+    worker.codec("upgrade-smoke-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("upgrade-smoke-output-v1", json.string, decode.string)
+  let assert Ok(smoke_worker) =
+    worker.define(
+      "upgrade.smoke-worker",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("upgrade-smoke")
+  let assert Ok(workers) = registry.register(workers, smoke_worker)
+  let assert Ok(handle) =
+    postgres.submit(upgrade_database, "upgrade-smoke", smoke_worker, 41)
+  let assert Ok(consumer) = queue.start_manual(upgrade_database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(upgrade_database, handle) |> should.equal(Ok(job.Succeeded))
+  postgres.outcome(upgrade_database, handle)
+  |> should.equal(Ok(job.SucceededWith("41")))
+
+  // ...and, specifically, against the legacy seeded rows themselves.
+  //
+  // Replays the real `submit_unique` seed above with its own real request
+  // hash — never a hand-written one — so this genuinely proves post-upgrade
+  // idempotency, not merely that a row exists.
+  let assert Ok(unique.Inserted(legacy_replayed_handle)) =
+    submit_keep_existing(
+      upgrade_database,
+      "upgrade-legacy",
+      "upgrade-legacy-submission",
+      legacy_worker,
+      5,
+      legacy_policy,
+    )
+  job.id_value(legacy_replayed_handle)
+  |> should.equal(job.id_value(legacy_unique_handle))
+
+  // Quarantines the seeded already-expired executing lease via a real
+  // legacy-queue poll.
+  let assert Ok(legacy_workers) = registry.new("upgrade-legacy")
+  let assert Ok(legacy_workers) =
+    registry.register(legacy_workers, legacy_worker)
+  let assert Ok(legacy_consumer) =
+    queue.start_manual(upgrade_database, legacy_workers)
+  use <- exception.defer(fn() { queue.stop(legacy_consumer) })
+  // Drains the still-queued (replayed, never claimed) unique submission
+  // above first, so it has no other legitimately claimable job competing in
+  // the same poll as the quarantine check below.
+  queue.process_one(legacy_consumer) |> should.equal(Ok(True))
+  let executing_handle =
+    job.new_handle(
+      executing_job_id,
+      storage_owner,
+      "upgrade-legacy",
+      legacy_worker,
+    )
+  queue.process_one(legacy_consumer) |> should.equal(Ok(False))
+  postgres.state(upgrade_database, executing_handle)
+  |> should.equal(Ok(job.Uncertain))
+
+  // Resolves the seeded uncertain row.
+  let uncertain_handle =
+    job.new_handle(
+      uncertain_job_id,
+      storage_owner,
+      "upgrade-legacy",
+      legacy_worker,
+    )
+  postgres.resolve_uncertain(
+    upgrade_database,
+    uncertain_handle,
+    "upgrade-legacy-uncertain-resolution",
+    "on-call",
+    "post-upgrade smoke resolution of the seeded uncertain row",
+    postgres.AuthorizeReplay,
+  )
+  |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
+
+  // Reconciles the seeded acknowledgement receipt by its own real command
+  // ID.
+  let succeeded_handle =
+    job.new_handle(
+      succeeded_job_id,
+      storage_owner,
+      "upgrade-legacy",
+      legacy_worker,
+    )
+  let assert Ok(receipt) =
+    postgres.reconcile_acknowledgement(
+      upgrade_database,
+      succeeded_handle,
+      "upgrade-legacy-command",
+    )
+  receipt.command_id |> should.equal("upgrade-legacy-command")
+  receipt.attempt_id |> should.equal(succeeded_attempt_id)
+  receipt.attempt_epoch |> should.equal(1)
+  receipt.committed_state |> should.equal(job.Succeeded)
+  receipt.business_failure_cause |> should.equal(None)
+
+  mark_database_test_executed("migrate-upgrade-harness-passed")
+}
+
 pub fn postgres_queue_commits_typed_worker_success_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
@@ -2198,7 +3117,8 @@ pub fn postgres_call_safely_wrapper_reports_closed_pool_test() {
 
 @external(erlang, "grind_postgres_ffi", "call_safely")
 fn call_safely_probe(
-  run: fn() -> Result(pog.Returned(Int), pog.QueryError),
+  connection: pog.Connection,
+  run: fn(pog.Connection) -> Result(pog.Returned(Int), pog.QueryError),
 ) -> Result(pog.Returned(Int), pog.QueryError)
 
 fn run_call_safely_closed_pool_test(database_url: String) -> Nil {
@@ -2214,7 +3134,9 @@ fn run_call_safely_closed_pool_test(database_url: String) -> Nil {
       use value <- decode.field(0, decode.int)
       decode.success(value)
     })
-  call_safely_probe(fn() { pog.execute(probe_query, connection) })
+  call_safely_probe(connection, fn(connection) {
+    pog.execute(probe_query, connection)
+  })
   |> should.equal(Error(pog.ConnectionUnavailable))
   mark_database_test_executed("call-safely-wrapper-closed-pool-passed")
 }
@@ -3024,7 +3946,10 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   database_url: String,
 ) -> Nil {
   let pool_name = process.new_name("grind_auto_ack_commit_loss")
-  let settings = postgres.settings(database_url, pool_name)
+  let settings =
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
   let assert Ok(validated) = postgres.validate(settings)
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -3055,7 +3980,7 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
     postgres.submit(database, "auto-ack-commit-loss", definition, 41)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1000)
+    |> queue.with_lease_duration(1600)
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
   use <- exception.defer(fn() {
@@ -3161,7 +4086,10 @@ pub fn postgres_automatic_ack_retry_bounded_eventually_uncertain_test() {
 fn run_automatic_ack_retry_bounded_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_auto_ack_retry_bounded")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -3191,7 +4119,7 @@ fn run_automatic_ack_retry_bounded_test(database_url: String) -> Nil {
     postgres.submit(database, "auto-ack-bounded", definition, 51)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(300)
+    |> queue.with_lease_duration(6100)
     |> queue.with_poll_interval(50)
     |> queue.with_maximum_concurrency(2)
     |> queue.validate_policy
@@ -3232,7 +4160,14 @@ fn run_automatic_ack_retry_bounded_test(database_url: String) -> Nil {
 
   process.send(release, ReleaseAttempt)
 
-  kill_ack_backends_until_uncertain(database, handle, connection, 40)
+  // The retry budget itself is ~3 ticks regardless of lease length (see
+  // `ConsumerState.pending_ack_retry_budget`), but each tick now fires every
+  // `lease_duration_ms / 3` — a real ~2000ms with this test's now-6100ms
+  // lease (bumped up from 300ms so `queue.start_with_policy` clears
+  // `LeaseTooShortForDeadline` against the default `statement_deadline_ms`)
+  // rather than ~100ms, so this iteration cap must cover several times
+  // longer in wall-clock terms than before.
+  kill_ack_backends_until_uncertain(database, handle, connection, 800)
   |> should.equal(True)
 
   mark_database_test_executed(
@@ -3983,7 +4918,10 @@ fn run_ack_receipt_test(database_url: String) -> Nil {
 fn run_lease_renewal_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_lease_renewal")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -4007,7 +4945,7 @@ fn run_lease_renewal_test(database_url: String) -> Nil {
     postgres.submit(database, "lease-renewal", slow_worker, 7)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1500)
+    |> queue.with_lease_duration(1600)
     |> queue.validate_policy
   let assert Ok(consumer) =
     queue.start_manual_with_policy(database, workers, policy)
@@ -4040,7 +4978,10 @@ fn run_lease_renewal_test(database_url: String) -> Nil {
 fn run_lease_renewal_loss_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_lease_renewal_loss")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -4070,7 +5011,7 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
     postgres.submit(database, "lease-renewal-loss", slow_worker, 7)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(900)
+    |> queue.with_lease_duration(1600)
     |> queue.validate_policy
   let assert Ok(consumer) =
     queue.start_manual_with_policy(database, workers, policy)
@@ -4104,7 +5045,10 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
 
 fn run_renewal_storage_error_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_renewal_storage_error")
-  let settings = postgres.settings(database_url, pool_name)
+  let settings =
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
   let assert Ok(validated) = postgres.validate(settings)
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -4135,7 +5079,7 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
     postgres.submit(database, "renewal-storage-error", slow_worker, 18)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1500)
+    |> queue.with_lease_duration(1600)
     |> queue.validate_policy
   let assert Ok(consumer) =
     queue.start_manual_with_policy(database, workers, policy)
@@ -4192,7 +5136,10 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
 
 fn run_closed_pool_renewal_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_closed_pool_renewal")
-  let settings = postgres.settings(database_url, pool_name)
+  let settings =
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
   let assert Ok(validated) = postgres.validate(settings)
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -4223,7 +5170,7 @@ fn run_closed_pool_renewal_test(database_url: String) -> Nil {
     postgres.submit(database, "closed-pool-renewal", slow_worker, 19)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1500)
+    |> queue.with_lease_duration(1600)
     |> queue.validate_policy
   let assert Ok(consumer) =
     queue.start_manual_with_policy(database, workers, policy)
@@ -4265,7 +5212,10 @@ fn run_owner_loss_recovers_after_pool_restart_test(
 ) -> Nil {
   let pool_name = process.new_name("grind_owner_pool_loss")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -4650,7 +5600,10 @@ fn run_scheduled_due_time_test(database_url: String) -> Nil {
 fn run_automatic_wakeup_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_automatic_wakeup")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -7626,12 +8579,22 @@ fn spawn_submit(result: process.Subject(a), submit: fn() -> a) -> Nil {
 /// uniqueness tests below use. `id` should already carry a
 /// `unique_test_suffix()`.
 fn unique_test_worker(id: String) -> worker.Worker(Int, String, e) {
+  unique_test_worker_versioned(id, "v1")
+}
+
+/// Like `unique_test_worker`, but with a caller-chosen worker version — used
+/// by the cross-version quarantine test below, which registers two different
+/// versions of the same worker id against two different consumers.
+fn unique_test_worker_versioned(
+  id: String,
+  version: String,
+) -> worker.Worker(Int, String, e) {
   let assert Ok(input_codec) =
-    worker.codec(id <> "-input-v1", json.int, decode.int)
+    worker.codec(id <> "-input-" <> version, json.int, decode.int)
   let assert Ok(output_codec) =
-    worker.codec(id <> "-output-v1", json.string, decode.string)
+    worker.codec(id <> "-output-" <> version, json.string, decode.string)
   let assert Ok(worker_def) =
-    worker.define(id, "v1", input_codec, output_codec, fn(value) {
+    worker.define(id, version, input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
     })
   worker_def
@@ -10102,6 +11065,113 @@ fn run_unique_contended_lock_wait_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-contended-lock-wait-passed")
 }
 
+/// DEFECT 1 (docs/RELEASE-READINESS.md, "Defects found while designing the
+/// deadline"): the same contention as above, but with *default*
+/// `postgres.settings` on the submitter — no `unique_lock_wait` override.
+/// Before the fix, the default `unique_lock_wait_ms` (5000) was equal to
+/// pgo's own hardcoded pool checkout deadline (also ~5000 ms — see
+/// `docs/RECOVERY-EVIDENCE.md`, "Acknowledgement deadline"), so contention
+/// could surface as the checkout being force-closed
+/// (`AdmissionFailed(pog.QueryTimeout)`/`CommitUnknown`) instead of the
+/// clean, typed `AdmissionContended` a caller can actually branch on — a
+/// race, not deterministically wrong every time, which is exactly why it
+/// went unnoticed: `postgres_submit_unique_contended_lock_wait_test` above
+/// always overrode `unique_lock_wait` to 200 ms and never exercised the
+/// default at all. `postgres.validate` now rejects any `Settings` where
+/// `unique_lock_wait_ms` is within `unique_lock_wait_margin_ms` (1000 ms) of
+/// `statement_deadline_ms` (`UniqueLockWaitTooCloseToDeadline`), and the
+/// shipped defaults (`unique_lock_wait_ms` 2000, `statement_deadline_ms`
+/// 4000) clear that margin — so this is deterministic today, not a race.
+pub fn postgres_submit_unique_contended_lock_wait_default_settings_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_unique_contended_lock_wait_default_settings_test(database_url)
+  }
+}
+
+fn run_unique_contended_lock_wait_default_settings_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  let worker_id = "unique.contended-default-" <> suffix
+  let worker_def = unique_test_worker(worker_id)
+  let test_queue = "unique-contended-default-" <> suffix
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+
+  let holder_pool =
+    process.new_name("grind_unique_contended_default_holder_" <> suffix)
+  let assert Ok(holder_settings) =
+    postgres.settings(database_url, holder_pool) |> postgres.validate
+  let assert Ok(holder_database) = postgres.start(holder_settings)
+  use <- exception.defer(fn() { postgres.close(holder_database) })
+  let assert Ok(Nil) = postgres.migrate(holder_database)
+  let holder_connection = pog.named_connection(holder_pool)
+  let storage_owner = postgres.storage_owner(holder_database)
+
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(
+      holder_connection,
+      unique_domain_lock_query(holder_database, worker_def, 1),
+    )
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  // No `unique_lock_wait` override: exercises the shipped default exactly
+  // as any caller who never touches this setting would experience it.
+  let submitter_pool =
+    process.new_name("grind_unique_contended_default_submitter_" <> suffix)
+  let assert Ok(submitter_settings) =
+    postgres.settings(database_url, submitter_pool) |> postgres.validate
+  let assert Ok(submitter_database) = postgres.start(submitter_settings)
+  use <- exception.defer(fn() { postgres.close(submitter_database) })
+
+  let submission_text = "unique-contended-default-1-" <> suffix
+  submit_keep_existing(
+    submitter_database,
+    test_queue,
+    submission_text,
+    worker_def,
+    1,
+    policy,
+  )
+  |> should.equal(Error(unique.AdmissionContended))
+  count_jobs_in_queue(holder_connection, test_queue) |> should.equal(0)
+  unique_receipt_exists(holder_connection, storage_owner, submission_text)
+  |> should.equal(False)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(unique.Inserted(_)) =
+    submit_keep_existing(
+      submitter_database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+      policy,
+    )
+  count_jobs_in_queue(holder_connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed(
+    "unique-contended-lock-wait-default-settings-passed",
+  )
+}
+
 /// The row-lock variant of contention: a scheduled row's own row lock (held
 /// by the test through an open `SELECT ... FOR UPDATE` transaction, not the
 /// domain lock) blocks a `RescheduleScheduledTo` submission's candidate
@@ -11504,17 +12574,33 @@ fn run_unique_aborted_commit_test(database_url: String) -> Nil {
   // terminate that backend — exactly the trap this early cleanup avoids.
   drop_trigger()
 
+  // The pool just had a connection deliberately terminated
+  // (`terminate_backend`, above): `pgo_connection`'s own supervised restart
+  // of that connection is a real, transient recovery window (not a
+  // steady-state failure), matching every other terminate-then-retry test
+  // in this file — `run_ack_commit_connection_loss_test`'s own
+  // `retry_transient_query` (documented `docs/RECOVERY-EVIDENCE.md`,
+  // "Acknowledgement deadline") is the pattern this test was previously
+  // missing, which is exactly why it flaked under load: a plain,
+  // unretried call here could observe `QueryTimeout`/`ConnectionUnavailable`
+  // during that same window instead of the deterministic recovered state.
   let assert Ok(unique.Inserted(handle)) =
-    submit_keep_existing(
-      database,
-      test_queue,
-      submission_text,
-      worker_def,
-      1,
-      policy,
+    retry_transient_query(
+      fn() {
+        submit_keep_existing(
+          database,
+          test_queue,
+          submission_text,
+          worker_def,
+          1,
+          policy,
+        )
+      },
+      20,
     )
   count_jobs_in_queue(connection, test_queue) |> should.equal(1)
-  postgres.arguments(database, handle) |> should.equal(Ok(1))
+  retry_transient_query(fn() { postgres.arguments(database, handle) }, 20)
+  |> should.equal(Ok(1))
 
   mark_database_test_executed("unique-aborted-commit-is-commit-unknown-passed")
 }
@@ -12358,7 +13444,10 @@ pub fn postgres_acknowledged_observation_isolation_test() {
 fn run_acknowledged_observation_isolation_test(database_url: String) -> Nil {
   let pool_name = process.new_name("grind_ack_observation_isolation")
   let assert Ok(validated) =
-    postgres.settings(database_url, pool_name) |> postgres.validate
+    postgres.settings(database_url, pool_name)
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
+    |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
@@ -12412,7 +13501,7 @@ fn run_acknowledged_observation_isolation_test(database_url: String) -> Nil {
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_maximum_concurrency(2)
-    |> queue.with_lease_duration(300)
+    |> queue.with_lease_duration(6100)
     |> queue.validate_policy
   let assert Ok(consumer) =
     queue.start_manual_with_policy(database, workers, policy)
@@ -14946,19 +16035,30 @@ fn run_resolved_observation_commit_unknown_test(database_url: String) -> Nil {
   process.receive(signal, within: 0) |> should.equal(Error(Nil))
   drop_trigger()
 
-  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
+  // The pool just had a connection deliberately terminated
+  // (`terminate_backend`, above): `pgo_connection`'s own supervised restart
+  // of that connection is a real, transient recovery window, not a
+  // steady-state failure — see `retry_transient_query`'s other call sites
+  // (for example `run_unique_aborted_commit_test`) for the same pattern.
+  retry_transient_query(fn() { postgres.state(database, handle) }, 20)
+  |> should.equal(Ok(job.Uncertain))
 
   // Sentinel: a distinct job/resolution through the exact same producer, so
   // a stray event wrongly emitted for the commit-unknown job above (which
   // would carry *that* job's id) is caught as a mismatch here rather than
   // coincidentally matching.
-  postgres.resolve_uncertain(
-    database,
-    sentinel_handle,
-    "resolution-commit-unknown-sentinel-" <> suffix,
-    "on-call",
-    "aborted commit proof",
-    postgres.AuthorizeReplay,
+  retry_transient_query(
+    fn() {
+      postgres.resolve_uncertain(
+        database,
+        sentinel_handle,
+        "resolution-commit-unknown-sentinel-" <> suffix,
+        "on-call",
+        "aborted commit proof",
+        postgres.AuthorizeReplay,
+      )
+    },
+    20,
   )
   |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
   let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
@@ -15104,9 +16204,15 @@ fn run_cancellation_observation_absent_test(database_url: String) -> Nil {
     postgres.submit(database, "cancellation-absent", definition, 1)
   let assert Ok(other_handle) =
     postgres.submit(database, "cancellation-absent", definition, 2)
-  postgres.cancel(database, handle)
-  |> should.equal(Ok(postgres.CancelledBeforeRun))
 
+  // Attach *before* the first (genuinely emitting) cancellation, not after:
+  // `forwarder.emit` hands the event to a separate forwarder process that
+  // dispatches it asynchronously, so a handler attached immediately after
+  // an emitting call returns can still race that call's own not-yet-
+  // delivered event and wrongly observe it as if it belonged to a later,
+  // supposedly silent operation. Draining and asserting this first event
+  // ourselves — rather than starting from a subject that might already
+  // have it queued — removes that race entirely.
   let signal = process.new_subject()
   let assert Ok(id) = sinal.handler_id("grind-test-cancellation-absent")
   let assert Ok(attachment) =
@@ -15116,8 +16222,18 @@ fn run_cancellation_observation_absent_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { detach(attachment) })
 
   postgres.cancel(database, handle)
+  |> should.equal(Ok(postgres.CancelledBeforeRun))
+  let assert Ok(#(_, first_metadata)) = process.receive(signal, within: 5000)
+  first_metadata.ref.job_id |> should.equal(job.id_value(handle))
+
+  // `AlreadyCancelled` is read-only and commits nothing, so it must never
+  // emit — proven the same deterministic way as every other `_absent_`
+  // observation test in this file: a following genuine cancellation
+  // through the exact same producer must be the very next event on
+  // `signal`, not a bounded `receive(within: 0)` that cannot distinguish
+  // "genuinely never emitted" from "emitted, but not yet delivered".
+  postgres.cancel(database, handle)
   |> should.equal(Ok(postgres.AlreadyCancelled))
-  process.receive(signal, within: 0) |> should.equal(Error(Nil))
 
   postgres.cancel(database, other_handle)
   |> should.equal(Ok(postgres.CancelledBeforeRun))
@@ -15641,4 +16757,707 @@ fn run_claimed_precedes_acknowledged_test(database_url: String) -> Nil {
     process.receive(signal, within: 5000)
   claimed_attempt_id |> should.equal(acknowledged_attempt_id)
   mark_database_test_executed("claimed-precedes-acknowledged-ordering-passed")
+}
+
+// -- Decision A (2026-09-25): cross-version quarantine coverage -------------
+//
+// `docs/RELEASE-READINESS.md`, "Old-version executing rows". Before this
+// decision, a consumer's per-poll quarantine scan (`claim_one`, via
+// `quarantine_expired_in_queue`) only ever considered rows whose
+// `(worker_id, worker_version)` the polling consumer itself registered, so
+// after a worker-version bump an old version's still-`executing` row (its
+// consumer long gone) was never quarantined by anything: the new consumer's
+// scan skipped it (unregistered identity), and nothing else ever looked at
+// it. The fix drops that identity filter from the per-queue scan entirely —
+// quarantining never decodes or runs code, so there is no reason to gate it
+// on registration — and adds a public, storage-owner-wide
+// `postgres.quarantine_expired` for a queue no consumer polls at all.
+
+/// (i) A job claimed under worker version `v1`, whose consumer is long gone,
+/// still gets quarantined by a *different* consumer that now only registers
+/// `v2` of the same worker id, once its lease has expired — proving the
+/// per-queue scan no longer restricts itself to registered identities.
+pub fn postgres_quarantine_covers_unregistered_worker_version_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_quarantine_covers_unregistered_worker_version_test(database_url)
+  }
+}
+
+fn run_quarantine_covers_unregistered_worker_version_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_quarantine_old_version_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let worker_id = "old-version.echo-" <> suffix
+  let worker_v1 = unique_test_worker_versioned(worker_id, "v1")
+  let worker_v2 = unique_test_worker_versioned(worker_id, "v2")
+  let test_queue = "old-version-quarantine-" <> suffix
+
+  let assert Ok(handle) = postgres.submit(database, test_queue, worker_v1, 1)
+  let connection = pog.named_connection(pool_name)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = 1, attempt_owner = 'retired-v1-consumer', lease_expires_at = clock_timestamp() WHERE worker_id = $1 AND worker_version = 'v1' AND queue = $2",
+    )
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(test_queue))
+    |> pog.execute(on: connection)
+
+  // Only `v2` is ever registered from here on — the `v1` consumer that
+  // claimed this row is gone for good, exactly as after a worker-version
+  // bump. Nothing in this registry can ever claim the `v1` row, but this
+  // consumer's own quarantine scan must still see it.
+  let assert Ok(workers_v2) = registry.new(test_queue)
+  let assert Ok(workers_v2) = registry.register(workers_v2, worker_v2)
+  let assert Ok(consumer) = queue.start_manual(database, workers_v2)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
+  postgres.outcome(database, handle)
+  |> should.equal(
+    Ok(job.ReconciliationRequired(
+      "expired attempt requires outcome reconciliation",
+    )),
+  )
+  mark_database_test_executed(
+    "quarantine-covers-unregistered-worker-version-passed",
+  )
+}
+
+/// (ii) The public, storage-owner-wide `quarantine_expired` sweeps an
+/// expired `executing` row in a queue no consumer ever polls at all — the
+/// per-queue scan above only ever runs as part of some consumer's own
+/// `claim_one`, so a queue nothing polls needs this separate operation. Also
+/// proves `limit` validation and bounding (a non-positive limit is rejected
+/// before touching storage, and a limit smaller than the number of expired
+/// rows quarantines only that many, idempotent to call again for the
+/// remainder), that the sweep genuinely crosses queues (two different
+/// unpolled queues, one row each, both eventually quarantined), and that
+/// the `[grind, job, quarantined]` observation's own `queue` field names
+/// each row's real queue — never a hardcoded or swapped one — since the
+/// global sweep, unlike the per-queue scan, spans more than one queue in a
+/// single call.
+///
+/// Runs against a database dedicated to this test alone
+/// (`GRIND_TEST_QUARANTINE_URL`), not the shared `GRIND_TEST_DATABASE_URL`:
+/// `quarantine_expired` sweeps every expired `executing` row for its whole
+/// storage owner, and storage owner is derived from `host:port/database`
+/// (`postgres.validate`), so sharing a database with dozens of other tests
+/// would make this test's own row/observation counts depend on whatever
+/// unrelated expired rows those other tests happen to leave behind at the
+/// moment this one runs — a dedicated database is a dedicated storage
+/// owner, immune to that ordering.
+pub fn postgres_quarantine_expired_global_operation_test() {
+  case quarantine_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_quarantine_expired_global_test(database_url)
+  }
+}
+
+fn run_quarantine_expired_global_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_quarantine_global_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+
+  let worker_def = unique_test_worker("unpolled-queue.echo-" <> suffix)
+  let queue_a = "unpolled-quarantine-a-" <> suffix
+  let queue_b = "unpolled-quarantine-b-" <> suffix
+
+  let assert Ok(first) = postgres.submit(database, queue_a, worker_def, 1)
+  let assert Ok(second) = postgres.submit(database, queue_b, worker_def, 2)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE grind_jobs SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = 1, attempt_owner = 'no-consumer-ever-polled', lease_expires_at = clock_timestamp() WHERE id = ANY($1::bigint[])",
+    )
+    |> pog.parameter(
+      pog.array(pog.int, [job.id_value(first), job.id_value(second)]),
+    )
+    |> pog.execute(on: connection)
+
+  let signal = process.new_subject()
+  let assert Ok(handler_id) =
+    sinal.handler_id("grind-test-quarantine-global-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(
+      handler_id,
+      observation.quarantined(),
+      fn(measurements, metadata) {
+        process.send(signal, #(measurements, metadata))
+      },
+    )
+  use <- exception.defer(fn() { detach(attachment) })
+
+  postgres.quarantine_expired(database, limit: 0)
+  |> should.equal(Error(postgres.NonPositiveLimit))
+  postgres.quarantine_expired(database, limit: -1)
+  |> should.equal(Error(postgres.NonPositiveLimit))
+  postgres.state(database, first) |> should.equal(Ok(job.Executing))
+  postgres.state(database, second) |> should.equal(Ok(job.Executing))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  postgres.quarantine_expired(database, limit: 1) |> should.equal(Ok(1))
+  let assert Ok(#(measurements_one, metadata_one)) =
+    process.receive(signal, within: 5000)
+  measurements_one
+  |> should.equal(observation.QuarantinedMeasurements(count: 1))
+  let states_after_one = [
+    postgres.state(database, first),
+    postgres.state(database, second),
+  ]
+  list.count(states_after_one, fn(state) { state == Ok(job.Uncertain) })
+  |> should.equal(1)
+  list.count(states_after_one, fn(state) { state == Ok(job.Executing) })
+  |> should.equal(1)
+  // Whichever row the sweep picked first (by `id`, not scoped to either
+  // queue), the observation's own `queue` field must name that exact row's
+  // real queue.
+  case metadata_one.ref.job_id == job.id_value(first) {
+    True -> metadata_one.ref.queue |> should.equal(queue_a)
+    False -> {
+      metadata_one.ref.job_id |> should.equal(job.id_value(second))
+      metadata_one.ref.queue |> should.equal(queue_b)
+    }
+  }
+
+  postgres.quarantine_expired(database, limit: 10) |> should.equal(Ok(1))
+  let assert Ok(#(_, metadata_two)) = process.receive(signal, within: 5000)
+  postgres.state(database, first) |> should.equal(Ok(job.Uncertain))
+  postgres.state(database, second) |> should.equal(Ok(job.Uncertain))
+  case metadata_two.ref.job_id == job.id_value(first) {
+    True -> metadata_two.ref.queue |> should.equal(queue_a)
+    False -> {
+      metadata_two.ref.job_id |> should.equal(job.id_value(second))
+      metadata_two.ref.queue |> should.equal(queue_b)
+    }
+  }
+  // The sweep genuinely crossed queues -- both distinct queues were the
+  // subject of one event each, not both events reporting the same queue.
+  list.contains([metadata_one.ref.queue, metadata_two.ref.queue], queue_a)
+  |> should.equal(True)
+  list.contains([metadata_one.ref.queue, metadata_two.ref.queue], queue_b)
+  |> should.equal(True)
+
+  // Nothing left to quarantine now.
+  postgres.quarantine_expired(database, limit: 10) |> should.equal(Ok(0))
+  process.receive(signal, within: 0) |> should.equal(Error(Nil))
+
+  mark_database_test_executed("quarantine-expired-global-operation-passed")
+}
+
+// -- Decision B (2026-09-25): retry-safe plain submit (`submit_with_id`) ----
+//
+// `docs/RELEASE-READINESS.md`, "Retry-safe plain submit", and
+// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts". Plain `submit`/
+// `submit_at` have no request identity, so a caller that retries after
+// `SubmitQueryFailed` (which may itself have committed) risks a duplicate
+// row. `submit_with_id` reuses `submit_unique`'s own admission receipt,
+// request fingerprint, and reconciliation machinery through a "no policy"
+// path in `grind/internal/unique_admission` — no uniqueness key, no
+// candidate selection, no conflict decision, always `Inserted` once
+// resolved.
+
+/// `submit_with_id` under `Immediately`, the shape every test below needs.
+fn submit_with_id_immediately(
+  database: postgres.Database,
+  queue: String,
+  id_text: String,
+  worker_def: worker.Worker(input, output, error),
+  input: input,
+) -> Result(
+  unique.Admission(input, output, error),
+  unique.SubmitError(input, output, error),
+) {
+  let assert Ok(submission) = unique.submission_id(id_text)
+  postgres.submit_with_id(
+    database,
+    queue,
+    submission,
+    worker_def,
+    input,
+    unique.Immediately,
+  )
+}
+
+pub fn postgres_submit_with_id_first_submit_inserted_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_with_id_first_submit_test(database_url)
+  }
+}
+
+fn run_submit_with_id_first_submit_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_submit_with_id_first_" <> suffix,
+  )
+  let worker_def = unique_test_worker("plain-first.echo-" <> suffix)
+  let test_queue = "plain-first-" <> suffix
+  let submission_text = "plain-first-" <> suffix
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      7,
+    )
+  postgres.arguments(database, handle) |> should.equal(Ok(7))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+  mark_database_test_executed("submit-with-id-first-submit-inserted-passed")
+}
+
+pub fn postgres_submit_with_id_same_request_retry_returns_original_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_with_id_retry_test(database_url)
+  }
+}
+
+fn run_submit_with_id_retry_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_submit_with_id_retry_" <> suffix,
+  )
+  let worker_def = unique_test_worker("plain-retry.echo-" <> suffix)
+  let test_queue = "plain-retry-" <> suffix
+  let submission_text = "plain-retry-" <> suffix
+
+  let assert Ok(unique.Inserted(first_handle)) =
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      11,
+    )
+  let assert Ok(unique.Inserted(retry_handle)) =
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      11,
+    )
+  job.id_value(first_handle) |> should.equal(job.id_value(retry_handle))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+  mark_database_test_executed("submit-with-id-retry-returns-original-passed")
+}
+
+pub fn postgres_submit_with_id_different_input_same_id_conflict_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_submit_with_id_different_input_conflict_test(database_url)
+  }
+}
+
+fn run_submit_with_id_different_input_conflict_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_submit_with_id_conflict_" <> suffix,
+  )
+  let worker_def = unique_test_worker("plain-conflict.echo-" <> suffix)
+  let test_queue = "plain-conflict-" <> suffix
+  let submission_text = "plain-conflict-" <> suffix
+
+  let assert Ok(unique.Inserted(_)) =
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      1,
+    )
+  submit_with_id_immediately(
+    database,
+    test_queue,
+    submission_text,
+    worker_def,
+    2,
+  )
+  |> should.equal(Error(unique.SubmissionConflict))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+  mark_database_test_executed("submit-with-id-different-input-conflict-passed")
+}
+
+/// A genuinely committed plain admission whose reply is lost after
+/// PostgreSQL has already committed locally (the same SyncRep-park-then-
+/// terminate mechanism Increment 2/11 use), scoped on `grind_unique_submissions`
+/// by `submission_id` — the same receipt table `submit_unique` uses, since
+/// `submit_with_id` reuses it directly. `submit_with_id` itself still
+/// returns `Ok(Inserted(handle))`, resolved by the shared `run`'s own
+/// follow-up receipt lookup (the identical code `submit_unique` runs
+/// through), not a `CommitUnknown` the caller must separately reconcile.
+pub fn postgres_submit_with_id_committed_reply_lost_returns_inserted_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_submit_with_id_committed_reply_lost_test(database_url)
+  }
+}
+
+fn run_submit_with_id_committed_reply_lost_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  let pool_name = process.new_name("grind_submit_with_id_reply_lost_" <> suffix)
+  let assert Ok(validated) =
+    postgres.settings(database_url, pool_name) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let connection = pog.named_connection(pool_name)
+  require_syncrep_cluster_configured(connection)
+
+  let worker_def = unique_test_worker("plain-reply-lost-" <> suffix)
+  let test_queue = "plain-reply-lost-" <> suffix
+  let submission_text = "plain-reply-lost-" <> suffix
+
+  use <- exception.defer(install_syncrep_reply_trigger(
+    connection,
+    "grind_test_plain_reply_lost_" <> suffix,
+    "grind_unique_submissions",
+    "NEW.submission_id = '" <> submission_text <> "'",
+  ))
+
+  let reply = process.new_subject()
+  spawn_submit(reply, fn() {
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      5,
+    )
+  })
+
+  let assert Ok(backend_pid) = wait_for_syncrep_trigger_backend(connection, 300)
+  terminate_backend(connection, backend_pid) |> should.equal(True)
+
+  let assert Ok(Ok(unique.Inserted(handle))) =
+    process.receive(reply, within: 10_000)
+  backend_pid_is_alive(connection, backend_pid) |> should.equal(False)
+
+  postgres.arguments(database, handle) |> should.equal(Ok(5))
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+  unique_receipt_exists(
+    connection,
+    postgres.storage_owner(database),
+    submission_text,
+  )
+  |> should.equal(True)
+
+  mark_database_test_executed(
+    "submit-with-id-committed-reply-lost-inserted-passed",
+  )
+}
+
+/// The exact query text `insert_job` (`grind/internal/unique_admission`)
+/// issues for a `policy: None` request, as a `LIKE` prefix for
+/// `await_overlap_shape`/`pg_stat_activity` — the "no policy" counterpart to
+/// `unique_insert_query_like` above (that one has the trailing
+/// `unique_key_contract, unique_key_sha256` columns this one omits).
+const plain_insert_query_like = "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at) VALUES%"
+
+/// Two concurrent `submit_with_id` callers, same `SubmissionId` and
+/// identical request, forced to actually overlap: a `BEFORE INSERT` barrier
+/// trigger (`install_unique_insert_barrier`, the same mechanism the
+/// uniqueness-admission overlap tests use) blocks both callers' own
+/// `grind_jobs` insert behind one held advisory lock until both are
+/// genuinely waiting, proven by `pg_stat_activity` rather than timing. There
+/// is no domain-wide advisory lock on this "no policy" path (see
+/// `admission_transaction`'s doc comment in
+/// `grind/internal/unique_admission.gleam`), so releasing the barrier lets
+/// whichever caller happens to proceed first commit its row and receipt;
+/// the other's own `record_receipt` then hits a real `23505` against that
+/// just-committed receipt, which the shared `run` resolves by re-reading
+/// the exact same receipt rather than surfacing a bare conflict for what
+/// is, from that caller's perspective, an ordinary successful retry. Both
+/// callers converge on `Inserted` with the same job id, and exactly one row
+/// is ever persisted.
+pub fn postgres_submit_with_id_concurrent_same_id_one_row_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_submit_with_id_concurrent_test(database_url)
+  }
+}
+
+fn run_submit_with_id_concurrent_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_submit_with_id_concurrent_" <> suffix,
+  )
+  let worker_id = "plain-concurrent.echo-" <> suffix
+  let worker_def = unique_test_worker_versioned(worker_id, "v1")
+  let test_queue = "plain-concurrent-" <> suffix
+  let submission_text = "plain-concurrent-" <> suffix
+
+  let lock_key = unique_test_lock_key(0)
+  let cleanup_trigger =
+    install_unique_insert_barrier(
+      connection,
+      "grind_test_plain_concurrent_" <> suffix,
+      worker_id,
+      lock_key,
+    )
+  use <- exception.defer(cleanup_trigger)
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_plain_concurrent_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      42,
+    )
+  })
+  spawn_submit(result_b, fn() {
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      42,
+    )
+  })
+
+  await_overlap_shape(
+    connection,
+    plain_insert_query_like,
+    plain_insert_query_like,
+    2,
+    2,
+    500,
+  )
+  |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 10_000)
+  let assert Ok(outcome_b) = process.receive(result_b, within: 10_000)
+
+  case outcome_a, outcome_b {
+    Ok(unique.Inserted(handle_a)), Ok(unique.Inserted(handle_b)) ->
+      job.id_value(handle_a) |> should.equal(job.id_value(handle_b))
+    _, _ -> should.fail()
+  }
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed("submit-with-id-concurrent-one-row-passed")
+}
+
+/// The same barrier-forced overlap as
+/// `postgres_submit_with_id_concurrent_same_id_one_row_test` above, but the
+/// two concurrent callers submit *different* inputs under the identical
+/// `SubmissionId`. Whichever the barrier releases first commits and is
+/// `Inserted`; the other's own `record_receipt` still hits the same real
+/// `23505` against that just-committed receipt, but this time
+/// `reconcile_from_receipt`'s fingerprint check does not match (different
+/// `encoded_input`, hence a different `request_sha256`) — it stays
+/// `SubmissionConflict` rather than converging, exactly like a sequential
+/// different-input-same-id retry, and exactly one row is ever persisted.
+pub fn postgres_submit_with_id_concurrent_different_input_conflict_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_submit_with_id_concurrent_different_input_test(database_url)
+  }
+}
+
+fn run_submit_with_id_concurrent_different_input_test(
+  database_url: String,
+) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, connection <- with_unique_database(
+    database_url,
+    "grind_submit_with_id_concurrent_diff_" <> suffix,
+  )
+  let worker_id = "plain-concurrent-diff.echo-" <> suffix
+  let worker_def = unique_test_worker_versioned(worker_id, "v1")
+  let test_queue = "plain-concurrent-diff-" <> suffix
+  let submission_text = "plain-concurrent-diff-" <> suffix
+
+  let lock_key = unique_test_lock_key(1)
+  let cleanup_trigger =
+    install_unique_insert_barrier(
+      connection,
+      "grind_test_plain_concurrent_diff_" <> suffix,
+      worker_id,
+      lock_key,
+    )
+  use <- exception.defer(cleanup_trigger)
+
+  let acquire_query =
+    pog.query(
+      "SELECT true FROM (SELECT pg_advisory_xact_lock($1)) AS grind_test_plain_concurrent_diff_barrier",
+    )
+    |> pog.parameter(pog.int(lock_key))
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection, acquire_query)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
+
+  let result_a = process.new_subject()
+  let result_b = process.new_subject()
+  spawn_submit(result_a, fn() {
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      42,
+    )
+  })
+  spawn_submit(result_b, fn() {
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      99,
+    )
+  })
+
+  await_overlap_shape(
+    connection,
+    plain_insert_query_like,
+    plain_insert_query_like,
+    2,
+    2,
+    500,
+  )
+  |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
+  let assert Ok(outcome_a) = process.receive(result_a, within: 10_000)
+  let assert Ok(outcome_b) = process.receive(result_b, within: 10_000)
+
+  let inserted =
+    list.filter_map([outcome_a, outcome_b], fn(outcome) {
+      case outcome {
+        Ok(unique.Inserted(handle)) -> Ok(handle)
+        _ -> Error(Nil)
+      }
+    })
+  let conflicts =
+    list.filter([outcome_a, outcome_b], fn(outcome) {
+      outcome == Error(unique.SubmissionConflict)
+    })
+  list.length(inserted) |> should.equal(1)
+  list.length(conflicts) |> should.equal(1)
+  count_jobs_in_queue(connection, test_queue) |> should.equal(1)
+
+  mark_database_test_executed(
+    "submit-with-id-concurrent-different-input-conflict-passed",
+  )
+}
+
+/// `submit_with_id`'s own `[grind, job, admitted]` observation: `Some`
+/// `submission_id`, `Replied` on the first genuine commit, `Reconciled` on a
+/// same-id/same-request replay resolved from the receipt without a fresh
+/// write — the same contract `submit_unique`'s admitted observation already
+/// has (`postgres_admitted_observation_unique_inserted_and_reconciled_test`),
+/// proven here for the "no policy" path.
+pub fn postgres_admitted_observation_submit_with_id_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_admitted_observation_submit_with_id_test(database_url)
+  }
+}
+
+fn run_admitted_observation_submit_with_id_test(database_url: String) -> Nil {
+  let suffix = unique_test_suffix()
+  use database, _connection <- with_unique_database(
+    database_url,
+    "grind_admitted_submit_with_id_" <> suffix,
+  )
+  let worker_def = unique_test_worker("admitted.submit-with-id-" <> suffix)
+  let test_queue = "admitted-submit-with-id-" <> suffix
+  let submission_text = "admitted-submit-with-id-" <> suffix
+
+  let signal = process.new_subject()
+  let assert Ok(id) =
+    sinal.handler_id("grind-test-admitted-submit-with-id-" <> suffix)
+  let assert Ok(attachment) =
+    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  let assert Ok(unique.Inserted(handle)) =
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      3,
+    )
+  let assert Ok(#(_, first_metadata)) = process.receive(signal, within: 5000)
+  first_metadata.ref.job_id |> should.equal(job.id_value(handle))
+  first_metadata.submission_id |> should.equal(Some(submission_text))
+  first_metadata.confirmation |> should.equal(observation.Replied)
+  first_metadata.committed_state |> should.equal(job.Queued)
+  let assert Some(_) = first_metadata.available_at_unix_ms
+
+  let assert Ok(unique.Inserted(replayed)) =
+    submit_with_id_immediately(
+      database,
+      test_queue,
+      submission_text,
+      worker_def,
+      3,
+    )
+  job.id_value(replayed) |> should.equal(job.id_value(handle))
+  let assert Ok(#(_, second_metadata)) = process.receive(signal, within: 5000)
+  second_metadata.ref.job_id |> should.equal(job.id_value(handle))
+  second_metadata.submission_id |> should.equal(Some(submission_text))
+  second_metadata.confirmation |> should.equal(observation.Reconciled)
+  second_metadata.available_at_unix_ms |> should.equal(None)
+
+  mark_database_test_executed("admitted-observation-submit-with-id-passed")
 }

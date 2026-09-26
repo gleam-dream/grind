@@ -176,6 +176,54 @@ pub type StartError {
   QueueSupervisorStartFailed(actor.StartError)
   QueueActorHandoffFailed
   QueueSupervisorStopTimedOut
+  /// `lease_duration_ms` is too short relative to `database`'s own
+  /// `postgres.Settings.statement_deadline_ms` (`D`) for the coordinator's
+  /// own recovery machinery to have a real chance to act before the lease
+  /// lapses. Derivation: a live attempt's own renewal timer fires every
+  /// `L / 3` (`renewal_interval_ms`, `start_with_policy`), so after a
+  /// renewal succeeds there is `L - L / 3 = (2 / 3) * L` of slack before
+  /// that same lease would otherwise expire. The coordinator's single
+  /// message loop can block for up to roughly `3 * D` retrying one pending
+  /// acknowledgement (`ConsumerState.pending_ack_retry_budget`, ~3 ticks),
+  /// during which a *sibling* attempt's own renewal tick sits queued behind
+  /// it before it can even start; that renewal call is itself now bounded
+  /// by `D`. At `maximum_concurrency > 1`, the slack must cover both: `(2 /
+  /// 3) * L >= 3 * D + D` gives `L >= 6 * D`, with *zero* margin left at
+  /// that exact minimum (the queued renewal starts the instant the stall
+  /// clears and takes the full `D` to finish, landing exactly at the
+  /// lease's own expiry). At `maximum_concurrency` of exactly 1 there is no
+  /// sibling to queue behind anything, so only the renewal's own `D` needs
+  /// to fit: `(2 / 3) * L >= D` gives `L >= 1.5 * D`, again with zero margin
+  /// at that minimum. `attempted` is the lease this call was given;
+  /// `minimum_ms` is the smallest lease that would have passed. Neither
+  /// bound carries any margin beyond exact algebraic sufficiency — a real
+  /// deployment should clear it with real headroom (the shipped
+  /// `default_policy` lease of 30000 clears the `maximum_concurrency > 1`
+  /// minimum of `6 * 4000 = 24000` by 6000ms, `1.5 * D`, not by design
+  /// margin baked into the rule itself).
+  /// Known limit even once this rule passes, assumed away by the derivation
+  /// above ("at most one stalled message ahead"): at `maximum_concurrency >
+  /// 2`, more than one sibling's renewal can queue up behind the same
+  /// stalled acknowledgement, each then also waiting out however many
+  /// siblings' own `D`-bounded renewal calls are queued ahead of it —
+  /// `3 * D + (N - 1) * D` for the `N`-th sibling in that queue, not the
+  /// `3 * D + D` this rule accounts for. The real fix is moving renewals off
+  /// the coordinator's own loop entirely (tracked in
+  /// `docs/RELEASE-READINESS.md`, "Decide on per-attempt storage calls").
+  LeaseTooShortForDeadline(attempted: Int, minimum_ms: Int)
+}
+
+/// The lease-rule minimum for `maximum_concurrency` and a storage deadline
+/// `D` (`postgres.statement_deadline_ms`) — see `LeaseTooShortForDeadline`.
+@internal
+pub fn minimum_lease_for_deadline(
+  maximum_concurrency: Int,
+  statement_deadline_ms: Int,
+) -> Int {
+  case maximum_concurrency > 1 {
+    True -> 6 * statement_deadline_ms
+    False -> 3 * statement_deadline_ms / 2
+  }
 }
 
 pub type StopError {
@@ -455,10 +503,22 @@ fn start_consumer(
   auto_poll: Bool,
 ) -> Result(Consumer, StartError) {
   let queue_name = registry.queue(workers)
-  case queue_name == "", registry.identities(workers) {
-    True, _ -> Error(RegistryQueueMismatch)
-    False, [] -> Error(NoRegisteredWorkers)
-    False, _ ->
+  let ValidatedPolicy(maximum_concurrency:, lease_duration_ms:, ..) = policy
+  let minimum_lease_ms =
+    minimum_lease_for_deadline(
+      maximum_concurrency,
+      postgres.statement_deadline_ms(database),
+    )
+  case
+    queue_name == "",
+    registry.identities(workers),
+    lease_duration_ms < minimum_lease_ms
+  {
+    True, _, _ -> Error(RegistryQueueMismatch)
+    False, [], _ -> Error(NoRegisteredWorkers)
+    False, _, True ->
+      Error(LeaseTooShortForDeadline(lease_duration_ms, minimum_lease_ms))
+    False, _, False ->
       start_configured_consumer(
         database,
         workers,

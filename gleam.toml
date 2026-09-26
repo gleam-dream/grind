@@ -10,7 +10,8 @@ repository = { type = "github", user = "gleam-dream", repo = "grind" }
 gleam_stdlib = ">= 0.70.0 and < 1.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
-pog = ">= 4.1.0 and < 5.0.0"
+pog = ">= 4.1.0 and < 4.2.0"
+pgo = ">= 0.20.0 and < 0.21.0"
 gleam_json = ">= 3.1.0 and < 4.0.0"
 exception = ">= 2.1.1 and < 3.0.0"
 sinal = { path = "../sinal" }
@@ -19,3 +20,4 @@ sinal = { path = "../sinal" }
 gleeunit = ">= 1.0.0 and < 2.0.0"
 squirrel = ">= 4.7.0 and < 5.0.0"
 simplifile = ">= 2.7.0 and < 3.0.0"
+cigogne = ">= 5.0.6 and < 6.0.0"

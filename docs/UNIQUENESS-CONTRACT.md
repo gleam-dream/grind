@@ -267,7 +267,13 @@ pub fn submit_unique(database, queue, submission_id, worker, input, availability
   -> Result(unique.Admission(i, o, e), unique.SubmitError(i, o, e))
 pub fn reconcile_unique(database, pending) -> Result(unique.Admission(i, o, e), unique.SubmitError(i, o, e))
 pub fn unique_lock_wait(settings: Settings, milliseconds: Int) -> Settings
+pub fn submit_with_id(database, queue, submission_id, worker, input, availability)
+  -> Result(unique.Admission(i, o, e), unique.SubmitError(i, o, e))
 ```
+
+`submit_with_id` (approved contract decision, 2026-09-25 — "Retry-safe plain
+submit") is a _second_ entry point into the same admission machinery, with
+no uniqueness policy at all: see "Admission receipts" below.
 
 `ConflictAction`'s reschedule target lives on the action itself
 (`RescheduleScheduledTo(job.AvailableAt)`), not as a separate combination of
@@ -687,5 +693,132 @@ nested projected value), and public-API consumer coverage of admission,
 existing-conflict rebinding, `SubmissionId` replay, and an across-queue
 reschedule — increments 4 through 13 of the same approved plan — are now
 covered; see "Status". This milestone is otherwise complete. Converging
-plain `submit`/`submit_at` onto `unique.Availability` instead of
-`Option(job.AvailableAt)` remains retained backlog, noted in Decision 5.
+plain `submit`/`submit_at` (the ID-less pair) onto `unique.Availability`
+instead of `Option(job.AvailableAt)` remains retained backlog, noted in
+Decision 5 — `submit_with_id` below already takes `unique.Availability`.
+
+## Admission receipts (approved contract decision, 2026-09-25)
+
+`postgres.submit_with_id(database, queue, submission_id, worker, input,
+availability)` gives a plain admission — no uniqueness key, no policy — the
+same retry safety `submit_unique` has, by reusing its admission receipt,
+request fingerprint, and reconciliation machinery: `submit_with_id` calls
+`grind/internal/unique_admission.submit_plain`, a thin entry point that
+builds the same internal `Request` `submit_unique` does with `policy: None`,
+then runs through the identical `run`/`admission_transaction`/`insert_job`
+functions `submit_unique` uses with `policy: Some(_)` — one admission
+transaction, not a duplicated implementation. It returns the same
+`unique.Admission`/
+`unique.SubmitError` family `submit_unique` does: `Inserted` on this call's
+own first commit, or on a matching replay; `SubmissionConflict` for a
+different request reusing the same id; `CommitUnknown` (recoverable with
+`reconcile_unique`, or a plain retry of the same `SubmissionId`) when this
+call's own outcome could not be established. `submit_unique`'s
+`Existing`/`Rescheduled` variants never occur here — there is no policy to
+conflict against, so every resolved call is `Inserted`.
+
+**Request fingerprint envelope.** The shared `fingerprint` function
+(`grind/internal/unique_admission`) tags its envelope
+`"grind-plain-request-v1"` when `Request.policy` is `None` and
+`"grind-unique-request-v1"` when it is `Some`; a `None` envelope carries no
+key, scope, period, states, or conflict-action fields at all: queue, worker
+id/version, input codec version and JSON, availability, the worker's output
+and error codec versions, and max attempts. The distinct tag is load-bearing,
+not decorative — it is what makes a `SubmissionId` accidentally reused
+between `submit_with_id` and `submit_unique` (or between two calls that
+differ only in whether a policy was supplied) fingerprint-mismatch and
+report `SubmissionConflict`, rather than silently replaying a decision from
+the wrong kind of admission. `grind_unique_submissions` itself needs no
+schema change to hold either kind of receipt: the table already carries no
+key material, only the identity, fingerprint, and outcome both request
+shapes share (see `record_receipt`, which both `submit_unique` and
+`submit_with_id` call with the same small `ReceiptWrite` record rather than
+a policy-bearing `Request`).
+
+**One admission transaction, not two.** `submit_unique` and `submit_with_id`
+build the same internal `Request` (`grind/internal/unique_admission`), whose
+`policy` field is `Option(PolicyPart)` — `Some` for a uniqueness policy,
+`None` for `submit_with_id`. `run`/`admission_transaction`/`insert_job` are
+single functions shared by both, not two parallel implementations: the
+domain-wide advisory lock and candidate selection run only when `policy` is
+`Some`; a `None` request goes straight from the receipt lookup to an insert
+with `NULL` key columns. There is no separate "plain" transaction function
+to drift out of sync with the policy-bearing one.
+
+**No domain-wide advisory lock for a `None` request — locking decision and
+justification.** `submit_unique` locks `pg_advisory_xact_lock` on the
+uniqueness key's own domain (storage owner, worker id/version, key
+contract, key digest) because its candidate selection must serialize
+against every other submitter of that same key, regardless of
+`SubmissionId`. A `None` request has no key and no candidate selection at
+all — the only correctness property it needs is "the same `SubmissionId`
+never produces two rows," and that is already provided, with no additional
+lock, by PostgreSQL's own unique-index insertion semantics on
+`grind_unique_submissions`'s primary key (`storage_owner`,
+`submission_id`): when two concurrent transactions attempt to insert a
+receipt under the same key, the second blocks on the first's
+still-uncommitted row (an ordinary tuple lock wait, not a deadlock — any
+number of concurrent writers of the same `SubmissionId` can queue on that
+row this way, one at a time; it is not limited to two, only serialized),
+then either finds no committed conflict (the first rolled back) and
+proceeds, or hits a genuine `23505` once the first commits. That `23505`
+rolls back the whole second transaction — `transaction_or_checkout_failure`
+(`grind_postgres_ffi.erl`) reports it as `TransactionRolledBack`, and `run`
+maps that outcome the same way regardless of `policy` — including its own
+now-orphaned `grind_jobs` insert, so a duplicate row can never survive the
+race regardless of which of the two commits first. `set_lock_timeout` (the
+same `unique_lock_wait_ms` setting `submit_unique` uses) is still applied
+in `admission_transaction` for every request regardless of `policy`, purely
+to bound that internal wait the same way every other lock wait in this
+module is bounded — PostgreSQL's tuple-lock wait during unique-index
+insertion honors `lock_timeout` exactly like an explicit lock acquisition,
+surfacing as `AdmissionContended` on expiry rather than hanging.
+
+That leaves one asymmetry for a `None` request, documented rather than
+hidden: because there is no domain lock forcing a losing concurrent
+submitter's own receipt lookup to happen _after_ the winner has already
+committed (the way a `Some` request's lock-then-find-receipt ordering
+guarantees), a genuinely concurrent same-id, same-request race can reach
+`record_receipt` on both sides. The loser's insert then fails with a real
+`23505` against the winner's now-committed receipt. Rather than surface that
+bare `SubmissionConflict` to a caller retrying an otherwise perfectly valid
+identical request, `run`'s `TransactionRolledBack(SubmissionConflict)` arm
+(present for both `policy` cases — see "One admission transaction, not two"
+above, and its own doc comment for why this is harmless for a `Some`
+request) resolves it exactly like the existing `TransactionQueryError`
+fallback already does: it re-reads the exact same receipt with
+`reconcile_from_receipt`, which resolves to that receipt's own recorded
+`Inserted` when the fingerprint matches (the concurrent-race case) and
+stays `SubmissionConflict` when it does not (a genuinely different request
+reusing the id) — the identical distinction `reconcile_from_receipt` already
+draws for every other caller.
+Proven against a real, barrier-forced overlap (the same `BEFORE INSERT`
+advisory-lock trigger `install_unique_insert_barrier` uses for the
+uniqueness-admission overlap tests, applied to the plain path's own
+`grind_jobs` insert): two concurrent `submit_with_id` callers, identical
+`SubmissionId` and request, forced to both reach their own blocked insert
+before either proceeds — both converge on `Inserted` with the same job id,
+and exactly one row is ever persisted
+(`postgres_submit_with_id_concurrent_same_id_one_row_test`). Proven by
+mutation: removing the `TransactionRolledBack(SubmissionConflict)` arm from
+that fallback reproduces the bug in exactly that one test (the loser then
+surfaces a bare `SubmissionConflict` instead of converging) with zero effect
+on any other test in the suite — a precisely localized fault, not a change
+to shared machinery.
+
+**Tests** (`test/grind_test.gleam`): first submit `Inserted`
+(`postgres_submit_with_id_first_submit_inserted_test`); a same-id,
+same-request retry after a genuine commit returns the original job id with
+no second row (`postgres_submit_with_id_same_request_retry_returns_original_test`);
+a different input under the same id is `SubmissionConflict`, one row
+(`postgres_submit_with_id_different_input_same_id_conflict_test`); a
+genuinely committed admission whose reply is lost after PostgreSQL already
+committed locally (the same SyncRep-park-then-terminate mechanism as
+Increment 11, scoped by `submission_id` on the shared
+`grind_unique_submissions` table) still returns `Ok(Inserted(handle))`
+directly (`postgres_submit_with_id_committed_reply_lost_returns_inserted_test`);
+and the barrier-forced concurrent-same-id test above. One public-imports-only
+consumer test (`consumer/test/grind_consumer_test.gleam`,
+`public_consumer_submit_with_id_retry_test`) proves the same retry
+convergence, a different-input conflict, and a claimed/acknowledged run
+through only Grind's public API.

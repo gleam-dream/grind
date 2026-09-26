@@ -3840,3 +3840,1022 @@ failures; the pinned Oban oracle harness and `gleam run -m squirrel check`
 both green; every contract marker in both `for contract in ...` loops
 present. `gleam check` (root and `consumer/`), `nix fmt`, and `nix flake
 check` all clean; `git diff --check` reports no whitespace errors.
+
+## Increment 14 — cross-version quarantine coverage and retry-safe plain submit (approved contract decisions, 2026-09-25; unified after independent review)
+
+### Claim: a consumer's own per-queue quarantine scan covers an expired executing row left by a worker version no consumer currently registers
+
+- **Test**: `postgres_quarantine_covers_unregistered_worker_version_test`
+  (`test/grind_test.gleam`; marker
+  `quarantine-covers-unregistered-worker-version-passed`).
+- **Fault injection**: a job is submitted under worker `v1`, then forced
+  directly to `executing` with an already-expired lease (`lease_expires_at =
+clock_timestamp()`, the same direct-`UPDATE` shape every other quarantine
+  test in this file uses) and an owner naming a consumer that no longer
+  exists. Only worker `v2` of the same worker id is registered from then on,
+  through a fresh `queue.start_manual` consumer — nothing in that registry
+  can ever claim the `v1` row.
+- **Genuine red against the real pre-fix filter**: the original bug was
+  reproduced exactly, not with a literal stand-in. `quarantine_expired_in_queue`
+  and its caller `claim_one` were temporarily reverted (via `Edit`, not `git
+checkout`) to the real pre-fix shape: `quarantine_expired_in_queue` took an
+  `identities: List(#(String, String))` parameter, `claim_one` passed
+  `registry.identities(workers)`, and the candidate `SELECT` spliced in the
+  original `(worker_id = $n AND worker_version = $n+1) OR ...` eligibility
+  clause built from those identities. Run against a fresh disposable
+  PostgreSQL cluster (`nix develop --command gleam test`,
+  `GRIND_TEST_DATABASE_URL`/`GRIND_TEST_QUEUE_DATABASE_URL`/
+  `GRIND_TEST_REPEATABLE_READ_URL`/`GRIND_TEST_QUARANTINE_URL` pointed at a
+  cluster started the same way `scripts/test-postgres.sh` does):
+  **168 passed, 1 failure — exactly and only
+  `postgres_quarantine_covers_unregistered_worker_version_test`**, with the
+  precise assertion failure `Ok(Executing) should equal Ok(Uncertain)`. No
+  other test in the 169-test suite failed: the real bug's blast radius is
+  narrow (every other test registers the same worker version that claimed
+  its own row, so the identity filter matches trivially there), unlike a
+  cruder stand-in mutation (see below). Reverted immediately via `Edit`;
+  `gleam check` recompiled clean and `git diff` showed no trace of the
+  reverted lines.
+- **Fix**: `quarantine_expired_in_queue` (`src/grind/postgres.gleam`) drops
+  the identity filter entirely — its candidate `SELECT` is scoped only by
+  `storage_owner` and `queue`, matching every `executing` row with an
+  expired lease regardless of which worker id/version claimed it.
+  Quarantining never decodes or runs any worker code (it is a single
+  `UPDATE ... SET state = 'uncertain'`), so there is no codec or
+  registration reason to restrict it.
+- **Secondary, broader mutation (kept as a second, distinct data point, not
+  a substitute for the real-filter reproduction above)**: `AND
+worker_version = 'v2'` added to the fixed `quarantine_expired_in_queue`'s
+  candidate `SELECT` — a cruder stand-in that hardcodes one literal version
+  rather than reproducing the real per-consumer registry filter. This
+  broke far more broadly (137 passed, 32 failures) because most other tests
+  in the suite use worker version `v1`, never `v2`, so this stand-in
+  disagrees with nearly every other quarantine-dependent test's own setup —
+  expected collateral from a cruder mutation of shared infrastructure, kept
+  here only to show the contrast with the precise, real-filter reproduction
+  above (which is the actual evidence for this claim). Reverted via `Edit`.
+
+### Claim: a queue no consumer ever polls still has its expired executing rows quarantined by the public `quarantine_expired` operation, bounded by `limit`, and the sweep genuinely crosses queues
+
+- **Test**: `postgres_quarantine_expired_global_operation_test`
+  (`test/grind_test.gleam`; marker
+  `quarantine-expired-global-operation-passed`). Runs against a database
+  dedicated to this test alone (`GRIND_TEST_QUARANTINE_URL`, added to
+  `scripts/test-postgres.sh` and `test/grind_test_env.erl` as
+  `grind_quarantine_test`), not the shared `GRIND_TEST_DATABASE_URL`
+  database every other test in this file uses: `quarantine_expired` sweeps
+  every expired `executing` row for its whole storage owner (not scoped to
+  one queue), and storage owner is derived from `host:port/database`
+  (`postgres.validate`), so sharing a database would make this test's own
+  row and observation counts depend on whatever unrelated expired rows other
+  tests happen to leave behind at the moment this one runs, in `id` order —
+  a dedicated database is a dedicated storage owner, immune to that
+  ordering.
+- **Mechanism**: two jobs are submitted to two _different_ queues neither
+  `queue.start_manual`/`queue.start` consumer ever polls, both forced
+  directly to `executing` with an already-expired lease. A `sinal.observe`
+  handler on `observation.quarantined()` captures each event's own metadata.
+  `limit: 0` and `limit: -1` are asserted to reject with
+  `Error(NonPositiveLimit)` before touching storage (both rows still
+  `Executing` afterward, no observation emitted); `limit: 1` quarantines
+  exactly one of the two, and the captured event's own `ref.queue` is
+  asserted to match that exact row's real queue (not a hardcoded or swapped
+  one — the global sweep, unlike the per-queue scan, spans more than one
+  queue in a single call, so `emit_quarantined`'s row-carried `queue` field
+  is genuinely exercised here); `limit: 10` then quarantines the remainder,
+  its own event's queue asserted the same way; the two captured queues
+  together are asserted to be exactly `{queue_a, queue_b}` — the sweep
+  genuinely crossed queues, not two events both reporting the same one. A
+  further `limit: 10` call reports `Ok(0)` with no further observation
+  (idempotent, nothing left).
+- **This is new code, not a red-before-green claim** (`postgres.quarantine_expired`
+  did not exist before this change) — compile-error "red" is not evidence,
+  so the claim is instead proven by mutation. **Mutation**: `limit > 0`
+  relaxed to `limit >= 0` in `quarantine_expired`. Run against a fresh
+  disposable cluster: 168 passed, 1 failure — exactly
+  `postgres_quarantine_expired_global_operation_test`, with zero collateral
+  damage. Reverted via `Edit`; `gleam check` recompiled clean.
+
+### Claim: `submit_with_id` gives a plain admission the same retry safety `submit_unique` has, with no uniqueness policy — one unified admission transaction, not two
+
+- **Tests** (`test/grind_test.gleam`):
+  `postgres_submit_with_id_first_submit_inserted_test`,
+  `postgres_submit_with_id_same_request_retry_returns_original_test`,
+  `postgres_submit_with_id_different_input_same_id_conflict_test`,
+  `postgres_submit_with_id_committed_reply_lost_returns_inserted_test`,
+  `postgres_submit_with_id_concurrent_same_id_one_row_test`,
+  `postgres_submit_with_id_concurrent_different_input_conflict_test`,
+  `postgres_admitted_observation_submit_with_id_test`; markers
+  `submit-with-id-first-submit-inserted-passed`,
+  `submit-with-id-retry-returns-original-passed`,
+  `submit-with-id-different-input-conflict-passed`,
+  `submit-with-id-committed-reply-lost-inserted-passed`,
+  `submit-with-id-concurrent-one-row-passed`,
+  `submit-with-id-concurrent-different-input-conflict-passed`,
+  `admitted-observation-submit-with-id-passed`. Consumer package:
+  `public_consumer_submit_with_id_retry_test`
+  (`consumer/test/grind_consumer_test.gleam`; marker
+  `consumer-submit-with-id-retry-passed`), public-imports only.
+- **This is new code**: `postgres.submit_with_id` and the "no policy"
+  (`policy: None`) path through `grind/internal/unique_admission` did not
+  exist before this change, so there is no red-before-green baseline —
+  proven instead by mutation, and by a real forced fault for the
+  reply-lost/concurrency claims.
+- **Post-review unification**: after independent review, the initial
+  implementation's parallel `PlainRequest`/`plain_fingerprint`/`run_plain`/
+  `plain_admission_transaction`/`insert_plain_job` functions were deleted.
+  `grind/internal/unique_admission` now has exactly one `Request` type
+  (`policy: Option(PolicyPart)`, `Some` for `submit_unique`'s uniqueness
+  policy, `None` for `submit_with_id`), one `fingerprint` function (tag and
+  policy-specific fields chosen by `policy`), and one `run`/
+  `admission_transaction`/`insert_job` used by both `submit` and
+  `submit_plain` — the domain-wide advisory lock and candidate selection run
+  only when `policy` is `Some`; `record_receipt` takes a small `ReceiptWrite`
+  record instead of 13 positional arguments. This is a pure refactor with no
+  intended behavior change: the fingerprint envelope's field order and
+  content are byte-for-byte identical to the pre-unification version for
+  both the `Some` and `None` cases (verified by inspection of `fingerprint`'s
+  field list against the deleted `fingerprint`/`plain_fingerprint`
+  functions), and the full suite (below) confirms every pre-existing
+  `submit_unique` test still passes unchanged after unification.
+- **Committed-reply-lost fault injection**: identical mechanism to
+  Increment 11 (`install_syncrep_reply_trigger`, generalized to any table
+  and predicate), scoped by `NEW.submission_id = '<this test's submission
+text>'` on `grind_unique_submissions` — the same receipt table
+  `submit_unique` uses, since `submit_with_id` reuses `record_receipt`
+  directly. The disposable cluster's `synchronous_standby_names =
+grind_never_standby` / `synchronous_commit = local` configuration lets the
+  test's own transaction raise `synchronous_commit` to `on` just before
+  `COMMIT`, parking it in `SyncRep` after the WAL record is already locally
+  flushed (genuinely committed, reply not yet sent); terminating that
+  backend (found by polling `pg_stat_activity` for `wait_event = 'SyncRep'`,
+  never a fixed sleep) reproduces "committed, but the client's connection
+  closed before it saw the reply." `submit_with_id` itself still returns
+  `Ok(Inserted(handle))` directly — the shared `run`'s follow-up receipt
+  lookup on the `TransactionQueryError` branch resolves it, the exact same
+  code `submit_unique` runs through.
+- **Concurrent-overlap fault injection, same-input**: the same `BEFORE
+INSERT` barrier trigger Increment 8 uses (`install_unique_insert_barrier`,
+  scoped by `worker_id`, blocking behind a held `pg_advisory_xact_lock`),
+  applied to the "no policy" path's own `grind_jobs` insert. Two
+  `submit_with_id` callers, identical `SubmissionId` and request, are
+  launched concurrently while a third process holds the barrier's lock;
+  `await_overlap_shape` polls `pg_stat_activity` (never a fixed sleep) until
+  both callers are genuinely parked on that lock (`wait_event = 'advisory'`,
+  matching the "no policy" insert's own query text) before the barrier is
+  released. Unlike a `Some` (`submit_unique`) request, a `None` request
+  acquires no domain-wide advisory lock (see
+  `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts", for the full
+  justification), so both callers reach their own `grind_jobs` insert;
+  whichever the barrier releases first commits its row and receipt, and the
+  other's own `record_receipt` then hits a real `23505` against that
+  just-committed row. The shared `run`'s
+  `TransactionRolledBack(SubmissionConflict)` arm resolves this by
+  re-reading the exact same receipt (`reconcile_from_receipt`) rather than
+  surfacing a bare `SubmissionConflict` for what is, from that caller's own
+  perspective, an ordinary successful retry — both callers observe
+  `Ok(Inserted(handle))` with the identical job id, and exactly one row is
+  ever persisted (`count_jobs_in_queue`).
+- **Concurrent-overlap fault injection, different-input**: the identical
+  barrier setup, but the two concurrent callers submit _different_ inputs
+  (`42` vs. `99`) under the same `SubmissionId`. Whichever commits first is
+  `Inserted`; the other still hits the same real `23505`, but this time
+  `reconcile_from_receipt`'s fingerprint check does not match (a different
+  `encoded_input` produces a different `request_sha256`) — it stays
+  `SubmissionConflict` rather than converging, exactly like a sequential
+  different-input-same-id retry, and exactly one row is ever persisted
+  (`postgres_submit_with_id_concurrent_different_input_conflict_test`).
+- **Mutation 1 (fingerprint envelope)**: the shared `fingerprint`'s `None`
+  branch had `json.string(request.encoded_input)` removed (so two different
+  inputs under the same `SubmissionId` would fingerprint-match). Against a
+  fresh disposable cluster: 170 passed, 1 failure — exactly
+  `postgres_submit_with_id_different_input_same_id_conflict_test`, no
+  collateral damage (in particular, no `submit_unique` test observed this
+  change, since its own `Some` branch of `fingerprint` was untouched).
+  Reverted via `Edit`.
+- **Mutation 2 (concurrent-race convergence, re-verified after
+  unification)**: the `Ok(Error(pog.TransactionRolledBack(unique.SubmissionConflict)))`
+  arm was removed from the now-shared `run`'s match (used by both `submit`
+  and `submit_plain`), leaving only the `TransactionQueryError` fallback.
+  Against a fresh disposable cluster: **170 passed, 1 failure — exactly and
+  only `postgres_submit_with_id_concurrent_same_id_one_row_test`**; every
+  `submit_unique` test, including its own forced-overlap and contention
+  tests (Increments 8–13), still passed. This empirically confirms the
+  "harmless on the unique path" claim in `docs/UNIQUENESS-CONTRACT.md`,
+  "One admission transaction, not two": `submit_unique`'s own domain lock
+  already prevents a losing same-key concurrent submitter from ever
+  reaching this arm in the first place (its `find_receipt` resolves before
+  `record_receipt` is ever attempted), so removing the arm from the now
+  _shared_ function still only breaks the "no policy" path that actually
+  depends on it. Reverted via `Edit`.
+- **Aborted-commit coverage**: no separate aborted-commit
+  (`pg_sleep`-during-`COMMIT`) test was written for `submit_with_id`. This
+  is not "inherited by code sharing" in the sense of two similar but
+  separate implementations happening to behave the same way — after the
+  post-review unification above, `submit_with_id` and `submit_unique` run
+  through the literal same `run`/`admission_transaction` function objects,
+  differing only in `Request.policy` (`None` vs. `Some`), and an aborted
+  commit is caught by the `pog.TransactionQueryError` branch before
+  `admission_transaction` itself ever inspects `policy` (`transaction_or_checkout_failure`'s
+  own classification happens above and outside the `policy` branch
+  entirely). `postgres_submit_unique_aborted_commit_is_commit_unknown_test`
+  (Increment 11) already forces and proves this exact branch, for the
+  identical code `submit_with_id` runs through — the claim for
+  `submit_with_id` is proven by construction (same code, no `policy`-
+  dependent branch between the fault and its handling), not merely assumed.
+  No dedicated `submit_with_id`-specific aborted-commit test was added on
+  top of that, since it would exercise no additional code path.
+
+### Full-suite confirmation (fresh disposable clusters, all mutations reverted)
+
+`nix develop --command gleam test` against fresh disposable PostgreSQL
+clusters started the same way `scripts/test-postgres.sh` configures its own
+(`synchronous_standby_names=grind_never_standby`,
+`synchronous_commit=local`), with `GRIND_TEST_DATABASE_URL`,
+`GRIND_TEST_QUEUE_DATABASE_URL`, `GRIND_TEST_REPEATABLE_READ_URL`, and
+`GRIND_TEST_QUARANTINE_URL` set: 171 passed, 0 failures, including all nine
+new tests above (two more than the pre-unification round: the
+different-input concurrent race and the `submit_with_id` admitted
+observation). See the gate run recorded at the end of this document (or the
+coordinator's own `scripts/test-postgres.sh` run) for the full
+official-script confirmation, external-consumer package, and pinned Oban
+oracle harness together.
+
+## Increment 15 — Acknowledgement deadline: a real fault proxy, a Grind-owned checkout deadline, and three defects it surfaced
+
+Answers the release-readiness open item verbatim: "Verify with a TCP-proxy
+fault test whether pog/pgo bounds a `COMMIT` on a half-open socket." Source
+reading alone (confirmed against `build/packages/pog/src/pog.gleam`,
+`pog_ffi.erl`, and `build/packages/pgo/src/pgo_pool.erl`) had suggested
+`pgo_pool`'s own absolute checkout-deadline timer (armed at checkout time,
+independent of what statement is later in flight) would bound a stuck
+connection at pog's hardcoded, unconfigurable 5000ms — but that mechanism is
+an implementation detail of a dependency two levels down, not a documented
+contract, and per-call it never applies uniformly (a single-connection
+`pog.execute`/`query_extended` call ignores `Query.timeout` entirely once
+checked out). This increment builds the proxy, proves the source reading
+empirically, then makes the bound a first-class, Grind-owned, configurable
+setting instead of an accident of pog's internals.
+
+### The fault proxy (`test/grind_fault_proxy.erl` + `test/fault_proxy.gleam`)
+
+A small Erlang TCP relay sits between a test `Database` and the real
+disposable cluster (new database `grind_fault_proxy`,
+`GRIND_TEST_FAULT_PROXY_URL`, wired into `scripts/test-postgres.sh`). A
+controller process owns the listen socket and a one-shot arming
+(`pass | {armed, on_commit | on_begin | {on_sql, Pattern}, drop_reply |
+drop_request}`); each accepted connection gets its own relay process owning
+both sockets (`{active, once}`), detecting the extended-query-protocol
+`Parse` message for an unnamed `begin`/`commit` statement by the byte
+pattern `<<0, "commit", 0>>`/`<<0, "begin", 0>>` (pog always sends these
+lowercase), or an arbitrary caller-supplied substring for a specific
+statement (`{on_sql, Pattern}`, used for the lease-renewal `UPDATE`).
+`drop_reply` forwards the triggering request (it genuinely executes) then
+silently discards every reply afterward; `drop_request` never forwards the
+triggering request, or anything after it, at all. Neither ever closes a
+socket — a true half-open fault, not a disguised close (unlike
+`pg_terminate_backend`, which the existing `postgres_ack_committed_reply_lost_*`
+tests already use and which closes the _server_ side, letting the client
+observe a fast, clean close rather than genuine silence).
+
+Two real bugs were found and fixed building this harness, both confirming
+Erlang basics rather than anything Grind-specific: `gen_tcp:accept/1` makes
+the _acceptor_ the accepted socket's controlling process, so the spawned
+relay process never received its `{tcp, ...}` messages until ownership was
+explicitly transferred via `gen_tcp:controlling_process/2` before the relay
+touched the socket; and the harness's own `start/2` return shape had to be
+`{ok, {Controller, Port}}` (a 2-tuple `Result` payload), not a flat 3-tuple,
+to match the Gleam `Result(#(Proxy, Int), Nil)` it is declared as.
+`fault_proxy_pass_through_test` proves the harness itself first: a `Database`
+behind the proxy connects, authenticates, and runs the full multi-statement,
+multi-transaction `migrate` and one real job end to end — byte-for-byte
+transparent relaying, not just "a socket accepted a connection" — before any
+other test relies on it to prove something about Grind.
+
+### T1–T5: verification against the code as found (before this increment's fix)
+
+All five ran against the code exactly as it stood before any FFI change in
+this increment (pog's own hardcoded, unconfigurable checkout deadline was
+the only bound in effect). Every one is **bounded**, confirming the source
+reading — but only via a side effect of pgo's internals Grind never asked
+for and could not tune:
+
+| Test | Fault                                                                            | Result before this increment                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| T1   | `drop_reply` on manual ack `COMMIT`                                              | bounded, **~5012ms**, `acknowledge_claim` itself returned `Ok(True)` (pgo's checkout-deadline timer force-closed the socket; the client-observed `closed` maps through pog's `convert_error` to `query_timeout`, but the coordinator's own retry-on-`QueueAckUnknown` path — the exact one the acknowledgement side already relies on — resolved it inline before this call even returned)                                                                                                                                   |
+| T2   | `drop_request` on manual ack `COMMIT`                                            | bounded, **~5005–5010ms**, `Error(QueueAckUnknown(...))` — the request never reached PostgreSQL, so pgo's checkout deadline (armed at checkout time, independent of the half-open socket) still force-closed the _client_ side on schedule; the _server_ session was left genuinely idle in transaction holding the row lock, requiring this test's own observer backstop (`pg_terminate_backend`) to clear it before a retried `acknowledge_claim` could succeed                                                            |
+| T3   | automatic, `maximum_concurrency: 2`, A's ack `COMMIT` `drop_request`'d           | B (unaffected sibling) succeeded in **~5021ms**; A converged to `Succeeded` via the automatic pending-ack retry in **~15029ms** total, but only after this test's own observer backstop cleared A's stuck idle-in-transaction backend (no server-side timeout existed yet to do it automatically)                                                                                                                                                                                                                            |
+| T4   | `drop_reply` on the coordinator's own lease-renewal `UPDATE` (not a transaction) | bounded, **~5000ms**, `Error(QueueClaimFailed(pog.QueryTimeout))`                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| T5   | `drop_reply` on manual ack's implicit `BEGIN`                                    | bounded, **~5011–5014ms**, `Error(QueueAckUnknown(...))` — `pog.transaction`'s own `use _ <- result.try(do(conn, "begin"))` short-circuits before the callback (the actual ack work) ever runs, so no receipt exists and the job stays `Executing`, exactly like a `TransactionQueryError` at any other step; pog exposes no way to tell "BEGIN failed" from "COMMIT failed after the callback ran", so Grind conservatively reports `QueueAckUnknown` for both rather than the more precise (but unproven) `QueueAckFailed` |
+
+**Verification answer: bounded, but only by an accident of a dependency two
+levels down** — pog's own hardcoded 5000ms, never surfaced as
+`postgres.Settings`, never validated against `unique_lock_wait_ms`, and
+silent about the one non-transactional call shape (T4) it also happens to
+cover only because that call still goes through a pool checkout.
+
+### DEFECT 2 probe: attempted, not reproduced — fixed anyway
+
+A dedicated, no-proxy-needed test (`fault_proxy_defect2_queue_deadline_test`)
+holds a `pool_size: 1` pool's sole connection with `SELECT pg_sleep(8)` (its
+own `pog.timeout` raised so _that_ checkout's own deadline does not fire
+first), then issues a single contended `postgres.state` call, and — finding
+that pgo's CoDel-style overload shedding returned the already-handled
+`none_available` (→ `ConnectionUnavailable`) well before the narrower race
+this defect targets — a second version bursts eight concurrent contended
+callers instead. Both variants, run repeatedly against a real cluster,
+consistently observed graceful `Error(StateQueryFailed(ConnectionUnavailable))`
+for every caller (~2675–2690ms), never the `error:function_clause` crash
+`pog_ffi:convert_error/1`'s missing clause for `pgo_pool`'s "connection not
+available because deadline reached while in queue" string (confirmed to
+exist in `pgo_pool.erl`'s `checkout_info/2`) would raise. The fix (below)
+is applied regardless, on the strength of the source-level confirmation, not
+this empirical attempt — CoDel's overload-shedding heuristic evidently wins
+the race under ordinary contention in this environment, but nothing
+guarantees it always will (heavier concurrent load, a different
+`queue_target`/`queue_interval`, or a genuine network partition instead of
+local contention could still hit the narrower window). Per independent
+review, the test now _asserts_ every contended caller's own monitor never
+reports an abnormal exit (`panic` if one does), rather than printing
+"CONFIRMED" and letting the test pass regardless of what it observed — a
+real defect reproduced this way would now fail the test, not just narrate
+itself into the log.
+
+### Decision 1: a Grind-owned checkout deadline (`src/grind_postgres_ffi.erl`)
+
+Every Grind storage call already funneled through one of four Erlang
+wrappers (`execute_safely/2`, `call_safely/2`, `transaction_safely/2`,
+`transaction_or_checkout_failure/2`). Each now checks out its own connection
+directly via the public `pgo:checkout/2` (`pgo.erl`'s own arity-2 form,
+`checkout(Pool, Options) -> pgo_pool:checkout(Pool, Options)`) with an
+explicit, Grind-chosen `{timeout, DeadlineMs}` option — _not_ the same
+function pog itself calls to check out a `{pool, Name}` connection
+(`pog_ffi:checkout/1`, which always calls the arity-1 `pgo:checkout/1` with
+no options at all, so `pgo_pool`'s own `?TIMEOUT` constant, 5000ms,
+applies unconditionally and unconfigurably) — and runs the actual work
+against the pog `Connection` shape `{single_connection, Conn}` (confirmed by
+reading the compiled `pog.erl`/`pog_ffi.erl`: `pog.transaction`'s
+`SingleConnection` branch calls `transaction_layer` directly with no further
+checkout, and `pog.execute`'s `{single_connection, _}` branch calls
+`pgo_handler:extended_query` directly) — so `pog:execute`/`pog:transaction`
+never re-checkout with pog's own unconfigurable default again. The deadline
+is attached to a pool by its atom name (`postgres.Database`'s
+`pog.Connection` is always `{pool, PoolName}` at this boundary) via
+`persistent_term`, set once in `postgres.start` and cleared in
+`postgres.close`, rather than threaded as an explicit parameter through
+every one of Grind's ~40 call sites; `call_safely`'s own Gleam signature
+changed from a zero-arity closure to `fn(connection, fn(connection) ->
+result)` so the closure actually runs against the deadline-checked-out
+connection instead of the original (possibly still-a-pool) one. A dedicated
+`migration_transaction_safely/3` takes an explicit deadline
+(`Settings.migration_deadline_ms`, default 30000ms) instead of the shared
+per-pool one, since a schema migration's DDL step can legitimately need
+longer than an ordinary job-lifecycle statement.
+
+`postgres.Settings` gained `statement_deadline_ms` (default 4000, setter
+`postgres.statement_deadline`) and `migration_deadline_ms` (default 30000,
+setter `postgres.migration_deadline`), both validated positive by
+`postgres.validate`. This also structurally fixes half of DEFECT 2: since
+Grind's own wrapper now always checks out first and never lets pog's
+`{pool, Name}` branches run their own checkout, the exact call sites
+`pog_ffi:convert_error/1`'s missing clause could previously crash from
+(`pog_ffi:checkout/1`, `pgo:query/3`'s pool path) are no longer reached at
+all through Grind.
+
+The _other_ half — a post-checkout query on an already-`{single_connection,
+_}` connection still calling `pgo_handler:extended_query`, which can still
+return an error shape `convert_error` has no clause for (`econnreset`/
+`etimedout`, distinct from the `closed` shape it does handle) — is defended
+by a `guarded_query`/`guarded_transaction` wrapper around the actual call.
+Per independent review, this catch is narrowed to a `function_clause`
+crash whose own top stack frame is genuinely `pog_ffi:convert_error`
+(`is_convert_error_crash/1`, checked against the captured stacktrace), so an
+unrelated `function_clause` bug elsewhere in the callback still crashes its
+caller instead of being silently absorbed into an endless `QueueAckUnknown`
+retry. It is mapped to `query_timeout` (an _uncertain_ outcome — the same
+one a genuine query timeout already produces, feeding the existing
+`QueueAckUnknown`/retry path), not `connection_unavailable`: the crash
+happens _after_ the request was already sent, so an `econnreset`/`etimedout`
+on `recv` gives no proof PostgreSQL never received or applied it, unlike a
+checkout failure (nothing was ever sent, correctly still
+`connection_unavailable`, unchanged, in `with_deadline_ms`'s own checkout-
+failure branch). Because `Conn`'s own protocol state is unknown after a
+crash mid-decode, it is `pgo:break/1`'d (disconnected and replaced) before
+being checked back in, rather than risking a corrupted connection being
+handed to the next caller.
+
+`gleam.toml` now pins `pog = ">= 4.1.0 and < 4.2.0"` (tightened from
+`< 5.0.0`) and declares `pgo` as a direct dependency (`>= 0.20.0 and <
+0.21.0`) rather than relying on it only being present transitively through
+pog's own `rebar.config` — this wrapper depends on `pog.Connection`'s exact
+`{pool, _} | {single_connection, _}` compiled shape and on `pgo`'s own
+`checkout/2`/`checkin/2`/`break/1` API directly, not just on pog's checkout
+timeout being 5000ms. `pog_connection_pool_shape_test` (no database needed)
+is a standing regression guard for the `{pool, Name}` shape specifically —
+`pog.named_connection(name)` is pattern-matched against it directly, so a
+future pog release changing that compiled representation fails this test
+immediately instead of surfacing as a silent `function_clause` inside
+`grind_postgres_ffi`'s own pattern matches.
+
+### T1–T5 re-verified after the fix, plus the mutation
+
+Same tests, same fault proxy, against the fixed code (default
+`statement_deadline_ms` 4000):
+
+| Test | Result after the fix                                                                                                                                            | Mutation (`deadline_for/1` forced to return `infinity`)                                                                                                                                                                                                     |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| T1   | bounded, **~4011ms**, `Ok(True)`                                                                                                                                | **UNBOUNDED** — did not return within the test's own 20000ms bound (panics as designed); the `COMMIT` had already genuinely succeeded server-side, so the session is plain `idle`, not idle-in-transaction — DEFECT 3's backstop does not apply here either |
+| T2   | bounded, **~4010ms**, `Error(QueueAckUnknown(...))`                                                                                                             | still bounded at **~8011ms** — _not_ via the (disabled) checkout deadline, but via DEFECT 3's independent `idle_in_transaction_session_timeout` (8000ms, `2 ×` the deadline) killing the genuinely-idle-in-transaction server session on its own            |
+| T3   | B **~4021ms**; A converges automatically in **~14009ms** total — the observer backstop is no longer load-bearing (DEFECT 3 clears A's stuck backend on its own) | still converges — B **~8047ms**, A **~28033ms** — again via DEFECT 3's independent backstop, not the checkout deadline                                                                                                                                      |
+| T4   | bounded, **~4000ms**, `Error(QueueClaimFailed(pog.QueryTimeout))`                                                                                               | **UNBOUNDED** — did not return within 20000ms; a single autocommit statement is never "in a transaction" at all, so DEFECT 3 cannot apply                                                                                                                   |
+| T5   | bounded, **~4011ms**, `Error(QueueAckUnknown(...))`                                                                                                             | still bounded at **~8009ms** via DEFECT 3 (the dropped `BEGIN` reply still leaves a real, genuinely open transaction server-side)                                                                                                                           |
+
+The mutation result is the more interesting evidence than a plain "still
+passes": it shows the checkout deadline and DEFECT 3's server-side idle
+timeout are two genuinely independent, complementary mechanisms, not one
+disguised as two — T1 (already-committed, session idle) and T4 (never in a
+transaction) have no exposure to `idle_in_transaction_session_timeout` at
+all and are honestly unbounded once the checkout deadline is disabled, while
+T2/T3/T5 (a real open transaction left stranded) are covered by _either_
+mechanism on its own. Both are required for full coverage; neither
+subsumes the other. The mutation's own collateral (T2 and T5 additionally
+observed a transient `AckReceiptQueryFailed(QueryTimeout)` from
+`reconcile_acknowledgement`/`reconcile_unique` immediately after DEFECT 3's
+more abrupt server-initiated kill, where the real fix's own client-owned
+deadline would have let the pool recover more gracefully on its own terms)
+is not itself evidence of a defect in the real, unmutated code — it is
+exactly the kind of degraded behavior the real fix exists to avoid, observed
+only because the mutation removed it. Reverted via `Edit`.
+
+**Tightened per independent review**: T1/T2/T4/T5 now _assert_
+`elapsed < 2 * postgres.statement_deadline_ms(database)` (reading the
+pool's own configured deadline, not a hardcoded constant), not merely
+"returned at all before the test's own generous 20000ms outer wait" — and
+T2's own "no reply within 20000ms" branch is now a hard `panic`, not a
+printed observation, since after this fix that call must always be bounded
+on its own. Mutation evidence that this tightened bound is not vacuous:
+T1's pool temporarily given `postgres.statement_deadline(15_000)` while its
+own assertion was temporarily hardcoded to the old default
+(`elapsed < 2 * 4000`, simulating the exact mistake of forgetting to read
+the deadline dynamically) — against a real cluster, `elapsed` came back
+**~15015ms** (proving it genuinely tracks the configured deadline, not some
+unrelated fixed timing) and the stale hardcoded bound correctly failed
+(`15015 < 8000` is `False`). Reverted via `Edit`; re-confirmed green
+afterward at `elapsed < 2 * 4000` with the real assertion restored.
+
+### DEFECT 1: `unique_lock_wait_ms` racing the checkout deadline (red, then green)
+
+Before this increment, `unique_lock_wait_ms` defaulted to 5000ms — the same
+value as pog's own hardcoded checkout deadline. A new test using entirely
+_default_ `postgres.settings` (no `unique_lock_wait` override —
+`postgres_submit_unique_contended_lock_wait_default_settings_test`;
+the existing `postgres_submit_unique_contended_lock_wait_test` always
+overrode `unique_lock_wait` to 200ms and never exercised the shipped
+default) holds the real domain lock in one connection while a second,
+default-settings `submit_unique` call contends for it. Mutation for red
+evidence: `unique_lock_wait_ms`'s default temporarily restored to 5000 and
+`postgres.validate`'s new margin check temporarily disabled (`Edit`, not a
+config toggle) — against a real cluster, the contended call returned
+**`Error(CommitUnknown(PendingSubmission(...)))`**, not the typed
+`AdmissionContended` a caller could actually branch on: with the checkout
+deadline now smaller (4000ms) than the old lock-wait default (5000ms), the
+connection was force-closed _before_ PostgreSQL's own `lock_timeout` error
+(55P03, raised after `unique_lock_wait_ms`) ever had a chance to surface.
+Reverted via `Edit` (`unique_lock_wait_ms` default back to 2000;
+`postgres.validate`'s margin check restored). Green after: the same test now
+deterministically observes `AdmissionContended`, no job row, no receipt.
+
+The fix: `postgres.validate` now rejects any `Settings` where
+`unique_lock_wait_ms + 1000 >= statement_deadline_ms`
+(`UniqueLockWaitTooCloseToDeadline`), and the shipped defaults
+(`unique_lock_wait_ms` 2000, `statement_deadline_ms` 4000) clear that margin
+by construction — this is no longer a race a caller could reintroduce by
+accident through the public API at all, not merely a better default number.
+
+**The `+1000` margin is a heuristic, not a proof.** It covers the specific
+race this defect names — PostgreSQL's own `lock_timeout` error surfacing
+before the checkout deadline force-closes the connection — but
+`statement_deadline_ms` also has to cover whatever time a caller's checkout
+itself spends queued under real pool contention (bounded separately by
+pgo's own overload shedding, not by this margin) and any statement the
+admission transaction runs _before_ it ever takes the domain lock (`SET
+lock_timeout`, `pin_read_committed`, the candidate read). Under genuine pool
+contention — several callers checked out at once, not just one lock held —
+the checkout deadline can still legitimately elapse before
+`unique_lock_wait_ms` does, and `CommitUnknown`/`AdmissionFailed` is still a
+possible outcome even with the margin satisfied; the margin only rules out
+the _specific_, previously-undefended race where the two values were simply
+too close together by construction.
+
+### DEFECT 3: `idle_in_transaction_session_timeout`
+
+`postgres.validate` now also sets `idle_in_transaction_session_timeout` to
+`2 × statement_deadline_ms` (8000ms by default) as a pooled connection
+startup parameter, alongside the existing `default_transaction_isolation`
+pin. This is what actually clears a request whose _reply_ was lost but
+which never even reached PostgreSQL (T2, T3, T5's `drop_request`/dropped-
+`BEGIN` scenarios above): the checkout deadline bounds the _client_, but
+without this setting the _server_ session is left genuinely idle in
+transaction, holding whatever row locks that transaction already took,
+until something else (an operator, or — before this fix — a test's own
+`pg_terminate_backend` observer backstop) clears it. TCP keepalive
+(`connection_parameters`' `tcp_keepalives_idle`/`_interval`/`_count`, or the
+equivalent client-side socket options) is a real, complementary defense for
+a genuine network partition (as opposed to a proxy that keeps the socket
+open but silent) but is not exercised here — loopback gives no way to
+distinguish a partitioned link from a merely idle one, and this deadline
+work does not attempt it; see "Limits" below.
+
+This setting is a connection _startup parameter_, so it applies to _every_
+session Grind opens on the named pool — not only the sessions that happen
+to run through `execute_safely`/`transaction_safely`/etc. A caller doing
+its own raw `pog.transaction(pog.named_connection(pool_name), callback)`
+directly (bypassing Grind's own storage functions entirely, as several
+tests in this file do for setup/observation) gets the identical
+`idle_in_transaction_session_timeout` on that same pool, whether or not
+that particular call goes through Grind's deadline wrapper. See "No
+poolers" under "Limits" below for the corresponding risk of a pooler
+silently dropping this parameter.
+
+### Lease rule: `queue.LeaseTooShortForDeadline`
+
+`queue.start`/`queue.start_with_policy`/`_manual`/`_manual_with_policy` now
+reject a lease too short relative to `database`'s own
+`postgres.statement_deadline_ms` (`D`) before starting any process:
+`lease_duration_ms < 6 × D` at `maximum_concurrency > 1`, or `< 1.5 × D` at
+exactly 1 (`queue.minimum_lease_for_deadline`, `@internal`, exposed for this
+reasoning to be checked directly; the full derivation now also lives in
+`queue.LeaseTooShortForDeadline`'s own doc comment).
+
+**Derivation.** A live attempt's own renewal timer fires every `L / 3`
+(`renewal_interval_ms`), so once a renewal succeeds there is `(2 / 3) × L`
+of slack before that same lease would otherwise expire. A stalled pending
+acknowledgement can occupy the coordinator's single message loop for up to
+roughly `3 × D` (`ConsumerState.pending_ack_retry_budget`, ~3 ticks), during
+which a _sibling_ attempt's own renewal tick sits queued behind it before it
+can even start; that queued renewal call is itself now bounded by `D`. At
+`maximum_concurrency > 1`, the slack must cover both stages:
+`(2 / 3) × L` at least `3 × D + D`, giving `L` at least `6 × D` — with _zero_
+margin left at that exact minimum (the queued renewal starts the instant the
+stall clears and takes the full `D` to finish, landing exactly at the
+lease's own expiry). At `maximum_concurrency` of exactly 1 there is no
+sibling to queue behind anything, so only the renewal's own `D` needs to
+fit: `(2 / 3) × L` at least `D`, giving `L` at least `1.5 × D`, again with
+zero margin at that minimum. Neither bound carries deployment headroom
+beyond exact algebraic sufficiency; a real deployment should clear it with
+real margin (the shipped `default_policy` lease of 30000 clears the
+`maximum_concurrency > 1` minimum of `6 × 4000 = 24000` — the shipped
+default `D` — by 6000ms, `1.5 × D` of headroom, not by design margin baked
+into the rule itself).
+
+**Default choice, decided and justified**: `statement_deadline_ms` defaults
+to 4000, not pog's old 5000, specifically so `queue.default_policy`'s
+existing 30000ms lease default clears `6 × D` (24000) at
+`maximum_concurrency > 1` with headroom, without having to raise the lease
+default itself (a lease is a worker-execution-time budget; tying it to a
+storage-mechanics constant would conflate two different concerns). Lowering
+`D` also let `unique_lock_wait_ms`'s own default drop from 5000 to 2000
+while still clearing DEFECT 1's margin.
+
+**A hard floor this rule collides with**: `unique_lock_wait_ms` must be a
+positive integer, so DEFECT 1's `+1000` margin forces `statement_deadline_ms`
+to at least 1002 for any pool at all (not just ones using uniqueness
+features) — a pool cannot pick an arbitrarily small `D` to keep an
+arbitrarily small lease valid. Eight existing tests using a short,
+fast-iteration lease (a manually forced expiry, not a wall-clock wait, in
+every case) collided with the lease rule once it shipped: each now sets its
+own small, explicit `D` on its pool — `postgres.statement_deadline(1002)`
+paired with `postgres.unique_lock_wait(1)` (the smallest `D` the DEFECT-1
+margin permits at all, since none of these tests exercise uniqueness
+contention and the exact wait value is otherwise irrelevant to them) —
+and bumps its lease to the smallest value clearing the rule against that
+`D`: 1600ms at `maximum_concurrency` 1 (minimum `1.5 × 1002 = 1503`), 6100ms
+at `maximum_concurrency > 1` (minimum `6 × 1002 = 6012`). This trades a
+comfortable default-`D` margin for a genuinely tight one: at `D = 1002`,
+_any_ Grind storage call on that pool — including time spent queued for a
+connection under contention, not just the query itself — that happens to
+take longer than 1002ms now also times out on that same pool, and its
+`idle_in_transaction_session_timeout` is `2 × 1002 = 2004ms`. These tests
+were chosen deliberately for a small `D` specifically because none of them
+hold a connection under real contention or run a genuinely slow statement,
+so 1002ms is expected to be ample in practice — but a sufficiently loaded
+CI host (scheduler jitter, GC pauses, or contention from tests running
+in the same suite) could in principle push an ordinary call past that
+window and produce a flake distinct from anything this increment set out to
+fix; watch this specific 1002ms/6100ms combination first if any of these
+eight tests (or the consumer package's `run_effect_crash_uncertainty_test`,
+same treatment) ever becomes intermittent. One of the eight
+(`postgres_automatic_ack_retry_bounded_eventually_uncertain_test`) also
+needed its own bounded retry-loop iteration cap raised (40 → 800) to match:
+the coordinator's own retry _budget_ (~3 ticks) is unaffected by the lease's
+absolute size, but each tick now fires roughly 4× further apart in
+wall-clock terms (`lease / 3`, 6100/3 versus the old 300/3), so the same
+number of _ticks_ now needs a proportionally larger _iteration_ budget to
+observe them all. The consumer package's own
+`run_effect_crash_uncertainty_test` needed the same treatment (its own pool
+also set to `D = 1002`/`unique_lock_wait = 1`, lease bumped 500 → 6100) and
+a correspondingly larger `await_state` budget (250 → 400 checks).
+
+**Known limit, unchanged by this rule**: the derivation above assumes at
+most one stalled acknowledgement ahead of one sibling's renewal. At
+`maximum_concurrency > 2`, more than one sibling's renewal can queue up
+behind the same stall, each also waiting out however many other siblings'
+own `D`-bounded renewals are queued ahead of it — `3 × D + (N − 1) × D` for
+the `N`-th sibling in that queue, not the `3 × D + D` this rule accounts
+for. The real fix is moving lease renewals off the coordinator's own
+message loop entirely — tracked in `docs/RELEASE-READINESS.md`, "Decide on
+per-attempt storage calls" (not attempted here).
+
+### The flaky `postgres_submit_unique_aborted_commit_is_commit_unknown_test`
+
+Its own `QueryTimeout` flake was never really about the 5000ms deadline
+directly — it is the same "pool just had a connection deliberately
+terminated" transient recovery window every other terminate-then-retry test
+in this file already defends against with `retry_transient_query`
+(`run_ack_commit_connection_loss_test`'s own pattern, documented above in
+"Isolation-level pinning"/Increment 2): `pgo_connection`'s own supervised
+restart of the just-killed connection is not instantaneous, and this one
+test's post-recovery retry (`submit_keep_existing`) and read
+(`postgres.arguments`) were the only ones in the file calling straight
+through without that tolerance. Wrapped both in the existing
+`retry_transient_query` helper (20 attempts, 50ms apart) — the same
+mechanism, not a bespoke one. The _same_ class of gap was independently
+found (not asked for by name, but the same root cause) in
+`postgres_resolved_observation_absent_on_commit_unknown_test`'s own
+post-termination `postgres.state` read and sentinel `resolve_uncertain`
+call, immediately after its own `resolve_uncertain`-`COMMIT` aborted-commit
+scenario; fixed the same way. Confirmed deterministic across multiple
+fresh-cluster reruns after the fix (previously intermittent depending on how
+long `pgo_connection`'s own restart took relative to the very next call).
+
+A third, unrelated `Undef` failure was found and fixed along the way:
+`postgres_call_safely_wrapper_reports_closed_pool_test` declared its own
+local `@external(erlang, "grind_postgres_ffi", "call_safely")` probe binding
+at the old arity-1 (zero-argument closure) signature, which became
+undefined the moment `call_safely`'s real Erlang arity changed to 2 for
+Decision 1 above — updated to the new `fn(connection, fn(connection) ->
+result)` shape.
+
+### Limits
+
+- **Loopback only.** The fault proxy runs on `127.0.0.1`; no real network
+  partition, packet loss, or asymmetric latency is exercised, only
+  in-process byte manipulation on an otherwise-healthy local TCP stream.
+- **TLS untested.** Every test database connects with `sslmode=disable`;
+  the proxy relays raw bytes and has no TLS termination or passthrough
+  logic, so an `sslmode=require` deployment is not covered by any of this
+  evidence.
+- **A connect-time hang is not covered.** Every fault here is injected
+  _after_ a real connection is already established; `gen_tcp:connect`
+  itself blocking indefinitely against an unresponsive (not
+  connection-refusing) host is a distinct, unaddressed gap — `pog`'s own
+  connection-establishment path has no deadline of its own either, and
+  Grind's new checkout deadline only bounds _checkout_ (acquiring an
+  already-connected pooled connection), not the pool's own initial
+  connect.
+- **DEFECT 2's exact crash shape remains unproven, not disproven.** See
+  above — the fix is applied on source-level confirmation of the missing
+  `convert_error` clause, not empirical reproduction.
+- **No poolers.** A connection pooler (PgBouncer or similar) between Grind
+  and PostgreSQL is not exercised; `idle_in_transaction_session_timeout` as
+  a startup parameter, in particular, could be silently dropped by one
+  (the existing `default_transaction_isolation` pin's own doc comment
+  already flags this same class of risk, which is why the admission
+  transaction additionally pins isolation level in-transaction as defense
+  in depth — no equivalent in-transaction fallback exists for an
+  idle-session timeout, since by definition nothing is running to set it
+  when the session goes idle).
+- **Concurrent pending acknowledgements**, not just one at a time, can
+  still starve sibling lease renewals even once the new lease rule passes
+  — see "Lease rule" above.
+- **"Bounds every Grind storage call" has two carve-outs.** The checkout
+  deadline bounds a call only once a pooled connection is checked out; it
+  does not bound the pool's own initial connect (see the connect-time-hang
+  limit above), and a checkout that has to queue behind other contended
+  callers is bounded by pgo's own overload-shedding heuristic, not by `D`
+  directly (see the DEFECT 1 margin caveat above and the DEFECT 2 probe,
+  where queued contention resolved in ~2.7s regardless of `D`).
+- **`postgres.close` stops the pool before clearing its deadline**, not the
+  reverse — reordered from the first version of this change specifically to
+  close this gap: clearing the deadline first would leave a window where an
+  in-flight checkout reads `persistent_term`'s fallback default (5000ms)
+  instead of the configured one, between the erase and the pool actually
+  stopping. Stopping first means any such checkout fails via the same
+  `pgo_pool` exit `with_deadline_ms` already catches, regardless of which
+  deadline it would otherwise have used.
+
+### Full-gate confirmation
+
+`nix develop --command bash scripts/test-postgres.sh` against a fresh
+disposable PostgreSQL cluster (own `initdb`, own port, torn down on exit):
+grind's own `gleam test` **180 passed, 0 failures** (170 pre-existing +
+`fault_proxy_pass_through_test`, T1–T5, the DEFECT 2 probe, the new
+DEFECT-1 default-settings contention test, and `pog_connection_pool_shape_test`),
+the pinned Oban oracle harness, and the external-consumer package's own
+`gleam test` **10 passed, 0 failures**, run together end to end — confirmed
+across the increment's own fixes and again, once more, after the
+independent-review round above (the narrowed/re-mapped/`pgo:break`-ed
+post-checkout catch, the corrected lease-rule and lease-bumped-test
+derivation text, the tightened fault-proxy elapsed-bound assertions and
+their own mutation evidence, the `pgo:checkout/2`/tightened dependency
+pins, the `pog_connection_pool_shape_test` regression guard, and the
+`postgres.close` ordering fix).
+
+## Increment 16 — Migration mechanism: versioned steps, advisory lock, upgrade harness
+
+Replaces the single-shot, fresh-install-only `postgres.migrate` (one
+`pog.transaction` wrapping the whole v11 DDL, no lock, no step concept) with
+`migrate_with(database, steps)` — a real forward-only runner over
+`grind/internal/migrations.migrations()`, one transaction per version, an
+advisory lock, and a re-read-and-skip check per step (`postgres.migrate` is
+`migrate_with(database, migrations())`). `priv/migrations/*.sql` mirrors
+`migrations()` in cigogne's own file format, proven in lockstep by a
+no-database conformance test using cigogne's own parser
+(`grind_migrations_conformance_test`).
+
+### Red evidence: concurrent migrators (pre-fix code, commit `aa54b60`)
+
+The pre-fix `migrate` has no locking at all: `read_schema_generation` decides
+`FreshSchema`, then one `pog.transaction` runs the entire v11 DDL — two
+concurrent callers against the same empty schema race each other's
+unlocked `CREATE TABLE`/marker `INSERT` statements with nothing serialising
+them.
+
+Proven empirically, not just reasoned about: a disposable `git worktree` was
+checked out at `aa54b60` (this repository's `HEAD` immediately before this
+increment), given a minimal standalone test that spawns two concurrent
+`postgres.migrate(database)` calls against the same fresh, empty schema and
+waits for both, and run against a fresh throwaway PostgreSQL cluster. Result:
+
+```
+#(Ok(Error(MigrationQueryFailed(ConstraintViolated(
+    "duplicate key value violates unique constraint \"pg_type_typname_nsp_index\"",
+    "pg_type_typname_nsp_index",
+    "Key (typname, typnamespace)=(grind_schema_migrations, 2200) already exists.")))),
+  Ok(Ok(Nil)))
+should equal
+#(Ok(Ok(Nil)), Ok(Ok(Nil)))
+```
+
+One of the two concurrent full-install calls loses the race on PostgreSQL's
+own `pg_type` catalog uniqueness constraint (both attempted `CREATE TABLE
+grind_schema_migrations` at once) and returns `MigrationQueryFailed`, exactly
+as expected — the gap the advisory lock in `migrate_with`'s runner closes.
+The equivalent test in the fixed code
+(`postgres_migrate_concurrent_migrators_both_apply_once_test`,
+`test/grind_test.gleam`) holds a real observer on the exact advisory-lock key
+`migrate` uses, spawns the same two concurrent callers, and proves both
+`Ok(Nil)` and exactly one marker row once the lock is released — confirmed
+green in the full gate below. The worktree, its throwaway probe test, and its
+throwaway cluster were all removed after capturing this; nothing from that
+worktree is part of this change.
+
+### Partial-failure step resumption (new behaviour; no pre-fix equivalent)
+
+`migrate_with`'s per-step, resumable transaction semantics have no analogue
+in the pre-fix single-transaction `migrate`, so there is no meaningful "red
+on old code" run for this one — the old code has no step or resumption
+concept to exercise. Instead,
+`postgres_migrate_with_partial_failure_preserves_earlier_steps_test` proves
+the new behaviour directly against a real fresh cluster: `migrate_with(real
+++ [synthetic v12 ok, synthetic v13 failing via a `ddl_command_end` event
+trigger targeting v13's own object])` returns `MigrationStepFailed(13, _)`,
+leaves markers at exactly `{11, 12}`, v12's own object present and v13's
+absent (its own transaction rolled back cleanly); removing the trigger and
+re-running the identical step list resumes to `{11, 12, 13}` — proving
+earlier committed steps are untouched by a later step's failure and a
+corrected re-run picks up exactly where it left off.
+
+### Three genuine defects this increment's own gate runs caught
+
+None of these were deliberately injected mutations — they were caught by
+simply running the real, official gate (`scripts/test-postgres.sh`) against
+a fresh cluster after writing the new tests, which is itself evidence the
+new assertions are not vacuous:
+
+1. `grind_catalog_digest`'s `pg_constraint` query concatenated
+   `contype` (PostgreSQL's `"char"` pseudo-type) directly with `text` via
+   `||`, which PostgreSQL rejects as `42725 ambiguous_function` ("operator
+   is not unique: text || \"char\"") — the whole upgrade-harness test failed
+   with that error before any of its actual assertions ran. Fixed by an
+   explicit `contype::text` cast.
+2. The upgrade-harness smoke test asserted
+   `postgres.outcome(..) == Ok(job.SucceededWith("42"))`, copied from a
+   different, incrementing test worker; the smoke worker here returns its
+   input unchanged, so the real result was `SucceededWith("41")` — a
+   `should.equal` panic caught it immediately. Corrected to `"41"`.
+3. The same test's quarantine-smoke step expected
+   `queue.process_one(consumer) |> should.equal(Ok(False))` (nothing
+   legitimately claimed, only the deliberately-expired job quarantined), but
+   got `Ok(True)`: an earlier `submit_unique` call in the same test had left
+   its own row genuinely still queued and claimable, and `process_one`
+   correctly claimed and ran _that_ job in the same poll it also quarantined
+   the expired one. Fixed by draining the unique-submission job first, so
+   the quarantine check's own poll has no other legitimately claimable work
+   competing in it.
+
+### Full-gate confirmation (Round 1)
+
+`nix develop --command bash scripts/test-postgres.sh` against a fresh
+disposable PostgreSQL cluster (own `initdb`, own port, torn down on exit),
+after the three fixes above: grind's own `gleam test` **184 passed, 0
+failures** (180 pre-existing + `grind_migrations_conformance_test`,
+`postgres_migration_future_version_precedes_shape_check_test`,
+`postgres_migrate_concurrent_migrators_both_apply_once_test`,
+`postgres_migrate_with_partial_failure_preserves_earlier_steps_test`, and
+`postgres_migrate_upgrade_from_frozen_v11_fixture_test`), the pinned Oban
+oracle harness, and the external-consumer package's own `gleam test` **10
+passed, 0 failures**, run together end to end, all required contract markers
+present.
+
+### Full-gate confirmation (Round 2, after the fixes above)
+
+Same command, same fresh-cluster discipline: grind's own `gleam test`
+**186 passed, 0 failures** (184 Round 1 + `postgres_migrate_detects_missing_relation_in_declared_shape_test`
+and `postgres_migration_quotes_mixed_case_schema_name_test`), the pinned
+Oban oracle harness, and the external-consumer package's own `gleam test`
+**10 passed, 0 failures**, all required contract markers present (including
+the two new ones, `migrate-missing-relation-shape-detected` and
+`migrate-mixed-case-schema-no-op-passed`). `gleam check` clean in both the
+root package and `consumer/`; `nix fmt`/`nix flake check`/`git diff --check`
+all clean.
+
+### Round 2 — coordinator review: exact-shape model, quoting, and a broader upgrade harness
+
+A second review round ("ACCEPT WITH FIXES") required five changes plus a
+list of smaller items. All applied, gated green; the two genuinely
+consequential findings — one demanded by the review, one found empirically
+while implementing it — are detailed below.
+
+**1 (required). "Trusted from the marker alone" removed.** A step is now
+`migrations.Migration(version, statements, shape)`, where `shape` is the
+version's own _cumulative_ expected set of `grind_`-prefixed relations
+(name + kind) plus any required key columns — generalising the old
+`v11_shape_matches`/`read_unique_key_columns` pair into one mechanism
+`read_schema_generation` applies to _every_ version, not just 11.
+`migrate_with` validates its own `steps` argument is exactly the contiguous
+range `{11..latest}` (`let assert`, a precondition on the caller — a
+malformed list is a programming error, not a runtime condition). After a
+step's own statements run, `run_migration_step_transaction` re-reads the
+generation once more, in the same transaction, and requires it now reports
+exactly `AtVersion(step.version)` before committing — catching a step whose
+DDL ran without SQL-level error but produced the wrong shape or marker.
+
+Red evidence, captured honestly (the fix was already drafted before this
+review comment, so red evidence needed a deliberate temporary revert rather
+than a fresh implementation): `validate_expected_shape` was edited in place
+to reproduce the old "trusted from the marker alone" behaviour (`Ok(AtVersion(version))`
+unconditionally, skipping the shape check), the new test
+`postgres_migrate_detects_missing_relation_in_declared_shape_test` (install
+`migrate_with(migrations() ++ [synthetic v12])`, drop the synthetic v12
+table, migrate again) was run against it, and failed exactly as predicted:
+
+```
+test: grind_test.postgres_migrate_detects_missing_relation_in_declared_shape_test
+Ok(Nil)
+should equal
+Error(IncompatibleSchema)
+```
+
+The revert was then undone (Edit, not git) and the test reran green.
+
+**A genuine bug this same test then found in the real fix, before it ever
+reached the coordinator**: the first version of `v11_shape()` listed only
+the DDL's own explicit objects (5 tables, 1 sequence, 1 partial index) —
+7 relations. Running the real v11 statements against a fresh database and
+querying `pg_class` directly showed **14** `grind_`-prefixed relations:
+PostgreSQL's own implicit objects — `grind_jobs_id_seq` (the `bigserial`
+column's sequence) and one backing index per `PRIMARY KEY`/`UNIQUE`
+constraint (`grind_schema_migrations_pkey`, `grind_jobs_pkey`,
+`grind_job_resolutions_pkey`, `grind_job_acknowledgements_pkey`,
+`grind_job_acknowledgements_attempt_key`, `grind_unique_submissions_pkey`)
+— are also `grind_`-prefixed and are compared _exactly_, so the
+under-declared shape rejected its own freshly-installed, entirely correct
+schema as `IncompatibleSchema`. Confirmed by literally applying the DDL and
+running `SELECT relname, relkind FROM pg_class WHERE relname LIKE
+'grind\_%'` rather than reasoning from the DDL text; `v11_shape()` and the
+two synthetic test migrations (whose own `id integer PRIMARY KEY` tables
+each need their own implicit `_pkey` index declared too) were corrected
+and reverified against a real cluster. AGENTS.md's "Adding a migration" now
+says to confirm the real relation set empirically for exactly this reason.
+
+**2. Schema-name quoting.** `schema_migrations_table_exists`'s
+`to_regclass(current_schema() || '.grind_schema_migrations')` silently
+folded an unquoted, mixed-case schema name to lower case, so `to_regclass`
+looked up a schema that did not exist and wrongly reported the marker table
+absent even when fully installed. Fixed with `quote_ident(current_schema())`.
+Proven against a real database whose default `search_path` is a quoted
+schema named `"MixedCase"` (`GRIND_TEST_SCHEMA_MIXED_CASE_URL`, configured
+once via `ALTER DATABASE ... SET search_path`, exactly like the existing
+`grind_repeatable_read_test` database's own isolation-level override, before
+the pool ever connects): `postgres_migration_quotes_mixed_case_schema_name_test`
+proves a second `migrate` call is a clean `Ok(Nil)` no-op.
+
+**3. A discriminating future-version-ordering test.**
+`postgres_migration_future_version_precedes_shape_check_test` now drops
+`grind_unique_submissions` (breaking v11's own declared shape) _and_ adds a
+`12` marker on top, still expecting `UnsupportedSchemaVersion(12)` — a
+shape-first implementation would evaluate the now-broken v11 shape and
+misreport `IncompatibleSchema` instead. The previous version of this test
+(an unrelated foreign object, not a broken shape) could not have told the
+two orderings apart.
+
+**4. The advisory lock embedded in the migration files themselves.** Every
+version's own `statements` list — both `migrations()` and
+`priv/migrations/*.sql` — now starts with the identical
+`pg_advisory_xact_lock` statement `migrate_with`'s own `acquire_migration_lock`
+already runs; re-acquiring the same transaction-scoped lock twice in one
+transaction is a no-op. This is what makes cigogne applying migrations
+directly serialise against a concurrent `postgres.migrate` caller too. v11's
+file content changed (the lock statement is new), so its pinned sha256 was
+recomputed (`2B79E6CBD28A36850E31E1D69CC0C353D9CCFC4A4D8CEC688B0DC9C4ECEF17A0`)
+and `test/fixtures/schema/v11.sql` regenerated from it — both unreleased, so
+re-pinning in place is correct, not a released-file tamper. The conformance
+test now also uses cigogne's own `config.get("grind")` (exercising the real
+`priv/cigogne.toml`) instead of a hand-built config, requires a pinned
+sha256 for every file except the newest, checks the marker statement
+literally starts with `INSERT INTO grind_schema_migrations`, and asserts the
+frozen fixture equals the pinned v11 migration's own `up` section.
+
+**5. Doc wording.** `MigrationCommitUnknown`'s doc comment (and README's,
+and `IMPLEMENTATION-SCOPE.md`'s) now names its three distinct
+may-or-may-not-have-committed shapes (a checkout failure before `BEGIN` ever
+ran, `BEGIN` itself failing, and a failed `ROLLBACK` after a statement
+error) instead of only "`BEGIN`/`COMMIT` failed". `MigrationQueryFailed`'s
+doc comment now also names lock acquisition and the `READ COMMITTED` pin.
+`migration_deadline`'s own doc comment now says explicitly that it applies
+_per step_, not to the whole `migrate`/`migrate_with` call. README now also
+states the lock is transaction-scoped (not session-scoped, the wrong word
+the first version of this section used), that an application must pick one
+owner (Grind's own `migrate` or cigogne) for a given database's schema
+rather than mixing them, and that `grind_v11`'s own `down` section is a
+real, destructive drop of every Grind table's data.
+
+**Also done, smaller items**: `READ COMMITTED` is now pinned as each
+migration step's own literal first statement (defence in depth, reusing
+`unique_admission`'s own `pin_read_committed` query); `read_schema_marker`
+and the new `relation_has_columns`/`read_grind_relations` all map a
+transient read failure to `MigrationQueryFailed`, never `IncompatibleSchema`;
+`scripts/generate-sql.sh`/`test-postgres.sh` now strip `\r` before extracting
+a migration file's `up` section and fail loudly if the extraction is empty;
+the catalog-equality digest now also covers `column_default`,
+`ordinal_position`, and `pg_sequences`; and the upgrade harness (below) was
+substantially broadened.
+
+### Upgrade harness, broadened
+
+`postgres_migrate_upgrade_from_frozen_v11_fixture_test` now seeds queued,
+scheduled, and retryable rows (previously only executing/uncertain/
+succeeded), and seeds its uniqueness row through a real `submit_unique` call
+against the pre-migration schema — never a hand-written `request_sha256` —
+so its own `unique_key_contract`/`unique_key_sha256` columns and hash are
+exactly what a genuine post-upgrade replay must still match. After
+migrating, the test now exercises the _seeded legacy rows themselves_, not
+only fresh new traffic: the seeded already-expired executing lease is
+genuinely quarantined by a real legacy-queue `process_one` poll (proven via
+a constructed `job.new_handle`, the `@internal` constructor the same package
+already exposes for exactly this), the seeded uncertain row is resolved
+(`resolve_uncertain`), the seeded acknowledgement receipt is reconciled by
+its own real command ID (`reconcile_acknowledgement`), and the seeded
+uniqueness submission is replayed (`submit_unique` again with the same
+submission ID) and asserted to resolve to the same job ID.
+
+Two real bugs surfaced getting this green, both fixed and reverified against
+a real cluster:
+
+- Every raw-seeded row and constructed handle originally used a literal
+  `'upgrade-owner'` as `storage_owner` — but `storage_owner` is not a
+  caller-chosen string, it is `host:port/database`, computed by
+  `postgres.validate`. Every typed call against a constructed handle
+  therefore failed with `StateStorageOwnerMismatch`. Fixed by reading the
+  pool's own real value (`postgres.storage_owner(upgrade_database)`, already
+  a public accessor other tests in this suite use) once and using it
+  everywhere instead of the hand-written string.
+- The quarantine-poll and unique-submission-replay checks each raced a
+  _different_ legitimately-claimable job left `queued` by an earlier step in
+  the same test (the seeded `queued` row for the first; the just-replayed
+  uniqueness submission for the second) — `queue.process_one` correctly
+  claimed that other due job in the same poll instead of the one the
+  assertion cared about, exactly the same shape of bug Round 1 already found
+  once. Fixed by draining each competing job first and, for the plain seeded
+  `queued`/`scheduled`/`retryable` rows, seeding them in a separate queue
+  from the ones the smoke checks actually poll.
+
+`reconcile_unique` specifically remains a stated scope cut (see below) —
+`reconcile_acknowledgement` is no longer one.
+
+### Scope cuts, stated honestly
+
+- The design's optional item ("cigogne applies the migrations end to end,
+  then `postgres.migrate` is a no-op") was not attempted — skipped for time,
+  as the design explicitly allowed.
+- `reconcile_unique` was not exercised against the seeded unique submission:
+  it takes a `unique.PendingSubmission`, a value only produced by a
+  `submit_unique` call that itself returned a commit-unknown outcome after a
+  genuinely lost reply — there is no "committed id" form of it to call
+  against an already-decided receipt. Exercising it honestly needs its own
+  lost-reply fault-injection rig (`test/grind_fault_proxy.erl` or
+  equivalent), not attempted here. The uniqueness side of the upgrade
+  harness is instead proven through a real `submit_unique` replay
+  (idempotent re-admission by receipt), which is the mechanism
+  `reconcile_unique` itself also reads.

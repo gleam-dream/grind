@@ -1,15 +1,28 @@
-//// The uniqueness admission transaction behind `postgres.submit_unique`/
-//// `reconcile_unique`. No dependency on `grind/postgres` (which depends on
-//// this module, not the reverse); this module returns `grind/unique`'s
-//// public `Admission`/`SubmitError`/`PendingSubmission` types
-//// directly, so `postgres.submit_unique`/`reconcile_unique` are thin entry
-//// points, not a second translating layer. See `docs/UNIQUENESS-CONTRACT.md`
-//// for the full contract.
+//// The admission transaction behind `postgres.submit_unique`/
+//// `postgres.reconcile_unique` and `postgres.submit_with_id`. No dependency
+//// on `grind/postgres` (which depends on this module, not the reverse);
+//// this module returns `grind/unique`'s public
+//// `Admission`/`SubmitError`/`PendingSubmission` types directly, so
+//// `postgres.submit_unique`/`reconcile_unique`/`submit_with_id` are thin
+//// entry points, not a second translating layer. See
+//// `docs/UNIQUENESS-CONTRACT.md` for the full contract.
+////
+//// One `Request` and one admission transaction serve both entry points:
+//// `Request.policy` is `Some(PolicyPart)` for `submit_unique` (a uniqueness
+//// key, scope, occupancy period, eligible states, and conflict action) and
+//// `None` for `submit_with_id` (a caller-supplied `SubmissionId` with no
+//// uniqueness key at all). The domain-wide advisory lock and candidate
+//// selection only ever run for `Some`; a `None` request always inserts (or
+//// replays its own prior receipt) with no candidate comparison. See
+//// "Admission receipts" in `docs/UNIQUENESS-CONTRACT.md` for the full
+//// contract of the `None` path, including why it needs no domain lock of
+//// its own.
 
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import grind/internal/sql
@@ -27,10 +40,14 @@ fn execute_safely(
 /// Generic form of `execute_safely`, for calling a Squirrel-generated query
 /// function (`grind/internal/sql`) that invokes `pog.execute` itself rather
 /// than going through `execute_safely`. See `grind/postgres`'s identical
-/// binding for the full rationale.
+/// binding for the full rationale. `run` receives the connection to actually
+/// issue that call against (the same value already checked out for the
+/// enclosing `transaction_or_checkout_failure` callback here, so this never
+/// triggers a second checkout).
 @external(erlang, "grind_postgres_ffi", "call_safely")
 fn call_safely(
-  run: fn() -> Result(pog.Returned(a), pog.QueryError),
+  connection: pog.Connection,
+  run: fn(pog.Connection) -> Result(pog.Returned(a), pog.QueryError),
 ) -> Result(pog.Returned(a), pog.QueryError)
 
 /// Distinguishes a checkout failure (the pool could not hand out a
@@ -54,9 +71,29 @@ fn transaction_or_checkout_failure(
 @external(erlang, "grind_unique_ffi", "sha256")
 fn sha256(data: BitArray) -> BitArray
 
-/// Every value the admission transaction needs, gathered once by `submit`.
-/// `request_sha256` starts empty and is filled in by `fingerprint`, which
-/// takes this whole record as its input — one field list, built once.
+/// The uniqueness-policy fields a `submit_unique` request carries and a
+/// `submit_with_id` request does not. Held as its own type (rather than
+/// flattened into `Request`) so `Request.policy: Option(PolicyPart)` alone
+/// expresses "does this request have a uniqueness policy" — no separate
+/// sentinel key/scope/period/states/action values are ever constructed for
+/// the "no policy" case.
+type PolicyPart {
+  PolicyPart(
+    key_contract: String,
+    encoded_key: String,
+    scope: unique.QueueScope,
+    period: unique.Period,
+    states: unique.States,
+    on_conflict: unique.ConflictAction,
+  )
+}
+
+/// Every value the admission transaction needs, gathered once by `submit`/
+/// `submit_plain`. `request_sha256` starts empty and is filled in by
+/// `fingerprint`, which takes this whole record as its input — one field
+/// list, built once. `policy: None` is `submit_with_id`'s "no policy" case:
+/// no uniqueness key, no candidate selection, no domain-wide advisory lock,
+/// always an insert (or a replayed receipt) — see the module doc comment.
 type Request(input, output, error) {
   Request(
     storage_owner: String,
@@ -70,26 +107,22 @@ type Request(input, output, error) {
     output_version: String,
     error_version: Option(String),
     max_attempts: Int,
-    key_contract: String,
-    encoded_key: String,
-    scope: unique.QueueScope,
-    period: unique.Period,
-    states: unique.States,
-    on_conflict: unique.ConflictAction,
     availability: unique.Availability,
+    policy: Option(PolicyPart),
     request_sha256: BitArray,
   )
 }
 
 /// The proven-committed outcome of one `submit` call, carried from wherever
 /// it was proven (a fresh write, or a durable receipt read back matching
-/// this exact submission) up to `grind/postgres`'s `submit_unique`, which is
-/// the only place that emits `[grind, job, admitted]` for it — never from
-/// inside a transaction callback. Mirrors `grind/postgres`'s own internal
-/// `AckCommit`. `via_receipt_match: True` means this call's own transaction
-/// (or its post-`CommitUnknown` reconciliation) did not write anything new —
-/// the exact same submission was already durably decided, so the
-/// observation's `confirmation` is `Reconciled` rather than `Replied`, and
+/// this exact submission) up to `grind/postgres`'s `submit_unique`/
+/// `submit_with_id`, whichever is the only place that emits
+/// `[grind, job, admitted]` for it — never from inside a transaction
+/// callback. Mirrors `grind/postgres`'s own internal `AckCommit`.
+/// `via_receipt_match: True` means this call's own transaction (or its
+/// post-`CommitUnknown` reconciliation) did not write anything new — the
+/// exact same submission was already durably decided, so the observation's
+/// `confirmation` is `Reconciled` rather than `Replied`, and
 /// `available_at_unix_ms` is `None` (a receipt read cannot re-derive it, the
 /// same limitation `AckCommit` documents for a receipt-matched
 /// acknowledgement).
@@ -102,6 +135,9 @@ pub type Commit(input, output, error) {
   )
 }
 
+/// Admits one job under a uniqueness policy, reached through
+/// `postgres.submit_unique`. Rejects an empty queue name before touching
+/// any resource.
 pub fn submit(
   connection: pog.Connection,
   storage_owner: String,
@@ -119,6 +155,59 @@ pub fn submit(
 ) {
   case queue {
     "" -> Error(unique.EmptyQueueName)
+    _ -> {
+      let unique.PolicyFields(key:, scope:, period:, states:) =
+        unique.policy_fields(policy)
+      run(
+        connection,
+        build_request(
+          storage_owner,
+          submission_id,
+          queue,
+          worker_def,
+          input,
+          availability,
+          fn(input_version, encoded_input) {
+            let #(key_contract, encoded_key) =
+              unique.key_material(key, input, input_version, encoded_input)
+            Some(PolicyPart(
+              key_contract:,
+              encoded_key:,
+              scope:,
+              period:,
+              states:,
+              on_conflict:,
+            ))
+          },
+        ),
+        lock_wait_ms,
+      )
+    }
+  }
+}
+
+/// Admits one job with a caller-supplied `SubmissionId` and no uniqueness
+/// policy, reached through `postgres.submit_with_id`. Rejects an empty
+/// queue name before touching any resource, exactly like `submit` above.
+/// No domain-wide advisory lock is ever acquired for this request — see
+/// `admission_transaction`'s own doc comment and
+/// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts", for the full
+/// justification.
+pub fn submit_plain(
+  connection: pog.Connection,
+  storage_owner: String,
+  lock_wait_ms: Int,
+  queue: String,
+  submission_id: unique.SubmissionId,
+  worker_def: Worker(input, output, error),
+  input: input,
+  availability: unique.Availability,
+) -> Result(
+  Commit(input, output, error),
+  unique.SubmitError(input, output, error),
+) {
+  case queue {
+    "" -> Error(unique.EmptyQueueName)
     _ ->
       run(
         connection,
@@ -129,8 +218,7 @@ pub fn submit(
           worker_def,
           input,
           availability,
-          policy,
-          on_conflict,
+          fn(_input_version, _encoded_input) { None },
         ),
         lock_wait_ms,
       )
@@ -159,6 +247,12 @@ pub fn reconcile(
   }
 }
 
+/// Gathers every value the admission transaction needs. `build_policy`
+/// receives the submitting worker's own input codec version and encoded
+/// input text (so a `Some` policy's key material is derived from exactly
+/// the same encoding the request itself carries, never re-encoded) and
+/// returns `Some(PolicyPart)` for `submit`'s uniqueness case or `None` for
+/// `submit_plain`'s "no policy" case.
 fn build_request(
   storage_owner: String,
   submission_id: unique.SubmissionId,
@@ -166,8 +260,7 @@ fn build_request(
   worker_def: Worker(input, output, error),
   input: input,
   availability: unique.Availability,
-  policy: unique.Policy(input),
-  on_conflict: unique.ConflictAction,
+  build_policy: fn(String, String) -> Option(PolicyPart),
 ) -> Request(input, output, error) {
   let worker.Metadata(
     id: worker_id,
@@ -178,10 +271,7 @@ fn build_request(
     max_attempts:,
   ) = worker.metadata(worker_def)
   let encoded_input = worker.encode_input(worker_def, input)
-  let unique.PolicyFields(key:, scope:, period:, states:) =
-    unique.policy_fields(policy)
-  let #(key_contract, encoded_key) =
-    unique.key_material(key, input, input_version, encoded_input)
+  let policy = build_policy(input_version, encoded_input)
   let request =
     Request(
       storage_owner:,
@@ -195,59 +285,115 @@ fn build_request(
       output_version:,
       error_version:,
       max_attempts:,
+      availability:,
+      policy:,
+      request_sha256: <<>>,
+    )
+  Request(..request, request_sha256: fingerprint(request))
+}
+
+/// The request fingerprint envelope; see `docs/UNIQUENESS-CONTRACT.md`,
+/// Decision 9, and "Admission receipts". Tagged `"grind-unique-request-v1"`
+/// when `policy` is `Some` and `"grind-plain-request-v1"` when it is
+/// `None` — deliberately different magic strings, so a `SubmissionId`
+/// reused between `submit_unique` and `submit_with_id` (or between two
+/// calls whose only difference is the presence of a policy) always
+/// fingerprint-mismatches and reports `SubmissionConflict`, never a
+/// silently-replayed decision from the wrong kind of admission. The
+/// policy-specific fields (key, scope, period, states, action) are present
+/// in the envelope only when `policy` is `Some`, in the same field order
+/// this envelope has always used.
+fn fingerprint(request: Request(input, output, error)) -> BitArray {
+  let tag = case request.policy {
+    Some(_) -> "grind-unique-request-v1"
+    None -> "grind-plain-request-v1"
+  }
+  let policy_fields = case request.policy {
+    None -> []
+    Some(PolicyPart(
       key_contract:,
       encoded_key:,
       scope:,
       period:,
       states:,
       on_conflict:,
-      availability:,
-      request_sha256: <<>>,
-    )
-  Request(..request, request_sha256: fingerprint(request))
-}
-
-/// The request fingerprint envelope; see `docs/UNIQUENESS-CONTRACT.md`, Decision 9.
-fn fingerprint(request: Request(input, output, error)) -> BitArray {
-  let #(period_ms, period_origin) = case unique.period_spec(request.period) {
-    unique.Unbounded -> #(None, None)
-    unique.FinitePeriod(ms, from) -> #(
-      Some(ms),
-      Some(unique.period_origin_label(from)),
-    )
+    )) -> {
+      let #(period_ms, period_origin) = case unique.period_spec(period) {
+        unique.Unbounded -> #(None, None)
+        unique.FinitePeriod(ms, from) -> #(
+          Some(ms),
+          Some(unique.period_origin_label(from)),
+        )
+      }
+      let reschedule_ms = unique.reschedule_target_ms(on_conflict)
+      [
+        json.string(key_contract),
+        json.string(encoded_key),
+        json.string(unique.scope_label(scope)),
+        json.bool(option.is_some(period_ms)),
+        json.nullable(period_ms, json.int),
+        json.bool(option.is_some(period_origin)),
+        json.nullable(period_origin, json.string),
+        json.string(unique.states_label(states)),
+        json.string(unique.action_label(on_conflict)),
+        json.bool(option.is_some(reschedule_ms)),
+        json.nullable(reschedule_ms, json.int),
+      ]
+    }
   }
-  let reschedule_ms = unique.reschedule_target_ms(request.on_conflict)
   let availability_ms = unique.availability_ms(request.availability)
-  json.preprocessed_array([
-    json.string("grind-unique-request-v1"),
-    json.string(request.queue),
-    json.string(request.worker_id),
-    json.string(request.worker_version),
-    json.string(request.input_version),
-    json.string(request.encoded_input),
-    json.string(request.key_contract),
-    json.string(request.encoded_key),
-    json.string(unique.scope_label(request.scope)),
-    json.bool(option.is_some(period_ms)),
-    json.nullable(period_ms, json.int),
-    json.bool(option.is_some(period_origin)),
-    json.nullable(period_origin, json.string),
-    json.string(unique.states_label(request.states)),
-    json.string(unique.action_label(request.on_conflict)),
-    json.bool(option.is_some(reschedule_ms)),
-    json.nullable(reschedule_ms, json.int),
-    json.bool(option.is_some(availability_ms)),
-    json.nullable(availability_ms, json.int),
-    json.string(request.output_version),
-    json.bool(option.is_some(request.error_version)),
-    json.nullable(request.error_version, json.string),
-    json.int(request.max_attempts),
-  ])
+  let envelope =
+    list.flatten([
+      [
+        json.string(tag),
+        json.string(request.queue),
+        json.string(request.worker_id),
+        json.string(request.worker_version),
+        json.string(request.input_version),
+        json.string(request.encoded_input),
+      ],
+      policy_fields,
+      [
+        json.bool(option.is_some(availability_ms)),
+        json.nullable(availability_ms, json.int),
+        json.string(request.output_version),
+        json.bool(option.is_some(request.error_version)),
+        json.nullable(request.error_version, json.string),
+        json.int(request.max_attempts),
+      ],
+    ])
+  json.preprocessed_array(envelope)
   |> json.to_string
   |> bit_array.from_string
   |> sha256
 }
 
+fn pending_submission(
+  request: Request(input, output, error),
+) -> unique.PendingSubmission(input, output, error) {
+  unique.new_pending_submission(
+    request.storage_owner,
+    request.submission_id,
+    request.worker,
+    request.request_sha256,
+  )
+}
+
+/// Runs the admission transaction and classifies its result. Shared by both
+/// `submit` (`policy: Some`) and `submit_plain` (`policy: None`) — the
+/// `TransactionRolledBack(SubmissionConflict)` arm below only ever fires
+/// naturally for the `None` path in the current admission flow (see
+/// `admission_transaction`'s doc comment: `Some`'s domain lock already
+/// forces a losing same-key concurrent submitter's own `find_receipt` to
+/// observe the winner's committed receipt before it could ever reach
+/// `record_receipt`'s own conflict), but resolving it the same way for
+/// `Some` is harmless: a `submit_unique` receipt-table primary-key conflict
+/// between two submitters sharing a `SubmissionId` but a *different* key
+/// (the untested different-key race `docs/UNIQUENESS-CONTRACT.md`,
+/// "Out of scope", already names) re-reads the exact same receipt and finds
+/// its fingerprint does not match this request's own — `SubmissionConflict`
+/// either way, just reached through one extra read instead of surfaced
+/// directly.
 fn run(
   connection: pog.Connection,
   request: Request(input, output, error),
@@ -268,19 +414,22 @@ fn run(
     // already know).
     Error(Nil) -> Error(unique.AdmissionFailed(pog.ConnectionUnavailable))
     Ok(Ok(commit)) -> Ok(commit)
-    Ok(Error(pog.TransactionRolledBack(error))) -> Error(error)
-    Ok(Error(pog.TransactionQueryError(_))) ->
-      case
-        reconcile_from_receipt(
-          connection,
-          unique.new_pending_submission(
-            request.storage_owner,
-            request.submission_id,
-            request.worker,
-            request.request_sha256,
-          ),
-        )
-      {
+    // A `SubmissionConflict` rolled back from inside the transaction, and a
+    // lost connection mid-transaction, both leave a receipt that may now be
+    // visible; re-reading it distinguishes a genuine mismatched retry (the
+    // fingerprint does not match — stays `SubmissionConflict`) from a
+    // same-id, same-request concurrent writer that committed first (the
+    // fingerprint matches — resolves to that receipt's own recorded
+    // decision) the same way `reconcile_from_receipt` always has. If that
+    // lookup itself cannot reach the store (rather than reaching it and
+    // finding no matching receipt), `reconcile_from_receipt` conservatively
+    // reports `CommitUnknown` either way — it never infers "must have
+    // rolled back, so this is definitely a conflict" from its own inability
+    // to check, since the `SubmissionConflict` case in particular really is
+    // ambiguous until the receipt is actually read.
+    Ok(Error(pog.TransactionRolledBack(unique.SubmissionConflict)))
+    | Ok(Error(pog.TransactionQueryError(_))) ->
+      case reconcile_from_receipt(connection, pending_submission(request)) {
         Ok(#(outcome, committed_state)) ->
           Ok(Commit(
             outcome:,
@@ -290,6 +439,7 @@ fn run(
           ))
         Error(error) -> Error(error)
       }
+    Ok(Error(pog.TransactionRolledBack(error))) -> Error(error)
   }
 }
 
@@ -313,6 +463,11 @@ fn reconcile_from_receipt(
     )
   {
     Ok(Some(outcome_with_state)) -> Ok(outcome_with_state)
+    // Conservative by construction: a failed lookup (the store could not be
+    // reached to check) is indistinguishable from "no receipt yet" here, so
+    // both report `CommitUnknown` rather than guessing — see `find_receipt`
+    // and `classify_query_error` below for how a query failure reaches this
+    // same `Ok(None)`-shaped uncertainty rather than its own `Error`.
     Ok(None) -> Error(unique.CommitUnknown(pending))
     // A fingerprint mismatch (or an unrecognized stored `decision`/
     // `observed_state`) is knowable, not uncertain: this exact
@@ -357,6 +512,21 @@ fn single_row(rows: List(a)) -> a {
   row
 }
 
+/// The domain-wide advisory lock (`acquire_lock`) and candidate selection
+/// only ever run when `request.policy` is `Some` — a `None` ("no policy")
+/// request has no uniqueness key to lock or compare candidates against, so
+/// it goes straight from the receipt lookup to `admit_candidate`'s own
+/// `None`-shaped insert path. See `docs/UNIQUENESS-CONTRACT.md`, "Admission
+/// receipts", for why no other lock is needed for the `None` case: the
+/// `grind_unique_submissions` primary key (`storage_owner`,
+/// `submission_id`) alone serializes two concurrent writers of the same
+/// `SubmissionId`, because PostgreSQL blocks the second writer's `INSERT`
+/// on the first's still-uncommitted conflicting row rather than the two
+/// ever inserting independently — not because at most two transactions
+/// could ever contend one key; any number of concurrent writers of the same
+/// `SubmissionId` queue on that same row the same way, one at a time, with
+/// no deadlock (each holds only its own uncommitted row and its own
+/// receipt-key intent, never another writer's).
 fn admission_transaction(
   connection: pog.Connection,
   lock_wait_ms: Int,
@@ -367,7 +537,17 @@ fn admission_transaction(
 ) {
   use _ <- result.try(pin_read_committed(connection))
   use _ <- result.try(set_lock_timeout(connection, lock_wait_ms))
-  use _ <- result.try(acquire_lock(connection, request))
+  use _ <- result.try(case request.policy {
+    Some(policy_part) ->
+      acquire_lock(
+        connection,
+        request.storage_owner,
+        request.worker_id,
+        request.worker_version,
+        policy_part,
+      )
+    None -> Ok(Nil)
+  })
   use existing <- result.try(find_receipt(
     connection,
     request.storage_owner,
@@ -408,7 +588,9 @@ fn pin_read_committed(
   connection: pog.Connection,
 ) -> Result(Nil, unique.SubmitError(input, output, error)) {
   use _ <- result.try(
-    call_safely(fn() { sql.pin_read_committed(connection) })
+    call_safely(connection, fn(connection) {
+      sql.pin_read_committed(connection)
+    })
     |> result.map_error(classify_query_error),
   )
   Ok(Nil)
@@ -419,7 +601,7 @@ fn set_lock_timeout(
   lock_wait_ms: Int,
 ) -> Result(Nil, unique.SubmitError(input, output, error)) {
   use _ <- result.try(
-    call_safely(fn() {
+    call_safely(connection, fn(connection) {
       sql.set_lock_timeout(connection, int.to_string(lock_wait_ms))
     })
     |> result.map_error(classify_query_error),
@@ -478,15 +660,18 @@ pub fn lock_query(
 
 fn acquire_lock(
   connection: pog.Connection,
-  request: Request(input, output, error),
+  storage_owner: String,
+  worker_id: String,
+  worker_version: String,
+  policy_part: PolicyPart,
 ) -> Result(Nil, unique.SubmitError(input, output, error)) {
   let query =
     lock_query(
-      request.storage_owner,
-      request.worker_id,
-      request.worker_version,
-      request.key_contract,
-      request.encoded_key,
+      storage_owner,
+      worker_id,
+      worker_version,
+      policy_part.key_contract,
+      policy_part.encoded_key,
     )
   use _ <- result.try(unique_execute(query, connection))
   Ok(Nil)
@@ -546,7 +731,7 @@ fn find_receipt(
   unique.SubmitError(input, output, error),
 ) {
   use returned <- result.try(
-    call_safely(fn() {
+    call_safely(connection, fn(connection) {
       sql.find_receipt(connection, storage_owner, submission_id_value)
     })
     |> result.map_error(classify_query_error),
@@ -598,6 +783,9 @@ fn outcome_of_receipt(
   }
 }
 
+/// Candidate selection only ever runs for a `Some` policy; a `None`
+/// ("no policy") request always inserts, since there is no candidate for it
+/// to compare against.
 fn admit_candidate(
   connection: pog.Connection,
   request: Request(input, output, error),
@@ -606,10 +794,20 @@ fn admit_candidate(
   unique.SubmitError(input, output, error),
 ) {
   use now_us <- result.try(sample_now(connection))
-  use candidate <- result.try(find_candidate(connection, request, now_us))
-  case candidate {
-    None -> insert_job(connection, request, now_us)
-    Some(row) -> decide_conflict(connection, request, row)
+  case request.policy {
+    None -> insert_job(connection, request, None, now_us)
+    Some(policy_part) -> {
+      use candidate <- result.try(find_candidate(
+        connection,
+        request,
+        policy_part,
+        now_us,
+      ))
+      case candidate {
+        None -> insert_job(connection, request, Some(policy_part), now_us)
+        Some(row) -> decide_conflict(connection, request, policy_part, row)
+      }
+    }
   }
 }
 
@@ -617,7 +815,7 @@ fn sample_now(
   connection: pog.Connection,
 ) -> Result(Int, unique.SubmitError(input, output, error)) {
   use returned <- result.try(
-    call_safely(fn() { sql.sample_now(connection) })
+    call_safely(connection, fn(connection) { sql.sample_now(connection) })
     |> result.map_error(classify_query_error),
   )
   let sql.SampleNowRow(int8: now) = single_row(returned.rows)
@@ -669,21 +867,25 @@ fn candidate_sql(
 
 fn bind_candidate_params(
   query: pog.Query(a),
-  request: Request(input, output, error),
+  storage_owner: String,
+  worker_id: String,
+  worker_version: String,
+  queue: String,
+  policy_part: PolicyPart,
   eligible_states: List(String),
   now_us: Int,
   period: unique.PeriodSpec,
 ) -> pog.Query(a) {
   let base =
     query
-    |> pog.parameter(pog.text(request.storage_owner))
-    |> pog.parameter(pog.text(request.worker_id))
-    |> pog.parameter(pog.text(request.worker_version))
-    |> pog.parameter(pog.text(request.key_contract))
-    |> pog.parameter(pog.text(request.encoded_key))
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(worker_version))
+    |> pog.parameter(pog.text(policy_part.key_contract))
+    |> pog.parameter(pog.text(policy_part.encoded_key))
     |> pog.parameter(pog.array(pog.text, eligible_states))
-  let scoped = case request.scope {
-    unique.WithinQueue -> base |> pog.parameter(pog.text(request.queue))
+  let scoped = case policy_part.scope {
+    unique.WithinQueue -> base |> pog.parameter(pog.text(queue))
     unique.AcrossQueues -> base
   }
   case period {
@@ -696,19 +898,29 @@ fn bind_candidate_params(
 fn find_candidate(
   connection: pog.Connection,
   request: Request(input, output, error),
+  policy_part: PolicyPart,
   now_us: Int,
 ) -> Result(Option(Candidate), unique.SubmitError(input, output, error)) {
-  let period_spec = unique.period_spec(request.period)
-  let eligible_states = unique.eligible_states(request.states)
+  let period_spec = unique.period_spec(policy_part.period)
+  let eligible_states = unique.eligible_states(policy_part.states)
   let sql =
     candidate_sql(
-      request.scope,
+      policy_part.scope,
       period_spec,
-      is_reschedule(request.on_conflict),
+      is_reschedule(policy_part.on_conflict),
     )
   let query =
     pog.query(sql)
-    |> bind_candidate_params(request, eligible_states, now_us, period_spec)
+    |> bind_candidate_params(
+      request.storage_owner,
+      request.worker_id,
+      request.worker_version,
+      request.queue,
+      policy_part,
+      eligible_states,
+      now_us,
+      period_spec,
+    )
     |> pog.returning({
       use id <- decode.field(0, decode.int)
       use row_queue <- decode.field(1, decode.string)
@@ -754,9 +966,91 @@ fn admitted_available_at(state: job.State, ms: Int) -> Option(Int) {
   }
 }
 
+/// Every value one `grind_unique_submissions` write needs, gathered by
+/// `insert_job`/`decide_conflict` rather than passed as a long positional
+/// argument list. `submitted_queue` is the request's own submitted queue
+/// (column `queue`); `job_queue` is the job's actual queue, which can differ
+/// from `submitted_queue` under `AcrossQueues` (column `job_queue`).
+type ReceiptWrite {
+  ReceiptWrite(
+    storage_owner: String,
+    submission_id: unique.SubmissionId,
+    submitted_queue: String,
+    worker_id: String,
+    worker_version: String,
+    request_sha256: BitArray,
+    decision: String,
+    job_id: Int,
+    job_queue: String,
+    observed_state: String,
+    rescheduled_from_ms: Option(Int),
+    rescheduled_to_ms: Option(Int),
+  )
+}
+
+/// Records one admission decision in `grind_unique_submissions`, shared by
+/// both `submit`'s policy-bearing requests and `submit_plain`'s "no policy"
+/// requests — the receipt table itself carries no key material either way,
+/// only the fields every request shape already has: the identity needed to
+/// look this receipt back up (`storage_owner`/`submission_id`), enough to
+/// detect a mismatched retry (`request_sha256`), and the outcome to record.
+fn record_receipt(
+  connection: pog.Connection,
+  write: ReceiptWrite,
+) -> Result(Nil, unique.SubmitError(input, output, error)) {
+  let ReceiptWrite(
+    storage_owner:,
+    submission_id:,
+    submitted_queue:,
+    worker_id:,
+    worker_version:,
+    request_sha256:,
+    decision:,
+    job_id:,
+    job_queue:,
+    observed_state:,
+    rescheduled_from_ms:,
+    rescheduled_to_ms:,
+  ) = write
+  let query =
+    pog.query(
+      "INSERT INTO grind_unique_submissions (storage_owner, submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state, rescheduled_from, rescheduled_to) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, "
+      <> to_timestamptz_sql(11, "1000.0")
+      <> ", "
+      <> to_timestamptz_sql(12, "1000.0")
+      <> ")",
+    )
+    |> pog.parameter(pog.text(storage_owner))
+    |> pog.parameter(pog.text(unique.submission_id_value(submission_id)))
+    |> pog.parameter(pog.text(submitted_queue))
+    |> pog.parameter(pog.text(worker_id))
+    |> pog.parameter(pog.text(worker_version))
+    |> pog.parameter(pog.bytea(request_sha256))
+    |> pog.parameter(pog.text(decision))
+    |> pog.parameter(pog.int(job_id))
+    |> pog.parameter(pog.text(job_queue))
+    |> pog.parameter(pog.text(observed_state))
+    |> pog.parameter(pog.nullable(pog.int, rescheduled_from_ms))
+    |> pog.parameter(pog.nullable(pog.int, rescheduled_to_ms))
+  case execute_safely(query, on: connection) {
+    Ok(_) -> Ok(Nil)
+    Error(pog.ConstraintViolated(_, "grind_unique_submissions_pkey", _)) ->
+      Error(unique.SubmissionConflict)
+    Error(other) -> Error(classify_query_error(other))
+  }
+}
+
+/// Inserts a fresh job row. `policy_part` here is `None` only for a
+/// `submit_plain` request; `admit_candidate` always passes `Some` for a
+/// policy-bearing `submit` request, even on a fresh insert (candidate
+/// selection found nothing to conflict with), so `submit_unique`'s rows
+/// always get real key columns. `None` binds `NULL` for both
+/// `unique_key_contract` and `unique_key_sha256`; `Some` binds the real key
+/// material.
 fn insert_job(
   connection: pog.Connection,
   request: Request(input, output, error),
+  policy_part: Option(PolicyPart),
   now_us: Int,
 ) -> Result(
   Commit(input, output, error),
@@ -768,14 +1062,27 @@ fn insert_job(
     Some(version) -> pog.text(version)
     None -> pog.null()
   }
+  let base_columns =
+    "storage_owner, queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at"
+  let base_values =
+    "$1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, "
+    <> to_timestamptz_sql(11, "1000.0")
+    <> ", "
+    <> to_timestamptz_sql(12, "1000000.0")
+  let #(columns, values, key_params) = case policy_part {
+    None -> #(base_columns, base_values, [])
+    Some(PolicyPart(key_contract:, encoded_key:, ..)) -> #(
+      base_columns <> ", unique_key_contract, unique_key_sha256",
+      base_values <> ", $13, " <> key_digest_sql(14),
+      [pog.text(key_contract), pog.text(encoded_key)],
+    )
+  }
   let query =
     pog.query(
-      "INSERT INTO grind_jobs (storage_owner, queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at, unique_key_contract, unique_key_sha256) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, "
-      <> to_timestamptz_sql(11, "1000.0")
-      <> ", "
-      <> to_timestamptz_sql(12, "1000000.0")
-      <> ", $13, "
-      <> key_digest_sql(14)
+      "INSERT INTO grind_jobs ("
+      <> columns
+      <> ") VALUES ("
+      <> values
       <> ") RETURNING id",
     )
     |> pog.parameter(pog.text(request.storage_owner))
@@ -790,8 +1097,9 @@ fn insert_job(
     |> pog.parameter(pog.text(job.state_to_stored(state)))
     |> pog.parameter(pog.int(available_at_ms))
     |> pog.parameter(pog.int(now_us))
-    |> pog.parameter(pog.text(request.key_contract))
-    |> pog.parameter(pog.text(request.encoded_key))
+  let query = list.fold(key_params, query, pog.parameter)
+  let query =
+    query
     |> pog.returning({
       use id <- decode.field(0, decode.int)
       decode.success(id)
@@ -800,13 +1108,20 @@ fn insert_job(
   let job_id = single_row(returned.rows)
   use _ <- result.try(record_receipt(
     connection,
-    request,
-    "inserted",
-    job_id,
-    request.queue,
-    job.state_to_stored(state),
-    None,
-    None,
+    ReceiptWrite(
+      storage_owner: request.storage_owner,
+      submission_id: request.submission_id,
+      submitted_queue: request.queue,
+      worker_id: request.worker_id,
+      worker_version: request.worker_version,
+      request_sha256: request.request_sha256,
+      decision: "inserted",
+      job_id:,
+      job_queue: request.queue,
+      observed_state: job.state_to_stored(state),
+      rescheduled_from_ms: None,
+      rescheduled_to_ms: None,
+    ),
   ))
   Ok(Commit(
     outcome: unique.Inserted(job.new_handle(
@@ -821,15 +1136,19 @@ fn insert_job(
   ))
 }
 
+/// Only ever called for a policy-bearing (`Some`) request — a `None`
+/// request never performs candidate selection, so it never has a candidate
+/// to decide against.
 fn decide_conflict(
   connection: pog.Connection,
   request: Request(input, output, error),
+  policy_part: PolicyPart,
   candidate: Candidate,
 ) -> Result(
   Commit(input, output, error),
   unique.SubmitError(input, output, error),
 ) {
-  case request.on_conflict, candidate.state {
+  case policy_part.on_conflict, candidate.state {
     unique.RescheduleScheduledTo(at), "scheduled" -> {
       let new_ms = job.available_at_unix_milliseconds(at)
       use _ <- result.try(reschedule_job(
@@ -840,13 +1159,20 @@ fn decide_conflict(
       ))
       use _ <- result.try(record_receipt(
         connection,
-        request,
-        "rescheduled",
-        candidate.id,
-        candidate.queue,
-        "scheduled",
-        Some(candidate.available_at_us / 1000),
-        Some(new_ms),
+        ReceiptWrite(
+          storage_owner: request.storage_owner,
+          submission_id: request.submission_id,
+          submitted_queue: request.queue,
+          worker_id: request.worker_id,
+          worker_version: request.worker_version,
+          request_sha256: request.request_sha256,
+          decision: "rescheduled",
+          job_id: candidate.id,
+          job_queue: candidate.queue,
+          observed_state: "scheduled",
+          rescheduled_from_ms: Some(candidate.available_at_us / 1000),
+          rescheduled_to_ms: Some(new_ms),
+        ),
       ))
       Ok(Commit(
         outcome: unique.Rescheduled(unique.new_conflict(
@@ -869,13 +1195,20 @@ fn decide_conflict(
       )
       use _ <- result.try(record_receipt(
         connection,
-        request,
-        "existing",
-        candidate.id,
-        candidate.queue,
-        candidate.state,
-        None,
-        None,
+        ReceiptWrite(
+          storage_owner: request.storage_owner,
+          submission_id: request.submission_id,
+          submitted_queue: request.queue,
+          worker_id: request.worker_id,
+          worker_version: request.worker_version,
+          request_sha256: request.request_sha256,
+          decision: "existing",
+          job_id: candidate.id,
+          job_queue: candidate.queue,
+          observed_state: candidate.state,
+          rescheduled_from_ms: None,
+          rescheduled_to_ms: None,
+        ),
       ))
       Ok(Commit(
         outcome: unique.Existing(unique.new_conflict(
@@ -904,50 +1237,10 @@ fn reschedule_job(
   new_ms: Int,
 ) -> Result(Nil, unique.SubmitError(input, output, error)) {
   use _ <- result.try(
-    call_safely(fn() {
+    call_safely(connection, fn(connection) {
       sql.reschedule_job(connection, new_ms, job_id, storage_owner)
     })
     |> result.map_error(classify_query_error),
   )
   Ok(Nil)
-}
-
-fn record_receipt(
-  connection: pog.Connection,
-  request: Request(input, output, error),
-  decision: String,
-  job_id: Int,
-  job_queue: String,
-  observed_state: String,
-  rescheduled_from_ms: Option(Int),
-  rescheduled_to_ms: Option(Int),
-) -> Result(Nil, unique.SubmitError(input, output, error)) {
-  let query =
-    pog.query(
-      "INSERT INTO grind_unique_submissions (storage_owner, submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state, rescheduled_from, rescheduled_to) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, "
-      <> to_timestamptz_sql(11, "1000.0")
-      <> ", "
-      <> to_timestamptz_sql(12, "1000.0")
-      <> ")",
-    )
-    |> pog.parameter(pog.text(request.storage_owner))
-    |> pog.parameter(
-      pog.text(unique.submission_id_value(request.submission_id)),
-    )
-    |> pog.parameter(pog.text(request.queue))
-    |> pog.parameter(pog.text(request.worker_id))
-    |> pog.parameter(pog.text(request.worker_version))
-    |> pog.parameter(pog.bytea(request.request_sha256))
-    |> pog.parameter(pog.text(decision))
-    |> pog.parameter(pog.int(job_id))
-    |> pog.parameter(pog.text(job_queue))
-    |> pog.parameter(pog.text(observed_state))
-    |> pog.parameter(pog.nullable(pog.int, rescheduled_from_ms))
-    |> pog.parameter(pog.nullable(pog.int, rescheduled_to_ms))
-  case execute_safely(query, on: connection) {
-    Ok(_) -> Ok(Nil)
-    Error(pog.ConstraintViolated(_, "grind_unique_submissions_pkey", _)) ->
-      Error(unique.SubmissionConflict)
-    Error(other) -> Error(classify_query_error(other))
-  }
 }

@@ -319,6 +319,8 @@ pub fn public_consumer_effect_crash_uncertainty_audited_recovery_test() {
 fn run_effect_crash_uncertainty_test(url: String) -> Nil {
   let assert Ok(settings) =
     postgres.settings(url, process.new_name("consumer_uncertain_pool"))
+    |> postgres.unique_lock_wait(1)
+    |> postgres.statement_deadline(1002)
     |> postgres.validate
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
@@ -359,7 +361,7 @@ fn run_effect_crash_uncertainty_test(url: String) -> Nil {
     |> queue.with_poll_interval(20)
     |> queue.with_maximum_jobs_per_poll(2)
     |> queue.with_maximum_concurrency(2)
-    |> queue.with_lease_duration(500)
+    |> queue.with_lease_duration(6100)
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start_with_policy(database, workers, policy)
   use <- exception.defer(fn() { queue.stop(consumer) })
@@ -370,9 +372,12 @@ fn run_effect_crash_uncertainty_test(url: String) -> Nil {
   // acknowledgement is ever attempted for that attempt. Only the short
   // lease's expiry, found by the automatic poller's own quarantine scan on a
   // later tick, moves each row to Uncertain.
-  await_state(database, job1_handle, job.Uncertain, 250)
+  // Budget covers the (now longer) lease itself — see
+  // `postgres.statement_deadline`/`queue.LeaseTooShortForDeadline` — plus a
+  // margin for the quarantine scan's own next poll tick.
+  await_state(database, job1_handle, job.Uncertain, 400)
   |> should.equal(True)
-  await_state(database, job2_handle, job.Uncertain, 250)
+  await_state(database, job2_handle, job.Uncertain, 400)
   |> should.equal(True)
   // The crash surfaced as worker death and conservative recovery -- never as
   // an invalid-input or business-failure outcome.
@@ -810,6 +815,78 @@ fn run_unique_admission_existing_conflict_and_retry_test(url: String) -> Nil {
   postgres.outcome(database, bound) |> should.equal(Ok(job.SucceededWith("42")))
 
   mark("consumer-unique-admission-existing-conflict-retry-passed")
+}
+
+/// `postgres.submit_with_id` — the retry-safe plain submit path, exercised
+/// from a consumer of only Grind's public API. A same-id, same-input retry
+/// after a genuine first commit converges on the original job (`Inserted`,
+/// the same id, no second row), unlike a plain `submit`/`submit_at` retry.
+pub fn public_consumer_submit_with_id_retry_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> run_submit_with_id_retry_test(url)
+  }
+}
+
+fn run_submit_with_id_retry_test(url: String) -> Nil {
+  let assert Ok(settings) =
+    postgres.settings(url, process.new_name("consumer_submit_with_id_pool"))
+    |> postgres.validate
+  let assert Ok(database) = postgres.start(settings)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+
+  let worker_def = unique_echo_worker("consumer.submit_with_id_echo")
+  let assert Ok(workers) = registry.new("consumer-submit-with-id")
+  let assert Ok(workers) = registry.register(workers, worker_def)
+  let test_queue = "consumer-submit-with-id"
+
+  let assert Ok(submission_id) = unique.submission_id("consumer-with-id-once")
+  let assert Ok(unique.Inserted(handle)) =
+    postgres.submit_with_id(
+      database,
+      test_queue,
+      submission_id,
+      worker_def,
+      42,
+      unique.Immediately,
+    )
+
+  // A retry with the identical `SubmissionId` and request converges on the
+  // exact same job -- no second row -- rather than risking a duplicate the
+  // way a plain `submit` retry could.
+  let assert Ok(unique.Inserted(retried)) =
+    postgres.submit_with_id(
+      database,
+      test_queue,
+      submission_id,
+      worker_def,
+      42,
+      unique.Immediately,
+    )
+  job.id_value(retried) |> should.equal(job.id_value(handle))
+
+  // A different request under the same id is a genuine conflict, not a
+  // silent replay.
+  postgres.submit_with_id(
+    database,
+    test_queue,
+    submission_id,
+    worker_def,
+    43,
+    unique.Immediately,
+  )
+  |> should.equal(Error(unique.SubmissionConflict))
+
+  let assert Ok(consumer) = queue.start_manual(database, workers)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+
+  await_state(database, handle, job.Succeeded, 250) |> should.equal(True)
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.SucceededWith("42")))
+
+  mark("consumer-submit-with-id-retry-passed")
 }
 
 pub fn public_consumer_unique_reschedule_across_queues_test() {

@@ -1,13 +1,6 @@
--- Grind's fresh-install schema DDL, kept byte-identical (statement text) to
--- the list `grind/postgres.schema_ddl_statements` returns and
--- `create_fresh_schema` executes, statement by statement, inside one
--- transaction. `postgres_schema_ddl_matches_sql_file_test`
--- (test/grind_test.gleam) proves the two stay equal.
---
--- This file exists for tooling, not for Grind itself to load at runtime:
--- scripts/generate-sql.sh applies it with `psql` so a disposable database has
--- Grind's schema before `gleam run -m squirrel` inspects real query types
--- against it.
+--- migration:up
+
+SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended('grind-migrate-v1:' || current_schema(), 0))) l;
 
 CREATE TABLE grind_schema_migrations (version integer PRIMARY KEY, installed_at timestamptz NOT NULL DEFAULT clock_timestamp());
 
@@ -24,3 +17,23 @@ CREATE SEQUENCE grind_attempts_id_seq AS bigint START WITH 1 INCREMENT BY 1 MINV
 CREATE TABLE grind_unique_submissions (storage_owner text NOT NULL, submission_id text NOT NULL, queue text NOT NULL, worker_id text NOT NULL, worker_version text NOT NULL, request_sha256 bytea NOT NULL CONSTRAINT grind_unique_submissions_request_sha256_check CHECK (octet_length(request_sha256) = 32), decision text NOT NULL CONSTRAINT grind_unique_submissions_decision_check CHECK (decision IN ('inserted', 'existing', 'rescheduled')), job_id bigint NOT NULL, job_queue text NOT NULL, observed_state text NOT NULL CONSTRAINT grind_unique_submissions_observed_state_check CHECK (observed_state IN ('queued', 'scheduled', 'retryable', 'executing', 'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain', 'discarded', 'cancelled')), decided_at timestamptz NOT NULL DEFAULT clock_timestamp(), rescheduled_from timestamptz, rescheduled_to timestamptz, CONSTRAINT grind_unique_submissions_pkey PRIMARY KEY (storage_owner, submission_id));
 
 INSERT INTO grind_schema_migrations (version) VALUES (11);
+
+--- migration:down
+
+DELETE FROM grind_schema_migrations WHERE version = 11;
+
+DROP TABLE grind_unique_submissions;
+
+DROP SEQUENCE grind_attempts_id_seq;
+
+DROP TABLE grind_job_acknowledgements;
+
+DROP TABLE grind_job_resolutions;
+
+DROP INDEX grind_jobs_unique_candidate_idx;
+
+DROP TABLE grind_jobs;
+
+DROP TABLE grind_schema_migrations;
+
+--- migration:end

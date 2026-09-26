@@ -282,15 +282,22 @@ pub type SubmitError(input, output, error) {
   EmptyQueueName
   /// The bounded wait for the admission lock (`postgres.unique_lock_wait`,
   /// default 5000ms) elapsed (PostgreSQL `55P03`). No conflicting job is
-  /// implied.
+  /// implied. For `submit_unique` this is the domain-wide advisory lock;
+  /// `submit_with_id` has no such lock, but the same bound also caps its
+  /// internal wait on the `grind_unique_submissions` primary key when a
+  /// concurrent same-id writer's insert is still uncommitted (see
+  /// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts").
   AdmissionContended
   /// This `SubmissionId` was already used for a request that does not match
-  /// this one (from either `submit_unique`'s own in-transaction receipt
-  /// check or a later `reconcile_unique` call). Also returned for a stored
-  /// receipt whose `decision`/`observed_state` text is not one this code
-  /// recognizes — unreachable without direct tampering, since both columns
-  /// carry a `CHECK` constraint against the same closed vocabulary this code
-  /// decodes, but handled the same fail-closed way rather than trusted.
+  /// this one (from `submit_unique`'s or `submit_with_id`'s own
+  /// in-transaction receipt check, a later `reconcile_unique` call, or a
+  /// genuinely concurrent same-id writer that committed first — see
+  /// `submit_with_id`'s own doc comment for that last case). Also returned
+  /// for a stored receipt whose `decision`/`observed_state` text is not one
+  /// this code recognizes — unreachable without direct tampering, since both
+  /// columns carry a `CHECK` constraint against the same closed vocabulary
+  /// this code decodes, but handled the same fail-closed way rather than
+  /// trusted.
   SubmissionConflict
   /// The admission did not commit. Reported only when that is knowable
   /// directly: either the store could not even hand out a connection to

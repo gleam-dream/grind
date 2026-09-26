@@ -31,8 +31,30 @@ initdb -D "$cluster" --username=grind --auth-local=trust --auth-host=trust >/dev
 pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port" -l "$root/postgres.log" start >/dev/null
 started=1
 createdb -h 127.0.0.1 -p "$port" -U grind grind_codegen
+
+# Grind's own migrations.gleam (src/grind/internal/migrations.gleam) is the
+# runtime source of truth; the cigogne-format files under priv/migrations
+# are a byte-identical mirror kept only so an application can apply Grind's
+# schema through cigogne (see README, "Migrations"). Apply their `up`
+# sections here, in filename order, exactly as an application importing them
+# via cigogne would, so Squirrel inspects the same schema either way.
+up_sql="$root/schema-up.sql"
+: >"$up_sql"
+for migration_file in "$repo_root"/priv/migrations/*.sql; do
+  # `tr -d '\r'` first: a migration file saved with CRLF line endings would
+  # otherwise leave the guard lines' trailing `\r` inside the sed patterns
+  # below, silently matching nothing and extracting an empty (or truncated)
+  # up section instead of failing loudly.
+  tr -d '\r' <"$migration_file" |
+    sed -n '/^--- migration:up$/,/^--- migration:down$/p' |
+    sed '1d;$d' >>"$up_sql"
+done
+if [[ ! -s "$up_sql" ]]; then
+  echo "extracted migration up SQL is empty; check priv/migrations/*.sql's own --- migration:up/down guards" >&2
+  exit 1
+fi
 psql -h 127.0.0.1 -p "$port" -U grind -d grind_codegen -v ON_ERROR_STOP=1 \
-  -f "$repo_root/src/grind/internal/schema.sql" >/dev/null
+  -f "$up_sql" >/dev/null
 
 printf 'Disposable PostgreSQL %s at 127.0.0.1:%s (Squirrel codegen database)\n' "$(postgres --version | awk '{print $3}')" "$port"
 

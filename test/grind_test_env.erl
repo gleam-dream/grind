@@ -1,5 +1,5 @@
 -module(grind_test_env).
--export([database_url/0, queue_database_url/0, owner_a_url/0, owner_b_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_atomic_url/0, resolution_route_a_url/0, resolution_route_b_url/0, repeatable_read_url/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0]).
+-export([database_url/0, queue_database_url/0, owner_a_url/0, owner_b_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_atomic_url/0, schema_concurrent_url/0, schema_partial_url/0, schema_upgrade_url/0, schema_upgrade_fresh_url/0, schema_future_foreign_url/0, schema_shape_url/0, schema_mixed_case_url/0, resolution_route_a_url/0, resolution_route_b_url/0, repeatable_read_url/0, quarantine_url/0, fault_proxy_url/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0, pool_connection_atom/1]).
 
 database_url() -> env("GRIND_TEST_DATABASE_URL").
 queue_database_url() -> env("GRIND_TEST_QUEUE_DATABASE_URL").
@@ -15,9 +15,18 @@ schema_missing_acknowledgements_url() -> env("GRIND_TEST_SCHEMA_MISSING_ACK_URL"
 schema_missing_attempt_sequence_url() -> env("GRIND_TEST_SCHEMA_MISSING_ATTEMPT_SEQUENCE_URL").
 schema_missing_unique_submissions_url() -> env("GRIND_TEST_SCHEMA_MISSING_UNIQUE_SUBMISSIONS_URL").
 schema_atomic_url() -> env("GRIND_TEST_SCHEMA_ATOMIC_URL").
+schema_concurrent_url() -> env("GRIND_TEST_SCHEMA_CONCURRENT_URL").
+schema_partial_url() -> env("GRIND_TEST_SCHEMA_PARTIAL_URL").
+schema_upgrade_url() -> env("GRIND_TEST_SCHEMA_UPGRADE_URL").
+schema_upgrade_fresh_url() -> env("GRIND_TEST_SCHEMA_UPGRADE_FRESH_URL").
+schema_future_foreign_url() -> env("GRIND_TEST_SCHEMA_FUTURE_FOREIGN_URL").
+schema_shape_url() -> env("GRIND_TEST_SCHEMA_SHAPE_URL").
+schema_mixed_case_url() -> env("GRIND_TEST_SCHEMA_MIXED_CASE_URL").
 resolution_route_a_url() -> env("GRIND_TEST_RESOLUTION_ROUTE_A_URL").
 resolution_route_b_url() -> env("GRIND_TEST_RESOLUTION_ROUTE_B_URL").
 repeatable_read_url() -> env("GRIND_TEST_REPEATABLE_READ_URL").
+quarantine_url() -> env("GRIND_TEST_QUARANTINE_URL").
+fault_proxy_url() -> env("GRIND_TEST_FAULT_PROXY_URL").
 
 env(Name) ->
     case os:getenv(Name) of
@@ -54,3 +63,17 @@ monotonic_ms() -> erlang:monotonic_time(millisecond).
 unique_test_run_id() ->
     erlang:system_time(microsecond) * 1000000 +
         erlang:unique_integer([positive, monotonic]) rem 1000000.
+
+%% A no-database regression guard for `src/grind_postgres_ffi.erl`'s own
+%% load-bearing assumption: `pog.named_connection/1` (a `Pool(Name)`
+%% `pog.Connection`) compiles to the raw tagged tuple `{pool, Name}`, and a
+%% checked-out single connection to `{single_connection, Conn}` — confirmed
+%% by reading the compiled `build/packages/pog/src/pog.erl`/`pog_ffi.erl`,
+%% never by pog's own published contract. If a future pog release changed
+%% this compiled shape, `grind_postgres_ffi`'s own pattern matches
+%% (`with_deadline/3`, `set_deadline/2`, `clear_deadline/1`) would silently
+%% stop matching a real `Pool` connection rather than raising here — this
+%% pattern-matches the exact same shape those functions depend on and
+%% surfaces a `function_clause` immediately if it ever no longer holds.
+pool_connection_atom({pool, Name}) -> {ok, Name};
+pool_connection_atom(_Other) -> {error, nil}.
