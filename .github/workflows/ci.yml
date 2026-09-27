@@ -1,16 +1,104 @@
-name: Test
+name: CI
 on: [push, pull_request]
+
+# Every job below checks out `gleam-dream/sinal` as a sibling directory of
+# this repo's own checkout (`../sinal`, relative to `grind/`): `gleam.toml`
+# depends on it as a local path dependency (`sinal = { path = "../sinal" }`),
+# not a Hex package, so `gleam deps download`/`gleam build` cannot resolve at
+# all without it — this is required just to compile, independent of whether
+# any PostgreSQL-backed test ever runs. Pinned to a fixed commit, not a
+# branch, so a later `sinal` change can never silently break this repo's own
+# CI without a deliberate bump here. See README, and
+# `docs/RELEASE-READINESS.md`, "CI", for why this pin exists and how to
+# update it.
+env:
+  SINAL_REF: f4622b67394965c18091ef95390cfd55ad6502db
+
 jobs:
-  test:
+  # Fast feedback: format, compile, and the plain `gleam test` run — every
+  # PostgreSQL-backed test in `test/grind_test.gleam` short-circuits to a
+  # no-op here (its own `case database_url() { Error(Nil) -> Nil ... }`
+  # guard, since no `GRIND_TEST_*_URL` environment variable is set), so a
+  # green run here only proves the code compiles and the DB-independent unit
+  # tests pass — never that the real system works. `postgres-gate` below is
+  # what actually exercises PostgreSQL-backed behavior; this job exists only
+  # to fail fast on a compile/format error without waiting on that heavier
+  # job's own Postgres/Elixir bootstrap.
+  quick-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: grind
+      - uses: actions/checkout@v4
+        with:
+          repository: gleam-dream/sinal
+          ref: ${{ env.SINAL_REF }}
+          path: sinal
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "28"
           gleam-version: "1.18.1"
           rebar3-version: "3.27.0"
-      - run: gleam deps download
-      - run: gleam format --check src test
-      - run: gleam build --warnings-as-errors
-      - run: gleam test
+      - working-directory: grind
+        run: gleam deps download
+      - working-directory: grind
+        run: gleam format --check src test
+      - working-directory: grind
+        run: gleam build --warnings-as-errors
+      - working-directory: grind
+        run: gleam test
+
+  # The real gate: the same disposable-PostgreSQL-cluster script the local
+  # development workflow runs (`scripts/test-postgres.sh`), through the
+  # identical Nix dev shell (`flake.nix`) rather than a hand-rolled
+  # reconstruction of its toolchain — so CI exercises literally the same
+  # PostgreSQL 16, Erlang/OTP, Gleam, and Elixir (for the pinned Oban oracle
+  # harness under `oracle/`) versions a contributor's own `nix develop`
+  # would. `scripts/test-postgres.sh` itself already fails closed if any
+  # named integration contract's own marker never got written (the
+  # `for contract in ...; do if ! grep -q "$contract" ...; then exit 1;
+  # fi; done` checklist for both the root suite and the external `consumer/`
+  # suite) — a DB-backed test silently short-circuiting the way it can in
+  # `quick-check` above therefore fails this job outright here, by design,
+  # rather than passing green with less coverage than it looks like.
+  postgres-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: grind
+      - uses: actions/checkout@v4
+        with:
+          repository: gleam-dream/sinal
+          ref: ${{ env.SINAL_REF }}
+          path: sinal
+      - uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            grind/build
+            grind/consumer/build
+            grind/oracle/deps
+            grind/oracle/_build
+            sinal/build
+          key: ${{ runner.os }}-grind-${{ hashFiles('grind/manifest.toml', 'grind/consumer/manifest.toml', 'grind/oracle/mix.lock', 'sinal/manifest.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-grind-
+      - name: nix flake check (grind)
+        working-directory: grind
+        run: nix flake check
+      # Sinal's own test suite — `docs/RELEASE-READINESS.md`'s own
+      # packaging checklist has long named this as a CI goal alongside the
+      # PostgreSQL gate. Sinal owns its own `flake.nix`, so this uses that
+      # devShell (its own pinned toolchain), not grind's — Sinal has no
+      # database dependency, so this is fast and fails independently of the
+      # PostgreSQL gate below.
+      - name: Sinal's own test suite
+        working-directory: sinal
+        run: nix develop --command gleam test
+      - name: PostgreSQL gate (root suite, consumer/ suite, pinned Oban oracle, Squirrel check)
+        working-directory: grind
+        run: nix develop --command bash scripts/test-postgres.sh

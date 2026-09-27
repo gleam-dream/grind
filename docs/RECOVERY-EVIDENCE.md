@@ -6633,3 +6633,86 @@ green, run twice (once piped through `tail`, once with full output capture
 to confirm exit 0 unambiguously). `gleam check` green for both `grind` and
 `consumer/`. `nix fmt` applied and re-verified clean. `nix flake check`
 green. `git diff --check` clean.
+
+---
+
+## Increment 32 — CI actually runs the PostgreSQL gate (docs/RELEASE-READINESS.md, "Packaging and documentation")
+
+**Context.** `.github/workflows/ci.yml` ran only `gleam deps download`,
+`gleam format --check`, `gleam build --warnings-as-errors`, and a plain
+`gleam test` — no database configured at all. Every PostgreSQL-backed test
+in `test/grind_test.gleam` short-circuits to a no-op with no
+`GRIND_TEST_*_URL` set (its own `case database_url() { Error(Nil) -> Nil
+... }` guard), so this CI was green regardless of whether any real
+PostgreSQL behavior actually worked — the marker-checklist safety net that
+makes `scripts/test-postgres.sh` fail closed on a silently-skipped test
+lives entirely inside that shell script, never inside plain `gleam test`
+itself, so CI never benefited from it.
+
+**A second, independent problem found while fixing the first.** `gleam.toml`
+depends on `sinal` as a local path dependency (`sinal = { path = "../sinal"
+}`), not a Hex package. `actions/checkout@v4` with no `path:` checks a repo
+out directly into `$GITHUB_WORKSPACE`, so `../sinal` would resolve to a
+sibling of the _workspace_, not of the checked-out repo — a directory that
+was never created by the old workflow at all. This means `gleam deps
+download`/`gleam build` could not have resolved even the base compile step
+on a clean checkout, independent of anything to do with PostgreSQL
+coverage — either this workflow was already failing before this change, or
+it had simply never been exercised end to end. Fixed by checking out
+`gleam-dream/sinal` as an explicit sibling directory (`path: sinal` next to
+`path: grind`) at a pinned commit (`f4622b67394965c18091ef95390cfd55ad6502db`,
+matching what this session's own local dev environment already had
+checked out) — pinned, not a floating branch, so a later Sinal change can
+never silently break Grind's own CI without a deliberate bump.
+
+**What changed.** `.github/workflows/ci.yml` now has two jobs:
+`quick-check` (the original format/build/plain-test steps, relocated under
+the sinal-sibling checkout, kept for fast feedback on a compile or format
+error) and `postgres-gate` (new): `nix flake check`, Sinal's own test suite
+(via Sinal's own `flake.nix`, matching `docs/RELEASE-READINESS.md`'s
+long-standing "and Sinal's tests" goal), and
+`nix develop --command bash scripts/test-postgres.sh` — the identical
+command this whole gate has been run with, by hand, throughout this entire
+review cycle, through the identical `flake.nix` dev shell rather than a
+hand-rolled reconstruction of the toolchain. Since `scripts/test-postgres.sh`
+already fails closed on any missing integration-contract marker, running it
+verbatim in CI is what actually closes the original gap — a DB test that
+silently skips now fails the job, not passes it. `actions/cache` added,
+keyed on `manifest.toml`/`mix.lock` hashes, for `build/` (root, consumer,
+and Sinal) and the Elixir oracle's `deps`/`_build`.
+
+**Verification (GitHub Actions itself cannot be run from this environment):**
+
+- `nix run nixpkgs#actionlint -- .github/workflows/ci.yml` — clean, no
+  findings, after every edit to the workflow file.
+- Every command the workflow runs was independently verified locally: `nix
+develop --command gleam deps download`, `gleam format --check src test`,
+  `gleam build --warnings-as-errors`, and a bare `gleam test` with no
+  `GRIND_TEST_*_URL` set at all (confirming, concretely, the exact "211
+  passed, no failures" false-confidence result this whole increment exists
+  to stop CI from reporting) — all green. `cd sinal && nix develop --command
+gleam test` — 80 passed, no failures. `nix develop --command bash
+scripts/test-postgres.sh` (the `postgres-gate` job's own real command) —
+  green, exit 0, confirmed twice.
+- The `gleam-dream/sinal` pin is the exact commit this local development
+  environment's own `../sinal` checkout is at (`git rev-parse HEAD`), so
+  the workflow tests the same Sinal version this whole review cycle has
+  actually been running against locally.
+
+**Not independently verifiable from this environment, flagged rather than
+assumed:** whether `gleam-dream/sinal` is reachable as a public GitHub
+repository from a GitHub Actions runner (README already links it publicly;
+not re-confirmed over the network here), and whether `cachix/install-nix-action@v27`
+is still the current recommended major version of that action.
+
+**Gate**: `scripts/test-postgres.sh` green (211 passed root, 11 passed
+consumer, pinned Oban oracle harness green, Squirrel check green, exit 0
+confirmed via full output capture). `gleam check` green for both `grind`
+and `consumer/`. `nix fmt` applied and re-verified clean. `nix flake check`
+green (required two rounds of restructuring a `docs/RELEASE-READINESS.md`
+paragraph into shorter sub-bullets after the local interactive `nix fmt`
+and the sandboxed `nix flake check` build disagreed on how to wrap a long
+paragraph containing several inline code spans — an environment-level
+formatter discrepancy, not a content defect; avoided rather than chased
+further once the reformatted structure made both agree). `git diff --check`
+clean. `nix run nixpkgs#actionlint` clean on the final workflow file.

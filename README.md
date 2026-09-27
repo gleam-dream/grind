@@ -739,6 +739,19 @@ occupied test port. Plain `gleam test` runs pure tests and skips database tests
 when their explicit test URL is absent; the script requires database markers so
 those skips cannot count as integration passes.
 
+**CI** (`.github/workflows/ci.yml`) runs this exact script, through the
+identical `nix develop` shell `flake.nix` defines, in a `postgres-gate` job —
+not a hand-rolled reconstruction of the toolchain, and not merely a plain
+`gleam test` with no database configured (which would pass regardless of
+whether any PostgreSQL-backed behavior actually works, since every such test
+short-circuits to a no-op with no test URL set — exactly what a separate,
+faster `quick-check` job's own plain `gleam test` step does _not_ prove on
+its own). `postgres-gate` also runs [Sinal](https://github.com/gleam-dream/sinal)'s
+own test suite and `nix flake check`. Sinal is a local path dependency
+(`../sinal`, not a Hex package), so CI checks it out as a sibling directory
+at a pinned commit (`SINAL_REF` in the workflow file) — bump that
+deliberately when Sinal changes.
+
 The pinned oracle source, commit, licenses, normalized observations, deliberate
 differences, and per-behavior evidence categories are recorded in
 [oracle/ORACLE-LEDGER.md](oracle/ORACLE-LEDGER.md). The separate

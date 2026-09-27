@@ -294,21 +294,44 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
 
 - [ ] Hex metadata; license and Apache-notice review for Oban-derived material.
 - [ ] Getting-started guide built on the consumer package; generated API docs.
-- [ ] CI workflow running `scripts/test-postgres.sh`, `nix flake check`, and
-      Sinal's tests. Must fetch dependencies fresh: a cached `build/`
-      directory carried over from before the pog fork was dropped once
-      silently kept the old fork's compiled artifacts in play even after
-      `gleam.toml`/`manifest.toml` moved to vanilla Hex `pog`. Do not reuse a
-      persistent `build/` cache across CI runs unless it is keyed on
-      `manifest.toml`'s own hash. `scripts/test-postgres.sh` now guards this
-      directly: it refuses to run if either manifest resolves `pog` from
-      anything but Hex, and unconditionally runs `gleam clean` in both the
-      root and consumer projects before compiling — plain
-      `gleam deps download` does not help here, since it trusts
-      `packages.toml`'s own record of what is already downloaded, not the
-      package directories on disk. This costs a full rebuild on every gate
-      run; accepted as the simplest guard that cannot itself drift from how
-      `gleam` tracks its own cache.
+- [x] CI workflow running `scripts/test-postgres.sh`, `nix flake check`, and
+      Sinal's tests (`.github/workflows/ci.yml`, `postgres-gate` job).
+  - Uses the same `nix develop` shell (`flake.nix`) a contributor's own
+    environment would, not a hand-rolled toolchain. CI exercises the same
+    PostgreSQL 16, Erlang, Gleam, and Elixir versions already proven green
+    locally.
+  - A separate, fast `quick-check` job (format, build, plain `gleam test`,
+    no database) gives quicker feedback on a compile or format error. Its
+    own `gleam test` step is not meaningful PostgreSQL coverage by itself:
+    every DB-backed test short-circuits to a no-op with no
+    `GRIND_TEST_*_URL` set. That gap is exactly why `postgres-gate` exists.
+  - `postgres-gate` is what actually proves the system works. Its own
+    `scripts/test-postgres.sh` already fails closed if any named
+    integration contract's marker was never written, so a DB test silently
+    skipping there fails the job outright.
+  - Sinal is checked out as a sibling directory at a pinned commit for both
+    jobs. `gleam.toml` depends on it as a local path (`../sinal`), not a
+    Hex package, so `gleam build` cannot resolve at all without that
+    checkout, true even before considering Postgres coverage. Bump
+    `SINAL_REF` in `.github/workflows/ci.yml` deliberately when Sinal
+    changes; never point it at a floating branch.
+  - `nix run nixpkgs#actionlint` validated the workflow YAML itself.
+    GitHub Actions cannot be run from this environment to confirm the
+    workflow end to end.
+  - `scripts/test-postgres.sh` must fetch dependencies fresh. A cached
+    `build/` directory carried over from before the pog fork was dropped
+    once silently kept the old fork's compiled artifacts in play even
+    after the manifest moved to vanilla Hex `pog`. Do not reuse a
+    persistent `build/` cache across CI runs unless it is keyed on the
+    manifest's own hash, the workflow's own `actions/cache` step is.
+  - `scripts/test-postgres.sh` guards this directly: it refuses to run if
+    either manifest resolves `pog` from anything but Hex, and
+    unconditionally runs `gleam clean` in both the root and consumer
+    projects before compiling. Plain `gleam deps download` does not help
+    here, since it trusts the packages record of what is already
+    downloaded, not the package directories on disk. This costs a full
+    rebuild on every gate run, accepted as the simplest guard that cannot
+    itself drift from how Gleam tracks its own cache.
 - [x] Update Oversight design docs (owner go-ahead given; Oversight is a
       separate repository). `sinal-design.md` now records the bounded
       emitter-side forwarder as delivered in Sinal core (not adapter-owned);
