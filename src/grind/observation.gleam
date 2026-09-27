@@ -5,7 +5,8 @@
 //// (`sinal.observe`/`sinal.attach`) to the descriptors this module exposes,
 //// the same way they would attach to any other Sinal event. This module
 //// only owns the events themselves: their native names and their typed
-//// measurement/metadata field contracts.
+//// measurement/metadata field contracts. Shared wire primitives and field
+//// codecs live in `grind/internal/observation/wire`.
 ////
 //// Every event here is emitted through `grind/postgres`'s own
 //// `sinal/forwarder.Forwarder` (one per `Database`), never through a plain
@@ -51,10 +52,9 @@
 //// into the same top-level fields either way), so this is unreleased-only
 //// housekeeping, not a compatibility break.
 
-import gleam/dynamic
-import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/option.{type Option}
+import grind/internal/observation/wire as observation_wire
 import grind/job
 import grind/worker
 import sinal.{type Event}
@@ -470,59 +470,6 @@ fn codec_kind_from_string(raw: String) -> Result(worker.CodecKind, Nil) {
   }
 }
 
-/// Declares a field whose wire representation is a native string but whose
-/// Gleam representation is a closed enum, via an explicit total
-/// `to_string`/partial `from_string` pair. Built directly on
-/// `sinal/fields.field` (the same construction `fields.string` itself
-/// uses), so this stays inside Sinal's public field API with no extra FFI.
-/// Mirrors `saga/observation`'s identical helper.
-fn closed_string_field(
-  key: String,
-  to_string: fn(a) -> String,
-  from_string: fn(String) -> Result(a, Nil),
-) -> fields.Fields(a) {
-  fields.field(
-    atom.create(key),
-    fn(value) { Ok(dynamic.string(to_string(value))) },
-    fn(raw) {
-      case decode.run(raw, decode.string) {
-        Error(_) ->
-          Error(fields.FieldDecodeError("Expected a native BEAM string"))
-        Ok(str) ->
-          case from_string(str) {
-            Ok(value) -> Ok(value)
-            Error(Nil) ->
-              Error(fields.FieldDecodeError(
-                "Unrecognized " <> key <> " kind: " <> str,
-              ))
-          }
-      }
-    },
-  )
-}
-
-/// A single-field `Fields(Int)` for the `count` measurement every
-/// `[grind, job, *]` event in this module carries (always `1`).
-fn count_fields() -> fields.Fields(Int) {
-  fields.int(atom.create("count"))
-}
-
-/// The shared `JobRef` codec: which job, queue, and worker contract an event
-/// is about. Built once here and embedded (via `fields.pair`) into every
-/// event introduced after `acknowledged`, rather than re-declaring the same
-/// four fields per event.
-fn job_ref_fields() -> fields.Fields(JobRef) {
-  let assert Ok(p1) =
-    fields.pair(
-      fields.int(atom.create("job_id")),
-      fields.string(atom.create("queue")),
-    )
-  let assert Ok(p2) = fields.pair(p1, fields.string(atom.create("worker_id")))
-  let assert Ok(p3) =
-    fields.pair(p2, fields.string(atom.create("worker_version")))
-  fields.imap(p3, job_ref_from_tuple, job_ref_to_tuple)
-}
-
 fn job_ref_from_tuple(t: #(#(#(Int, String), String), String)) -> JobRef {
   let #(p2, worker_version) = t
   let #(p1, worker_id) = p2
@@ -533,18 +480,6 @@ fn job_ref_from_tuple(t: #(#(#(Int, String), String), String)) -> JobRef {
 fn job_ref_to_tuple(ref: JobRef) -> #(#(#(Int, String), String), String) {
   let JobRef(job_id:, queue:, worker_id:, worker_version:) = ref
   #(#(#(job_id, queue), worker_id), worker_version)
-}
-
-/// The shared `AttemptRef` codec: `attempt_id`, `epoch`, and the attempt
-/// number, embedded into every event about one claimed attempt.
-fn attempt_ref_fields() -> fields.Fields(AttemptRef) {
-  let assert Ok(p1) =
-    fields.pair(
-      fields.int(atom.create("attempt_id")),
-      fields.int(atom.create("epoch")),
-    )
-  let assert Ok(p2) = fields.pair(p1, fields.int(atom.create("attempt")))
-  fields.imap(p2, attempt_ref_from_tuple, attempt_ref_to_tuple)
 }
 
 fn attempt_ref_from_tuple(t: #(#(Int, Int), Int)) -> AttemptRef {
@@ -559,34 +494,34 @@ fn attempt_ref_to_tuple(ref: AttemptRef) -> #(#(Int, Int), Int) {
 }
 
 fn admitted_measurements_fields() -> fields.Fields(AdmittedMeasurements) {
-  fields.imap(count_fields(), AdmittedMeasurements, fn(m) { m.count })
+  fields.imap(observation_wire.count_fields(), AdmittedMeasurements, fn(m) {
+    m.count
+  })
 }
 
 fn admitted_metadata_fields() -> fields.Fields(AdmittedMetadata) {
+  let ref =
+    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
+  let state =
+    observation_wire.closed_string_field(
+      "committed_state",
+      job.state_to_stored,
+      job.state_of_stored,
+    )
+  let confirmation =
+    observation_wire.closed_string_field(
+      "confirmation",
+      confirmation_to_string,
+      confirmation_from_string,
+    )
   let assert Ok(available_at_field) =
     fields.optional(fields.int(atom.create("available_at_unix_ms")))
   let assert Ok(submission_id_field) =
     fields.optional(fields.string(atom.create("submission_id")))
-  let assert Ok(p1) =
-    fields.pair(
-      job_ref_fields(),
-      closed_string_field(
-        "committed_state",
-        job.state_to_stored,
-        job.state_of_stored,
-      ),
-    )
+  let assert Ok(p1) = fields.pair(ref, state)
   let assert Ok(p2) = fields.pair(p1, available_at_field)
   let assert Ok(p3) = fields.pair(p2, submission_id_field)
-  let assert Ok(p4) =
-    fields.pair(
-      p3,
-      closed_string_field(
-        "confirmation",
-        confirmation_to_string,
-        confirmation_from_string,
-      ),
-    )
+  let assert Ok(p4) = fields.pair(p3, confirmation)
   fields.imap(
     p4,
     fn(t) {
@@ -619,15 +554,24 @@ fn admitted_metadata_fields() -> fields.Fields(AdmittedMetadata) {
 }
 
 fn claimed_measurements_fields() -> fields.Fields(ClaimedMeasurements) {
-  fields.imap(count_fields(), ClaimedMeasurements, fn(m) { m.count })
+  fields.imap(observation_wire.count_fields(), ClaimedMeasurements, fn(m) {
+    m.count
+  })
 }
 
 fn claimed_metadata_fields() -> fields.Fields(ClaimedMetadata) {
-  let assert Ok(p1) = fields.pair(job_ref_fields(), attempt_ref_fields())
+  let assert Ok(p1) =
+    fields.pair(
+      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
+      observation_wire.attempt_ref_fields(
+        attempt_ref_from_tuple,
+        attempt_ref_to_tuple,
+      ),
+    )
   let assert Ok(p2) =
     fields.pair(
       p1,
-      closed_string_field(
+      observation_wire.closed_string_field(
         "previous_state",
         job.state_to_stored,
         job.state_of_stored,
@@ -648,11 +592,20 @@ fn claimed_metadata_fields() -> fields.Fields(ClaimedMetadata) {
 }
 
 fn quarantined_measurements_fields() -> fields.Fields(QuarantinedMeasurements) {
-  fields.imap(count_fields(), QuarantinedMeasurements, fn(m) { m.count })
+  fields.imap(observation_wire.count_fields(), QuarantinedMeasurements, fn(m) {
+    m.count
+  })
 }
 
 fn quarantined_metadata_fields() -> fields.Fields(QuarantinedMetadata) {
-  let assert Ok(p1) = fields.pair(job_ref_fields(), attempt_ref_fields())
+  let assert Ok(p1) =
+    fields.pair(
+      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
+      observation_wire.attempt_ref_fields(
+        attempt_ref_from_tuple,
+        attempt_ref_to_tuple,
+      ),
+    )
   let assert Ok(p2) =
     fields.pair(p1, fields.bool(atom.create("cancellation_was_requested")))
   fields.imap(
@@ -670,40 +623,38 @@ fn quarantined_metadata_fields() -> fields.Fields(QuarantinedMetadata) {
 }
 
 fn resolved_measurements_fields() -> fields.Fields(ResolvedMeasurements) {
-  fields.imap(count_fields(), ResolvedMeasurements, fn(m) { m.count })
+  fields.imap(observation_wire.count_fields(), ResolvedMeasurements, fn(m) {
+    m.count
+  })
 }
 
 fn resolved_metadata_fields() -> fields.Fields(ResolvedMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      job_ref_fields(),
-      closed_string_field(
-        "decision",
-        resolution_decision_to_string,
-        resolution_decision_from_string,
-      ),
+  let ref =
+    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
+  let decision =
+    observation_wire.closed_string_field(
+      "decision",
+      resolution_decision_to_string,
+      resolution_decision_from_string,
     )
-  let assert Ok(p2) =
-    fields.pair(
-      p1,
-      closed_string_field(
-        "committed_state",
-        job.state_to_stored,
-        job.state_of_stored,
-      ),
+  let state =
+    observation_wire.closed_string_field(
+      "committed_state",
+      job.state_to_stored,
+      job.state_of_stored,
     )
+  let confirmation =
+    observation_wire.closed_string_field(
+      "confirmation",
+      confirmation_to_string,
+      confirmation_from_string,
+    )
+  let assert Ok(p1) = fields.pair(ref, decision)
+  let assert Ok(p2) = fields.pair(p1, state)
   let assert Ok(p3) =
     fields.pair(p2, fields.string(atom.create("resolution_id")))
   let assert Ok(p4) = fields.pair(p3, fields.string(atom.create("resolved_by")))
-  let assert Ok(p5) =
-    fields.pair(
-      p4,
-      closed_string_field(
-        "confirmation",
-        confirmation_to_string,
-        confirmation_from_string,
-      ),
-    )
+  let assert Ok(p5) = fields.pair(p4, confirmation)
   fields.imap(
     p5,
     fn(t) {
@@ -740,14 +691,16 @@ fn resolved_metadata_fields() -> fields.Fields(ResolvedMetadata) {
 }
 
 fn cancellation_measurements_fields() -> fields.Fields(CancellationMeasurements) {
-  fields.imap(count_fields(), CancellationMeasurements, fn(m) { m.count })
+  fields.imap(observation_wire.count_fields(), CancellationMeasurements, fn(m) {
+    m.count
+  })
 }
 
 fn cancellation_metadata_fields() -> fields.Fields(CancellationMetadata) {
   let assert Ok(p1) =
     fields.pair(
-      job_ref_fields(),
-      closed_string_field(
+      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
+      observation_wire.closed_string_field(
         "previous_state",
         job.state_to_stored,
         job.state_of_stored,
@@ -756,7 +709,7 @@ fn cancellation_metadata_fields() -> fields.Fields(CancellationMetadata) {
   let assert Ok(p2) =
     fields.pair(
       p1,
-      closed_string_field(
+      observation_wire.closed_string_field(
         "outcome",
         cancellation_outcome_to_string,
         cancellation_outcome_from_string,
@@ -777,15 +730,24 @@ fn cancellation_metadata_fields() -> fields.Fields(CancellationMetadata) {
 }
 
 fn released_measurements_fields() -> fields.Fields(ReleasedMeasurements) {
-  fields.imap(count_fields(), ReleasedMeasurements, fn(m) { m.count })
+  fields.imap(observation_wire.count_fields(), ReleasedMeasurements, fn(m) {
+    m.count
+  })
 }
 
 fn released_metadata_fields() -> fields.Fields(ReleasedMetadata) {
-  let assert Ok(p1) = fields.pair(job_ref_fields(), attempt_ref_fields())
+  let assert Ok(p1) =
+    fields.pair(
+      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
+      observation_wire.attempt_ref_fields(
+        attempt_ref_from_tuple,
+        attempt_ref_to_tuple,
+      ),
+    )
   let assert Ok(p2) =
     fields.pair(
       p1,
-      closed_string_field(
+      observation_wire.closed_string_field(
         "restored_state",
         job.state_to_stored,
         job.state_of_stored,
@@ -808,18 +770,31 @@ fn released_metadata_fields() -> fields.Fields(ReleasedMetadata) {
 fn contract_mismatch_measurements_fields() -> fields.Fields(
   ContractMismatchMeasurements,
 ) {
-  fields.imap(count_fields(), ContractMismatchMeasurements, fn(m) { m.count })
+  fields.imap(
+    observation_wire.count_fields(),
+    ContractMismatchMeasurements,
+    fn(m) { m.count },
+  )
 }
 
 fn contract_mismatch_metadata_fields() -> fields.Fields(
   ContractMismatchMetadata,
 ) {
-  let assert Ok(p1) = fields.pair(job_ref_fields(), attempt_ref_fields())
-  let assert Ok(p2) =
-    fields.pair(
-      p1,
-      closed_string_field("kind", codec_kind_to_string, codec_kind_from_string),
+  let ref =
+    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
+  let attempt =
+    observation_wire.attempt_ref_fields(
+      attempt_ref_from_tuple,
+      attempt_ref_to_tuple,
     )
+  let kind =
+    observation_wire.closed_string_field(
+      "kind",
+      codec_kind_to_string,
+      codec_kind_from_string,
+    )
+  let assert Ok(p1) = fields.pair(ref, attempt)
+  let assert Ok(p2) = fields.pair(p1, kind)
   let assert Ok(p3) =
     fields.pair(p2, fields.string(atom.create("expected_version")))
   let assert Ok(p4) =
@@ -885,7 +860,9 @@ fn prune_completed_metadata_fields() -> fields.Fields(PruneCompletedMetadata) {
 }
 
 fn prune_failed_measurements_fields() -> fields.Fields(PruneFailedMeasurements) {
-  fields.imap(count_fields(), PruneFailedMeasurements, fn(m) { m.count })
+  fields.imap(observation_wire.count_fields(), PruneFailedMeasurements, fn(m) {
+    m.count
+  })
 }
 
 fn prune_failure_kind_to_string(kind: PruneFailureKind) -> String {
@@ -918,7 +895,7 @@ fn prune_failed_metadata_fields() -> fields.Fields(PruneFailedMetadata) {
   let assert Ok(p2) =
     fields.pair(
       p1,
-      closed_string_field(
+      observation_wire.closed_string_field(
         "kind",
         prune_failure_kind_to_string,
         prune_failure_kind_from_string,
@@ -945,40 +922,46 @@ fn measurements_fields() -> fields.Fields(AcknowledgedMeasurements) {
 }
 
 fn metadata_fields() -> fields.Fields(AcknowledgedMetadata) {
-  let assert Ok(failure_cause_field) =
-    fields.optional(closed_string_field(
+  let ref =
+    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
+  let attempt =
+    observation_wire.attempt_ref_fields(
+      attempt_ref_from_tuple,
+      attempt_ref_to_tuple,
+    )
+  let proposed =
+    observation_wire.closed_string_field(
+      "proposed",
+      proposed_to_string,
+      proposed_from_string,
+    )
+  let state =
+    observation_wire.closed_string_field(
+      "committed_state",
+      job.state_to_stored,
+      job.state_of_stored,
+    )
+  let failure_cause =
+    observation_wire.closed_string_field(
       "failure_cause",
       worker.business_failure_cause_to_string,
       worker.business_failure_cause_from_string,
-    ))
+    )
+  let confirmation =
+    observation_wire.closed_string_field(
+      "confirmation",
+      confirmation_to_string,
+      confirmation_from_string,
+    )
+  let assert Ok(failure_cause_field) = fields.optional(failure_cause)
   let assert Ok(available_at_field) =
     fields.optional(fields.int(atom.create("available_at_unix_ms")))
-  let assert Ok(p1) = fields.pair(job_ref_fields(), attempt_ref_fields())
-  let assert Ok(p2) =
-    fields.pair(
-      p1,
-      closed_string_field("proposed", proposed_to_string, proposed_from_string),
-    )
-  let assert Ok(p3) =
-    fields.pair(
-      p2,
-      closed_string_field(
-        "committed_state",
-        job.state_to_stored,
-        job.state_of_stored,
-      ),
-    )
+  let assert Ok(p1) = fields.pair(ref, attempt)
+  let assert Ok(p2) = fields.pair(p1, proposed)
+  let assert Ok(p3) = fields.pair(p2, state)
   let assert Ok(p4) = fields.pair(p3, failure_cause_field)
   let assert Ok(p5) = fields.pair(p4, available_at_field)
-  let assert Ok(p6) =
-    fields.pair(
-      p5,
-      closed_string_field(
-        "confirmation",
-        confirmation_to_string,
-        confirmation_from_string,
-      ),
-    )
+  let assert Ok(p6) = fields.pair(p5, confirmation)
   let assert Ok(p7) = fields.pair(p6, fields.string(atom.create("command_id")))
   fields.imap(
     p7,
@@ -1033,15 +1016,7 @@ pub fn acknowledged() -> Event(AcknowledgedMeasurements, AcknowledgedMetadata) {
     atom.create("job"),
     atom.create("acknowledged"),
   ]
-  let assert Ok(event) =
-    sinal.event(name, measurements_fields(), metadata_fields())
-  event
-}
-
-/// Builds a `[grind, job, <parts>]` name from its final component (the shared
-/// `[grind, job, ...]` prefix is fixed for every event this module exposes).
-fn job_event_name(part: String) -> List(atom.Atom) {
-  [atom.create("grind"), atom.create("job"), atom.create(part)]
+  observation_wire.event(name, measurements_fields(), metadata_fields())
 }
 
 /// The `[grind, job, admitted]` event descriptor: one committed admission
@@ -1049,52 +1024,44 @@ fn job_event_name(part: String) -> List(atom.Atom) {
 /// (`Inserted`, `Existing`, or `Rescheduled`). Emitted by `grind/postgres`
 /// strictly after that decision is proven committed — see `AdmittedMetadata`.
 pub fn admitted() -> Event(AdmittedMeasurements, AdmittedMetadata) {
-  let assert Ok(event) =
-    sinal.event(
-      job_event_name("admitted"),
-      admitted_measurements_fields(),
-      admitted_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    observation_wire.job_event_name("admitted"),
+    admitted_measurements_fields(),
+    admitted_metadata_fields(),
+  )
 }
 
 /// The `[grind, job, claimed]` event descriptor: one job atomically claimed
 /// for execution. Emitted strictly after the claim's own fenced `UPDATE ...
 /// RETURNING` returns a row — see `ClaimedMetadata`.
 pub fn claimed() -> Event(ClaimedMeasurements, ClaimedMetadata) {
-  let assert Ok(event) =
-    sinal.event(
-      job_event_name("claimed"),
-      claimed_measurements_fields(),
-      claimed_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    observation_wire.job_event_name("claimed"),
+    claimed_measurements_fields(),
+    claimed_metadata_fields(),
+  )
 }
 
 /// The `[grind, job, quarantined]` event descriptor: one abandoned attempt
 /// (an expired lease) moved to `uncertain` by the claim-time quarantine scan.
 /// Emitted once per row the scan's `RETURNING` reports as quarantined.
 pub fn quarantined() -> Event(QuarantinedMeasurements, QuarantinedMetadata) {
-  let assert Ok(event) =
-    sinal.event(
-      job_event_name("quarantined"),
-      quarantined_measurements_fields(),
-      quarantined_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    observation_wire.job_event_name("quarantined"),
+    quarantined_measurements_fields(),
+    quarantined_metadata_fields(),
+  )
 }
 
 /// The `[grind, job, resolved]` event descriptor: one audited operator
 /// decision committed against an `uncertain` job. Emitted strictly after that
 /// decision is proven committed — see `ResolvedMetadata`.
 pub fn resolved() -> Event(ResolvedMeasurements, ResolvedMetadata) {
-  let assert Ok(event) =
-    sinal.event(
-      job_event_name("resolved"),
-      resolved_measurements_fields(),
-      resolved_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    observation_wire.job_event_name("resolved"),
+    resolved_measurements_fields(),
+    resolved_metadata_fields(),
+  )
 }
 
 /// The `[grind, job, cancellation_decided]` event descriptor: a cancellation request
@@ -1106,26 +1073,22 @@ pub fn cancellation_decided() -> Event(
   CancellationMeasurements,
   CancellationMetadata,
 ) {
-  let assert Ok(event) =
-    sinal.event(
-      job_event_name("cancellation_decided"),
-      cancellation_measurements_fields(),
-      cancellation_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    observation_wire.job_event_name("cancellation_decided"),
+    cancellation_measurements_fields(),
+    cancellation_metadata_fields(),
+  )
 }
 
 /// The `[grind, job, released]` event descriptor: a claimed attempt refunded
 /// before its worker ever ran. Emitted strictly after the release's own
 /// fenced `UPDATE ... RETURNING` returns a row.
 pub fn released() -> Event(ReleasedMeasurements, ReleasedMetadata) {
-  let assert Ok(event) =
-    sinal.event(
-      job_event_name("released"),
-      released_measurements_fields(),
-      released_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    observation_wire.job_event_name("released"),
+    released_measurements_fields(),
+    released_metadata_fields(),
+  )
 }
 
 /// The `[grind, job, contract_mismatch_recorded]` event descriptor: a claimed attempt
@@ -1137,13 +1100,11 @@ pub fn contract_mismatch_recorded() -> Event(
   ContractMismatchMeasurements,
   ContractMismatchMetadata,
 ) {
-  let assert Ok(event) =
-    sinal.event(
-      job_event_name("contract_mismatch_recorded"),
-      contract_mismatch_measurements_fields(),
-      contract_mismatch_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    observation_wire.job_event_name("contract_mismatch_recorded"),
+    contract_mismatch_measurements_fields(),
+    contract_mismatch_metadata_fields(),
+  )
 }
 
 /// The `[grind, prune, completed]` event descriptor: one aggregate per
@@ -1156,13 +1117,11 @@ pub fn prune_completed() -> Event(
   PruneCompletedMeasurements,
   PruneCompletedMetadata,
 ) {
-  let assert Ok(event) =
-    sinal.event(
-      [atom.create("grind"), atom.create("prune"), atom.create("completed")],
-      prune_completed_measurements_fields(),
-      prune_completed_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    [atom.create("grind"), atom.create("prune"), atom.create("completed")],
+    prune_completed_measurements_fields(),
+    prune_completed_metadata_fields(),
+  )
 }
 
 /// The `[grind, prune, failed]` event descriptor: `grind/pruner`'s own tick
@@ -1171,11 +1130,9 @@ pub fn prune_completed() -> Event(
 /// `PruneError` to directly. `postgres.prune_finished` itself never emits
 /// this — see its own doc comment.
 pub fn prune_failed() -> Event(PruneFailedMeasurements, PruneFailedMetadata) {
-  let assert Ok(event) =
-    sinal.event(
-      [atom.create("grind"), atom.create("prune"), atom.create("failed")],
-      prune_failed_measurements_fields(),
-      prune_failed_metadata_fields(),
-    )
-  event
+  observation_wire.event(
+    [atom.create("grind"), atom.create("prune"), atom.create("failed")],
+    prune_failed_measurements_fields(),
+    prune_failed_metadata_fields(),
+  )
 }

@@ -35,7 +35,7 @@ jobs:
   # Fast feedback: format, compile (both the root package and the external
   # `consumer/` package that exercises Grind's own public API from outside
   # the package boundary), and the plain `gleam test` run — every
-  # PostgreSQL-backed test in `test/grind_test.gleam` short-circuits to a
+  # PostgreSQL-backed test under `test/` short-circuits to a
   # no-op here (its own `case database_url() { Error(Nil) -> Nil ... }`
   # guard, since no `GRIND_TEST_*_URL` environment variable is set), so a
   # green run here only proves the code compiles and the DB-independent unit

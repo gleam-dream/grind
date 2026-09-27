@@ -151,7 +151,7 @@ general limit this reproduction derives is `2L/3 ≥ C · D_eff`, i.e.
 `L ≥ 1.5 · C · D` — at `C=10`, `D=4s`, this requires `L ≥ 60s`. **The
 shipped validation rule, `L ≥ 6D`
 (`queue.LeaseTooShortForDeadline`/`minimum_lease_for_deadline`,
-`src/grind/queue.gleam` ~231-272), only covers `C ≤ 2`; it does not hold for
+`src/grind/internal/queue/timing.gleam`), only covers `C ≤ 2`; it does not hold for
 `C > 2`** — see risk 5, which already named this gap algebraically before
 this reproduction confirmed it empirically.
 
@@ -337,7 +337,7 @@ remains for tuning manual batch size, independent of automatic polling.
 
 **Evidence.** `postgres_automatic_consumer_drains_backlog_without_per_interval_ceiling_test`
 and `postgres_automatic_consumer_waits_full_interval_when_idle_test`
-(`test/grind_test.gleam`) are committed, deterministic regression coverage
+(`test/grind/queue/capacity_test.gleam`) are committed, deterministic regression coverage
 for the fix and for the no-busy-loop guarantee, respectively — not purely
 "database-clock-bound" (an earlier overclaim in this entry): each test still
 waits out a local, bounded polling loop for the system to reach the state it
@@ -392,7 +392,7 @@ table. Since the uniqueness admission lock key used to be keyed by
 could each acquire a _different_ advisory lock and both insert — a genuine
 duplicate-admission defect, not merely a theoretical one; see
 `postgres_user_schema_fallback_shares_one_installation_test`
-(`test/grind_test.gleam`) for the red-then-green proof. `Settings.schema`
+(`test/grind/database/isolation_test.gleam`) for the red-then-green proof. `Settings.schema`
 (`postgres.with_schema`, default `"public"`) closes this at its root:
 `postgres.validate` pins every pooled connection's own `search_path`
 connection parameter to exactly this one configured schema, so
@@ -483,7 +483,7 @@ entirely on the effect; unbounded for a non-idempotent external effect with
 no application-level dedup.
 
 **Current mitigation.** Application-level deduplication is the documented,
-required mitigation — exercised in `consumer/test/grind_consumer_test.gleam`'s
+required mitigation — exercised in `consumer/test/grind_consumer/recovery_test.gleam`'s
 dedup-key job, which looks up its own application-owned dedup record before
 performing its effect rather than trusting Grind's attempt/delivery counts
 alone.
@@ -613,7 +613,7 @@ table (all job, receipt, and resolution data with it): a cigogne rollback
 here is a real, destructive operation, not a reversible preview.
 
 **Evidence.** `grind_migrations_conformance_test`
-(`test/grind_test.gleam`) proves the two sources stay byte-for-byte in
+(`test/grind/migrations/conformance_test.gleam`) proves the two sources stay byte-for-byte in
 lockstep; the dual-ownership failure mode itself is documented, not tested
 (no test runs both mechanisms against one database simultaneously).
 
@@ -775,7 +775,8 @@ are independently proven).
 round trip (cigogne applies, `migrate` no-ops, both succeed when racing the
 shared advisory lock); `postgres_migrate_upgrade_reconcile_unique_lost_reply_test`
 proves a genuine lost-reply `reconcile_unique` specifically across the v11→v12
-boundary. See `test/grind_test.gleam` and `docs/RECOVERY-EVIDENCE.md`,
+boundary. See `test/grind/migrations/conformance_test.gleam`,
+`test/grind/migrations/upgrade_test.gleam`, and `docs/RECOVERY-EVIDENCE.md`,
 Increment 34, including a documented empirical finding (the TCP fault
 proxy's `OnCommit`/`DropReply` does not produce a genuine commit for
 `submit_unique` specifically, unlike the acknowledgement path).

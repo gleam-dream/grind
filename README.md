@@ -89,7 +89,7 @@ reaching a second delivery, cooperative cancellation of a genuinely running
 attempt, a worker crash recovering through `Uncertain` and an audited
 resolution, uniqueness admission, and `submit_with_id` retries. Read
 `consumer/src/grind_consumer.gleam` and
-`consumer/test/grind_consumer_test.gleam` alongside its README for a
+`consumer/test/grind_consumer/` alongside its README for a
 working, copy-pasteable shape; the snippet below covers the same steps in
 isolation, the minimum to get a queue polling.
 
@@ -152,7 +152,7 @@ compute a different schema identity than another such role, even though
 both operate on the exact same physical table; see
 [docs/RISKS.md](docs/RISKS.md) risk 7 and
 `postgres_user_schema_fallback_shares_one_installation_test`
-(`test/grind_test.gleam`) for the concrete duplicate-admission hazard this
+(`test/grind/database/isolation_test.gleam`) for the concrete duplicate-admission hazard this
 caused and the proof it is now closed.
 
 **Creating the schema.** `postgres.migrate`/`migrate_with` create the
@@ -172,7 +172,7 @@ pass that same name to `with_schema` — this is the least-privilege shape:
 the connecting role never needs database-level `CREATE`, only ownership of
 its own schema, exactly like
 `postgres_two_schemas_share_a_database_but_stay_isolated_test`
-(`test/grind_test.gleam`) sets itself up. `with_schema`'s own default
+(`test/grind/database/isolation_test.gleam`) sets itself up. `with_schema`'s own default
 (`"public"`) is fine for a single-installation deployment with no need to
 share a database with another Grind installation. Two installations sharing
 one physical database must pass genuinely distinct schema names to
@@ -371,7 +371,7 @@ real external effect:
   it.
 - **Application-level deduplication is required for any effect that must not
   repeat**, and is exercised this way in the consumer tests (see
-  `consumer/test/grind_consumer_test.gleam`'s dedup-key job): the worker looks
+  `consumer/test/grind_consumer/recovery_test.gleam`'s dedup-key job): the worker looks
   up its own application-owned dedup record before performing its effect,
   never relying on Grind's attempt/delivery counts alone.
 - **The coordinator runs claim and acknowledgement SQL synchronously, bounded
@@ -797,6 +797,10 @@ mutation-proven admission-race fix `prune_finished` required
 (`grind/internal/unique_admission`'s candidate lock).
 
 ## Development and integration checks
+
+See the [module map](docs/MODULE-MAP.md) for implementation and test locations,
+and the [recovery evidence index](docs/RECOVERY-EVIDENCE.md#topic-index) for
+fault and recovery evidence.
 
 Run all checks in a fresh local PostgreSQL cluster with separate databases for
 Grind, the pinned Oban harness, and the public-import consumer:

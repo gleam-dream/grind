@@ -507,7 +507,7 @@ Inside one PostgreSQL transaction (`transaction_safely`, the same wrapper
    `current_schema()` values while both actually reading and writing the
    identical physical table (see `docs/RISKS.md` risk 7's `$user`-fallback
    hazard, and `postgres_user_schema_fallback_shares_one_installation_test`
-   in `test/grind_test.gleam`). `postgres.validate` already pins every
+   in `test/grind/database/isolation_test.gleam`). `postgres.validate` already pins every
    pooled connection's `search_path` to exactly this one configured schema,
    so in ordinary operation the bound value and `current_schema()` always
    agree — binding it directly is simply not relying on that agreement
@@ -946,7 +946,7 @@ surfaces a bare `SubmissionConflict` instead of converging) with zero effect
 on any other test in the suite — a precisely localized fault, not a change
 to shared machinery.
 
-**Tests** (`test/grind_test.gleam`): first submit `Inserted`
+**Tests** (`test/grind/submission/with_id_test.gleam`): first submit `Inserted`
 (`postgres_submit_with_id_first_submit_inserted_test`); a same-id,
 same-request retry after a genuine commit returns the original job id with
 no second row (`postgres_submit_with_id_same_request_retry_returns_original_test`);
@@ -958,7 +958,7 @@ Increment 11, scoped by `submission_id` on the shared
 `grind_unique_submissions` table) still returns `Ok(Inserted(handle))`
 directly (`postgres_submit_with_id_committed_reply_lost_returns_inserted_test`);
 and the barrier-forced concurrent-same-id test above. One public-imports-only
-consumer test (`consumer/test/grind_consumer_test.gleam`,
+consumer test (`consumer/test/grind_consumer/admission_test.gleam`,
 `public_consumer_submit_with_id_retry_test`) proves the same retry
 convergence, a different-input conflict, and a claimed/acknowledged run
 through only Grind's public API.

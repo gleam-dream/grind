@@ -1,3 +1,6 @@
+//// Public queue policy and coordinator. Internal queue modules own the
+//// active-attempt ledger, temporary worker, startup handoff, and timers.
+
 import exception
 import gleam/erlang/process
 import gleam/int
@@ -11,6 +14,10 @@ import gleam/result
 import gleam/string
 import grind/internal/attempt
 import grind/internal/consumer_hooks.{type Hooks}
+import grind/internal/queue/active.{type ActiveAttempt, ActiveAttempt} as queue_active
+import grind/internal/queue/handoff as queue_handoff
+import grind/internal/queue/timing as queue_timing
+import grind/internal/queue/worker as queue_worker
 import grind/postgres.{type Database}
 import grind/registry.{type Registry}
 import grind/worker
@@ -93,7 +100,12 @@ pub fn renewal_is_current(
   tick_attempt_id: Int,
   tick_epoch: Int,
 ) -> Bool {
-  active_attempt_id == tick_attempt_id && active_epoch == tick_epoch
+  queue_timing.renewal_is_current(
+    active_attempt_id,
+    active_epoch,
+    tick_attempt_id,
+    tick_epoch,
+  )
 }
 
 /// Starts one shutdown grace period, or keeps its generation when another
@@ -103,10 +115,10 @@ pub fn next_shutdown_generation(
   current_generation: Int,
   shutdown_already_pending: Bool,
 ) -> Int {
-  case shutdown_already_pending {
-    True -> current_generation
-    False -> current_generation + 1
-  }
+  queue_timing.next_shutdown_generation(
+    current_generation,
+    shutdown_already_pending,
+  )
 }
 
 pub fn with_poll_interval(
@@ -273,10 +285,10 @@ pub fn minimum_lease_for_deadline(
   maximum_concurrency: Int,
   statement_deadline_ms: Int,
 ) -> Int {
-  case maximum_concurrency > 1 {
-    True -> 6 * statement_deadline_ms
-    False -> 3 * statement_deadline_ms / 2
-  }
+  queue_timing.minimum_lease_for_deadline(
+    maximum_concurrency,
+    statement_deadline_ms,
+  )
 }
 
 pub type StopError {
@@ -368,18 +380,6 @@ pub type ShutdownReply {
   ShutdownForced(Int)
 }
 
-type WorkerMessage {
-  StartAttempt
-  StopWorker
-}
-
-type WorkerRequest {
-  WorkerRequest(
-    queue_subject: process.Subject(Message),
-    claimed: attempt.ClaimedJob,
-  )
-}
-
 type Completion {
   ManualCompletion(reply: process.Subject(Result(Bool, ProcessError)))
   Automatic
@@ -388,55 +388,6 @@ type Completion {
 type ProcessOneResponse {
   ProcessOneResult(Result(Bool, ProcessError))
   ProcessOneActorDown(process.Down)
-}
-
-type ActiveAttempt {
-  ActiveAttempt(
-    id: Int,
-    attempt_id: Int,
-    epoch: Int,
-    claimed: attempt.ClaimedJob,
-    worker_subject: process.Subject(WorkerMessage),
-    monitor: process.Monitor,
-    completion: Completion,
-    renewal_status: RenewalStatus,
-    /// `Some(execution)` once this `Automatic`-completion attempt's worker
-    /// has already returned and its acknowledgement came back
-    /// `QueueAckUnknown` (the ack transaction reached the database but its
-    /// reply was lost) — the attempt is kept in `active` rather than
-    /// dropped, so it still counts against `maximum_concurrency` and blocks
-    /// a clean shutdown drain, but its `worker_subject`/`monitor` are
-    /// already stale (the worker was stopped and demonitored before the ack
-    /// was ever attempted). This incarnation's own renewal timer retries the
-    /// exact same `acknowledge` call (`attempt.acknowledgement_command_id`
-    /// is deterministic in job id, attempt id, and epoch, so the retry is
-    /// idempotent), renewing the lease first on each tick while within
-    /// `ConsumerState.pending_ack_retry_budget` — see `retry_pending_ack`'s
-    /// and `retry_ack_until_known`'s doc comments for the full mechanism and
-    /// why renewing (bounded) is the safe choice, not the lease-independence
-    /// an earlier version of this fix wrongly assumed. Always `None` for a
-    /// `ManualCompletion` — a `process_one` caller already gets
-    /// `QueueAckUnknown` back synchronously and can retry itself — and for
-    /// an attempt whose worker is still running normally.
-    pending_ack: Option(worker.Execution),
-    /// Number of retry attempts already made while `pending_ack` has been
-    /// `Some` (0 for the first one, about to be made). Compared against
-    /// `ConsumerState.pending_ack_retry_budget` to decide whether this
-    /// tick still renews the lease before retrying the acknowledgement.
-    /// Meaningless (left at its last value) while `pending_ack` is `None`.
-    pending_ack_ticks: Int,
-    /// Invalidates a still-outstanding timer from an earlier chain: bumped
-    /// only when `retry_ack_until_known` first moves this attempt from
-    /// `pending_ack: None` to `Some` (there is always exactly one leftover
-    /// ordinary-renewal timer already scheduled at that point, from the
-    /// chain `start_attempt`/`renew_lease` maintains), and carried unchanged
-    /// by every later tick of the same chain (ordinary renewal or pending
-    /// retry alike). `renew_active_attempt` ignores a `Renew` whose own
-    /// `generation` does not match this field — see its doc comment for why
-    /// this, not just the existing `attempt_id`/`epoch` match, is needed to
-    /// guarantee exactly one outstanding timer per attempt.
-    renewal_generation: Int,
-  )
 }
 
 /// Reports acknowledged outcomes before a later attempt in the same poll fails.
@@ -452,8 +403,8 @@ type ConsumerState {
     database: Database,
     workers: Registry,
     worker_factory: factory_supervisor.Supervisor(
-      WorkerRequest,
-      process.Subject(WorkerMessage),
+      queue_worker.WorkerRequest(Message),
+      process.Subject(queue_worker.WorkerMessage),
     ),
     queue: String,
     attempt_owner: String,
@@ -492,7 +443,7 @@ type ConsumerState {
     /// and the retry's next attempt observes that as an ordinary known
     /// `QueueAckStale(_, AckLeaseExpired(..))` rather than retrying forever.
     pending_ack_retry_budget: Int,
-    active: List(ActiveAttempt),
+    active: List(ActiveAttempt(Completion, RenewalStatus)),
     /// True while a `Poll` timer is already scheduled against
     /// `incarnation_subject` and has not yet fired. `continue_if_idle` is the
     /// sole scheduler and checks this before arming another one, so free
@@ -582,13 +533,13 @@ fn start_configured_consumer(
   // atom creation to one name per `Consumer` value, not one per restart.
   let coordinator_name = process.new_name("grind_queue_coordinator")
   let handoff_reply = process.new_subject()
-  let handoff_pid = start_queue_actor_handoff(handoff_reply, process.self())
+  let handoff_pid = queue_handoff.start(handoff_reply, process.self())
   case process.receive(handoff_reply, within: 5000) {
     Error(Nil) -> {
       process.kill(handoff_pid)
       Error(QueueActorHandoffFailed)
     }
-    Ok(QueueActorHandoffSubjects(actor_ready, stop_handoff)) ->
+    Ok(queue_handoff.HandoffSubjects(actor_ready, stop_handoff)) ->
       start_configured_consumer_with_handoff(
         database,
         workers,
@@ -601,7 +552,7 @@ fn start_configured_consumer(
         actor_ready,
         stop_handoff,
       )
-    Ok(QueueActorHandoffStarted(_)) -> {
+    Ok(queue_handoff.HandoffStarted(_)) -> {
       process.kill(handoff_pid)
       Error(QueueActorHandoffFailed)
     }
@@ -615,7 +566,7 @@ fn start_configured_consumer_with_handoff(
   policy: ValidatedPolicy,
   hooks: Hooks,
   coordinator_name: process.Name(Message),
-  handoff_reply: process.Subject(QueueActorHandoffMessage),
+  handoff_reply: process.Subject(queue_handoff.HandoffMessage(Message)),
   handoff_pid: process.Pid,
   actor_ready: process.Subject(process.Subject(Message)),
   stop_handoff: process.Subject(Nil),
@@ -642,7 +593,7 @@ fn start_configured_consumer_with_handoff(
   }
   let worker_factory_builder =
     factory_supervisor.worker_child(fn(request) {
-      actor.start(worker_actor(request))
+      actor.start(queue_worker.worker_actor(request))
     })
     |> factory_supervisor.restart_strategy(supervision.Temporary)
   let builder =
@@ -664,7 +615,7 @@ fn start_configured_consumer_with_handoff(
       // comment on `ConsumerState` for why every self-scheduled timer uses
       // this instead of the named `subject`.
       let incarnation_subject = process.new_subject()
-      start_polling(incarnation_subject, auto_poll)
+      queue_timing.start_polling(incarnation_subject, auto_poll, Poll)
       case factory_supervisor.start(worker_factory_builder) {
         Error(error) -> Error(string.inspect(error))
         Ok(started_factory) -> {
@@ -734,7 +685,7 @@ fn start_configured_consumer_with_handoff(
             Error(Nil) -> Error(QueueSupervisorStopTimedOut)
           }
         }
-        Ok(QueueActorHandoffStarted(subject)) ->
+        Ok(queue_handoff.HandoffStarted(subject)) ->
           Ok(Consumer(
             subject,
             started.pid,
@@ -742,7 +693,7 @@ fn start_configured_consumer_with_handoff(
             shutdown_grace_ms,
             process.self(),
           ))
-        Ok(QueueActorHandoffSubjects(_, _)) -> {
+        Ok(queue_handoff.HandoffSubjects(_, _)) -> {
           process.send(stop_handoff, Nil)
           process.kill(handoff_pid)
           case stop_consumer_supervisor(started.pid) {
@@ -751,62 +702,6 @@ fn start_configured_consumer_with_handoff(
           }
         }
       }
-  }
-}
-
-type QueueActorHandoffMessage {
-  QueueActorHandoffSubjects(
-    actor_ready: process.Subject(process.Subject(Message)),
-    stop: process.Subject(Nil),
-  )
-  QueueActorHandoffStarted(process.Subject(Message))
-}
-
-type QueueActorHandoffEvent {
-  QueueActorStarted(process.Subject(Message))
-  QueueActorHandoffStopped
-  QueueActorHandoffOwnerDown(process.Down)
-}
-
-fn start_queue_actor_handoff(
-  reply: process.Subject(QueueActorHandoffMessage),
-  owner: process.Pid,
-) -> process.Pid {
-  process.spawn_unlinked(fn() {
-    let actor_ready = process.new_subject()
-    let stop = process.new_subject()
-    process.send(reply, QueueActorHandoffSubjects(actor_ready, stop))
-    let monitor = process.monitor(owner)
-    let selector =
-      process.new_selector()
-      |> process.select_map(actor_ready, fn(subject) {
-        QueueActorStarted(subject)
-      })
-      |> process.select_map(stop, fn(_) { QueueActorHandoffStopped })
-      |> process.select_specific_monitor(monitor, fn(down) {
-        QueueActorHandoffOwnerDown(down)
-      })
-    case process.selector_receive_forever(selector) {
-      QueueActorStarted(subject) -> {
-        process.send(reply, QueueActorHandoffStarted(subject))
-        let _ = process.demonitor_process(monitor)
-        Nil
-      }
-      QueueActorHandoffStopped | QueueActorHandoffOwnerDown(_) -> {
-        let _ = process.demonitor_process(monitor)
-        Nil
-      }
-    }
-  })
-}
-
-fn start_polling(subject: process.Subject(Message), auto_poll: Bool) -> Nil {
-  case auto_poll {
-    True -> {
-      let _ = process.send(subject, Poll)
-      Nil
-    }
-    False -> Nil
   }
 }
 
@@ -1180,20 +1075,6 @@ fn begin_shutdown(
   }
 }
 
-fn schedule_poll(
-  subject: process.Subject(Message),
-  auto_poll: Bool,
-  poll_interval_ms: Int,
-) -> Nil {
-  case auto_poll {
-    True -> {
-      let _ = process.send_after(subject, poll_interval_ms, Poll)
-      Nil
-    }
-    False -> Nil
-  }
-}
-
 fn start_attempt(
   state: ConsumerState,
   completion: Completion,
@@ -1224,7 +1105,14 @@ fn start_attempt(
     Ok(None) -> finish_without_claim(state, completion, Ok(False))
     Ok(Some(claimed)) -> {
       let #(id, attempt_id, epoch) = attempt.claim_identity(claimed)
-      let request = WorkerRequest(incarnation_subject, claimed)
+      let request =
+        queue_worker.WorkerRequest(
+          incarnation_subject,
+          claimed,
+          fn(id, attempt_id, epoch, execution) {
+            AttemptReturned(id, attempt_id, epoch, execution)
+          },
+        )
       let start_result = case hooks.before_worker_start() {
         Error(reason) -> Error(actor.InitFailed(reason))
         Ok(Nil) -> factory_supervisor.start_child(worker_factory, request)
@@ -1241,7 +1129,7 @@ fn start_attempt(
               release_dead_worker_before_activation(state, completion, claimed)
             }
             True -> {
-              process.send(started.data, StartAttempt)
+              process.send(started.data, queue_worker.StartAttempt)
               let active =
                 ActiveAttempt(
                   id:,
@@ -1384,12 +1272,12 @@ fn finish_attempt(
   epoch: Int,
   execution: worker.Execution,
 ) -> actor.Next(ConsumerState, Message) {
-  case find_active(state.active, id, attempt_id, epoch) {
+  case queue_active.find_active(state.active, id, attempt_id, epoch) {
     Error(Nil) -> actor.continue(state)
     Ok(active) -> {
       let ActiveAttempt(claimed:, worker_subject:, monitor:, ..) = active
       process.demonitor_process(monitor)
-      process.send(worker_subject, StopWorker)
+      process.send(worker_subject, queue_worker.StopWorker)
       let result =
         attempt.acknowledge(
           state.database,
@@ -1426,7 +1314,7 @@ fn finish_attempt(
 /// left to hand an unknown ack to, which is the gap this fixes.
 fn finalize_ack_result(
   state: ConsumerState,
-  active: ActiveAttempt,
+  active: ActiveAttempt(Completion, RenewalStatus),
   result: Result(Bool, postgres.QueueRunError),
 ) -> actor.Next(ConsumerState, Message) {
   case result, active.completion, active.pending_ack {
@@ -1439,7 +1327,12 @@ fn finalize_ack_result(
       let state =
         ConsumerState(
           ..state,
-          active: remove_active(state.active, id, attempt_id, epoch),
+          active: queue_active.remove_active(
+            state.active,
+            id,
+            attempt_id,
+            epoch,
+          ),
         )
       finish_completion(
         state,
@@ -1466,7 +1359,7 @@ fn finalize_ack_result(
 /// invalidate.
 fn retry_ack_until_known(
   state: ConsumerState,
-  active: ActiveAttempt,
+  active: ActiveAttempt(Completion, RenewalStatus),
   execution: worker.Execution,
 ) -> actor.Next(ConsumerState, Message) {
   let ActiveAttempt(
@@ -1490,7 +1383,7 @@ fn retry_ack_until_known(
   actor.continue(
     ConsumerState(
       ..state,
-      active: replace_active(
+      active: queue_active.replace_active(
         state.active,
         id,
         attempt_id,
@@ -1528,7 +1421,7 @@ fn retry_ack_until_known(
 /// of retried forever.
 fn retry_pending_ack(
   state: ConsumerState,
-  active: ActiveAttempt,
+  active: ActiveAttempt(Completion, RenewalStatus),
   execution: worker.Execution,
 ) -> actor.Next(ConsumerState, Message) {
   let ActiveAttempt(claimed:, pending_ack_ticks:, ..) = active
@@ -1690,77 +1583,11 @@ fn continue_if_idle(
   }
 }
 
-fn find_active(
-  active_attempts: List(ActiveAttempt),
-  id: Int,
-  attempt_id: Int,
-  epoch: Int,
-) -> Result(ActiveAttempt, Nil) {
-  list.find(active_attempts, fn(active) {
-    let ActiveAttempt(
-      id: active_id,
-      attempt_id: active_attempt_id,
-      epoch: active_epoch,
-      ..,
-    ) = active
-    active_id == id && active_attempt_id == attempt_id && active_epoch == epoch
-  })
-}
-
-fn remove_active(
-  active_attempts: List(ActiveAttempt),
-  id: Int,
-  attempt_id: Int,
-  epoch: Int,
-) -> List(ActiveAttempt) {
-  list.filter(active_attempts, fn(active) {
-    let ActiveAttempt(
-      id: active_id,
-      attempt_id: active_attempt_id,
-      epoch: active_epoch,
-      ..,
-    ) = active
-    case
-      active_id == id
-      && active_attempt_id == attempt_id
-      && active_epoch == epoch
-    {
-      True -> False
-      False -> True
-    }
-  })
-}
-
 /// This incarnation's renewal timer fires once per active attempt every
 /// `renewal_interval_ms`. A `pending_ack` attempt (its worker has already
 /// returned; see `ActiveAttempt`'s doc comment) repurposes this same tick to
 /// retry its acknowledgement instead of renewing a lease nothing is running
 /// against.
-fn replace_active(
-  active_attempts: List(ActiveAttempt),
-  id: Int,
-  attempt_id: Int,
-  epoch: Int,
-  replacement: ActiveAttempt,
-) -> List(ActiveAttempt) {
-  list.map(active_attempts, fn(active) {
-    let ActiveAttempt(
-      id: active_id,
-      attempt_id: active_attempt_id,
-      epoch: active_epoch,
-      ..,
-    ) = active
-    case
-      active_id == id
-      && active_attempt_id == attempt_id
-      && active_epoch == epoch
-    {
-      True -> replacement
-      False -> active
-    }
-  })
-}
-
 /// This incarnation's renewal timer fires once per active attempt every
 /// `renewal_interval_ms`. A `pending_ack` attempt (its worker has already
 /// returned; see `ActiveAttempt`'s doc comment) repurposes this same tick to
@@ -1781,7 +1608,13 @@ fn renew_active_attempt(
   tick_epoch: Int,
   tick_generation: Int,
 ) -> actor.Next(ConsumerState, Message) {
-  case find_active_by_attempt(state.active, tick_attempt_id, tick_epoch) {
+  case
+    queue_active.find_active_by_attempt(
+      state.active,
+      tick_attempt_id,
+      tick_epoch,
+    )
+  {
     Error(Nil) -> actor.continue(state)
     Ok(active) -> {
       let ActiveAttempt(
@@ -1808,7 +1641,7 @@ fn renew_active_attempt(
 
 fn renew_lease(
   state: ConsumerState,
-  active: ActiveAttempt,
+  active: ActiveAttempt(Completion, RenewalStatus),
 ) -> actor.Next(ConsumerState, Message) {
   let ActiveAttempt(attempt_id:, epoch:, renewal_generation:, ..) = active
   let result =
@@ -1859,25 +1692,13 @@ fn set_renewal_status(
   renewal_status: RenewalStatus,
 ) -> ConsumerState {
   let active =
-    list.map(state.active, fn(active) {
-      let ActiveAttempt(attempt_id: active_id, epoch: active_epoch, ..) = active
-      case active_id == attempt_id && active_epoch == epoch {
-        True -> ActiveAttempt(..active, renewal_status:)
-        False -> active
-      }
-    })
+    queue_active.set_renewal_status(
+      state.active,
+      attempt_id,
+      epoch,
+      renewal_status,
+    )
   ConsumerState(..state, active:)
-}
-
-fn find_active_by_attempt(
-  active_attempts: List(ActiveAttempt),
-  attempt_id: Int,
-  epoch: Int,
-) -> Result(ActiveAttempt, Nil) {
-  list.find(active_attempts, fn(active) {
-    let ActiveAttempt(attempt_id: active_id, epoch: active_epoch, ..) = active
-    active_id == attempt_id && active_epoch == epoch
-  })
 }
 
 fn handle_worker_down(
@@ -1900,7 +1721,12 @@ fn handle_worker_down(
           let state =
             ConsumerState(
               ..state,
-              active: remove_active(state.active, id, attempt_id, epoch),
+              active: queue_active.remove_active(
+                state.active,
+                id,
+                attempt_id,
+                epoch,
+              ),
             )
           case completion {
             ManualCompletion(reply) ->
@@ -1924,33 +1750,10 @@ fn schedule_next_poll(state: ConsumerState) -> Nil {
     PollEvery(interval_ms) -> interval_ms
     Manual -> 0
   }
-  schedule_poll(state.incarnation_subject, state.auto_poll, poll_interval_ms)
-}
-
-type WorkerState {
-  WorkerState(
-    queue_subject: process.Subject(Message),
-    claimed: attempt.ClaimedJob,
+  queue_timing.schedule_poll(
+    state.incarnation_subject,
+    state.auto_poll,
+    poll_interval_ms,
+    Poll,
   )
-}
-
-fn worker_actor(
-  request: WorkerRequest,
-) -> actor.Builder(WorkerState, WorkerMessage, process.Subject(WorkerMessage)) {
-  let WorkerRequest(queue_subject:, claimed:) = request
-  actor.new(WorkerState(queue_subject:, claimed:))
-  |> actor.on_message(fn(state, message) {
-    case message {
-      StartAttempt -> {
-        let #(id, attempt_id, epoch) = attempt.claim_identity(state.claimed)
-        let execution = attempt.execute_claim(state.claimed)
-        process.send(
-          state.queue_subject,
-          AttemptReturned(id, attempt_id, epoch, execution),
-        )
-        actor.continue(state)
-      }
-      StopWorker -> actor.stop()
-    }
-  })
 }

@@ -12,7 +12,7 @@ ledger.
 
 ## Last full run
 
-- Root Gleam package (`gleam test` under `scripts/test-postgres.sh`): 201
+- Root Gleam package (`gleam test` under `scripts/test-postgres.sh`): 228
   passed, 0 failures, against PostgreSQL 16.15. The current schema contract
   is v12 (see `docs/UNIQUENESS-CONTRACT.md` for the schema change and its
   user impact); there is no deployed-schema upgrade path from the prior

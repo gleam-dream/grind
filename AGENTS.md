@@ -25,7 +25,7 @@ progress:
 
 - **Squirrel-generated (static queries)**: any query whose SQL text is fixed
   at compile time, given its own `.sql` file.
-- **Hand-written inline (`grind/postgres`, `grind/internal/unique_admission`)**:
+- **Hand-written inline (`grind/postgres` and its `grind/internal/` collaborators)**:
   dynamic SQL — shared lease/period/lock predicate fragments spliced into
   more than one query, per-disposition acknowledgement SQL (branches on the
   proposed state), nullable-parameter queries whose bound value shape varies
@@ -81,7 +81,8 @@ pg_class WHERE relname LIKE 'grind\_%' ORDER BY relname` against a
    written).
 3. Once the migration is released (merged, not still under review), compute
    its file's sha256 (`shasum -a 256 <file> | awk '{print toupper($1)}'`) and
-   add it to `released_migration_sha256` in `test/grind_test.gleam` — this is
+   add it to `released_migration_sha256` in
+   `test/grind/migrations/conformance_test.gleam` — this is
    what makes `grind_migrations_conformance_test` catch an accidental
    post-release edit to a file that has already shipped. (The _newest_
    version does not need a pin yet, since it may still be edited in the same

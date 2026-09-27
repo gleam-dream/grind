@@ -1,71 +1,29 @@
 //// The admission transaction behind `postgres.submit_unique`/
 //// `reconcile_unique`/`submit_with_id` — one `Request` and transaction
-//// serve both, keyed on whether `Request.policy` is `Some` or `None`. See
+//// serve both, keyed on whether `Request.policy` is `Some` or `None`.
+//// Request fingerprints and dynamic query construction live in the
+//// `grind/internal/unique_admission` submodules. See
 //// `docs/UNIQUENESS-CONTRACT.md` for the full contract.
 
-import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/int
-import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import grind/internal/sql
 import grind/internal/store
+import grind/internal/unique_admission/query as unique_admission_query
+import grind/internal/unique_admission/request.{
+  type PolicyPart, type Request, PolicyPart,
+} as unique_admission_request
 import grind/job
 import grind/submission
 import grind/unique
 import grind/worker.{type Worker}
 import pog
 
-/// The request fingerprint's hash; see `docs/UNIQUENESS-CONTRACT.md`, Decision 9.
-@external(erlang, "grind_unique_ffi", "sha256")
-fn sha256(data: BitArray) -> BitArray
-
-/// The uniqueness-policy fields a `submit_unique` request carries and a
-/// `submit_with_id` request does not. Held as its own type (rather than
-/// flattened into `Request`) so `Request.policy: Option(PolicyPart)` alone
-/// expresses "does this request have a uniqueness policy" — no separate
-/// sentinel key/scope/period/states/action values are ever constructed for
-/// the "no policy" case.
-type PolicyPart {
-  PolicyPart(
-    key_contract: String,
-    encoded_key: String,
-    scope: unique.QueueScope,
-    period: unique.Period,
-    states: unique.States,
-    on_conflict: unique.ConflictAction,
-  )
-}
-
-/// Every value the admission transaction needs, gathered once by `submit`/
-/// `submit_plain`. `request_sha256` starts empty and is filled in by
-/// `fingerprint`, which takes this whole record as its input — one field
-/// list, built once. `policy: None` is `submit_with_id`'s "no policy" case:
-/// no uniqueness key, no candidate selection, no domain-wide advisory lock,
-/// always an insert (or a replayed receipt) — see the module doc comment.
-type Request(input, output, error) {
-  Request(
-    installation: job.Installation,
-    submission_id: submission.SubmissionId,
-    queue: String,
-    worker: Worker(input, output, error),
-    worker_id: String,
-    worker_version: String,
-    input_version: String,
-    encoded_input: String,
-    output_version: String,
-    error_version: Option(String),
-    max_attempts: Int,
-    availability: submission.Availability,
-    policy: Option(PolicyPart),
-    request_sha256: BitArray,
-  )
-}
-
 /// The proven-committed outcome of one `submit` call. Mirrors
-/// `grind/internal/attempt`'s own internal `AckCommit`, including
+/// `grind/internal/attempt/acknowledgement`'s `AckCommit`, including
 /// `via_receipt_match`'s and `available_at_unix_ms`'s meaning — see that
 /// type's doc comment.
 pub type Commit(input, output, error) {
@@ -102,7 +60,7 @@ pub fn submit(
         unique.policy_fields(policy)
       run(
         connection,
-        build_request(
+        unique_admission_request.build_request(
           installation,
           submission_id,
           queue,
@@ -153,7 +111,7 @@ pub fn submit_plain(
     _ ->
       run(
         connection,
-        build_request(
+        unique_admission_request.build_request(
           installation,
           submission_id,
           queue,
@@ -189,138 +147,6 @@ pub fn reconcile(
   }
 }
 
-/// Gathers every value the admission transaction needs. `build_policy`
-/// receives the submitting worker's own input codec version and encoded
-/// input text (so a `Some` policy's key material is derived from exactly
-/// the same encoding the request itself carries, never re-encoded) and
-/// returns `Some(PolicyPart)` for `submit`'s uniqueness case or `None` for
-/// `submit_plain`'s "no policy" case.
-fn build_request(
-  installation: job.Installation,
-  submission_id: submission.SubmissionId,
-  queue: String,
-  worker_def: Worker(input, output, error),
-  input: input,
-  availability: submission.Availability,
-  build_policy: fn(String, String) -> Option(PolicyPart),
-) -> Request(input, output, error) {
-  let worker.Metadata(
-    id: worker_id,
-    worker_version:,
-    input_version:,
-    output_version:,
-    error_version:,
-    max_attempts:,
-  ) = worker.metadata(worker_def)
-  let encoded_input = worker.encode_input(worker_def, input)
-  let policy = build_policy(input_version, encoded_input)
-  let request =
-    Request(
-      installation:,
-      submission_id:,
-      queue:,
-      worker: worker_def,
-      worker_id:,
-      worker_version:,
-      input_version:,
-      encoded_input:,
-      output_version:,
-      error_version:,
-      max_attempts:,
-      availability:,
-      policy:,
-      request_sha256: <<>>,
-    )
-  Request(..request, request_sha256: fingerprint(request))
-}
-
-/// The request fingerprint envelope; see `docs/UNIQUENESS-CONTRACT.md`,
-/// Decision 9, and "Admission receipts". Tagged `"grind-unique-request-v1"`
-/// when `policy` is `Some` and `"grind-plain-request-v1"` when it is
-/// `None` — deliberately different magic strings, so a `SubmissionId`
-/// reused between `submit_unique` and `submit_with_id` (or between two
-/// calls whose only difference is the presence of a policy) always
-/// fingerprint-mismatches and reports `SubmissionConflict`, never a
-/// silently-replayed decision from the wrong kind of admission. The
-/// policy-specific fields (key, scope, period, states, action) are present
-/// in the envelope only when `policy` is `Some`, in the same field order
-/// this envelope has always used.
-fn fingerprint(request: Request(input, output, error)) -> BitArray {
-  let tag = case request.policy {
-    Some(_) -> "grind-unique-request-v1"
-    None -> "grind-plain-request-v1"
-  }
-  let policy_fields = case request.policy {
-    None -> []
-    Some(PolicyPart(
-      key_contract:,
-      encoded_key:,
-      scope:,
-      period:,
-      states:,
-      on_conflict:,
-    )) -> {
-      let #(period_ms, period_origin) = case unique.period_spec(period) {
-        unique.Unbounded -> #(None, None)
-        unique.FinitePeriod(ms, from) -> #(
-          Some(ms),
-          Some(unique.period_origin_label(from)),
-        )
-      }
-      let reschedule_ms = unique.reschedule_target_ms(on_conflict)
-      [
-        json.string(key_contract),
-        json.string(encoded_key),
-        json.string(unique.scope_label(scope)),
-        json.bool(option.is_some(period_ms)),
-        json.nullable(period_ms, json.int),
-        json.bool(option.is_some(period_origin)),
-        json.nullable(period_origin, json.string),
-        json.string(unique.states_label(states)),
-        json.string(unique.action_label(on_conflict)),
-        json.bool(option.is_some(reschedule_ms)),
-        json.nullable(reschedule_ms, json.int),
-      ]
-    }
-  }
-  let availability_ms = submission.availability_ms(request.availability)
-  let envelope =
-    list.flatten([
-      [
-        json.string(tag),
-        json.string(request.queue),
-        json.string(request.worker_id),
-        json.string(request.worker_version),
-        json.string(request.input_version),
-        json.string(request.encoded_input),
-      ],
-      policy_fields,
-      [
-        json.bool(option.is_some(availability_ms)),
-        json.nullable(availability_ms, json.int),
-        json.string(request.output_version),
-        json.bool(option.is_some(request.error_version)),
-        json.nullable(request.error_version, json.string),
-        json.int(request.max_attempts),
-      ],
-    ])
-  json.preprocessed_array(envelope)
-  |> json.to_string
-  |> bit_array.from_string
-  |> sha256
-}
-
-fn pending_submission(
-  request: Request(input, output, error),
-) -> submission.PendingSubmission(input, output, error) {
-  submission.new_pending_submission(
-    request.installation,
-    request.submission_id,
-    request.worker,
-    request.request_sha256,
-  )
-}
-
 /// Runs the admission transaction and classifies its result. Shared by
 /// `submit` (`policy: Some`) and `submit_plain` (`policy: None`); see
 /// "Out of scope" in `docs/UNIQUENESS-CONTRACT.md` for why the
@@ -351,7 +177,12 @@ fn run(
     // `docs/UNIQUENESS-CONTRACT.md`.
     Ok(Error(pog.TransactionRolledBack(submission.SubmissionConflict)))
     | Ok(Error(pog.TransactionQueryError(_))) ->
-      case reconcile_from_receipt(connection, pending_submission(request)) {
+      case
+        reconcile_from_receipt(
+          connection,
+          unique_admission_request.pending_submission(request),
+        )
+      {
         Ok(#(outcome, committed_state)) ->
           Ok(Commit(
             outcome:,
@@ -547,52 +378,6 @@ fn set_lock_timeout(
 /// ever widened `search_path` again. `first_parameter` is the worker id's
 /// own position, with worker version, key contract, and key JSON following
 /// it, and the schema bound one position before it.
-pub fn lock_key_sql(first_parameter: Int) -> String {
-  "hashtextextended(jsonb_build_array('grind-unique-v1', "
-  <> sql_parameter(first_parameter - 1, "text")
-  <> ", "
-  <> sql_parameter(first_parameter, "text")
-  <> ", "
-  <> sql_parameter(first_parameter + 1, "text")
-  <> ", "
-  <> sql_parameter(first_parameter + 2, "text")
-  <> ", encode("
-  <> key_digest_sql(first_parameter + 3)
-  <> ", 'hex'))::text, 0)"
-}
-
-/// The domain-wide advisory lock query itself — SQL text, parameter
-/// binding, and the `Bool` decoder together — built once here so
-/// `acquire_lock` and any test that needs to hold this exact same lock (the
-/// forced-overlap and contention tests in `test/grind_test.gleam`) never
-/// re-encode it by hand; `pg_advisory_xact_lock` itself returns `void`,
-/// which `pg_types` cannot decode (see `docs/UNIQUENESS-CONTRACT.md`'s
-/// PostgreSQL driver note), hence the `SELECT true FROM (...)` wrapping.
-/// `schema` is the configured schema (see `lock_key_sql`'s own doc comment
-/// for why it is bound here rather than resolved server-side).
-pub fn lock_query(
-  schema: String,
-  worker_id: String,
-  worker_version: String,
-  key_contract: String,
-  encoded_key: String,
-) -> pog.Query(Bool) {
-  pog.query(
-    "SELECT true FROM (SELECT pg_advisory_xact_lock("
-    <> lock_key_sql(2)
-    <> ")) AS grind_unique_lock",
-  )
-  |> pog.parameter(pog.text(schema))
-  |> pog.parameter(pog.text(worker_id))
-  |> pog.parameter(pog.text(worker_version))
-  |> pog.parameter(pog.text(key_contract))
-  |> pog.parameter(pog.text(encoded_key))
-  |> pog.returning({
-    use acquired <- decode.field(0, decode.bool)
-    decode.success(acquired)
-  })
-}
-
 fn acquire_lock(
   connection: pog.Connection,
   schema: String,
@@ -601,7 +386,7 @@ fn acquire_lock(
   policy_part: PolicyPart,
 ) -> Result(Nil, submission.SubmitError(input, output, error)) {
   let query =
-    lock_query(
+    unique_admission_query.lock_query(
       schema,
       worker_id,
       worker_version,
@@ -610,45 +395,6 @@ fn acquire_lock(
     )
   use _ <- result.try(unique_execute(query, connection))
   Ok(Nil)
-}
-
-fn sql_parameter(index: Int, cast: String) -> String {
-  "$" <> int.to_string(index) <> "::" <> cast
-}
-
-/// The uniqueness key digest; see `docs/UNIQUENESS-CONTRACT.md`, Decision 1.
-fn key_digest_sql(key_json_parameter: Int) -> String {
-  "sha256(convert_to(("
-  <> sql_parameter(key_json_parameter, "jsonb")
-  <> ")::text, 'UTF8'))"
-}
-
-/// Converts a bound millisecond (`divisor` `1000.0`) or microsecond
-/// (`1000000.0`) integer into `timestamptz` (also correct for a bound
-/// `NULL`). See `docs/UNIQUENESS-CONTRACT.md`'s PostgreSQL driver note for
-/// why time round-trips through a bound integer instead of a decoded value.
-fn to_timestamptz_sql(param_index: Int, divisor: String) -> String {
-  "to_timestamp("
-  <> sql_parameter(param_index, "double precision")
-  <> " / "
-  <> divisor
-  <> ")"
-}
-
-/// The uniqueness period predicate; see `docs/UNIQUENESS-CONTRACT.md`,
-/// admission transaction step 6. `column` and `now_expression` are trusted
-/// SQL fragments spliced verbatim, never caller input.
-pub fn period_predicate(
-  column: String,
-  now_expression: String,
-  period_ms_expression: String,
-) -> String {
-  column
-  <> " >= "
-  <> now_expression
-  <> " - ("
-  <> period_ms_expression
-  <> "::double precision * interval '1 millisecond')"
 }
 
 /// `Ok(None)` means no receipt yet; a fingerprint mismatch or an
@@ -759,110 +505,6 @@ type Candidate {
   Candidate(id: Int, queue: String, state: String, available_at_us: Int)
 }
 
-fn is_reschedule(action: unique.ConflictAction) -> Bool {
-  case action {
-    unique.RescheduleScheduledTo(_) -> True
-    unique.KeepExisting -> False
-  }
-}
-
-/// Every candidate this admission transaction reads is locked, never merely
-/// read: a `RescheduleScheduledTo` action needs `FOR UPDATE` (it is about to
-/// write `available_at`), and every other action still needs `FOR KEY
-/// SHARE` — the weakest lock mode that still conflicts with a `DELETE`
-/// (`postgres.prune_finished` locks its own candidates at `FOR UPDATE`
-/// strength). `prune_finished` itself never blocks on this: its own scan is
-/// `FOR UPDATE SKIP LOCKED`, so a row this transaction already holds is
-/// simply skipped, never waited on. The direction that *can* block is this
-/// transaction's own read, when `prune_finished` instead reaches and locks
-/// this row first — held for as long as that one `DELETE` statement, batch
-/// and all, takes to run — this read then waits behind it, and reports
-/// `AdmissionContended` if that wait exceeds this transaction's own
-/// `lock_timeout`: a correct outcome, bounded to however long that single
-/// prune batch holds the row, not a bug. `FOR KEY SHARE` deliberately does
-/// *not* conflict with `FOR NO KEY UPDATE`: `attempt.claim_registered_job`,
-/// `postgres.cancel_lock`, `lease`'s own quarantine scan, and
-/// `postgres.apply_uncertain_resolution`'s own row lock all lock this same
-/// table at that weaker strength precisely so an unrelated claim, cancel,
-/// quarantine sweep, or resolution racing a `KeepExisting` read of the
-/// identical row never spuriously contends (`AdmissionContended`) for a
-/// reason that was never actually a write conflict — see
-/// `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" step 6, for the
-/// full contention picture.
-///
-/// The window this lock actually closes: this transaction committing (its
-/// own `INSERT` and receipt) *after* `prune_finished`'s `DELETE` statement
-/// already took its snapshot but *before* that statement's own scan reaches
-/// and locks this exact row — without this lock, `prune_finished`'s `SKIP
-/// LOCKED` search would find the row still unlocked at that point and
-/// delete it out from under the read this transaction just performed.
-/// `grind_v12`'s own `ON DELETE CASCADE` foreign keys are the second,
-/// independent backstop for the one narrower window this lock alone cannot
-/// close (a prune statement that already locked this row, under its own
-/// fixed snapshot, strictly before this admission's own commit becomes
-/// visible to it) — see `docs/RECOVERY-EVIDENCE.md`, Increment 24, for why
-/// a receipt referencing an already-deleted job can still never become a
-/// permanent orphan either way.
-fn candidate_sql(
-  scope: unique.QueueScope,
-  period: unique.PeriodSpec,
-  is_reschedule: Bool,
-) -> String {
-  let base =
-    "SELECT id, queue, state, (extract(epoch FROM available_at) * 1000000)::bigint FROM grind_jobs WHERE worker_id = $1 AND worker_version = $2 AND unique_key_contract = $3 AND unique_key_sha256 = "
-    <> key_digest_sql(4)
-    <> " AND state = ANY($5::text[])"
-  let #(scoped, next) = case scope {
-    unique.WithinQueue -> #(base <> " AND queue = $6", 7)
-    unique.AcrossQueues -> #(base, 6)
-  }
-  let with_period = case period {
-    unique.Unbounded -> scoped
-    unique.FinitePeriod(_, from) ->
-      scoped
-      <> " AND "
-      <> period_predicate(
-        unique.period_column(from),
-        to_timestamptz_sql(next, "1000000.0"),
-        sql_parameter(next + 1, "bigint"),
-      )
-  }
-  with_period
-  <> " ORDER BY id LIMIT 1"
-  <> case is_reschedule {
-    True -> " FOR UPDATE"
-    False -> " FOR KEY SHARE"
-  }
-}
-
-fn bind_candidate_params(
-  query: pog.Query(a),
-  worker_id: String,
-  worker_version: String,
-  queue: String,
-  policy_part: PolicyPart,
-  eligible_states: List(String),
-  now_us: Int,
-  period: unique.PeriodSpec,
-) -> pog.Query(a) {
-  let base =
-    query
-    |> pog.parameter(pog.text(worker_id))
-    |> pog.parameter(pog.text(worker_version))
-    |> pog.parameter(pog.text(policy_part.key_contract))
-    |> pog.parameter(pog.text(policy_part.encoded_key))
-    |> pog.parameter(pog.array(pog.text, eligible_states))
-  let scoped = case policy_part.scope {
-    unique.WithinQueue -> base |> pog.parameter(pog.text(queue))
-    unique.AcrossQueues -> base
-  }
-  case period {
-    unique.Unbounded -> scoped
-    unique.FinitePeriod(ms, _) ->
-      scoped |> pog.parameter(pog.int(now_us)) |> pog.parameter(pog.int(ms))
-  }
-}
-
 fn find_candidate(
   connection: pog.Connection,
   request: Request(input, output, error),
@@ -872,14 +514,14 @@ fn find_candidate(
   let period_spec = unique.period_spec(policy_part.period)
   let eligible_states = unique.eligible_states(policy_part.states)
   let sql =
-    candidate_sql(
+    unique_admission_query.candidate_sql(
       policy_part.scope,
       period_spec,
-      is_reschedule(policy_part.on_conflict),
+      unique_admission_query.is_reschedule(policy_part.on_conflict),
     )
   let query =
     pog.query(sql)
-    |> bind_candidate_params(
+    |> unique_admission_query.bind_candidate_params(
       request.worker_id,
       request.worker_version,
       request.queue,
@@ -982,9 +624,9 @@ fn record_receipt(
   let query =
     pog.query(
       "INSERT INTO grind_unique_submissions (submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state, rescheduled_from, rescheduled_to) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, "
-      <> to_timestamptz_sql(10, "1000.0")
+      <> unique_admission_query.to_timestamptz_sql(10, "1000.0")
       <> ", "
-      <> to_timestamptz_sql(11, "1000.0")
+      <> unique_admission_query.to_timestamptz_sql(11, "1000.0")
       <> ")",
     )
     |> pog.parameter(pog.text(submission.submission_id_value(submission_id)))
@@ -1032,14 +674,14 @@ fn insert_job(
     "queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at"
   let base_values =
     "$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, "
-    <> to_timestamptz_sql(10, "1000.0")
+    <> unique_admission_query.to_timestamptz_sql(10, "1000.0")
     <> ", "
-    <> to_timestamptz_sql(11, "1000000.0")
+    <> unique_admission_query.to_timestamptz_sql(11, "1000000.0")
   let #(columns, values, key_params) = case policy_part {
     None -> #(base_columns, base_values, [])
     Some(PolicyPart(key_contract:, encoded_key:, ..)) -> #(
       base_columns <> ", unique_key_contract, unique_key_sha256",
-      base_values <> ", $12, " <> key_digest_sql(13),
+      base_values <> ", $12, " <> unique_admission_query.key_digest_sql(13),
       [pog.text(key_contract), pog.text(encoded_key)],
     )
   }
@@ -1197,4 +839,39 @@ fn reschedule_job(
     |> result.map_error(classify_query_error),
   )
   Ok(Nil)
+}
+
+/// The exact lock key used by a unique admission transaction.
+pub fn lock_key_sql(first_parameter: Int) -> String {
+  unique_admission_query.lock_key_sql(first_parameter)
+}
+
+/// The domain-wide advisory lock query used by admission and overlap tests.
+pub fn lock_query(
+  schema: String,
+  worker_id: String,
+  worker_version: String,
+  key_contract: String,
+  encoded_key: String,
+) -> pog.Query(Bool) {
+  unique_admission_query.lock_query(
+    schema,
+    worker_id,
+    worker_version,
+    key_contract,
+    encoded_key,
+  )
+}
+
+/// The predicate shared by period-bounded candidate selection.
+pub fn period_predicate(
+  column: String,
+  now_expression: String,
+  period_ms_expression: String,
+) -> String {
+  unique_admission_query.period_predicate(
+    column,
+    now_expression,
+    period_ms_expression,
+  )
 }

@@ -9,7 +9,8 @@
 //// advisory-lock statement every version's list starts with, so an
 //// application applying migrations directly through cigogne serialises
 //// against a concurrent `postgres.migrate` caller exactly the same way;
-//// `grind_migrations_conformance_test` (test/grind_test.gleam) proves this
+//// `grind_migrations_conformance_test`
+//// (test/grind/migrations/conformance_test.gleam) proves this
 //// with cigogne's own public parser, with no database required.
 ////
 //// See AGENTS.md, "Adding a migration", for the steps to add a new version

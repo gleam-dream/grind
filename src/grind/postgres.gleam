@@ -1,9 +1,13 @@
+//// Public PostgreSQL facade: configuration, database ownership, and typed
+//// storage operations. Migration execution, audited resolution, and job
+//// reads live in `grind/internal/postgres`.
+
 import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/list
-import gleam/option.{type Option, None, Some, unwrap}
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
@@ -11,11 +15,13 @@ import gleam/result
 import gleam/string
 import grind/internal/lease
 import grind/internal/migrations
+import grind/internal/postgres/job_reads as postgres_job_reads
+import grind/internal/postgres/migration as postgres_migration
+import grind/internal/postgres/resolution as postgres_resolution
 import grind/internal/sql
 import grind/internal/store
-import grind/internal/terminal
 import grind/internal/unique_admission
-import grind/job.{type JobHandle, type State, Queued, Scheduled}
+import grind/job.{type JobHandle, type State}
 import grind/observation
 import grind/submission
 import grind/unique
@@ -140,7 +146,7 @@ pub fn with_observation_capacity(
 /// either a properly quoted identifier (`CREATE SCHEMA IF NOT EXISTS`, the
 /// `search_path` connection parameter) or an ordinary bound query parameter
 /// (the uniqueness admission lock key, see
-/// `grind/internal/unique_admission.lock_key_sql`), never spliced as
+/// `grind/internal/unique_admission/query.lock_key_sql`), never spliced as
 /// unescaped text.
 pub fn with_schema(settings: Settings, schema: String) -> Settings {
   Settings(..settings, schema:)
@@ -352,7 +358,7 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
               // one configured schema — see `with_schema`'s own doc comment
               // and `docs/RISKS.md` #7. This is what makes the advisory lock
               // key's bound `schema` parameter (see
-              // `grind/internal/unique_admission.lock_key_sql`) and every
+              // `grind/internal/unique_admission/query.lock_key_sql`) and every
               // `current_schema()`-based query elsewhere in this module
               // (`read_schema_generation` and friends) agree by
               // construction: there is exactly one schema in `search_path`,
@@ -390,7 +396,8 @@ pub opaque type Database {
 /// This `Database`'s own installation token — see `grind/job`'s
 /// `Installation` type doc comment. Exposed only so the test suite can hold
 /// the exact same uniqueness advisory lock a real `submit_unique` call
-/// would (`unique_domain_lock_query`, `test/grind_test.gleam`); never part
+/// would (`unique_domain_lock_query` in `test/grind/support/lock_wait.gleam`,
+/// exercised by `test/grind/unique/lock_contention_test.gleam`); never part
 /// of the public API.
 @internal
 pub fn installation(database: Database) -> job.Installation {
@@ -468,7 +475,8 @@ pub type StartError {
 /// observation is a diagnostic side channel, never a policy decision) —
 /// jobs keep being admitted, claimed, and acknowledged normally. See
 /// `postgres_forwarder_crash_loop_does_not_stop_the_pool_test`
-/// (`test/grind_test.gleam`) and `docs/RECOVERY-EVIDENCE.md`, "Acknowledged
+/// (`test/grind/observations/delivery_test.gleam`) and
+/// `docs/RECOVERY-EVIDENCE.md`, "Acknowledged
 /// observation".
 pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
   let ValidatedSettings(
@@ -791,575 +799,52 @@ fn resolve_uncertain_checked(
   decision: Resolution(output, error),
 ) -> Result(ResolutionResult, ResolutionError) {
   let ResolutionRequest(resolution_id:, resolved_by:, details:, ..) = request
-  {
-    let #(_, _, _, _, _, bound_output_version, _) =
-      job.reconciliation_fields(handle)
-    use
-      #(
-        decision,
-        state,
-        output_version,
-        encoded_output,
-        error_version,
-        encoded_error,
-        failure_description,
-      )
-    <- result.try(case decision {
-      ConfirmSuccess(value) -> {
-        let #(version, encoded) = job.encode_reconciled_success(handle, value)
-        Ok(#(
-          "confirm_success",
-          "succeeded",
-          version,
-          Some(encoded),
-          None,
-          None,
-          None,
-        ))
-      }
-      ConfirmBusinessFailure(value) ->
-        case job.encode_reconciled_error(handle, value) {
-          None -> Error(ResolutionRequiresErrorCodec)
-          Some(#(version, encoded)) ->
-            Ok(#(
-              "confirm_business_failure",
-              "business_failed",
-              bound_output_version,
-              None,
-              Some(version),
-              Some(encoded),
-              Some(details),
-            ))
-        }
-      AuthorizeReplay ->
-        Ok(#(
-          "authorize_replay",
-          "queued",
-          bound_output_version,
-          None,
-          None,
-          None,
-          None,
-        ))
-    })
-    let #(
-      id,
-      _,
-      queue,
-      worker_id,
-      worker_version,
-      expected_output_version,
-      expected_error_version,
-    ) = job.reconciliation_fields(handle)
-    let Database(connection:, forwarder:, ..) = database
-    let command =
-      ResolutionCommand(
-        id:,
-        queue:,
-        worker_id:,
-        worker_version:,
-        expected_output_version:,
-        expected_error_version:,
-        resolution_id:,
-        resolved_by:,
-        details:,
-        decision:,
-        target_state: state,
-        output_version:,
-        encoded_output:,
-        error_version:,
-        encoded_error:,
-        failure_description:,
-      )
-    case
-      store.transaction_safely(connection, fn(transaction) {
-        reconcile_transaction(transaction, command)
-      })
-    {
-      Ok(result) -> {
-        case resolution_decision_of_stored(decision) {
-          Error(Nil) -> Nil
-          Ok(decision) -> {
-            let #(committed_state, confirmation) = case result {
-              ResolutionApplied(state) -> #(state, observation.Replied)
-              ResolutionAlreadyApplied(state) -> #(
-                state,
-                observation.Reconciled,
-              )
-            }
-            emit_resolved(
-              forwarder,
-              queue,
-              id,
-              worker_id,
-              worker_version,
-              decision,
-              committed_state,
-              resolution_id,
-              resolved_by,
-              confirmation,
-            )
-          }
-        }
-        Ok(result)
-      }
-      Error(pog.TransactionQueryError(_)) ->
-        Error(ResolutionCommitUnknown(resolution_id))
-      Error(pog.TransactionRolledBack(error)) -> Error(error)
-    }
+  let Database(connection:, forwarder:, ..) = database
+  let decision = case decision {
+    ConfirmSuccess(value) -> postgres_resolution.ConfirmSuccess(value)
+    ConfirmBusinessFailure(value) ->
+      postgres_resolution.ConfirmBusinessFailure(value)
+    AuthorizeReplay -> postgres_resolution.AuthorizeReplay
   }
-}
-
-/// Builds and forwards `[grind, job, resolved]` from a proven-committed
-/// `ResolutionResult`. Called only from `resolve_uncertain`, strictly after
-/// `transaction_safely` has already returned — never from inside a
-/// transaction callback. `ResolutionApplied` is this call's own fresh commit
-/// (`Replied`); `ResolutionAlreadyApplied` is a prior commit of this exact
-/// `resolution_id` proven by a receipt read (`Reconciled`) — see
-/// `resolution_receipt_outcome`.
-fn emit_resolved(
-  fwd: Forwarder,
-  queue: String,
-  job_id: Int,
-  worker_id: String,
-  worker_version: String,
-  decision: observation.ResolutionDecision,
-  committed_state: State,
-  resolution_id: String,
-  resolved_by: String,
-  confirmation: observation.Confirmation,
-) -> Nil {
-  let _ =
-    forwarder.emit(
-      fwd,
-      observation.resolved(),
-      observation.ResolvedMeasurements(count: 1),
-      observation.ResolvedMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
-        decision:,
-        committed_state:,
-        resolution_id:,
-        resolved_by:,
-        confirmation:,
-      ),
-    )
-  Nil
-}
-
-fn resolution_decision_of_stored(
-  decision: String,
-) -> Result(observation.ResolutionDecision, Nil) {
-  case decision {
-    "confirm_success" -> Ok(observation.DecisionConfirmSuccess)
-    "confirm_business_failure" -> Ok(observation.DecisionConfirmBusinessFailure)
-    "authorize_replay" -> Ok(observation.DecisionAuthorizeReplay)
-    _ -> Error(Nil)
-  }
-}
-
-fn reconcile_transaction(
-  connection: pog.Connection,
-  command: ResolutionCommand,
-) -> Result(ResolutionResult, ResolutionError) {
-  case resolution_receipt_outcome(connection, command) {
-    Error(error) -> Error(error)
-    Ok(Some(result)) -> Ok(result)
-    Ok(None) -> apply_uncertain_resolution(connection, command)
-  }
-}
-
-/// Looks up an existing resolution receipt for `command`'s `resolution_id`
-/// and, if one exists, checks it matches this exact command. `Ok(None)`
-/// means no receipt exists yet — the caller decides what to do (apply a
-/// fresh resolution, or — the second, post-lock call site in
-/// `apply_uncertain_resolution` below — report that reconciliation is
-/// genuinely not required). Shared by two call sites deliberately: this is
-/// the exact "re-read the receipt instead of misreporting a concurrent
-/// retry as stale" pattern the acknowledgement path already uses
-/// (`acknowledge_transaction`'s re-read of `matching_acknowledgement` after
-/// a 0-row fenced `UPDATE`), applied here to `resolve_uncertain`'s
-/// analogous race — see `docs/RECOVERY-EVIDENCE.md`, "Concurrent audited
-/// resolution".
-fn resolution_receipt_outcome(
-  connection: pog.Connection,
-  command: ResolutionCommand,
-) -> Result(Option(ResolutionResult), ResolutionError) {
-  let ResolutionCommand(
-    id:,
-    queue:,
-    worker_id:,
-    worker_version:,
-    resolution_id:,
-    resolved_by:,
-    details:,
-    decision:,
-    target_state:,
-    output_version:,
-    encoded_output:,
-    error_version:,
-    encoded_error:,
-    ..,
-  ) = command
-  let #(payload_version, payload) = case decision {
-    "confirm_success" -> #(Some(output_version), encoded_output)
-    "confirm_business_failure" -> #(error_version, encoded_error)
-    _ -> #(None, None)
-  }
-  case find_resolution(connection, resolution_id, payload) {
-    Error(error) -> Error(error)
-    Ok(None) -> Ok(None)
-    Ok(Some(#(
-      job_id,
-      old_queue,
-      stored_worker_id,
-      stored_worker_version,
-      old_decision,
-      old_resolver,
-      old_details,
-      old_target_state,
-      old_payload_version,
-      payload_match,
-    ))) ->
-      case
-        job_id == id
-        && old_queue == queue
-        && stored_worker_id == Some(worker_id)
-        && stored_worker_version == Some(worker_version)
-        && old_decision == decision
-        && old_resolver == resolved_by
-        && old_details == details
-        && old_target_state == target_state
-        && old_payload_version == payload_version
-        && payload_match == "same"
-      {
-        False -> Error(ResolutionCommandConflict)
-        True ->
-          resolution_state(old_target_state)
-          |> result.map(fn(state) { Some(ResolutionAlreadyApplied(state)) })
-      }
-  }
-}
-
-fn find_resolution(
-  connection: pog.Connection,
-  resolution_id: String,
-  payload: Option(String),
-) -> Result(
-  Option(
-    #(
-      Int,
-      String,
-      Option(String),
-      Option(String),
-      String,
-      String,
-      String,
-      String,
-      Option(String),
-      String,
+  postgres_resolution.resolve_uncertain(
+    connection,
+    forwarder,
+    handle,
+    postgres_resolution.Request(
+      resolution_id:,
+      resolved_by:,
+      details:,
+      decision:,
     ),
-  ),
-  ResolutionError,
-) {
-  let query =
-    pog.query(
-      "SELECT job_id, queue, worker_id, worker_version, decision, resolved_by, details, target_state, payload_version, CASE WHEN payload IS NOT DISTINCT FROM $2::jsonb THEN 'same' ELSE 'different' END FROM grind_job_resolutions WHERE resolution_id = $1",
-    )
-    |> pog.parameter(pog.text(resolution_id))
-    |> pog.parameter(pog.nullable(pog.text, payload))
-    |> pog.returning({
-      use job_id <- decode.field(0, decode.int)
-      use queue <- decode.field(1, decode.string)
-      use worker_id <- decode.field(2, decode.optional(decode.string))
-      use worker_version <- decode.field(3, decode.optional(decode.string))
-      use decision <- decode.field(4, decode.string)
-      use resolved_by <- decode.field(5, decode.string)
-      use details <- decode.field(6, decode.string)
-      use target_state <- decode.field(7, decode.string)
-      use payload_version <- decode.field(8, decode.optional(decode.string))
-      use payload_match <- decode.field(9, decode.string)
-      decode.success(#(
-        job_id,
-        queue,
-        worker_id,
-        worker_version,
-        decision,
-        resolved_by,
-        details,
-        target_state,
-        payload_version,
-        payload_match,
-      ))
-    })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(ReconciliationQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [] -> Ok(None)
-        [resolution] -> Ok(Some(resolution))
-        _ -> Error(ResolutionCommandConflict)
-      }
-  }
-}
-
-fn resolution_state(state: String) -> Result(State, ResolutionError) {
-  case state {
-    "queued" -> Ok(Queued)
-    "scheduled" -> Ok(Scheduled)
-    "executing" -> Ok(job.Executing)
-    "succeeded" -> Ok(job.Succeeded)
-    "business_failed" -> Ok(job.BusinessFailed)
-    "runtime_failed" -> Ok(job.RuntimeFailed)
-    "contract_mismatch" -> Ok(job.ContractMismatch)
-    "uncertain" -> Ok(job.Uncertain)
-    "discarded" -> Ok(job.Discarded)
-    "cancelled" -> Ok(job.Cancelled)
-    _ -> Error(ReconciliationNotRequired)
-  }
-}
-
-fn apply_uncertain_resolution(
-  connection: pog.Connection,
-  command: ResolutionCommand,
-) -> Result(ResolutionResult, ResolutionError) {
-  let ResolutionCommand(
-    id:,
-    queue:,
-    worker_id:,
-    worker_version:,
-    expected_output_version:,
-    expected_error_version:,
-    decision:,
-    ..,
-  ) = command
-  // `FOR NO KEY UPDATE`, not `FOR UPDATE`: this row lock's own later
-  // `UPDATE grind_jobs` (in `write_resolution`, below) never touches a key
-  // column (`id`, `worker_id`, `worker_version`, `unique_key_contract`,
-  // `unique_key_sha256` — the columns any unique index on `grind_jobs`
-  // covers, all of which stay in that `UPDATE`'s `WHERE`, never its `SET`),
-  // so the weaker mode is exactly as safe and does not conflict with
-  // `unique_admission.candidate_sql`'s own `FOR KEY SHARE` on a
-  // `KeepExisting` uniqueness candidate — a plain `FOR UPDATE` here would
-  // otherwise make an audited resolution spuriously contend
-  // (`AdmissionContended`) with an unrelated admission reading the exact
-  // same row for a reason that was never actually incompatible with this
-  // resolution's own write. See `docs/UNIQUENESS-CONTRACT.md`, "Admission
-  // transaction" step 6, for the full contention picture across claim,
-  // cancel, quarantine, and now resolution.
-  let select =
-    pog.query(
-      "SELECT queue, worker_id, worker_version, state, attempt_id, attempt_epoch, attempt_owner, lease_expires_at::text, output_version, error_version, cancel_requested_at IS NOT NULL FROM grind_jobs WHERE id = $1 FOR NO KEY UPDATE",
-    )
-    |> pog.parameter(pog.int(id))
-    |> pog.returning({
-      use stored_queue <- decode.field(0, decode.string)
-      use stored_worker <- decode.field(1, decode.string)
-      use stored_worker_version <- decode.field(2, decode.string)
-      use state <- decode.field(3, decode.string)
-      use attempt_id <- decode.field(4, decode.optional(decode.int))
-      use attempt_epoch <- decode.field(5, decode.int)
-      use attempt_owner <- decode.field(6, decode.optional(decode.string))
-      use lease_expires_at <- decode.field(7, decode.optional(decode.string))
-      use stored_output_version <- decode.field(8, decode.string)
-      use stored_error_version <- decode.field(
-        9,
-        decode.optional(decode.string),
-      )
-      use cancel_requested <- decode.field(10, decode.bool)
-      decode.success(#(
-        stored_queue,
-        stored_worker,
-        stored_worker_version,
-        state,
-        attempt_id,
-        attempt_epoch,
-        attempt_owner,
-        lease_expires_at,
-        stored_output_version,
-        stored_error_version,
-        cancel_requested,
-      ))
-    })
-  use stored <- result.try(case store.execute_safely(select, on: connection) {
-    Error(error) -> Error(ReconciliationQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [stored] -> Ok(stored)
-        _ -> Error(ReconciliationNotRequired)
-      }
+  )
+  |> result.map(fn(result) {
+    case result {
+      postgres_resolution.ResolutionApplied(state) -> ResolutionApplied(state)
+      postgres_resolution.ResolutionAlreadyApplied(state) ->
+        ResolutionAlreadyApplied(state)
+    }
   })
-  let #(
-    stored_queue,
-    stored_worker,
-    stored_worker_version,
-    stored_state,
-    attempt_id,
-    attempt_epoch,
-    attempt_owner,
-    lease_expires_at,
-    stored_output_version,
-    stored_error_version,
-    cancel_requested,
-  ) = stored
-  let codec_matches = case decision {
-    "authorize_replay" -> True
-    "confirm_success" -> stored_output_version == expected_output_version
-    "confirm_business_failure" ->
-      stored_output_version == expected_output_version
-      && stored_error_version == expected_error_version
-    _ -> False
-  }
-  case stored_queue == queue {
-    False -> Error(ResolutionRouteMismatch)
-    True ->
-      case
-        stored_worker == worker_id && stored_worker_version == worker_version
-      {
-        False -> Error(ResolutionWorkerContractMismatch)
-        True ->
-          case stored_state == "uncertain" {
-            // The row is no longer `uncertain` — either genuinely no
-            // reconciliation is needed, or (the race this re-check exists
-            // for) a concurrent call for this exact command won and already
-            // committed while this call waited on the row lock just above.
-            // Re-reading the receipt here, rather than assuming the former,
-            // is the same "re-read instead of misreporting a concurrent
-            // retry as stale" pattern `acknowledge_transaction` already
-            // uses.
-            False ->
-              case resolution_receipt_outcome(connection, command) {
-                Error(error) -> Error(error)
-                Ok(Some(result)) -> Ok(result)
-                Ok(None) -> Error(ReconciliationNotRequired)
-              }
-            True ->
-              case codec_matches {
-                False -> Error(ResolutionCodecMismatch)
-                True ->
-                  case decision == "authorize_replay" && cancel_requested {
-                    True -> Error(ResolutionCancellationPending)
-                    False ->
-                      case attempt_id, attempt_owner, lease_expires_at {
-                        Some(attempt_id), Some(attempt_owner), Some(_) ->
-                          write_resolution(
-                            connection,
-                            command,
-                            attempt_id,
-                            attempt_epoch,
-                            attempt_owner,
-                          )
-                        _, _, _ -> Error(ResolutionAttemptMetadataMissing)
-                      }
-                  }
-              }
-          }
-      }
-  }
-}
-
-fn write_resolution(
-  connection: pog.Connection,
-  command: ResolutionCommand,
-  attempt_id: Int,
-  attempt_epoch: Int,
-  attempt_owner: String,
-) -> Result(ResolutionResult, ResolutionError) {
-  let ResolutionCommand(
-    id:,
-    queue:,
-    worker_id:,
-    worker_version:,
-    resolution_id:,
-    resolved_by:,
-    details:,
-    decision:,
-    target_state:,
-    output_version:,
-    encoded_output:,
-    error_version:,
-    encoded_error:,
-    failure_description:,
-    ..,
-  ) = command
-  let insert =
-    pog.query(
-      "INSERT INTO grind_job_resolutions (queue, job_id, worker_id, worker_version, resolution_id, attempt_id, attempt_epoch, attempt_owner, lease_expires_at, decision, resolved_by, details, target_state, payload_version, payload) SELECT job.queue, job.id, $13, $14, $3, job.attempt_id, job.attempt_epoch, job.attempt_owner, job.lease_expires_at, $7, $8, $9, $10, $11, $12::jsonb FROM grind_jobs AS job WHERE job.id = $2 AND job.queue = $1 AND job.worker_id = $15 AND job.worker_version = $16 AND job.state = 'uncertain' AND job.attempt_id = $4 AND job.attempt_epoch = $5 AND job.attempt_owner = $6 AND job.lease_expires_at IS NOT NULL RETURNING resolution_id",
-    )
-    |> pog.parameter(pog.text(queue))
-    |> pog.parameter(pog.int(id))
-    |> pog.parameter(pog.text(resolution_id))
-    |> pog.parameter(pog.int(attempt_id))
-    |> pog.parameter(pog.int(attempt_epoch))
-    |> pog.parameter(pog.text(attempt_owner))
-    |> pog.parameter(pog.text(decision))
-    |> pog.parameter(pog.text(resolved_by))
-    |> pog.parameter(pog.text(details))
-    |> pog.parameter(pog.text(target_state))
-    |> pog.parameter(
-      pog.nullable(pog.text, case decision {
-        "confirm_success" -> Some(output_version)
-        "confirm_business_failure" -> error_version
-        _ -> None
-      }),
-    )
-    |> pog.parameter(
-      pog.nullable(pog.text, case decision {
-        "confirm_success" -> encoded_output
-        "confirm_business_failure" -> encoded_error
-        _ -> None
-      }),
-    )
-    |> pog.parameter(pog.text(worker_id))
-    |> pog.parameter(pog.text(worker_version))
-    |> pog.parameter(pog.text(worker_id))
-    |> pog.parameter(pog.text(worker_version))
-    |> pog.returning({
-      use resolution_id <- decode.field(0, decode.string)
-      decode.success(resolution_id)
-    })
-  use _ <- result.try(case store.execute_safely(insert, on: connection) {
-    Error(error) -> Error(ReconciliationQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [_] -> Ok(Nil)
-        _ -> Error(ResolutionWriteRejected)
-      }
+  |> result.map_error(fn(error) {
+    case error {
+      postgres_resolution.ReconciliationQueryFailed(reason) ->
+        ReconciliationQueryFailed(reason)
+      postgres_resolution.ReconciliationNotRequired -> ReconciliationNotRequired
+      postgres_resolution.ResolutionCommandConflict -> ResolutionCommandConflict
+      postgres_resolution.ResolutionRouteMismatch -> ResolutionRouteMismatch
+      postgres_resolution.ResolutionWorkerContractMismatch ->
+        ResolutionWorkerContractMismatch
+      postgres_resolution.ResolutionCodecMismatch -> ResolutionCodecMismatch
+      postgres_resolution.ResolutionRequiresErrorCodec ->
+        ResolutionRequiresErrorCodec
+      postgres_resolution.ResolutionCancellationPending ->
+        ResolutionCancellationPending
+      postgres_resolution.ResolutionAttemptMetadataMissing ->
+        ResolutionAttemptMetadataMissing
+      postgres_resolution.ResolutionWriteRejected -> ResolutionWriteRejected
+      postgres_resolution.ResolutionCommitUnknown(resolution_id) ->
+        ResolutionCommitUnknown(resolution_id)
+    }
   })
-  let update =
-    pog.query(
-      "UPDATE grind_jobs SET state = $1, output = $2::jsonb, output_version = $3, error = $4::jsonb, error_version = $5, failure_description = $6, attempt_id = CASE WHEN $1 = 'queued' THEN NULL ELSE attempt_id END, attempt_owner = NULL, lease_expires_at = NULL, available_at = CASE WHEN $1 = 'queued' THEN clock_timestamp() ELSE available_at END, finished_at = CASE WHEN $1 IN ("
-      <> terminal.states_sql()
-      <> ") THEN clock_timestamp() ELSE NULL END WHERE id = $7 AND queue = $8 AND worker_id = $9 AND worker_version = $10 AND state = 'uncertain' AND attempt_id = $11 AND attempt_epoch = $12 AND attempt_owner = $13 RETURNING state",
-    )
-    |> pog.parameter(pog.text(target_state))
-    |> pog.parameter(pog.nullable(pog.text, encoded_output))
-    |> pog.parameter(pog.text(output_version))
-    |> pog.parameter(pog.nullable(pog.text, encoded_error))
-    |> pog.parameter(pog.nullable(pog.text, error_version))
-    |> pog.parameter(pog.nullable(pog.text, failure_description))
-    |> pog.parameter(pog.int(id))
-    |> pog.parameter(pog.text(queue))
-    |> pog.parameter(pog.text(worker_id))
-    |> pog.parameter(pog.text(worker_version))
-    |> pog.parameter(pog.int(attempt_id))
-    |> pog.parameter(pog.int(attempt_epoch))
-    |> pog.parameter(pog.text(attempt_owner))
-    |> pog.returning({
-      use state <- decode.field(0, decode.string)
-      decode.success(state)
-    })
-  use state <- result.try(case store.execute_safely(update, on: connection) {
-    Error(error) -> Error(ReconciliationQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [state] -> Ok(state)
-        _ -> Error(ResolutionWriteRejected)
-      }
-  })
-  case resolution_state(state) {
-    Error(error) -> Error(error)
-    Ok(state) -> Ok(ResolutionApplied(state))
-  }
 }
 
 /// Applies every not-yet-applied step of `grind/internal/migrations.migrations()`
@@ -1419,584 +904,35 @@ pub fn migrate_with(
   database: Database,
   steps: List(migrations.Migration),
 ) -> Result(Nil, StorageError) {
-  let assert True = steps_are_contiguous_from_baseline(steps)
-    as "migrate_with's steps must be exactly the contiguous range {baseline_schema_version..latest}, with no gaps or duplicate versions"
   let Database(connection:, installation:, migration_deadline_ms:, ..) =
     database
-  use _ <- result.try(ensure_schema_exists(
+  let schema = job.installation_schema(installation)
+  postgres_migration.run(
     connection,
-    job.installation_schema(installation),
-  ))
-  steps
-  |> list.sort(fn(a, b) { int.compare(a.version, b.version) })
-  |> list.try_each(fn(step) {
-    run_migration_step(connection, migration_deadline_ms, steps, step)
-  })
+    schema,
+    quote_ident(schema),
+    migration_deadline_ms,
+    migration_lock_timeout_ms,
+    steps,
+  )
+  |> result.map_error(migration_error)
 }
 
-/// Creates the configured schema (`postgres.with_schema`, default
-/// `"public"`) if it does not already exist — `migrate`/`migrate_with`'s own
-/// first action, run before the advisory lock or any `current_schema()`-based
-/// read: with `search_path` pinned (`validate`) to exactly this one schema,
-/// `current_schema()` resolves to nothing at all until the schema physically
-/// exists, so every later step in this call depends on this having already
-/// run. `CREATE SCHEMA IF NOT EXISTS` is naturally idempotent, so running it
-/// on every `migrate_with` call (including once the schema is long since
-/// created) is a cheap no-op, not repeated work to guard against. `schema`
-/// is quoted (`quote_ident`), never spliced unescaped. `postgres.start`
-/// itself never creates a schema — only `migrate`/`migrate_with` do, per
-/// this package's documented "migrate creates the schema if absent; other
-/// calls fail typed if tables are missing" split (see `README.md`,
-/// "Isolation").
-fn ensure_schema_exists(
-  connection: pog.Connection,
-  schema: String,
-) -> Result(Nil, StorageError) {
-  use exists <- result.try(schema_exists(connection, schema))
-  case exists {
-    True -> Ok(Nil)
-    False -> {
-      let query =
-        pog.query("CREATE SCHEMA IF NOT EXISTS " <> quote_ident(schema))
-      case store.execute_safely(query, on: connection) {
-        Ok(_) -> Ok(Nil)
-        // `IF NOT EXISTS` does not make this statement concurrency-safe on
-        // its own: two sessions can both run the existence check above,
-        // both see it absent, and both attempt the actual `CREATE` — one of
-        // them loses to PostgreSQL's own catalog uniqueness check and gets
-        // a real error back (observed as `42P06 duplicate_schema` or
-        // `23505 unique_violation` depending on timing), not a silent
-        // no-op the way `IF NOT EXISTS` might suggest. Re-checking
-        // existence here, rather than trusting this statement's own error
-        // as fatal, is what makes two concurrent first-time `migrate`
-        // callers both succeed regardless of which one actually created the
-        // schema — see `postgres_migrate_concurrent_first_time_schema_creation_both_succeed_test`.
-        Error(create_error) ->
-          case schema_exists(connection, schema) {
-            Ok(True) -> Ok(Nil)
-            // The recheck itself failing is never more informative than the
-            // `CREATE` failure that prompted it — surface the original
-            // `create_error` (never `recheck_error`, and never
-            // `schema_exists`'s own `IncompatibleSchema` for a malformed
-            // row shape) so a caller sees why the schema could not be
-            // created, not why a secondary existence probe also failed.
-            Ok(False) | Error(_) -> Error(SchemaCreationFailed(create_error))
-          }
-      }
-    }
-  }
-}
-
-/// Checked separately from, and before, `CREATE SCHEMA IF NOT EXISTS`
-/// itself: PostgreSQL's own `CREATE SCHEMA` (even with `IF NOT EXISTS`)
-/// checks the connecting role's `CREATE` privilege on the *database* before
-/// it ever checks whether the schema already exists, so a role that owns
-/// its own already-existing schema — the exact least-privilege,
-/// non-superuser "recommended setup" README, "Isolation" points to (a role
-/// with `CREATE SCHEMA AUTHORIZATION <role>` run once by an administrator,
-/// but no broader database-level `CREATE` grant) — would otherwise get
-/// `42501 insufficient_privilege` from `ensure_schema_exists` on every
-/// single `migrate` call, even though nothing would actually need
-/// creating. A plain `pg_namespace` lookup needs no special privilege
-/// (schema names are not access-controlled information), so checking first
-/// and only ever attempting `CREATE SCHEMA` for a genuinely absent schema
-/// keeps the "migrate creates the schema if absent" contract while never
-/// demanding a privilege an already-provisioned installation has no reason
-/// to hold. See `docs/RECOVERY-EVIDENCE.md` for the real failure this fixes.
-fn schema_exists(
-  connection: pog.Connection,
-  schema: String,
-) -> Result(Bool, StorageError) {
-  let query =
-    pog.query("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
-    |> pog.parameter(pog.text(schema))
-    |> pog.returning({
-      use exists <- decode.field(0, decode.bool)
-      decode.success(exists)
-    })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(SchemaCreationFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [exists] -> Ok(exists)
-        _ -> Error(IncompatibleSchema)
-      }
-  }
-}
-
-fn steps_are_contiguous_from_baseline(
-  steps: List(migrations.Migration),
-) -> Bool {
-  let versions =
-    steps
-    |> list.map(fn(step) { step.version })
-    |> list.sort(int.compare)
-  case versions {
-    [] -> False
-    [first, ..] if first != baseline_schema_version -> False
-    _ ->
-      versions
-      |> list.index_map(fn(version, index) {
-        version == baseline_schema_version + index
-      })
-      |> list.all(fn(matches) { matches })
-  }
-}
-
-fn run_migration_step(
-  connection: pog.Connection,
-  migration_deadline_ms: Int,
-  steps: List(migrations.Migration),
-  step: migrations.Migration,
-) -> Result(Nil, StorageError) {
-  case
-    store.migration_transaction_safely(
-      connection,
-      migration_deadline_ms,
-      fn(transaction) {
-        run_migration_step_transaction(transaction, steps, step)
-      },
-    )
-  {
-    Ok(Nil) -> Ok(Nil)
-    // `BEGIN`/`COMMIT` itself failing or losing its reply is one of three
-    // shapes this covers — see `MigrationCommitUnknown`'s own doc comment
-    // for the other two (a checkout failure before `BEGIN` ever ran, and a
-    // failed `ROLLBACK` after a statement error). Re-running `migrate` is
-    // always safe regardless of which one occurred.
-    Error(pog.TransactionQueryError(_)) ->
-      Error(MigrationCommitUnknown(step.version))
-    Error(pog.TransactionRolledBack(error)) -> Error(error)
-  }
-}
-
-fn run_migration_step_transaction(
-  connection: pog.Connection,
-  steps: List(migrations.Migration),
-  step: migrations.Migration,
-) -> Result(Nil, StorageError) {
-  use _ <- result.try(pin_read_committed(connection))
-  use _ <- result.try(acquire_migration_lock(connection))
-  use _ <- result.try(set_migration_lock_timeout(connection))
-  use generation <- result.try(read_schema_generation(connection, steps))
-  case generation_at_least(generation, step.version) {
-    True -> Ok(Nil)
-    False -> {
-      use _ <- result.try(
-        list.try_each(step.statements, fn(statement) {
-          case store.execute_safely(pog.query(statement), on: connection) {
-            Ok(_) -> Ok(Nil)
-            Error(pog.PostgresqlError("55P03", _, _)) ->
-              Error(MigrationLockUnavailable(step.version))
-            Error(query_error) ->
-              Error(MigrationStepFailed(step.version, query_error))
-          }
-        }),
-      )
-      use applied <- result.try(read_schema_generation(connection, steps))
-      case applied {
-        AtVersion(version) if version == step.version -> Ok(Nil)
-        _ -> Error(IncompatibleSchema)
-      }
-    }
-  }
-}
-
-/// Pins this transaction to `READ COMMITTED`, as its own literal first
-/// statement — reusing the same Squirrel-generated query and rationale as
-/// `grind/internal/unique_admission`'s own `pin_read_committed`. Not
-/// load-bearing the same way there (a migration step's later reads have no
-/// concurrent-commit-visibility requirement `READ COMMITTED` specifically
-/// satisfies), but kept as the same defence in depth against a role or
-/// database whose own `default_transaction_isolation` is not already
-/// `READ COMMITTED`, for consistency and because the pool-level pin
-/// (`postgres.validate`) — the two connections' first line of defence — can
-/// still be silently dropped by a pooler between Grind and PostgreSQL.
-fn pin_read_committed(connection: pog.Connection) -> Result(Nil, StorageError) {
-  case
-    store.call_safely(connection, fn(connection) {
-      sql.pin_read_committed(connection)
-    })
-  {
-    Error(error) -> Error(MigrationQueryFailed(error))
-    Ok(_) -> Ok(Nil)
-  }
-}
-
-/// Serialises concurrent migrators (this process or another) against one
-/// another: an ordinary PostgreSQL transaction-scoped advisory lock, held
-/// until this step's own transaction commits or rolls back, keyed by a
-/// fixed Grind string plus the current schema so unrelated schemas (or a
-/// non-Grind advisory lock user) never collide with it. The identical
-/// statement text is also embedded as every version's own first entry in
-/// `migrations()`/`priv/migrations/*.sql`
-/// (`migrations.advisory_lock_statement()`) so cigogne serialises the same
-/// way; running it here too, unconditionally, is what makes `migrate_with`
-/// itself safe even for a caller that only ever uses `postgres.migrate`.
-fn acquire_migration_lock(
-  connection: pog.Connection,
-) -> Result(Nil, StorageError) {
-  let query =
-    pog.query(migrations.advisory_lock_statement())
-    |> pog.returning({
-      use locked <- decode.field(0, decode.bool)
-      decode.success(locked)
-    })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(MigrationQueryFailed(error))
-    Ok(_) -> Ok(Nil)
-  }
-}
-
-/// Sets this step's transaction to the constant `migration_lock_timeout_ms`
-/// (2000ms), transaction-local (`SET LOCAL`, via the same
-/// `grind/internal/unique_admission` uses for `unique_lock_wait_ms`) and
-/// therefore never leaking onto the pooled connection once this transaction
-/// commits or rolls back. Run after `acquire_migration_lock` so the wait for
-/// that advisory lock itself is unaffected — only this step's own
-/// statements are bounded by it.
-fn set_migration_lock_timeout(
-  connection: pog.Connection,
-) -> Result(Nil, StorageError) {
-  case
-    store.call_safely(connection, fn(connection) {
-      sql.set_lock_timeout(connection, int.to_string(migration_lock_timeout_ms))
-    })
-  {
-    Error(error) -> Error(MigrationQueryFailed(error))
-    Ok(_) -> Ok(Nil)
-  }
-}
-
-/// The lowest schema version `migrate`/`migrate_with` ever accepts as an
-/// already-installed generation. Anything below it (including the legacy,
-/// never-migrated v10 experimental marker) fails closed as
-/// `UnsupportedSchemaVersion`; there is no migration path onto v11.
-const baseline_schema_version = 11
-
-type SchemaGeneration {
-  Fresh
-  AtVersion(Int)
-}
-
-fn generation_at_least(generation: SchemaGeneration, version: Int) -> Bool {
-  case generation {
-    Fresh -> False
-    AtVersion(current) -> current >= version
-  }
-}
-
-/// Reads the schema's current generation against `steps` (the full step
-/// list this `migrate_with` call was given — `migrate` itself always passes
-/// `migrations()`; `latest` is the highest version among them):
-///
-/// - No `grind_schema_migrations` marker table: `Fresh` if no other
-///   `grind_`-prefixed object exists either, else `IncompatibleSchema` (a
-///   foreign or partial schema that never reached Grind's own bookkeeping).
-/// - A marker table whose rows are not exactly the contiguous range
-///   `{baseline_schema_version..max}` (a gap, an empty table, or a marker
-///   starting below the baseline while also reaching at or above it):
-///   `IncompatibleSchema`.
-/// - `max` above `latest`: `UnsupportedSchemaVersion(max)` — a schema newer
-///   than this call knows how to run against. Checked *before* any physical
-///   shape check runs, so a schema tagged with a foreign or future marker
-///   is rejected correctly even alongside unrelated foreign objects or a
-///   broken shape at an earlier, otherwise-valid version.
-/// - `max` below `baseline_schema_version` (the legacy, never-migrated v10
-///   experimental marker, or any older one): `UnsupportedSchemaVersion(max)`.
-/// - Otherwise, `max` is a version present in `steps`: `AtVersion(max)` once
-///   the actual `grind_`-prefixed relation set (name and kind) is *exactly*
-///   (no fewer, no more) that version's own `Migration.shape`, and every
-///   `key_columns` entry in it is present — a defensive, fail-closed check
-///   against a tampered or partially-repaired schema, never trusted from
-///   the marker alone. A version absent from `steps` at this point cannot
-///   occur: `max <= latest` and `max >= baseline_schema_version` were just
-///   checked, and `migrate_with`'s own precondition guarantees `steps`
-///   covers every version in that range — but is still handled as
-///   `IncompatibleSchema` rather than a crash, defensively.
-fn read_schema_generation(
-  connection: pog.Connection,
-  steps: List(migrations.Migration),
-) -> Result(SchemaGeneration, StorageError) {
-  let latest =
-    list.fold(steps, 0, fn(highest, step) { int.max(highest, step.version) })
-  use marker_table_exists <- result.try(schema_migrations_table_exists(
-    connection,
-  ))
-  case marker_table_exists {
-    False ->
-      case read_grind_relations(connection) {
-        Error(error) -> Error(error)
-        Ok([]) -> Ok(Fresh)
-        Ok(_) -> Error(IncompatibleSchema)
-      }
-    True -> {
-      use #(count, minimum, maximum) <- result.try(read_schema_marker(
-        connection,
-      ))
-      case count, minimum, maximum {
-        0, _, _ -> Error(IncompatibleSchema)
-        count, minimum, maximum if count != maximum - minimum + 1 ->
-          Error(IncompatibleSchema)
-        _, _, maximum if maximum > latest ->
-          Error(UnsupportedSchemaVersion(maximum))
-        _, _, maximum if maximum < baseline_schema_version ->
-          Error(UnsupportedSchemaVersion(maximum))
-        _, minimum, _ if minimum < baseline_schema_version ->
-          Error(IncompatibleSchema)
-        _, minimum, _ if minimum > baseline_schema_version ->
-          Error(IncompatibleSchema)
-        _, _, maximum -> validate_expected_shape(connection, maximum, steps)
-      }
-    }
-  }
-}
-
-/// Quotes the schema name (`quote_ident`) before embedding it in the
-/// textual argument `to_regclass` parses — a bare `current_schema() || '.'
-/// || ...` would silently fold a mixed-case or otherwise identifier-quoted
-/// schema name to lower case, `to_regclass` would then look up a schema
-/// that does not exist, and this would wrongly report the marker table
-/// absent even when installed and fully functional.
-fn schema_migrations_table_exists(
-  connection: pog.Connection,
-) -> Result(Bool, StorageError) {
-  let query =
-    pog.query(
-      "SELECT to_regclass(quote_ident(current_schema()) || '.grind_schema_migrations') IS NOT NULL",
-    )
-    |> pog.returning({
-      use present <- decode.field(0, decode.bool)
-      decode.success(present)
-    })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(MigrationQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [present] -> Ok(present)
-        _ -> Error(IncompatibleSchema)
-      }
-  }
-}
-
-/// Every `grind_`-prefixed relation (table, sequence, index, ...) in the
-/// current schema, as `#(relname, relkind)` — `relkind` is PostgreSQL's own
-/// single-character code (`r`/`S`/`i`/...), cast to `text` explicitly since
-/// its native `"char"` pseudo-type has no unique `||` overload against
-/// `text` (`42725 ambiguous_function`) should a caller ever concatenate it.
-/// Backs both the fresh-schema check (an empty result) and the per-version
-/// exact-shape check (`relation_shape_matches`).
-fn read_grind_relations(
-  connection: pog.Connection,
-) -> Result(List(#(String, String)), StorageError) {
-  let query =
-    pog.query(
-      "SELECT c.relname, c.relkind::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND left(c.relname, 6) = 'grind_'",
-    )
-    |> pog.returning({
-      use name <- decode.field(0, decode.string)
-      use kind <- decode.field(1, decode.string)
-      decode.success(#(name, kind))
-    })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(MigrationQueryFailed(error))
-    Ok(returned) -> Ok(returned.rows)
-  }
-}
-
-fn read_schema_marker(
-  connection: pog.Connection,
-) -> Result(#(Int, Int, Int), StorageError) {
-  let query =
-    pog.query(
-      "SELECT count(*)::bigint, COALESCE(min(version), 0)::bigint, COALESCE(max(version), 0)::bigint FROM grind_schema_migrations",
-    )
-    |> pog.returning({
-      use count <- decode.field(0, decode.int)
-      use minimum <- decode.field(1, decode.int)
-      use maximum <- decode.field(2, decode.int)
-      decode.success(#(count, minimum, maximum))
-    })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(MigrationQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [version] -> Ok(version)
-        _ -> Error(IncompatibleSchema)
-      }
-  }
-}
-
-/// The per-version physical-shape check backing `read_schema_generation`'s
-/// fail-closed guarantee: `version`'s own `Migration.shape`, looked up from
-/// `steps`, must match the current schema's actual `grind_`-prefixed
-/// relation set *exactly* (a stray relation this shape does not list — a
-/// leftover from a version this schema was never fully repaired from, or
-/// genuinely foreign clutter — fails closed exactly like a missing one).
-fn validate_expected_shape(
-  connection: pog.Connection,
-  version: Int,
-  steps: List(migrations.Migration),
-) -> Result(SchemaGeneration, StorageError) {
-  case list.find(steps, fn(step) { step.version == version }) {
-    Error(Nil) -> Error(IncompatibleSchema)
-    Ok(step) -> {
-      use shape_ok <- result.try(relation_shape_matches(connection, step.shape))
-      case shape_ok {
-        False -> Error(IncompatibleSchema)
-        True ->
-          case relation_foreign_keys_match(connection, step.foreign_keys) {
-            Error(error) -> Error(error)
-            Ok(False) -> Error(IncompatibleSchema)
-            Ok(True) ->
-              case
-                forbidden_columns_absent(connection, step.forbidden_columns)
-              {
-                Error(error) -> Error(error)
-                Ok(False) -> Error(IncompatibleSchema)
-                Ok(True) -> Ok(AtVersion(version))
-              }
-          }
-      }
-    }
-  }
-}
-
-fn relation_kind_code(kind: migrations.RelationKind) -> String {
-  case kind {
-    migrations.Table -> "r"
-    migrations.Sequence -> "S"
-    migrations.Index -> "i"
-  }
-}
-
-fn relation_shape_matches(
-  connection: pog.Connection,
-  shape: List(migrations.ExpectedRelation),
-) -> Result(Bool, StorageError) {
-  use actual <- result.try(read_grind_relations(connection))
-  let expected =
-    shape
-    |> list.map(fn(relation) {
-      #(relation.name, relation_kind_code(relation.kind))
-    })
-    |> list.sort(fn(a, b) { string.compare(a.0, b.0) })
-  case list.sort(actual, fn(a, b) { string.compare(a.0, b.0) }) == expected {
-    False -> Ok(False)
-    True -> relation_key_columns_match(connection, shape)
-  }
-}
-
-fn relation_key_columns_match(
-  connection: pog.Connection,
-  shape: List(migrations.ExpectedRelation),
-) -> Result(Bool, StorageError) {
-  shape
-  |> list.filter(fn(relation) { relation.key_columns != [] })
-  |> list.try_fold(True, fn(all_matched_so_far, relation) {
-    case all_matched_so_far {
-      False -> Ok(False)
-      True ->
-        relation_has_columns(connection, relation.name, relation.key_columns)
-    }
-  })
-}
-
-fn relation_has_columns(
-  connection: pog.Connection,
-  table_name: String,
-  columns: List(String),
-) -> Result(Bool, StorageError) {
-  let query =
-    pog.query(
-      "SELECT count(*) FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = $1 AND column_name = ANY($2)",
-    )
-    |> pog.parameter(pog.text(table_name))
-    |> pog.parameter(pog.array(pog.text, columns))
-    |> pog.returning({
-      use present <- decode.field(0, decode.int)
-      decode.success(present)
-    })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(MigrationQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [present] -> Ok(present == list.length(columns))
-        _ -> Error(IncompatibleSchema)
-      }
-  }
-}
-
-/// Every one of `foreign_keys` (constraint names) must exist as a real
-/// foreign key (`pg_constraint.contype = 'f'`) in the current schema — a
-/// step whose `foreign_keys` is `[]` (every version before `grind_v12`)
-/// always matches without a query. `pg_constraint`, never `pg_class`: a
-/// plain foreign key creates no relation of its own (unlike a `PRIMARY
-/// KEY`/`UNIQUE` constraint's backing index, already covered by `shape`
-/// itself), so it would otherwise never be checked at all — a database
-/// missing one of `grind_v12`'s three `ON DELETE CASCADE` constraints (say,
-/// dropped by hand) must fail closed exactly like a missing relation or
-/// column does, not silently pass as if the receipt-orphan backstop
-/// `docs/RECOVERY-EVIDENCE.md` Increment 24 describes were still in place.
-fn relation_foreign_keys_match(
-  connection: pog.Connection,
-  foreign_keys: List(String),
-) -> Result(Bool, StorageError) {
-  case foreign_keys {
-    [] -> Ok(True)
-    _ -> {
-      let query =
-        pog.query(
-          "SELECT count(*) FROM pg_constraint WHERE connamespace = (SELECT oid FROM pg_namespace WHERE nspname = current_schema()) AND contype = 'f' AND conname = ANY($1)",
-        )
-        |> pog.parameter(pog.array(pog.text, foreign_keys))
-        |> pog.returning({
-          use present <- decode.field(0, decode.int)
-          decode.success(present)
-        })
-      case store.execute_safely(query, on: connection) {
-        Error(error) -> Error(MigrationQueryFailed(error))
-        Ok(returned) ->
-          case returned.rows {
-            [present] -> Ok(present == list.length(foreign_keys))
-            _ -> Error(IncompatibleSchema)
-          }
-      }
-    }
-  }
-}
-
-/// The inverse of `relation_key_columns_match`: none of `forbidden` (each a
-/// `#(table_name, column_name)` pair — see `migrations.Migration`'s own doc
-/// comment) may exist in the current schema. `[]` always matches without a
-/// query, exactly like `relation_foreign_keys_match`'s own empty case.
-fn forbidden_columns_absent(
-  connection: pog.Connection,
-  forbidden: List(#(String, String)),
-) -> Result(Bool, StorageError) {
-  case forbidden {
-    [] -> Ok(True)
-    _ -> {
-      let #(tables, columns) = list.unzip(forbidden)
-      let query =
-        pog.query(
-          "SELECT count(*) FROM information_schema.columns c JOIN unnest($1::text[], $2::text[]) AS forbidden(table_name, column_name) ON c.table_name = forbidden.table_name AND c.column_name = forbidden.column_name WHERE c.table_schema = current_schema()",
-        )
-        |> pog.parameter(pog.array(pog.text, tables))
-        |> pog.parameter(pog.array(pog.text, columns))
-        |> pog.returning({
-          use present <- decode.field(0, decode.int)
-          decode.success(present)
-        })
-      case store.execute_safely(query, on: connection) {
-        Error(error) -> Error(MigrationQueryFailed(error))
-        Ok(returned) ->
-          case returned.rows {
-            [present] -> Ok(present == 0)
-            _ -> Error(IncompatibleSchema)
-          }
-      }
-    }
+fn migration_error(error: postgres_migration.RunnerError) -> StorageError {
+  case error {
+    postgres_migration.MigrationQueryFailed(error) ->
+      MigrationQueryFailed(error)
+    postgres_migration.IncompatibleSchema -> IncompatibleSchema
+    postgres_migration.UnsupportedSchemaVersion(version) ->
+      UnsupportedSchemaVersion(version)
+    postgres_migration.SchemaCreationFailed(error) ->
+      SchemaCreationFailed(error)
+    postgres_migration.MigrationStepFailed(version, error) ->
+      MigrationStepFailed(version, error)
+    postgres_migration.MigrationLockUnavailable(version) ->
+      MigrationLockUnavailable(version)
+    postgres_migration.MigrationCommitUnknown(version) ->
+      MigrationCommitUnknown(version)
   }
 }
 
@@ -2223,6 +1159,38 @@ pub type JobReadError {
   HandleFromAnotherInstallation
 }
 
+/// Exhaustive conversion keeps the public error constructors owned here.
+fn job_read_error(error: postgres_job_reads.JobReadError) -> JobReadError {
+  case error {
+    postgres_job_reads.JobReadQueryFailed(reason) -> JobReadQueryFailed(reason)
+    postgres_job_reads.JobNotFound -> JobNotFound
+    postgres_job_reads.QueueRouteMismatch(expected:, actual:) ->
+      QueueRouteMismatch(expected:, actual:)
+    postgres_job_reads.WorkerContractMismatch(
+      expected_id:,
+      expected_version:,
+      actual_id:,
+      actual_version:,
+    ) ->
+      WorkerContractMismatch(
+        expected_id:,
+        expected_version:,
+        actual_id:,
+        actual_version:,
+      )
+    postgres_job_reads.CodecContractMismatch(kind:, expected:, actual:) ->
+      CodecContractMismatch(kind:, expected:, actual:)
+    postgres_job_reads.CodecFailed(reason) -> CodecFailed(reason)
+    postgres_job_reads.InvalidStoredState(state) -> InvalidStoredState(state)
+    postgres_job_reads.SucceededOutputMissing -> SucceededOutputMissing
+    postgres_job_reads.ReceiptNotFound -> ReceiptNotFound
+    postgres_job_reads.ReceiptJobMismatch(expected:, actual:) ->
+      ReceiptJobMismatch(expected:, actual:)
+    postgres_job_reads.HandleFromAnotherInstallation ->
+      HandleFromAnotherInstallation
+  }
+}
+
 /// Reconstructs a typed handle from durable identity after an application
 /// restart, scoped to whatever schema this `Database`'s pool connects to —
 /// see `README.md`, "Isolation". The current worker definition must exactly
@@ -2256,77 +1224,8 @@ pub fn bind_handle(
   id: Int,
 ) -> Result(JobHandle(input, output, error), JobReadError) {
   let Database(connection:, installation:, ..) = database
-  let worker.Metadata(
-    id: expected_worker_id,
-    worker_version: expected_worker_version,
-    input_version: expected_input_version,
-    output_version: expected_output_version,
-    error_version: expected_error_version,
-    ..,
-  ) = worker.metadata(worker)
-  case
-    store.call_safely(connection, fn(connection) {
-      sql.bind_handle(connection, id)
-    })
-  {
-    Error(error) -> Error(JobReadQueryFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [] -> Error(JobNotFound)
-        [
-          sql.BindHandleRow(
-            queue:,
-            worker_id: stored_worker_id,
-            worker_version: stored_worker_version,
-            input_version: stored_input_version,
-            output_version: stored_output_version,
-            error_version: stored_error_version,
-          ),
-        ] ->
-          case
-            stored_worker_id == expected_worker_id
-            && stored_worker_version == expected_worker_version
-          {
-            False ->
-              Error(WorkerContractMismatch(
-                expected_id: expected_worker_id,
-                expected_version: expected_worker_version,
-                actual_id: stored_worker_id,
-                actual_version: stored_worker_version,
-              ))
-            True ->
-              case stored_input_version == expected_input_version {
-                False ->
-                  Error(CodecContractMismatch(
-                    kind: worker.InputCodec,
-                    expected: expected_input_version,
-                    actual: stored_input_version,
-                  ))
-                True ->
-                  case stored_output_version == expected_output_version {
-                    False ->
-                      Error(CodecContractMismatch(
-                        kind: worker.OutputCodec,
-                        expected: expected_output_version,
-                        actual: stored_output_version,
-                      ))
-                    True ->
-                      case stored_error_version == expected_error_version {
-                        False ->
-                          Error(CodecContractMismatch(
-                            kind: worker.ErrorCodec,
-                            expected: unwrap(expected_error_version, "none"),
-                            actual: unwrap(stored_error_version, "none"),
-                          ))
-                        True ->
-                          Ok(job.new_handle(id, installation, queue, worker))
-                      }
-                  }
-              }
-          }
-        _ -> Error(JobNotFound)
-      }
-  }
+  postgres_job_reads.bind_handle(connection, installation, worker, id)
+  |> result.map_error(job_read_error)
 }
 
 /// Reloads the typed, version-checked input from PostgreSQL. May return
@@ -2339,63 +1238,9 @@ pub fn arguments(
   database: Database,
   handle: JobHandle(input, output, error),
 ) -> Result(input, JobReadError) {
-  let Database(connection:, installation: database_installation, ..) = database
-  let #(
-    id,
-    handle_installation,
-    handle_queue,
-    worker_id,
-    worker_version,
-    input_codec,
-  ) = job.storage_fields(handle)
-  case job.same_installation(handle_installation, database_installation) {
-    False -> Error(HandleFromAnotherInstallation)
-    True ->
-      case
-        store.call_safely(connection, fn(connection) {
-          sql.arguments(connection, id)
-        })
-      {
-        Error(error) -> Error(JobReadQueryFailed(error))
-        Ok(returned) ->
-          case returned.rows {
-            [] -> Error(JobNotFound)
-            [
-              sql.ArgumentsRow(
-                input: encoded,
-                input_version: codec_version,
-                queue: stored_queue,
-                worker_id: stored_worker,
-                worker_version: stored_worker_version,
-              ),
-            ] ->
-              case stored_queue == handle_queue {
-                False ->
-                  Error(QueueRouteMismatch(
-                    expected: handle_queue,
-                    actual: stored_queue,
-                  ))
-                True ->
-                  case
-                    stored_worker == worker_id
-                    && stored_worker_version == worker_version
-                  {
-                    False ->
-                      Error(WorkerContractMismatch(
-                        expected_id: worker_id,
-                        expected_version: worker_version,
-                        actual_id: stored_worker,
-                        actual_version: stored_worker_version,
-                      ))
-                    True ->
-                      worker.decode_codec(input_codec, codec_version, encoded)
-                      |> result.map_error(CodecFailed)
-                  }
-              }
-            _ -> Error(JobNotFound)
-          }
-      }
-  }
+  let Database(connection:, installation:, ..) = database
+  postgres_job_reads.arguments(connection, installation, handle)
+  |> result.map_error(job_read_error)
 }
 
 pub type CancellationResult {
@@ -2680,27 +1525,6 @@ pub type AcknowledgementReceipt {
   )
 }
 
-type ResolutionCommand {
-  ResolutionCommand(
-    id: Int,
-    queue: String,
-    worker_id: String,
-    worker_version: String,
-    expected_output_version: String,
-    expected_error_version: Option(String),
-    resolution_id: String,
-    resolved_by: String,
-    details: String,
-    decision: String,
-    target_state: String,
-    output_version: String,
-    encoded_output: Option(String),
-    error_version: Option(String),
-    encoded_error: Option(String),
-    failure_description: Option(String),
-  )
-}
-
 /// Exposed only so `grind/internal/attempt` can read a connection out of an
 /// opaque `Database` — that module cannot pattern-match `Database`'s own
 /// constructor, which stays private to this module.
@@ -2962,56 +1786,9 @@ pub fn state(
   database: Database,
   handle: JobHandle(input, output, error),
 ) -> Result(State, JobReadError) {
-  let Database(connection:, installation: database_installation, ..) = database
-  let #(id, handle_installation, handle_queue, worker_id, worker_version, _) =
-    job.storage_fields(handle)
-  case job.same_installation(handle_installation, database_installation) {
-    False -> Error(HandleFromAnotherInstallation)
-    True ->
-      case
-        store.call_safely(connection, fn(connection) {
-          sql.state(connection, id)
-        })
-      {
-        Error(error) -> Error(JobReadQueryFailed(error))
-        Ok(returned) ->
-          case returned.rows {
-            [] -> Error(JobNotFound)
-            [
-              sql.StateRow(
-                queue: stored_queue,
-                worker_id: stored_worker,
-                worker_version: stored_worker_version,
-                state:,
-              ),
-            ] ->
-              case stored_queue == handle_queue {
-                False ->
-                  Error(QueueRouteMismatch(
-                    expected: handle_queue,
-                    actual: stored_queue,
-                  ))
-                True ->
-                  case
-                    stored_worker == worker_id
-                    && stored_worker_version == worker_version
-                  {
-                    False ->
-                      Error(WorkerContractMismatch(
-                        expected_id: worker_id,
-                        expected_version: worker_version,
-                        actual_id: stored_worker,
-                        actual_version: stored_worker_version,
-                      ))
-                    True ->
-                      job.state_of_stored(state)
-                      |> result.replace_error(InvalidStoredState(state))
-                  }
-              }
-            _ -> Error(JobNotFound)
-          }
-      }
-  }
+  let Database(connection:, installation:, ..) = database
+  postgres_job_reads.state(connection, installation, handle)
+  |> result.map_error(job_read_error)
 }
 
 /// Reads the last committed result without confusing it with a handler
@@ -3024,65 +1801,9 @@ pub fn outcome(
   database: Database,
   handle: JobHandle(input, output, error),
 ) -> Result(job.Outcome(output, error), JobReadError) {
-  let Database(connection:, installation: database_installation, ..) = database
-  let #(
-    id,
-    handle_installation,
-    handle_queue,
-    worker_id,
-    worker_version,
-    output_codec,
-    error_codec,
-  ) = job.result_fields(handle)
-  case job.same_installation(handle_installation, database_installation) {
-    False -> Error(HandleFromAnotherInstallation)
-    True ->
-      case
-        store.call_safely(connection, fn(connection) {
-          sql.outcome(connection, id)
-        })
-      {
-        Error(error) -> Error(JobReadQueryFailed(error))
-        Ok(returned) ->
-          case returned.rows {
-            [] -> Error(JobNotFound)
-            [
-              sql.OutcomeRow(
-                queue: stored_queue,
-                worker_id: stored_worker,
-                worker_version: stored_worker_version,
-                state:,
-                output: encoded_output,
-                output_version:,
-                error: encoded_error,
-                error_version:,
-                failure_description:,
-                failure_cause:,
-              ),
-            ] ->
-              outcome_from_row(
-                handle_queue,
-                worker_id,
-                worker_version,
-                output_codec,
-                error_codec,
-                #(
-                  stored_queue,
-                  stored_worker,
-                  stored_worker_version,
-                  state,
-                  encoded_output,
-                  output_version,
-                  encoded_error,
-                  error_version,
-                  failure_description,
-                  failure_cause,
-                ),
-              )
-            _ -> Error(JobNotFound)
-          }
-      }
-  }
+  let Database(connection:, installation:, ..) = database
+  postgres_job_reads.outcome(connection, installation, handle)
+  |> result.map_error(job_read_error)
 }
 
 /// Reads a compact acknowledgement receipt by its stable command ID.
@@ -3099,248 +1820,32 @@ pub fn reconcile_acknowledgement(
   handle: JobHandle(input, output, error),
   command_id: String,
 ) -> Result(AcknowledgementReceipt, JobReadError) {
-  let Database(connection:, installation: database_installation, ..) = database
-  let #(id, handle_installation, queue, worker_id, worker_version, _) =
-    job.storage_fields(handle)
-  case job.same_installation(handle_installation, database_installation) {
-    False -> Error(HandleFromAnotherInstallation)
-    True ->
-      case
-        store.call_safely(connection, fn(connection) {
-          sql.reconcile_acknowledgement(connection, command_id)
-        })
-      {
-        Error(error) -> Error(JobReadQueryFailed(error))
-        Ok(returned) ->
-          case returned.rows {
-            [] -> Error(ReceiptNotFound)
-            [receipt] -> {
-              let sql.ReconcileAcknowledgementRow(
-                queue: stored_queue,
-                job_id: stored_id,
-                worker_id: stored_worker,
-                worker_version: stored_worker_version,
-                attempt_id:,
-                attempt_epoch:,
-                committed_state:,
-                failure_cause:,
-                committed_at_unix_ms:,
-              ) = receipt
-              case stored_id == id {
-                False ->
-                  Error(ReceiptJobMismatch(expected: id, actual: stored_id))
-                True ->
-                  case stored_queue == queue {
-                    False ->
-                      Error(QueueRouteMismatch(
-                        expected: queue,
-                        actual: stored_queue,
-                      ))
-                    True ->
-                      case
-                        stored_worker == worker_id
-                        && stored_worker_version == worker_version
-                      {
-                        False ->
-                          Error(WorkerContractMismatch(
-                            expected_id: worker_id,
-                            expected_version: worker_version,
-                            actual_id: stored_worker,
-                            actual_version: stored_worker_version,
-                          ))
-                        True -> {
-                          use committed_state <- result.try(
-                            acknowledgement_state(committed_state),
-                          )
-                          use failure_cause <- result.try(
-                            acknowledgement_failure_cause(failure_cause),
-                          )
-                          Ok(AcknowledgementReceipt(
-                            command_id:,
-                            attempt_id:,
-                            attempt_epoch:,
-                            committed_state:,
-                            business_failure_cause: failure_cause,
-                            committed_at_unix_ms:,
-                          ))
-                        }
-                      }
-                  }
-              }
-            }
-            _ -> Error(ReceiptNotFound)
-          }
-      }
-  }
-}
-
-fn acknowledgement_state(state: String) -> Result(job.State, JobReadError) {
-  case state {
-    "queued" -> Ok(job.Queued)
-    "scheduled" -> Ok(job.Scheduled)
-    "retryable" -> Ok(job.Retryable)
-    "executing" -> Ok(job.Executing)
-    "succeeded" -> Ok(job.Succeeded)
-    "business_failed" -> Ok(job.BusinessFailed)
-    "runtime_failed" -> Ok(job.RuntimeFailed)
-    "contract_mismatch" -> Ok(job.ContractMismatch)
-    "uncertain" -> Ok(job.Uncertain)
-    "discarded" -> Ok(job.Discarded)
-    "cancelled" -> Ok(job.Cancelled)
-    other -> Error(InvalidStoredState(other))
-  }
-}
-
-fn acknowledgement_failure_cause(
-  cause: Option(String),
-) -> Result(Option(worker.BusinessFailureCause), JobReadError) {
-  case cause {
-    None -> Ok(None)
-    Some(raw) ->
-      worker.business_failure_cause_from_string(raw)
-      |> result.map(Some)
-      |> result.replace_error(InvalidStoredState(raw))
-  }
-}
-
-fn outcome_from_row(
-  handle_queue: String,
-  handle_worker: String,
-  handle_worker_version: String,
-  output_codec: worker.Codec(output),
-  error_codec: Option(worker.Codec(error)),
-  stored: #(
-    String,
-    String,
-    String,
-    String,
-    Option(String),
-    String,
-    Option(String),
-    Option(String),
-    Option(String),
-    Option(String),
-  ),
-) -> Result(job.Outcome(output, error), JobReadError) {
-  let #(
-    stored_queue,
-    stored_worker,
-    stored_worker_version,
-    state,
-    encoded_output,
-    output_version,
-    encoded_error,
-    error_version,
-    failure_description,
-    failure_cause,
-  ) = stored
-  case stored_queue == handle_queue {
-    False ->
-      Error(QueueRouteMismatch(expected: handle_queue, actual: stored_queue))
-    True ->
-      case
-        stored_worker == handle_worker
-        && stored_worker_version == handle_worker_version
-      {
-        False ->
-          Error(WorkerContractMismatch(
-            expected_id: handle_worker,
-            expected_version: handle_worker_version,
-            actual_id: stored_worker,
-            actual_version: stored_worker_version,
-          ))
-        True ->
-          outcome_value(
-            state,
-            output_codec,
-            error_codec,
-            encoded_output,
-            output_version,
-            encoded_error,
-            error_version,
-            failure_description,
-            failure_cause,
-          )
-      }
-  }
-}
-
-fn outcome_value(
-  state: String,
-  output_codec: worker.Codec(output),
-  error_codec: Option(worker.Codec(error)),
-  encoded_output: Option(String),
-  output_version: String,
-  encoded_error: Option(String),
-  error_version: Option(String),
-  failure_description: Option(String),
-  failure_cause: Option(String),
-) -> Result(job.Outcome(output, error), JobReadError) {
-  case state {
-    "queued" -> Ok(job.Pending(Queued))
-    "scheduled" -> Ok(job.Pending(Scheduled))
-    "retryable" -> Ok(job.Pending(job.Retryable))
-    "executing" -> Ok(job.Pending(job.Executing))
-    "succeeded" ->
-      case encoded_output {
-        Some(encoded) ->
-          worker.decode_codec(output_codec, output_version, encoded)
-          |> result.map(job.SucceededWith)
-          |> result.map_error(CodecFailed)
-        None -> Error(SucceededOutputMissing)
-      }
-    "business_failed" -> {
-      let cause = case failure_cause {
-        Some(raw) ->
-          option.from_result(worker.business_failure_cause_from_string(raw))
-        None -> None
-      }
-      case error_codec, encoded_error, error_version {
-        Some(codec), Some(encoded), Some(version) ->
-          worker.decode_codec(codec, version, encoded)
-          |> result.map(fn(error) {
-            case cause {
-              Some(terminal_cause) ->
-                job.BusinessFailedWithCause(error, terminal_cause)
-              None -> job.BusinessFailedWith(error)
-            }
-          })
-          |> result.map_error(CodecFailed)
-        _, _, _ ->
-          case cause {
-            Some(terminal_cause) ->
-              Ok(job.FailedOperationallyWithCause(
-                failure_description
-                  |> unwrap("worker returned an application error"),
-                terminal_cause,
-              ))
-            None ->
-              Ok(job.FailedOperationally(
-                failure_description
-                |> unwrap("worker returned an application error"),
-              ))
-          }
-      }
-    }
-    "runtime_failed" ->
-      Ok(job.FailedOperationally(
-        failure_description |> unwrap("worker runtime failed"),
-      ))
-    "contract_mismatch" ->
-      Ok(job.FailedOperationally(
-        failure_description |> unwrap("worker codec contract mismatch"),
-      ))
-    "uncertain" ->
-      Ok(job.ReconciliationRequired(
-        failure_description
-        |> unwrap("attempt outcome requires reconciliation"),
-      ))
-    "discarded" ->
-      Ok(job.DiscardedWithReason(failure_description |> unwrap("job discarded")))
-    "cancelled" ->
-      Ok(job.CancelledWithReason(failure_description |> unwrap("job cancelled")))
-    other -> Error(InvalidStoredState(other))
-  }
+  let Database(connection:, installation:, ..) = database
+  postgres_job_reads.reconcile_acknowledgement(
+    connection,
+    installation,
+    handle,
+    command_id,
+  )
+  |> result.map(fn(receipt) {
+    let postgres_job_reads.AcknowledgementReceipt(
+      command_id:,
+      attempt_id:,
+      attempt_epoch:,
+      committed_state:,
+      business_failure_cause:,
+      committed_at_unix_ms:,
+    ) = receipt
+    AcknowledgementReceipt(
+      command_id:,
+      attempt_id:,
+      attempt_epoch:,
+      committed_state:,
+      business_failure_cause:,
+      committed_at_unix_ms:,
+    )
+  })
+  |> result.map_error(job_read_error)
 }
 
 // -- Uniqueness admission ----------------------------------------------------
