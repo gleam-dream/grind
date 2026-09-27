@@ -13,13 +13,17 @@ import grind/worker.{type BusinessFailureCause, type Codec, type Worker}
 /// case: a fresh cluster's first created database is conventionally OID
 /// 16384) while both also default to schema `"public"` — without it, two
 /// such clusters' tokens would be indistinguishable from one shared
-/// installation. `pg_control_system()` is a restricted, superuser-adjacent
-/// function in stock PostgreSQL; a role without permission to call it
-/// (an ordinary non-superuser connecting role, the common case for a
-/// least-privilege installation) makes this read fail, silently, at
-/// `postgres.start` — never surfaced as a `StartError`, since this
-/// disambiguation is a best-effort improvement, not something `start`
-/// itself depends on. In that case `same_installation` below falls back to
+/// installation. Stock, unmodified PostgreSQL does not actually restrict
+/// `pg_control_system()` at all — any connecting role can call it by
+/// default; some managed or deliberately hardened deployments do revoke
+/// `EXECUTE` on it from `PUBLIC`, and a role without permission to call it
+/// there makes this read fail, silently, at `postgres.start` — never
+/// surfaced as a `StartError`, since this disambiguation is a best-effort
+/// improvement, not something `start` itself depends on
+/// (`postgres.read_cluster_identifier` checks the privilege itself first,
+/// as a separate query, specifically so that failure never reaches
+/// PostgreSQL's own server log either — see its own doc comment). In that
+/// case `same_installation` below falls back to
 /// comparing only the database OID and schema, exactly as before this
 /// field existed: two different physical clusters that collide on OID and
 /// schema can still be indistinguishable to this client-side check when
@@ -64,7 +68,14 @@ pub fn installation_schema(installation: Installation) -> String {
 /// one, this falls back to comparing only the database OID and schema,
 /// exactly as it always has. A thin, named wrapper around this fallback
 /// logic (never a plain `==`) so every call site reads as a deliberate
-/// installation check.
+/// installation check. Not transitive: an installation whose cluster
+/// identifier could not be read can compare equal (via the OID+schema
+/// fallback) to two installations that would themselves compare unequal to
+/// each other once their own cluster identifiers are actually compared —
+/// safe because a `JobHandle`/`PendingSubmission` only ever carries the
+/// token of the single `Database` that minted it, so this function is only
+/// ever called pairwise against that one minting `Database`, never chained
+/// across independently-minted tokens.
 @internal
 pub fn same_installation(a: Installation, b: Installation) -> Bool {
   let Installation(

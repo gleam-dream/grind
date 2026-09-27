@@ -6716,3 +6716,262 @@ paragraph containing several inline code spans — an environment-level
 formatter discrepancy, not a content defect; avoided rather than chased
 further once the reformatted structure made both agree). `git diff --check`
 clean. `nix run nixpkgs#actionlint` clean on the final workflow file.
+
+## Increment 33 — CI/script robustness, and test-first coverage for Increment 31/32's own review findings
+
+**Context.** A further review of `6842d39` (Increment 31) and `997d989`
+(Increment 32) found: the oracle harness's `mix deps.get --check-locked`
+has no Hex bootstrap of its own on a bare CI runner; the CI cache covers
+`grind/build`/`grind/consumer/build` directories that
+`scripts/test-postgres.sh` unconditionally `gleam clean`s anyway; several
+CI hygiene gaps (`permissions`, a stale `install-nix-action`
+major, a useless `nix_path`, a double-run trigger, `quick-check` never
+building `consumer/`, no Nix-store cache); `job.same_installation` and
+`postgres.validate`'s schema-name rejection had no direct unit tests; the
+concurrent-schema-creation test raced two pools with no real barrier; and
+`read_cluster_identifier` could raise (and log) a genuine PostgreSQL error
+for a role denied the privilege. Every code/test item below was fixed
+test-first: a new test proven red under a stated mutation, then green with
+the fix. Two findings from this same review turned out to rest on premises
+that did not hold empirically against a real PostgreSQL 16.15 cluster —
+documented in place, not silently "fixed" against a fiction.
+
+### 1. Hex/rebar bootstrap in `scripts/test-postgres.sh`
+
+**Claim as stated**: a bare CI runner has no Hex archive and `mix
+deps.get`'s own interactive "install Hex?" prompt reads EOF from a
+non-interactive runner's stdin and aborts.
+
+**What was actually verified.** Against this session's own Nix dev shell
+(Elixir 1.18 / Mix, with network access to hex.pm and the OTP/rebar3 build
+infrastructure), running `oracle`'s `mix deps.get --check-locked` with a
+brand-new, empty `MIX_HOME`/`HEX_HOME` and stdin fully closed (`0<&-`, the
+sharpest simulation of a non-interactive runner available here) did **not**
+reproduce an abort: current Mix silently force-installs both the Hex
+archive and its own rebar3 build with no prompt at all. The specific
+"reads EOF and aborts" failure mode did not reproduce in this environment —
+recorded here rather than claimed fixed on faith.
+
+**What is genuinely true and fixed regardless.** That same unfixed run
+built its own copy of rebar3 over the network (`* creating
+.../mix/elixir/1-18-otp-28/rebar3`) — an avoidable network dependency the
+dev shell's own `rebar3` (`flake.nix`) already provides — and used
+whatever `~/.mix`/`~/.hex` the invoking user already had, never isolated
+from the disposable gate run. `scripts/test-postgres.sh` now sets
+`MIX_HOME`/`HEX_HOME` to a run-local directory under its own disposable
+`$root` (already `rm -rf`'d by the existing `cleanup` trap) and
+`MIX_REBAR3` to the nix store's own `rebar3`, scoped to the one subshell
+that runs the oracle harness.
+
+**Evidence.** Re-ran the fixed sequence (`mix local.hex --force
+--if-missing` under the new `MIX_HOME`/`HEX_HOME`, then `mix deps.get
+--check-locked`, stdin closed, brand-new empty home) and inspected the
+resulting `MIX_HOME` afterward: `find "$MIX_HOME" -iname '*rebar3*'`
+returned nothing — no network rebar3 build occurred, confirming
+`MIX_REBAR3` was actually honored — where the unfixed sequence's identical
+inspection found one. `mix deps.get --check-locked` itself still resolved
+correctly (`All dependencies are up to date`) in both the isolated-fixed
+and default-unfixed runs. The full gate (`scripts/test-postgres.sh`,
+below) exercises the real fixed script end to end afterward.
+
+### 2 & 3. CI workflow (`.github/workflows/ci.yml`)
+
+`permissions: contents: read` added; `cachix/install-nix-action` bumped
+`@v27` → `@v31` (confirmed current major via the action's own release
+list); the useless `nix_path` input removed; the trigger changed from `on:
+[push, pull_request]` (which double-runs every PR's own branch push) to
+`push: branches: [main]` plus `pull_request`; `quick-check` now also runs
+`gleam deps download`/`gleam build --warnings-as-errors` for `consumer/`
+(previously exercised only by the heavier `postgres-gate` job, at the very
+end of `scripts/test-postgres.sh`); a comment now states plainly that
+`gleam-dream/sinal` must stay public for the sibling checkout to succeed
+with no token. Cache: `grind/build` and `grind/consumer/build` dropped
+(`scripts/test-postgres.sh` unconditionally `gleam clean`s both as its own
+first step — see that script's own comment on the stale-fork incident this
+guards against — so caching either tree only ever cached something this
+same job immediately discards); `grind/oracle/deps`, `grind/oracle/_build`,
+and `sinal/build` kept; the cache key now hashes only the manifests that
+actually matter to those three trees (`oracle/mix.lock`,
+`sinal/manifest.toml`) with **no** `restore-keys` fallback prefix, so a
+same-OS/different-hash run can never silently restore a `sinal/build` or
+oracle `_build` built against a different dependency version than the run
+actually resolves. `DeterminateSystems/magic-nix-cache-action@v15` added,
+caching the Nix store itself (every `nix develop`/`nix flake check`
+derivation) independently of the Gleam/Mix artifact cache above.
+
+**Evidence.** `nix run nixpkgs#actionlint -- .github/workflows/ci.yml` —
+clean, no findings, on the final workflow file.
+
+### 4. `job.same_installation` unit tests
+
+Six pure, in-memory tests added (no `Database`, no PostgreSQL): identical
+cluster identifiers match; different cluster identifiers differ even when
+OID and schema agree; one side missing a cluster identifier and both sides
+missing one both fall back to OID+schema; within that fallback, a
+differing OID or a differing schema each still makes the installations
+differ. `same_installation`'s own doc comment now states, in one sentence,
+that the relation is not transitive (an installation whose cluster
+identifier could not be read can compare equal, via the fallback, to two
+installations that would themselves disagree once their own identifiers
+are compared) and why that is safe — a handle only ever carries the token
+of the single `Database` that minted it, so the function is only ever
+called pairwise against that one minting `Database`, never chained.
+
+**Red.** Mutation 1 (`_, _ -> True`, the fallback branch reporting a match
+unconditionally): `job_same_installation_fallback_still_rejects_differing_oid_test`
+and `..._differing_schema_test` both failed (`True should equal False`);
+the other four tests, which already expect `True` in that branch, were
+unaffected — confirming the mutation's blast radius matched exactly the
+two tests meant to catch it. Mutation 2 (`_, _ -> schema_a == schema_b`,
+dropping the OID comparison specifically): only
+`..._differing_oid_test` failed. **Green**: reverted, `225 passed, no
+failures`.
+
+### 5 & 6. `postgres.validate` schema-name rejection unit tests
+
+Seven pure tests added: empty name, a 64-byte ASCII name, a multibyte name
+crossing 63 bytes at only 32 _characters_ (`"é"` × 32 — 2 bytes each), a
+NUL byte, the literal `"$user"` token, and the reserved `pg_` prefix all
+`Error(InvalidSchema)`; a name at exactly the 63-byte boundary is `Ok`.
+`ConfigError.InvalidSchema`'s own doc comment now documents all five
+rejected shapes, including _why_ `"$user"` and `pg_`-prefixed names are
+rejected (a quoted, literal `"$user"` schema behaves differently from
+`search_path`'s own unquoted `$user` substitution token and can leave the
+migration advisory lock key `NULL`; PostgreSQL reserves the `pg_` prefix
+for its own system/temporary schemas and would reject it anyway, only
+later and less specifically, inside `migrate`).
+
+**Red.** Mutation 1 (`schema_is_valid` always `True`): all six rejection
+tests failed (`Ok(...) should equal Error(InvalidSchema)`); the
+boundary-accepting test was unaffected. Mutation 2 (only the `$user`/`pg_`
+checks removed, byte-length/NUL checks left intact): exactly
+`postgres_schema_rejects_dollar_user_test` and
+`postgres_schema_rejects_pg_prefix_test` failed, isolating item 6 from item 5. **Green**: reverted after each, `225 passed, no failures`.
+
+### 7. Deterministic concurrent-schema-creation test
+
+The original `postgres_migrate_concurrent_first_time_schema_creation_both_succeed_test`
+spawned two `migrate` callers back-to-back with no real barrier ("there is
+no lockable object to hold one on before the schema exists" — true only
+until something is deliberately made into that object). Now: a third
+session runs `BEGIN; CREATE SCHEMA "<name>";` against the exact,
+freshly-suffixed schema name and never commits; both `migrate` callers are
+spawned, then the test polls `pg_stat_activity` (`state = 'active' AND
+wait_event_type = 'Lock' AND query = 'CREATE SCHEMA IF NOT EXISTS
+"<name>"'`) until the count is exactly 2 — proof both are genuinely
+blocked on the still-open blocking transaction, not inferred from a sleep
+— before committing the blocker and asserting both `migrate` calls return
+`Ok(Nil)`.
+
+**Red.** Mutation: reverted `ensure_schema_exists`'s catch branch to the
+pre-Increment-31 shape (`Error(create_error) ->
+Error(SchemaCreationFailed(create_error))`, no recheck at all). Every run
+now fails deterministically (not merely "usually"), since the barrier
+forces the race every time:
+
+```
+test: grind_test.postgres_migrate_concurrent_first_time_schema_creation_both_succeed_test
+info:
+Ok(Error(SchemaCreationFailed(ConstraintViolated("duplicate key value violates unique constraint \"pg_namespace_nspname_index\"", "pg_namespace_nspname_index", "Key (nspname)=(grind_concurrent_schema_...) already exists."))))
+should equal
+Ok(Ok(Nil))
+```
+
+**Green**: reverted, `225 passed, no failures` (ran against a disposable
+two-database harness dedicated to this and item 8's own DB-backed tests,
+and again inside the full `scripts/test-postgres.sh` gate below).
+
+### 8. `read_cluster_identifier` no longer risks a server-logged permission error
+
+**A factual correction found while fixing this.** Stock, unmodified
+PostgreSQL does **not** restrict `EXECUTE` on `pg_control_system()` at
+all — confirmed empirically (an ordinary `CREATE ROLE ... LOGIN` role,
+freshly created with no grants at all, ran `SELECT pg_control_system()`
+successfully against this disposable cluster). This matches Increment 27's
+own earlier privilege check (`docs/RECOVERY-EVIDENCE.md`, "Increment 27"),
+which found the identical thing for `pg_control_system()`'s use in
+`storage_owner`. `job.Installation`'s own doc comment and
+`read_cluster_identifier`'s previously called it "a restricted,
+superuser-adjacent function in stock PostgreSQL" — both corrected here.
+The real hazard is a managed/hardened deployment that _deliberately_
+revokes `EXECUTE` on it from `PUBLIC`, which is the scenario this fix and
+its test actually exercise (via an explicit, test-scoped
+`REVOKE`/`GRANT ... TO PUBLIC` pair).
+
+**A second finding, about the review's own suggested fix shape.** The
+review proposed guarding the call with a single query: `SELECT CASE WHEN
+has_function_privilege('pg_control_system()', 'execute') THEN (SELECT
+system_identifier FROM pg_control_system()) END`. This does **not**
+actually work: PostgreSQL performs a function's own ACL check at
+expression-initialization time for every function-call node the plan
+contains, regardless of which `CASE` branch is reached at runtime.
+Verified directly with `psql`: as a role with `EXECUTE` explicitly revoked,
+the guarded query above still raised `ERROR:  permission denied for
+function pg_control_system` and the server still logged it — identical to
+the raw, unguarded call. The actual fix issues the privilege check as its
+own separate query first (`has_pg_control_system_privilege`) and only ever
+sends the real `pg_control_system()` query text at all when that check
+reports `True` — verified the same way: the privilege-check-only query
+returned `f` with zero log lines added, and the restricted call was never
+sent.
+
+**Test.** `postgres_start_with_non_superuser_role_never_logs_a_permission_error_test`
+revokes `EXECUTE ... FROM PUBLIC` (restored via `exception.defer`
+immediately after, regardless of outcome — scoped to `owner_a_url()`'s own
+database, which several other tests share but none of which assert
+anything about a cluster identifier specifically), starts a non-superuser
+role's own pool, and checks both that `postgres.start` succeeds with
+`Installation`'s cluster identifier falling back to `None`, and — the part
+a return-value assertion alone cannot distinguish, since both the guarded
+and unguarded query already resolve to `None` for this role either way —
+that the disposable cluster's own server log (exposed to the test via a
+new `GRIND_TEST_POSTGRES_LOG` environment variable, read with
+`simplifile`) never gained the `permission denied for function
+pg_control_system` line, polled for up to ~500ms to allow for log-write
+buffering.
+
+**Red.** Mutation: reverted `read_cluster_identifier` to the raw, unguarded
+query (no privilege pre-check). Fails deterministically:
+
+```
+test: grind_test.postgres_start_with_non_superuser_role_never_logs_a_permission_error_test
+info:
+False
+should equal
+True
+```
+
+(`await_log_never_shows` returned `False` — the permission-denied line was
+found in the log, as predicted.) **Green**: reverted, `225 passed, no
+failures` against the same two-database harness.
+
+### 9. `ensure_schema_exists`: keep the original `CREATE` error on a failed recheck
+
+Nit-level fix, no dedicated new test requested by the review for this one
+alone (already exercised indirectly by item 7's own test, which never
+reaches this specific sub-branch since the recheck there always succeeds).
+Previously, `Error(recheck_error) -> Error(recheck_error)` replaced the
+original `CREATE SCHEMA` failure with whatever the secondary existence
+probe's own error happened to be — less informative for a caller trying to
+understand why the schema could not be created. Now `Ok(False) |
+Error(_) -> Error(SchemaCreationFailed(create_error))` always surfaces the
+original `create_error` regardless of whether the recheck itself
+succeeded-but-reported-absent or failed outright. Verified by `gleam
+check` (both branches now agree on the same constructor and error value)
+and by item 7's own test continuing to pass (the recheck's success path is
+unaffected).
+
+**Gate.** `nix develop --command bash scripts/test-postgres.sh`: **225
+passed root** (211 baseline + 14 new pure unit tests: 6 for item 4, 7 for
+items 5/6, 1 pre-existing test's assertions widened for item 7's own
+barrier — see above), **11 passed consumer**, pinned Oban oracle harness
+green, Squirrel check green, exit `0`. `gleam check` green for `grind` and
+`consumer/`. `nix fmt` applied and re-verified clean. `nix flake check` —
+`all checks passed!`. `nix run nixpkgs#actionlint` clean on the final
+`ci.yml`.
+
+**Not fixed, and why.** Item 1's literal "interactive prompt reads EOF and
+aborts" premise did not reproduce in this environment (see item 1 above);
+the script-local `MIX_HOME`/`HEX_HOME`/`MIX_REBAR3` fix is applied anyway,
+since it is strictly more correct and isolated regardless of which Mix
+behavior a given CI runner exhibits.

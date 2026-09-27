@@ -352,7 +352,14 @@ state).
 own `search_path` connection-parameter pin, described above — no longer
 documentation-only. `docs/UNIQUENESS-CONTRACT.md` and README, "Isolation"
 both state the explicit-schema contract and name the residual
-configuration-discipline hazard.
+configuration-discipline hazard. `postgres.validate` additionally rejects
+the literal schema name `"$user"` outright (a quoted `"$user"` behaves
+differently from `search_path`'s own unquoted `$user`-substitution
+convention this risk names, and can leave the migration advisory lock
+key `NULL`) and any `pg_`-prefixed name (reserved by PostgreSQL for its
+own system/temporary schemas) — closing off the two schema-name shapes
+most likely to be an accidental copy-paste of that same `$user` convention,
+rather than relying on documentation alone to warn against them.
 
 **Evidence.**
 `postgres_user_schema_fallback_shares_one_installation_test` proves the

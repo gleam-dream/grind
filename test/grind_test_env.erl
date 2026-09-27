@@ -1,5 +1,5 @@
 -module(grind_test_env).
--export([database_url/0, queue_database_url/0, owner_a_url/0, user_schema_fallback_url/0, migration_collision_submissions_url/0, migration_collision_resolutions_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_missing_fk_url/0, schema_atomic_url/0, schema_concurrent_url/0, schema_partial_url/0, schema_upgrade_url/0, schema_upgrade_fresh_url/0, schema_future_foreign_url/0, schema_shape_url/0, schema_mixed_case_url/0, repeatable_read_url/0, quarantine_url/0, fault_proxy_url/0, migration_deadline_url/0, migration_lock_url/0, prune_url/0, prune_owner_b_url/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0, pool_connection_atom/1]).
+-export([database_url/0, queue_database_url/0, owner_a_url/0, user_schema_fallback_url/0, migration_collision_submissions_url/0, migration_collision_resolutions_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_missing_fk_url/0, schema_atomic_url/0, schema_concurrent_url/0, schema_partial_url/0, schema_upgrade_url/0, schema_upgrade_fresh_url/0, schema_future_foreign_url/0, schema_shape_url/0, schema_mixed_case_url/0, repeatable_read_url/0, quarantine_url/0, fault_proxy_url/0, migration_deadline_url/0, migration_lock_url/0, prune_url/0, prune_owner_b_url/0, postgres_log_path/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0, pool_connection_atom/1]).
 
 database_url() -> env("GRIND_TEST_DATABASE_URL").
 queue_database_url() -> env("GRIND_TEST_QUEUE_DATABASE_URL").
@@ -32,6 +32,15 @@ migration_deadline_url() -> env("GRIND_TEST_MIGRATION_DEADLINE_URL").
 migration_lock_url() -> env("GRIND_TEST_MIGRATION_LOCK_URL").
 prune_url() -> env("GRIND_TEST_PRUNE_URL").
 prune_owner_b_url() -> env("GRIND_TEST_PRUNE_OWNER_B_URL").
+%% The disposable PostgreSQL cluster's own server log
+%% (`scripts/test-postgres.sh`'s `pg_ctl ... -l`) — read-only, used solely to
+%% prove `read_cluster_identifier`'s `has_function_privilege` guard actually
+%% suppresses the server-side `ERROR:  permission denied for function
+%% pg_control_system` a non-superuser role would otherwise raise (and have
+%% logged) on every `postgres.start`, a fact no Gleam-visible return value
+%% distinguishes on its own (both the guarded and unguarded query already
+%% resolve to `None` for such a role).
+postgres_log_path() -> env("GRIND_TEST_POSTGRES_LOG").
 
 env(Name) ->
     case os:getenv(Name) of

@@ -153,12 +153,28 @@ pub type ConfigError {
   InvalidObservationCapacity
   InvalidStatementDeadline
   InvalidMigrationDeadline
-  /// `Settings.schema` is empty, exceeds PostgreSQL's own 63-byte identifier
-  /// limit (`NAMEDATALEN` 64, minus the terminator), or contains a NUL
-  /// byte (PostgreSQL text values cannot hold one at all — a driver or
-  /// C-level truncation at that byte would otherwise silently change which
-  /// schema this actually names, a confusion Grind would rather reject
-  /// outright than risk). See `with_schema`.
+  /// `Settings.schema` is empty, exceeds PostgreSQL's own 63-*byte*
+  /// identifier limit (`NAMEDATALEN` 64, minus the terminator — checked in
+  /// bytes, not characters, since a multibyte name can cross that limit
+  /// well under 63 characters), contains a NUL byte (PostgreSQL text values
+  /// cannot hold one at all — a driver or C-level truncation at that byte
+  /// would otherwise silently change which schema this actually names, a
+  /// confusion Grind would rather reject outright than risk), is exactly
+  /// `"$user"` (PostgreSQL's own `search_path` treats an unquoted `$user`
+  /// token as "substitute the current role's own name" — but
+  /// `with_schema`'s value is always double-quoted when it reaches
+  /// `search_path` (`quote_ident`), which makes a *literal* schema named
+  /// `$user` behave differently again: a quoted `"$user"` is looked up as
+  /// that literal name, not substituted, and PostgreSQL's own migration
+  /// advisory lock key derivation for such a name can end up `NULL` in
+  /// edge cases — configuring it at all is never something a caller
+  /// actually means, only ever a copy-paste of the *unquoted* convention
+  /// documented in risk 7), or starts with the reserved `pg_` prefix
+  /// (PostgreSQL reserves every `pg_`-prefixed schema name for its own
+  /// system and temporary schemas; `CREATE SCHEMA` refuses one outright,
+  /// so accepting it here would only defer that same rejection to
+  /// `migrate`, with a less specific error). See `with_schema` and
+  /// `docs/RISKS.md` risk 7.
   InvalidSchema
   /// `unique_lock_wait_ms` is within roughly one second of
   /// `statement_deadline_ms` (DEFECT 1, docs/RELEASE-READINESS.md): default
@@ -212,12 +228,15 @@ const unique_lock_wait_margin_ms = 1000
 const max_schema_name_bytes = 63
 
 /// `Settings.schema` must be non-empty, at or under PostgreSQL's own
-/// 63-byte identifier limit, and free of NUL bytes — see `ConfigError`'s
-/// own `InvalidSchema` doc comment for why each of these matters.
+/// 63-byte identifier limit, free of NUL bytes, not the literal `"$user"`,
+/// and not `pg_`-prefixed — see `ConfigError`'s own `InvalidSchema` doc
+/// comment for why each of these matters.
 fn schema_is_valid(schema: String) -> Bool {
   schema != ""
   && bit_array.byte_size(bit_array.from_string(schema)) <= max_schema_name_bytes
   && !string.contains(schema, "\u{0}")
+  && schema != "$user"
+  && !string.starts_with(schema, "pg_")
 }
 
 /// The constant transaction-local `lock_timeout` (milliseconds) every
@@ -537,25 +556,77 @@ fn read_database_oid(
 /// This PostgreSQL *cluster*'s own identity (`pg_control_system()`'s
 /// `system_identifier`), used only to disambiguate two different clusters
 /// that happen to collide on database OID and configured schema — see
-/// `job.Installation`'s own doc comment. Best-effort only: `pg_control_system()`
-/// is a restricted, superuser-adjacent function, so an ordinary connecting
-/// role commonly cannot call it at all; any failure (a permission error, an
-/// unexpected row shape) is swallowed into `None` here rather than ever
-/// failing `postgres.start` — this read is a client-side improvement, not
+/// `job.Installation`'s own doc comment. Best-effort only: on some
+/// deployments (managed/hardened PostgreSQL commonly revokes `EXECUTE` on
+/// `pg_control_system()` from `PUBLIC`, though stock, unmodified PostgreSQL
+/// does not restrict it at all by default) an ordinary connecting role
+/// cannot call it; any failure (a permission error, an unexpected row
+/// shape) is swallowed into `None` here rather than ever failing
+/// `postgres.start` — this read is a client-side improvement, not
 /// something `start` itself depends on.
+///
+/// Checked with `has_function_privilege` *first*, as its own separate
+/// query, before ever sending the actual `pg_control_system()` call —
+/// deliberately not a single query with the call nested inside a `CASE
+/// WHEN has_function_privilege(...) THEN (...) END` guard, which looks
+/// like it should short-circuit but does not: PostgreSQL performs a
+/// function's own ACL check at expression-initialization time, for every
+/// function call node the query plan contains, regardless of which
+/// `CASE` branch is actually reached at runtime — a role denied `EXECUTE`
+/// still gets the real `ERROR:  permission denied for function
+/// pg_control_system`, and PostgreSQL still logs it server-side, even
+/// though the branch calling it would never have been taken (confirmed
+/// empirically against a role with the privilege explicitly revoked; see
+/// `docs/RECOVERY-EVIDENCE.md`). Never sending the restricted call's own
+/// query text at all, once the separate privilege check reports `False`,
+/// is what actually avoids both the client-visible error (already
+/// swallowed into `None` either way) and the server-side log line — the
+/// genuine defect this function's own two-query shape exists to close on
+/// an ordinary least-privilege installation.
 fn read_cluster_identifier(connection: pog.Connection) -> Option(Int) {
+  case has_pg_control_system_privilege(connection) {
+    False -> None
+    True -> {
+      let query =
+        pog.query("SELECT system_identifier FROM pg_control_system()")
+        |> pog.returning({
+          use system_identifier <- decode.field(0, decode.int)
+          decode.success(system_identifier)
+        })
+      case store.execute_safely(query, on: connection) {
+        Error(_) -> None
+        Ok(returned) ->
+          case returned.rows {
+            [system_identifier] -> Some(system_identifier)
+            _ -> None
+          }
+      }
+    }
+  }
+}
+
+/// Whether this connection's own role currently has `EXECUTE` on
+/// `pg_control_system()` — `has_function_privilege` is a plain,
+/// always-callable introspection function (no privilege of its own is
+/// needed to ask this question), so this never itself raises or logs an
+/// error the way actually calling the restricted function would for a
+/// role that lacks it. Any failure here (an unexpected row shape, a lost
+/// reply) is conservatively `False`, since the only consequence is
+/// `read_cluster_identifier` skipping a best-effort read it would
+/// otherwise have attempted.
+fn has_pg_control_system_privilege(connection: pog.Connection) -> Bool {
   let query =
-    pog.query("SELECT system_identifier FROM pg_control_system()")
+    pog.query("SELECT has_function_privilege('pg_control_system()', 'execute')")
     |> pog.returning({
-      use system_identifier <- decode.field(0, decode.int)
-      decode.success(system_identifier)
+      use allowed <- decode.field(0, decode.bool)
+      decode.success(allowed)
     })
   case store.execute_safely(query, on: connection) {
-    Error(_) -> None
+    Error(_) -> False
     Ok(returned) ->
       case returned.rows {
-        [system_identifier] -> Some(system_identifier)
-        _ -> None
+        [allowed] -> allowed
+        _ -> False
       }
   }
 }
@@ -1403,8 +1474,13 @@ fn ensure_schema_exists(
         Error(create_error) ->
           case schema_exists(connection, schema) {
             Ok(True) -> Ok(Nil)
-            Ok(False) -> Error(SchemaCreationFailed(create_error))
-            Error(recheck_error) -> Error(recheck_error)
+            // The recheck itself failing is never more informative than the
+            // `CREATE` failure that prompted it — surface the original
+            // `create_error` (never `recheck_error`, and never
+            // `schema_exists`'s own `IncompatibleSchema` for a malformed
+            // row shape) so a caller sees why the schema could not be
+            // created, not why a secondary existence probe also failed.
+            Ok(False) | Error(_) -> Error(SchemaCreationFailed(create_error))
           }
       }
     }

@@ -2387,6 +2387,131 @@ fn run_handle_cross_installation_test(base_url: String) -> Nil {
   mark_database_test_executed("handle-cross-installation-rejected")
 }
 
+/// Red-first proof of the coordinator review's `read_cluster_identifier`
+/// guard. Stock, unmodified PostgreSQL does *not* actually restrict
+/// `EXECUTE` on `pg_control_system()` at all (confirmed empirically against
+/// this disposable cluster — any ordinary role can call it by default);
+/// some managed/hardened deployments revoke it from `PUBLIC`, which is the
+/// scenario `read_cluster_identifier`'s guard exists for. This test
+/// reproduces that scenario directly, by revoking it from `PUBLIC` for the
+/// life of this one test and restoring it unconditionally afterward, rather
+/// than relying on a default this cluster does not actually enforce. Once
+/// revoked, an ordinary role calling `pg_control_system()` raw surfaces a
+/// genuine PostgreSQL `ERROR:  permission denied for function
+/// pg_control_system` on the server — even though this read is meant to be
+/// a silent, best-effort improvement `postgres.start` never depends on. The
+/// pre-existing swallow into `None` already made that failure invisible to
+/// the *caller*, so a plain return-value assertion cannot tell the guarded
+/// query apart from the unguarded one (both resolve to `None` for this role
+/// either way); the disposable cluster's own server log
+/// (`GRIND_TEST_POSTGRES_LOG`) is what actually distinguishes them:
+/// `postgres.start` must still succeed for the role, its `Installation`
+/// still falls back to no cluster identifier, and — the part only the
+/// guard changes — PostgreSQL itself must never have raised, or logged,
+/// that permission error while getting there.
+pub fn postgres_start_with_non_superuser_role_never_logs_a_permission_error_test() {
+  case owner_a_url(), postgres_log_path() {
+    Error(Nil), _ | _, Error(Nil) -> Nil
+    Ok(base_url), Ok(log_path) ->
+      run_non_superuser_cluster_identifier_test(base_url, log_path)
+  }
+}
+
+fn run_non_superuser_cluster_identifier_test(
+  base_url: String,
+  log_path: String,
+) -> Nil {
+  let assert Ok(admin_validated) =
+    postgres.settings(base_url) |> postgres.validate
+  let assert Ok(admin_database) = postgres.start(admin_validated)
+  use <- exception.defer(fn() { postgres.close(admin_database) })
+  let admin_connection = postgres.connection(admin_database)
+
+  // Revoked (and restored) here, per database, rather than assumed:
+  // `owner_a_url()`'s own database is used by several other tests in this
+  // suite, each with their own roles, but none of them ever assert
+  // anything about a cluster identifier specifically (only installation
+  // *equality*, which this revoke does not change), so this is safe
+  // regardless of test ordering within one run.
+  let assert Ok(_) =
+    pog.query("REVOKE EXECUTE ON FUNCTION pg_control_system() FROM PUBLIC")
+    |> pog.execute(on: admin_connection)
+  use <- exception.defer(fn() {
+    let _ =
+      pog.query("GRANT EXECUTE ON FUNCTION pg_control_system() TO PUBLIC")
+      |> pog.execute(on: admin_connection)
+    Nil
+  })
+
+  let suffix = int.to_string(unique_test_run_id())
+  let role = "grind_no_cluster_id_" <> suffix
+  create_isolated_schema_role(admin_connection, role)
+  use <- exception.defer(fn() {
+    drop_isolated_schema_role(admin_connection, role)
+  })
+
+  let assert Ok(oid_returned) =
+    pog.query(
+      "SELECT oid::int4 FROM pg_database WHERE datname = current_database()",
+    )
+    |> pog.returning({
+      use oid <- decode.field(0, decode.int)
+      decode.success(oid)
+    })
+    |> pog.execute(on: admin_connection)
+  let assert [oid] = oid_returned.rows
+
+  let assert Ok(validated) =
+    postgres.settings(role_scoped_url(base_url, role))
+    |> postgres.with_schema(role)
+    |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+
+  // `postgres.start` succeeds, and the resulting installation's own
+  // cluster identifier is `None` for this non-superuser role — exactly as
+  // documented. Identical with or without the guard; the guard's own
+  // effect is server-log-only, checked below.
+  postgres.installation(database)
+  |> should.equal(job.new_installation(oid, role, None))
+
+  await_log_never_shows(
+    log_path,
+    "permission denied for function pg_control_system",
+    25,
+  )
+  |> should.equal(True)
+
+  mark_database_test_executed("start-non-superuser-no-permission-error-logged")
+}
+
+/// Polls (bounded, ~500ms total) the disposable cluster's own server log,
+/// waiting out any write-buffering delay before concluding `fragment` never
+/// appeared — the passing case once `read_cluster_identifier`'s guard is in
+/// place. Returns `False` the instant `fragment` is seen, rather than
+/// waiting out the rest of the budget, since presence is decisive already.
+fn await_log_never_shows(
+  log_path: String,
+  fragment: String,
+  checks_remaining: Int,
+) -> Bool {
+  let seen = case simplifile.read(from: log_path) {
+    Ok(contents) -> string.contains(contents, fragment)
+    Error(_) -> False
+  }
+  case seen {
+    True -> False
+    False ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_log_never_shows(log_path, fragment, checks_remaining - 1)
+        }
+        False -> True
+      }
+  }
+}
+
 pub fn postgres_migration_rejects_incompatible_existing_schema_test() {
   case schema_bad_url() {
     Error(Nil) -> Nil
@@ -2945,13 +3070,23 @@ fn run_concurrent_migrators_test(database_url: String) -> Nil {
 /// depending on timing) rather than a silent no-op the way `IF NOT EXISTS`
 /// might suggest. `ensure_schema_exists` re-checks existence on any
 /// `CREATE SCHEMA` failure and reports `Ok(Nil)` if the schema is now
-/// present regardless of which side actually created it. Two independent
-/// pools configured with the identical, freshly-suffixed (never-before-used)
-/// schema name both call `migrate` with no explicit barrier beyond spawning
-/// them back-to-back from the same process — a real, if not perfectly
-/// deterministic, race between two genuine PostgreSQL sessions (there is no
-/// lockable object to hold a barrier on before the schema exists) — and
-/// both must return `Ok(Nil)`.
+/// present regardless of which side actually created it.
+///
+/// Made deterministic (the original version of this test raced two pools
+/// back-to-back with no barrier at all, "there is no lockable object to
+/// hold one on before the schema exists" — true only until a third session
+/// is used to actually become that lockable object): a third session runs
+/// `BEGIN; CREATE SCHEMA "<name>";` against this exact, never-before-used
+/// name and never commits, so both `migrate` callers' own existence check
+/// sees the schema genuinely absent (the blocker's insert is invisible
+/// until it commits or rolls back) and both then attempt the real `CREATE
+/// SCHEMA IF NOT EXISTS`, which blocks — provably, polled via
+/// `pg_stat_activity` rather than inferred from a sleep — on the blocker's
+/// still-open transaction. Once the blocker commits, PostgreSQL's own
+/// catalog uniqueness check resolves both blocked inserts against the
+/// schema that now definitely exists, and both must still return `Ok(Nil)`
+/// every single run — not merely "usually", the way the original
+/// best-effort race could only ever claim.
 pub fn postgres_migrate_concurrent_first_time_schema_creation_both_succeed_test() {
   case database_url() {
     Error(Nil) -> Nil
@@ -2973,17 +3108,90 @@ fn run_concurrent_schema_creation_test(base_url: String) -> Nil {
     |> postgres.validate
   let assert Ok(database_b) = postgres.start(validated_b)
   use <- exception.defer(fn() { postgres.close(database_b) })
+  let connection_a = postgres.connection(database_a)
+
+  // The barrier: a third session holds `CREATE SCHEMA "<schema>"` open,
+  // uncommitted, for the rest of this test — the one lockable object that
+  // makes both migrators' own `CREATE SCHEMA IF NOT EXISTS` genuinely block
+  // (on the blocker's own transaction id) rather than race however the
+  // scheduler happens to interleave them.
+  let held_create = pog.query("CREATE SCHEMA \"" <> schema <> "\"")
+  let #(lock_ready, lock_finished) =
+    spawn_lock_holder(connection_a, held_create)
+  let assert Ok(ClaimGateAcquired(release_lock)) =
+    process.receive(lock_ready, within: 5000)
+  use <- exception.defer(fn() {
+    process.send(release_lock, ReleaseAttempt)
+    Nil
+  })
 
   let result_a = process.new_subject()
   let result_b = process.new_subject()
   spawn_submit(result_a, fn() { postgres.migrate(database_a) })
   spawn_submit(result_b, fn() { postgres.migrate(database_b) })
+
+  await_both_blocked_creating_schema(connection_a, schema, 250)
+  |> should.equal(True)
+
+  process.send(release_lock, ReleaseAttempt)
+  process.receive(lock_finished, within: 5000)
+  |> should.equal(Ok(ClaimGateReleased(True)))
+
   process.receive(result_a, within: 10_000) |> should.equal(Ok(Ok(Nil)))
   process.receive(result_b, within: 10_000) |> should.equal(Ok(Ok(Nil)))
 
-  let connection_a = postgres.connection(database_a)
   schema_marker_max_version(connection_a) |> should.equal(12)
   mark_database_test_executed("migrate-concurrent-schema-creation-both-succeed")
+}
+
+/// Polls (bounded) until exactly two other backends are genuinely blocked
+/// running `migrate`'s own literal `CREATE SCHEMA IF NOT EXISTS "<schema>"`
+/// statement — proof both migrators have already run their own existence
+/// check (seeing it absent, since the blocker's insert is not yet
+/// committed) and are now waiting on the blocker's transaction to end,
+/// rather than inferring this from timing alone. Never fewer than two
+/// still-running checks are treated as "not yet both blocked" (one might
+/// simply not have reached the statement yet); more than two would mean
+/// this helper is somehow observing another test's own activity and is
+/// treated the same way, never as a false positive.
+fn await_both_blocked_creating_schema(
+  connection: pog.Connection,
+  schema: String,
+  checks_remaining: Int,
+) -> Bool {
+  let blocked =
+    pog.query(
+      "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND usename = current_user AND state = 'active' AND wait_event_type = 'Lock' AND query = 'CREATE SCHEMA IF NOT EXISTS \""
+      <> schema
+      <> "\"'",
+    )
+    |> pog.returning({
+      use blocked <- decode.field(0, decode.int)
+      decode.success(blocked)
+    })
+    |> pog.execute(on: connection)
+    |> result.map_error(fn(_) { Nil })
+    |> result.try(fn(returned) {
+      case returned.rows {
+        [blocked] -> Ok(blocked)
+        _ -> Error(Nil)
+      }
+    })
+  case blocked {
+    Ok(2) -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_both_blocked_creating_schema(
+            connection,
+            schema,
+            checks_remaining - 1,
+          )
+        }
+        False -> False
+      }
+  }
 }
 
 /// The real, released `v11` step, looked up from `migrations.migrations()`
@@ -3200,6 +3408,9 @@ fn prune_url() -> Result(String, Nil)
 
 @external(erlang, "grind_test_env", "prune_owner_b_url")
 fn prune_owner_b_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "postgres_log_path")
+fn postgres_log_path() -> Result(String, Nil)
 
 /// A synthetic step whose own statement (`pg_sleep(6)`) legitimately runs
 /// longer than the pool's own `statement_deadline_ms` (4000ms default) but
@@ -12091,6 +12302,110 @@ pub fn postgres_unique_lock_wait_must_be_positive_test() {
     Ok(_) -> Nil
     Error(_) -> should.fail()
   }
+}
+
+/// Pure, in-memory coverage of `job.same_installation` — no `Database` and
+/// no PostgreSQL involved, since the function itself is a pure comparison
+/// over two already-constructed `job.Installation` tokens. Covers every
+/// combination the coordinator review named: identical cluster identifiers
+/// match; different cluster identifiers differ even when OID and schema
+/// agree; either side missing a cluster identifier (one `None`, or both
+/// `None`) falls back to comparing OID and schema alone; and, within that
+/// fallback, a differing OID or a differing schema each still makes the
+/// installations differ.
+pub fn job_same_installation_matches_when_cluster_identifiers_agree_test() {
+  let a = job.new_installation(1, "public", Some(42))
+  let b = job.new_installation(1, "public", Some(42))
+  job.same_installation(a, b) |> should.equal(True)
+}
+
+pub fn job_same_installation_differs_when_cluster_identifiers_disagree_test() {
+  let a = job.new_installation(1, "public", Some(42))
+  let b = job.new_installation(1, "public", Some(43))
+  job.same_installation(a, b) |> should.equal(False)
+}
+
+pub fn job_same_installation_falls_back_when_one_side_unreadable_test() {
+  let a = job.new_installation(1, "public", Some(42))
+  let b = job.new_installation(1, "public", None)
+  job.same_installation(a, b) |> should.equal(True)
+}
+
+pub fn job_same_installation_falls_back_when_neither_side_readable_test() {
+  let a = job.new_installation(1, "public", None)
+  let b = job.new_installation(1, "public", None)
+  job.same_installation(a, b) |> should.equal(True)
+}
+
+pub fn job_same_installation_fallback_still_rejects_differing_oid_test() {
+  let a = job.new_installation(1, "public", None)
+  let b = job.new_installation(2, "public", None)
+  job.same_installation(a, b) |> should.equal(False)
+}
+
+pub fn job_same_installation_fallback_still_rejects_differing_schema_test() {
+  let a = job.new_installation(1, "public", None)
+  let b = job.new_installation(1, "other", None)
+  job.same_installation(a, b) |> should.equal(False)
+}
+
+/// Pure, in-memory coverage of `postgres.validate`'s schema-name rejection
+/// — no PostgreSQL connection involved, since `validate` itself never
+/// acquires one. Covers every condition `ConfigError.InvalidSchema`'s own
+/// doc comment names: empty, over PostgreSQL's 63-*byte* `NAMEDATALEN`
+/// limit (both a 64-byte ASCII name and a multibyte name that crosses 63
+/// bytes at well under 63 *characters*), a NUL byte, the literal `"$user"`
+/// token, and the reserved `pg_` prefix — plus the boundary case (exactly
+/// 63 bytes) that must still be accepted.
+fn schema_settings(schema: String) -> postgres.Settings {
+  postgres.settings("postgres://grind@127.0.0.1:5432/unused")
+  |> postgres.with_schema(schema)
+}
+
+pub fn postgres_schema_rejects_empty_name_test() {
+  schema_settings("")
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidSchema))
+}
+
+pub fn postgres_schema_rejects_64_byte_ascii_name_test() {
+  schema_settings(string.repeat("a", 64))
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidSchema))
+}
+
+pub fn postgres_schema_rejects_multibyte_name_crossing_63_bytes_test() {
+  // "é" is 2 bytes in UTF-8; 32 of them is 64 bytes at only 32 characters —
+  // over PostgreSQL's own byte-counted `NAMEDATALEN` limit despite looking
+  // short by character count.
+  schema_settings(string.repeat("é", 32))
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidSchema))
+}
+
+pub fn postgres_schema_rejects_nul_byte_test() {
+  schema_settings("bad\u{0}name")
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidSchema))
+}
+
+pub fn postgres_schema_accepts_exactly_63_bytes_test() {
+  case schema_settings(string.repeat("a", 63)) |> postgres.validate {
+    Ok(_) -> Nil
+    Error(_) -> should.fail()
+  }
+}
+
+pub fn postgres_schema_rejects_dollar_user_test() {
+  schema_settings("$user")
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidSchema))
+}
+
+pub fn postgres_schema_rejects_pg_prefix_test() {
+  schema_settings("pg_temp")
+  |> postgres.validate
+  |> should.equal(Error(postgres.InvalidSchema))
 }
 
 type RawInput {
