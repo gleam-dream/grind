@@ -546,7 +546,63 @@ every file's statements, marker version, and filename version stay
 byte-for-byte in lockstep with `migrations()`, and that every released file
 (every one but the newest, which may still be under active development)
 has a pinned sha256 that matches — so the two can never silently drift
-apart.
+apart. A separate, real-database test proves the two mechanisms actually
+_interoperate_, not merely that the files match: cigogne itself applies
+every file to a fresh schema, `postgres.migrate` against the result is a
+genuine no-op (`read_schema_generation` accepts it as a fully up-to-date
+install, never `IncompatibleSchema`/`UnsupportedSchemaVersion`), the
+cigogne-applied schema is fully functional for ordinary submit/claim/ack
+traffic, cigogne's own down-then-up of `grind_v12` round-trips, and a
+concurrent `postgres.migrate` caller genuinely queues behind cigogne's own
+held advisory lock and then no-ops once cigogne commits — see
+`docs/RECOVERY-EVIDENCE.md`, Increment 34.
+
+Driving cigogne from Gleam (rather than its CLI) needs no extra runtime
+dependency — `cigogne` is already a dev-dependency (used by
+`grind_migrations_conformance_test` above) — and can share a `Database`'s
+own connection instead of opening a second pool against `DATABASE_URL`/
+`PGHOST` separately:
+
+```gleam
+import cigogne
+import cigogne/config
+
+let assert Ok(base_config) = config.get("grind")
+let cigogne_config =
+  config.Config(
+    ..base_config,
+    database: config.ConnectionDbConfig(postgres.connection(database)),
+  )
+let assert Ok(engine) = cigogne.create_engine(cigogne_config)
+let assert Ok(Nil) = cigogne.apply_all(engine)
+```
+
+`config.get("grind")` reads the real, published `priv/cigogne.toml`
+(`migrations.migration_folder`, `"migrations"`), so this differs from the
+default config only in _how_ it connects — `postgres.connection`'s own
+`pog.Connection` is a pool handle just like the one every raw-SQL helper in
+this codebase's own test suite already passes around, so cigogne and the
+rest of the application genuinely share one pool.
+
+Cigogne keeps its own migration-tracking table (`priv/cigogne.toml`'s
+`[migration-table]` section — `schema`/`table`, defaulting to
+`public`/`_migrations`), entirely independent bookkeeping from
+`grind_schema_migrations`: cigogne's own `applied`/`unapplied` computation
+never reads Grind's marker table, only its own. An application that also
+uses `postgres.with_schema` to put Grind's own tables in a non-`public`
+schema gets that placement automatically for cigogne's _DDL_ too — the
+shared connection's `search_path`, which Grind's own `postgres.validate`
+pins to exactly the configured schema, is what every unqualified
+`CREATE TABLE`/`ALTER TABLE` in `priv/migrations/*.sql` resolves against —
+but cigogne's own _tracking table_ location is a separate decision the
+application must make explicitly (`priv/cigogne.toml`'s
+`[migration-table] schema = "..."`, or the equivalent
+`config.MigrationTableConfig` override): left at the default, every Grind
+schema on one database would share the same `public._migrations` table,
+which is fine for a single schema but ambiguous once more than one
+`postgres.with_schema` install shares a database — point `migration-table`
+at the same schema `with_schema` names, or a schema dedicated to migration
+bookkeeping, to keep it unambiguous.
 
 Each step's transaction also sets a constant, transaction-local
 `lock_timeout` (2000ms) right after acquiring its own advisory lock — a

@@ -6975,3 +6975,176 @@ aborts" premise did not reproduce in this environment (see item 1 above);
 the script-local `MIX_HOME`/`HEX_HOME`/`MIX_REBAR3` fix is applied anyway,
 since it is strictly more correct and isolated regardless of which Mix
 behavior a given CI runner exhibits.
+
+## Increment 34 — end-to-end cigogne interop, and a genuine upgrade-boundary lost-reply `reconcile_unique` (docs/RELEASE-READINESS.md, "Migration gaps"; docs/RISKS.md risk 16)
+
+**Context.** Two narrow interaction gaps remained between two
+already-separately-tested mechanisms: (1) no test proved cigogne itself
+applying `priv/migrations/*.sql` against a real database, with
+`postgres.migrate` then a genuine no-op against that same database and the
+two mechanisms' shared advisory lock genuinely serializing a concurrent
+caller of the other one; (2) the upgrade harness had no test of a genuine
+lost reply during `reconcile_unique` specifically spanning a schema
+upgrade, as opposed to the general lost-reply evidence proven elsewhere
+against a stable, already-latest schema. Commit 72fe573 closes both.
+
+### 1. Cigogne applies Grind's files; `migrate` is then a no-op
+
+`cigogne_applies_grind_files_then_migrate_is_noop_test`
+(`test/grind_test.gleam`) drives cigogne directly as a Gleam library
+(`cigogne.create_engine`/`apply_all`/`rollback`/`apply`), pointed at the
+`Database`'s own shared pool via `config.ConnectionDbConfig` rather than
+opening a second pool against `DATABASE_URL` — no new runtime dependency,
+`cigogne` stays a dev-dependency exactly as before. Against a fresh schema:
+cigogne applies both real files; `postgres.migrate` against the result
+returns `Ok(Nil)` with the marker count unchanged at 2 (a genuine no-op,
+not merely "no error"); a real worker submits, claims, and runs to
+`Succeeded` against the cigogne-applied schema; and cigogne's own
+`rollback` of `grind_v12` then `apply` of it again round-trips (marker
+count 1 then 2 again), with the earlier job's own `outcome` still readable
+afterward, unaffected by the column churn `ALTER TABLE ... DROP COLUMN`/
+`ADD COLUMN` cycles the round trip causes (see "Not proven" below for why
+this test does not compare a raw catalog digest across the round trip).
+
+**Gate.** `nix develop --command bash scripts/test-postgres.sh`, full run,
+exit `0`: `228 passed` root (`grind_cigogne_e2e`/`grind_cigogne_e2e_fresh`
+databases), `11 passed` consumer, oracle green, Squirrel check green.
+
+### 2. `postgres.migrate` serializes against a concurrent cigogne apply
+
+`cigogne_apply_serializes_with_concurrent_migrate_test`
+(`test/grind_test.gleam`, `grind_cigogne_concurrent` database) applies
+`grind_v11` alone through cigogne first (synchronous, no race — the
+realistic "an application has already been running a while" starting
+point), then races cigogne applying `grind_v12` alone against a concurrent
+`postgres.migrate` caller. Rather than hoping for a favorable scheduler
+race — genuinely racing cigogne (no per-step skip check of its own) against
+`migrate` (which does have one) for the _same_ unapplied step can otherwise
+resolve either way, and the loser landing second on cigogne's own side
+would hit a real duplicate-object error (`docs/RISKS.md` risk 11's own
+documented mixing hazard, not a false alarm) — the test polls `pg_locks`
+for the advisory lock actually being _granted_ to cigogne's own session
+before ever starting `migrate`, making the ordering a proven fact rather
+than a hopeful one: `migrate`, started only after cigogne provably already
+holds the lock, is guaranteed to queue behind cigogne's still-open
+transaction, and once cigogne commits, `migrate`'s own per-step re-read
+sees `grind_v12` already applied and skips it. Both calls return `Ok(Nil)`;
+exactly one marker row exists per version.
+
+**Red (mutation).** Temporarily removed `grind_v12`'s own first `up`
+statement (the `pg_advisory_xact_lock` line) from
+`priv/migrations/20260926000000-grind_v12.sql` — chosen over mutating
+`grind_v11`'s own file because `grind_v11` is applied synchronously, alone,
+before the race even starts in this test, so only `grind_v12`'s own line is
+actually exercised by the race; migrations already merged into one cigogne
+transaction chunk would otherwise share `grind_v11`'s lock statement and
+mask the mutation. `gleam test` (focused, `GRIND_TEST_CIGOGNE_CONCURRENT_URL`
+only) against a disposable local cluster:
+`await_advisory_lock_granted(connection, 250) |> should.equal(True)` failed
+(`False should equal True`) — cigogne, applying the mutated file, never
+takes the lock at all, so the poll never observes a grant. `grind_migrations_conformance_test` also
+failed on the same mutation (an independent, expected side effect of the
+same file edit — the byte-for-byte lockstep check).
+
+**Green.** Reverted via `Edit` (exact prior text restored — `git diff
+--stat` against HEAD showed no change to the file); re-ran the same focused
+`gleam test`: `228 passed, no failures`.
+
+### 3. A genuine lost-reply `reconcile_unique` across the v11→v12 boundary
+
+`postgres_migrate_upgrade_reconcile_unique_lost_reply_test`
+(`test/grind_test.gleam`, `grind_upgrade_lost_reply` database) seeds the
+frozen v11 fixture, then two independent `submit_unique` calls whose
+outcome is genuinely uncertain to the caller:
+
+- **(a) Genuinely committed, reply lost** — the same deferred-constraint
+  `synchronous_commit` trigger `run_unique_committed_reply_lost_store_unavailable_test`
+  already uses (Increment 11), scoped to this submission id: the admission
+  transaction's own `COMMIT` parks in `SyncRep` (no standby will ever
+  connect — `synchronous_standby_names = grind_never_standby`), and closing
+  the pool while it is parked there leaves it genuinely mid-flight.
+  `submit_unique` returns `Error(CommitUnknown(pending))`. The orphaned
+  backend is explicitly terminated and confirmed gone (PostgreSQL's own
+  SyncRep wait does not notice a client disconnect on its own) _before_
+  migrating, since the still-open transaction's own row lock would
+  otherwise block the migration's `ACCESS EXCLUSIVE` DDL.
+- **(b) Genuinely never reaches PostgreSQL** — the real TCP fault proxy
+  (`test/grind_fault_proxy.erl`, the same mechanism T1-T5 in
+  `test/grind_fault_proxy_test.gleam` use for the acknowledgement path),
+  `OnCommit`/`DropRequest`: the triggering `commit` chunk is never
+  forwarded, so PostgreSQL never attempts it at all.
+
+`postgres.migrate_with(direct_database, migrations.migrations())` then
+upgrades both `PendingSubmission`s' schema out from under them, from v11 to
+v12 (narrowing `grind_unique_submissions`'s primary key from
+`(storage_owner, submission_id)` to `(submission_id)`-only, among other
+changes). `reconcile_unique` against the upgraded schema then resolves
+each correctly: (a) to `Inserted`, with the real job id independently
+confirmed via a raw `grind_jobs` query — not a fabricated one, and not
+another `CommitUnknown`; (b) to `CommitUnknown` again, with zero rows on
+either table — nothing was ever committed, so there is nothing to find on
+either schema.
+
+**A genuine empirical finding, not silently glossed over** (matching this
+codebase's own practice — see Increment 33, "two findings ... rest on
+premises that did not hold empirically"): scenario (a) was originally
+attempted with the TCP fault proxy's `OnCommit`/`DropReply`, exactly the
+mechanism T1 (`test/grind_fault_proxy_test.gleam`) uses for the
+acknowledgement path. It does not work for `submit_unique`. Debugging with
+a live `pg_stat_activity` poll (`state`, `wait_event_type`/`wait_event`,
+`query`) showed the real backend parked on `active`/`Client`/`ClientRead`
+with `query = commit`, continuously, for the full ten seconds polled both
+before and after `submit_unique` itself returned `CommitUnknown` — zero
+rows ever inserted on an independent, unproxied connection. PostgreSQL had
+received the extended-protocol `Parse "commit"` message and was waiting to
+read the client's next protocol message (`Bind`); pog's own connection
+process never sends it once that `Parse` reply is swallowed, so the
+transaction never reaches `Execute` at all and stays open until Grind's own
+client-side deadline force-closes the socket, which cascades through the
+proxy to closing its upstream connection too — PostgreSQL rolls the whole
+transaction back on the disconnect, never a genuine commit. This is a
+property of _this_ transaction shape (`pin_read_committed`, `set_lock_timeout`,
+an advisory-lock acquisition, a candidate `SELECT`, and two `INSERT`s, all
+before ever reaching `commit`), not a flaw in the proxy or in T1-T5, whose
+own shorter, single-`UPDATE` acknowledgement transaction is timed
+differently and which document their own non-determinism (sometimes a
+transparent recovery, sometimes `QueueAckUnknown`) rather than a guaranteed
+commit either. Recorded in the test's own doc comment; scenario (a) uses
+the SyncRep-trigger technique instead, and (b) still uses the real TCP
+proxy.
+
+**Red (mutation).** Temporarily changed `sql.gleam`'s generated
+`find_receipt` query from
+`... FROM grind_unique_submissions WHERE submission_id = $1` to `... AND
+false` (simulating "break the receipt lookup" — a squirrel-generated file
+CLAUDE.md otherwise forbids hand-editing, mutated here only as a
+temporary, immediately-reverted proof). `gleam test` (focused,
+`GRIND_TEST_UPGRADE_LOST_REPLY_URL` only): `let assert Ok(submission.Inserted(committed_handle))
+= postgres.reconcile_unique(direct_database, committed_pending)` failed —
+`Error(CommitUnknown(...))` instead, `227 passed, 1 failures`. Confirms the
+test genuinely depends on the receipt lookup finding the real,
+already-committed row after the upgrade, not merely returning early on some
+unrelated success.
+
+**Green.** Reverted via `Edit` (exact prior text restored — `git diff
+--stat` against HEAD showed no change to the file); re-ran the same focused
+`gleam test`: `228 passed, no failures`.
+
+**Gate.** `nix develop --command bash scripts/test-postgres.sh`, full run
+against a fresh disposable cluster, exit `0`: `228 passed` root, `11
+passed` consumer, pinned Oban oracle harness green, Squirrel check green —
+every one of the four new completion markers
+(`cigogne-e2e-migrate-noop-passed`, `cigogne-migrate-concurrent-serialize-passed`,
+`upgrade-reconcile-unique-lost-reply-passed`, and the pre-existing
+`migrate-upgrade-harness-passed`) present. `nix fmt` applied (one file
+reformatted) and re-verified clean. `nix flake check` — `all checks
+passed!`.
+
+**Caveat for an application driving cigogne itself.** Cigogne keeps its own
+migration-tracking bookkeeping (`priv/cigogne.toml`'s `[migration-table]`,
+default `public._migrations`) entirely independent of
+`grind_schema_migrations`; an application using `postgres.with_schema`
+should point `migration-table` at the same (or another dedicated) schema
+explicitly, or every `with_schema` install on one database shares the same
+default tracking table — see README, "Migrations", for the full note and a
+worked `config.ConnectionDbConfig` example.

@@ -52,9 +52,32 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
       same scenario instead block until `migration_deadline_ms` and report
       `MigrationCommitUnknown`). Evidence: `docs/RECOVERY-EVIDENCE.md`,
       Increment 20.
-- [ ] Migration gaps: an end-to-end test that cigogne applies Grind's files
-      and `migrate` is then a no-op; an upgrade-harness `reconcile_unique` on
-      a genuine lost reply.
+- [x] **Migration gaps** (72fe573). `cigogne_applies_grind_files_then_migrate_is_noop_test`:
+      cigogne itself applies `priv/migrations/*.sql` to a fresh schema
+      (sharing the `Database`'s own pool via `config.ConnectionDbConfig`),
+      `postgres.migrate` against the result is a genuine no-op, the
+      cigogne-applied schema submits/claims/acks a real job, and cigogne's
+      own down-then-up of `grind_v12` round-trips.
+      `cigogne_apply_serializes_with_concurrent_migrate_test`:
+      `postgres.migrate`, started only once `pg_locks` confirms cigogne's
+      own session already holds the shared advisory lock, genuinely queues
+      behind it and then no-ops once cigogne commits — both calls succeed.
+      `postgres_migrate_upgrade_reconcile_unique_lost_reply_test`: a
+      `submit_unique` against the frozen v11 fixture whose outcome is
+      genuinely uncertain (one committed via the SyncRep-trigger technique,
+      one never-committed via the real TCP fault proxy's own
+      `OnCommit`/`DropRequest`) survives `migrate_with` to v12, and
+      `reconcile_unique` against the upgraded schema resolves each
+      correctly. Mutation-proven (dropping `grind_v12`'s own advisory-lock
+      line, and breaking the generated receipt-lookup SQL, each turn the
+      relevant test red). A genuine empirical finding surfaced while
+      building this, documented rather than glossed over: the TCP fault
+      proxy's `OnCommit`/`DropReply` does not produce a genuine commit for
+      `submit_unique` specifically (its admission transaction reliably
+      parks on `wait_event = Client/ClientRead` and rolls back instead),
+      unlike the shorter acknowledgement transaction T1-T5
+      (`test/grind_fault_proxy_test.gleam`) exercise — see that test's own
+      doc comment and `docs/RECOVERY-EVIDENCE.md`, Increment 34.
 
 ### Defects found while designing the deadline (fix with it)
 

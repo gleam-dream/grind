@@ -769,14 +769,21 @@ impact if a real gap exists (most likely surfaces as a confusing error
 during an upgrade, not silent data loss, since both underlying mechanisms
 are independently proven).
 
-**Current mitigation.** None beyond the two mechanisms' own separate test
-coverage (the conformance test for cigogne-file/`migrations()` lockstep; the
-general `reconcile_unique` lost-reply tests against a stable schema).
+**Current mitigation.** Both gaps closed (72fe573):
+`cigogne_applies_grind_files_then_migrate_is_noop_test` and
+`cigogne_apply_serializes_with_concurrent_migrate_test` prove the full
+round trip (cigogne applies, `migrate` no-ops, both succeed when racing the
+shared advisory lock); `postgres_migrate_upgrade_reconcile_unique_lost_reply_test`
+proves a genuine lost-reply `reconcile_unique` specifically across the v11→v12
+boundary. See `test/grind_test.gleam` and `docs/RECOVERY-EVIDENCE.md`,
+Increment 34, including a documented empirical finding (the TCP fault
+proxy's `OnCommit`/`DropReply` does not produce a genuine commit for
+`submit_unique` specifically, unlike the acknowledgement path).
 
-**Evidence.** Named explicitly as open in `docs/RELEASE-READINESS.md`
-("1. Contract decisions", "Migration gaps").
+**Evidence.** `docs/RELEASE-READINESS.md` ("1. Contract decisions",
+"Migration gaps"); `docs/RECOVERY-EVIDENCE.md`, Increment 34.
 
-**Status.** Open.
+**Status.** Closed.
 
 ---
 
