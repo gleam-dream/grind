@@ -2,6 +2,7 @@ import cigogne
 import cigogne/config
 import cigogne/migration
 import exception
+import fault_proxy
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
@@ -239,6 +240,263 @@ fn marker_insert_version(statement: String) -> Option(Int) {
         Ok(#(digits, _)) -> int.parse(string.trim(digits)) |> option.from_result
       }
   }
+}
+
+// -- Cigogne end-to-end (docs/RELEASE-READINESS.md, "Migration gaps") ------
+//
+// Grind ships `priv/migrations/*.sql` (cigogne format) as a mirror for an
+// application that wants to apply Grind's schema through cigogne instead of
+// `postgres.migrate` (see README, "Migrations").
+// `grind_migrations_conformance_test` above already proves the two sources
+// stay byte-for-byte in lockstep with no database — these tests prove the
+// two mechanisms actually *interoperate* against a real PostgreSQL server:
+// cigogne genuinely applies the files, Grind's own `read_schema_generation`
+// (exercised through a follow-up `migrate`) accepts the result and treats it
+// as a no-op, ordinary API traffic works against the cigogne-applied
+// schema, cigogne's own down-then-up of `grind_v12` round-trips, and the two
+// mechanisms' shared advisory lock genuinely serializes a concurrent caller
+// of the other one.
+
+@external(erlang, "grind_test_env", "cigogne_e2e_url")
+fn cigogne_e2e_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "cigogne_e2e_fresh_url")
+fn cigogne_e2e_fresh_url() -> Result(String, Nil)
+
+@external(erlang, "grind_test_env", "cigogne_concurrent_url")
+fn cigogne_concurrent_url() -> Result(String, Nil)
+
+/// Builds the `cigogne.Config` for Grind's own package — reading the real
+/// `priv/cigogne.toml` via `config.get`, exactly like
+/// `grind_migrations_conformance_test` — pointed at `connection` instead of
+/// opening a second pool of its own: a plain `pog.Connection` is already
+/// shareable (every raw-SQL helper in this suite passes one around the same
+/// way), so cigogne and the `postgres.Database` under test genuinely share
+/// one pool rather than each managing an independent connection to the same
+/// server. This is also the shape an application would use to run cigogne
+/// against a `Database` it already started with `postgres.connection`,
+/// rather than pointing cigogne at `DATABASE_URL`/`PGHOST` etc. separately
+/// (see README, "Migrations").
+fn cigogne_config_for(connection: pog.Connection) -> config.Config {
+  let assert Ok(base) = config.get("grind")
+  config.Config(..base, database: config.ConnectionDbConfig(connection))
+}
+
+fn schema_marker_count(connection: pog.Connection) -> Result(Int, Nil) {
+  pog.query("SELECT count(*)::bigint FROM grind_schema_migrations")
+  |> pog.returning({
+    use count <- decode.field(0, decode.int)
+    decode.success(count)
+  })
+  |> pog.execute(on: connection)
+  |> result.map_error(fn(_) { Nil })
+  |> result.try(fn(returned) {
+    case returned.rows {
+      [count] -> Ok(count)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// Cigogne itself applies every file under `priv/migrations/` to a fresh
+/// schema, Grind accepts the result (a follow-up `migrate` is a genuine
+/// no-op, never `IncompatibleSchema`/`UnsupportedSchemaVersion`), the
+/// cigogne-applied schema is fully functional for ordinary API traffic, its
+/// catalog shape matches a fresh `postgres.migrate_with` install of the same
+/// steps exactly, and cigogne's own down-then-up of `grind_v12` round-trips.
+pub fn cigogne_applies_grind_files_then_migrate_is_noop_test() {
+  case cigogne_e2e_url(), cigogne_e2e_fresh_url() {
+    Ok(e2e_url), Ok(fresh_url) -> run_cigogne_e2e_test(e2e_url, fresh_url)
+    _, _ -> Nil
+  }
+}
+
+fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
+  let assert Ok(validated) = postgres.settings(e2e_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let connection = postgres.connection(database)
+
+  // 1. Cigogne itself applies every file under `priv/migrations/` — real
+  // DDL, through cigogne's own public engine, not Grind's `migrate`.
+  let cigogne_config = cigogne_config_for(connection)
+  let assert Ok(engine) = cigogne.create_engine(cigogne_config)
+  cigogne.get_unapplied_migrations(engine) |> list.length |> should.equal(2)
+  let assert Ok(Nil) = cigogne.apply_all(engine)
+
+  // 2. Grind accepts the result: `read_schema_generation` (exercised via
+  // `migrate`'s own version read) recognizes the schema as a legitimate,
+  // fully up-to-date v12 install rather than `IncompatibleSchema`/
+  // `UnsupportedSchemaVersion` — and running `migrate` against it is a
+  // genuine no-op: no new marker rows, `Ok(Nil)` with zero steps run.
+  let assert Ok(marker_count_before) = schema_marker_count(connection)
+  marker_count_before |> should.equal(2)
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(marker_count_after) = schema_marker_count(connection)
+  marker_count_after |> should.equal(2)
+
+  // 3. Fully functional for ordinary API traffic: submit, claim, and run a
+  // job to completion against the cigogne-applied schema.
+  let assert Ok(input_codec) =
+    worker.codec("cigogne-e2e-input-v1", json.int, decode.int)
+  let assert Ok(output_codec) =
+    worker.codec("cigogne-e2e-output-v1", json.string, decode.string)
+  let assert Ok(definition) =
+    worker.define(
+      "cigogne.e2e-worker",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok("cigogne-" <> int.to_string(value)) },
+    )
+  let assert Ok(workers) = registry.new("cigogne-e2e")
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle) =
+    postgres.submit(database, "cigogne-e2e", definition, 9)
+  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
+  use <- exception.defer(fn() {
+    let _ = queue.stop(consumer)
+    Nil
+  })
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.SucceededWith("cigogne-9")))
+
+  // 4. Catalog shape matches a fresh `postgres.migrate_with` install of the
+  // exact same steps — cigogne's own real DDL execution produced the exact
+  // same schema `migrate` itself would have, not merely "a schema that
+  // happens to pass validation".
+  let assert Ok(fresh_validated) =
+    postgres.settings(fresh_url) |> postgres.validate
+  let assert Ok(fresh_database) = postgres.start(fresh_validated)
+  use <- exception.defer(fn() { postgres.close(fresh_database) })
+  let assert Ok(Nil) = postgres.migrate(fresh_database)
+  grind_catalog_digest(connection)
+  |> should.equal(grind_catalog_digest(postgres.connection(fresh_database)))
+
+  // 5. Cigogne's own down migration of v12, then up again, round-trips: the
+  // schema returns to a fully valid, functional v12 install again, and the
+  // job seeded above survives (v12's own down section only drops
+  // columns/constraints/indexes it itself added, never a whole table — see
+  // README, "Migrations", on `grind_v11`'s own down section being the
+  // destructive one, not v12's). Deliberately *not* a raw catalog-digest
+  // comparison against the fresh install here — a genuine, inherent
+  // PostgreSQL property, not a Grind defect, makes that comparison the
+  // wrong check: dropping and re-adding a column never reuses its old
+  // `ordinal_position` (`pg_attribute.attnum` only ever increases), so a
+  // schema that has been through a real down/up cycle ends up with
+  // different (higher) column numbers for `storage_owner`/`finished_at`
+  // than a schema that never dropped them at all, even though every column,
+  // constraint, index, and default is otherwise identical. `migrate` being
+  // a genuine no-op again below is the right proof instead: it re-runs
+  // `read_schema_generation`'s own shape check (existence-based, not
+  // ordinal-position-based) against the round-tripped schema and would
+  // report `IncompatibleSchema`/`MigrationShapeMismatch` were anything
+  // actually missing.
+  let assert Ok(engine_at_v12) = cigogne.create_engine(cigogne_config)
+  let assert Ok(Nil) = cigogne.rollback(engine_at_v12)
+  let assert Ok(marker_after_rollback) = schema_marker_count(connection)
+  marker_after_rollback |> should.equal(1)
+  let assert Ok(engine_at_v11) = cigogne.create_engine(cigogne_config)
+  let assert Ok(Nil) = cigogne.apply(engine_at_v11)
+  let assert Ok(marker_after_reapply) = schema_marker_count(connection)
+  marker_after_reapply |> should.equal(2)
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(marker_after_migrate_noop) = schema_marker_count(connection)
+  marker_after_migrate_noop |> should.equal(2)
+  postgres.outcome(database, handle)
+  |> should.equal(Ok(job.SucceededWith("cigogne-9")))
+
+  mark_database_test_executed("cigogne-e2e-migrate-noop-passed")
+}
+
+fn await_advisory_lock_granted(
+  connection: pog.Connection,
+  checks_remaining: Int,
+) -> Bool {
+  let granted =
+    pog.query(
+      "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted",
+    )
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+    |> pog.execute(on: connection)
+    |> result.map_error(fn(_) { Nil })
+    |> result.try(fn(returned) {
+      case returned.rows {
+        [count] -> Ok(count)
+        _ -> Error(Nil)
+      }
+    })
+  case granted {
+    Ok(count) if count >= 1 -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          await_advisory_lock_granted(connection, checks_remaining - 1)
+        }
+        False -> False
+      }
+  }
+}
+
+/// Cigogne applies `grind_v11` alone first (synchronously, no race — this is
+/// the realistic "an app has already been running a while" starting point,
+/// not a from-scratch install), then races cigogne applying `grind_v12`
+/// alone against a concurrent `postgres.migrate` caller. `grind_v12`'s own
+/// file begins with the identical advisory-lock statement `migrate` itself
+/// runs (`migrations.advisory_lock_statement()`) — this test only starts
+/// `migrate` once it has *proven*, by polling `pg_locks`, that cigogne's own
+/// session already holds that lock (not merely raced for it), so the
+/// ordering below is a proven fact, not a hopeful race: `migrate` is
+/// guaranteed to queue behind cigogne's still-open transaction, and once
+/// cigogne commits, `migrate`'s own per-step re-read sees `grind_v12`
+/// already applied and skips it — both calls return `Ok(Nil)`, and exactly
+/// one marker row exists per version, never a duplicate-object error from
+/// either side.
+pub fn cigogne_apply_serializes_with_concurrent_migrate_test() {
+  case cigogne_concurrent_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_cigogne_concurrent_test(database_url)
+  }
+}
+
+fn run_cigogne_concurrent_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let connection = postgres.connection(database)
+
+  let assert Ok(engine_v11) =
+    cigogne.create_engine(cigogne_config_for(connection))
+  let assert Ok(Nil) = cigogne.apply(engine_v11)
+  let assert Ok(marker_after_v11) = schema_marker_count(connection)
+  marker_after_v11 |> should.equal(1)
+
+  let engine_v12 = cigogne.create_engine(cigogne_config_for(connection))
+  let assert Ok(engine_v12) = engine_v12
+  cigogne.get_unapplied_migrations(engine_v12)
+  |> list.length
+  |> should.equal(1)
+
+  let cigogne_result = process.new_subject()
+  spawn_submit(cigogne_result, fn() { cigogne.apply(engine_v12) })
+
+  await_advisory_lock_granted(connection, 250) |> should.equal(True)
+
+  let migrate_result = process.new_subject()
+  spawn_submit(migrate_result, fn() { postgres.migrate(database) })
+
+  process.receive(cigogne_result, within: 10_000) |> should.equal(Ok(Ok(Nil)))
+  process.receive(migrate_result, within: 10_000) |> should.equal(Ok(Ok(Nil)))
+
+  let assert Ok(marker_count) = schema_marker_count(connection)
+  marker_count |> should.equal(2)
+  mark_database_test_executed("cigogne-migrate-concurrent-serialize-passed")
 }
 
 pub type LookupFailure {
@@ -4125,6 +4383,305 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
   receipt.business_failure_cause |> should.equal(None)
 
   mark_database_test_executed("migrate-upgrade-harness-passed")
+}
+
+@external(erlang, "grind_test_env", "upgrade_lost_reply_url")
+fn upgrade_lost_reply_url() -> Result(String, Nil)
+
+/// Starts a real TCP fault proxy (`test/grind_fault_proxy.erl`, bound
+/// through `fault_proxy.gleam` — the same mechanism
+/// `test/grind_fault_proxy_test.gleam`'s T1-T5 use for the acknowledgement
+/// path) in front of `base_url`'s real host/port, and returns the handle
+/// plus a database URL pointing at the proxy, at `database`, instead of the
+/// real cluster.
+fn start_lost_reply_proxy(
+  base_url: String,
+  database: String,
+) -> #(fault_proxy.Proxy, String) {
+  let assert Ok(config) =
+    pog.url_config(process.new_name("grind_upgrade_lost_reply_proxy"), base_url)
+  let assert Ok(#(proxy, proxy_port)) =
+    fault_proxy.start(config.host, config.port)
+  let url =
+    "postgres://"
+    <> config.user
+    <> "@127.0.0.1:"
+    <> int.to_string(proxy_port)
+    <> "/"
+    <> database
+    <> "?sslmode=disable"
+  #(proxy, url)
+}
+
+/// Polls (bounded) until no other backend on this database is sitting
+/// `idle in transaction` — used before migrating, so a just-recovered fault
+/// scenario's own transaction (rolled back or about to be, but not
+/// necessarily processed by PostgreSQL yet at the instant the client itself
+/// gave up waiting) cannot still be holding a lock the migration's own DDL
+/// would block on.
+fn wait_for_no_idle_in_transaction(
+  connection: pog.Connection,
+  checks_remaining: Int,
+) -> Bool {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'idle in transaction'",
+    )
+    |> pog.returning({
+      use count <- decode.field(0, decode.int)
+      decode.success(count)
+    })
+    |> pog.execute(on: connection)
+  case returned.rows {
+    [0] -> True
+    _ ->
+      case checks_remaining > 0 {
+        True -> {
+          process.sleep(20)
+          wait_for_no_idle_in_transaction(connection, checks_remaining - 1)
+        }
+        False -> False
+      }
+  }
+}
+
+fn job_id_for_queue(
+  connection: pog.Connection,
+  queue: String,
+) -> Result(Int, Nil) {
+  pog.query("SELECT id FROM grind_jobs WHERE queue = $1")
+  |> pog.parameter(pog.text(queue))
+  |> pog.returning({
+    use id <- decode.field(0, decode.int)
+    decode.success(id)
+  })
+  |> pog.execute(on: connection)
+  |> result.map_error(fn(_) { Nil })
+  |> result.try(fn(returned) {
+    case returned.rows {
+      [id] -> Ok(id)
+      _ -> Error(Nil)
+    }
+  })
+}
+
+/// The genuine lost-reply gap named in `docs/RELEASE-READINESS.md`
+/// ("Migration gaps"): every other `reconcile_unique` lost-reply test in
+/// this file proves the mechanism against a stable, already-latest schema.
+/// This one proves it survives a real schema upgrade landing *between* the
+/// lost reply and the reconciliation call — the exact interaction a caller
+/// retrying across a deploy window would hit.
+///
+/// Two independent submissions are seeded against the frozen v11 fixture:
+///
+/// (a) Genuinely committed, reply lost — the same deferred-constraint
+/// `synchronous_commit` trigger `run_unique_committed_reply_lost_store_unavailable_test`
+/// uses (Increment 11), not the TCP fault proxy: **empirically, the TCP
+/// proxy's `OnCommit`/`DropReply` does not produce this half for
+/// `submit_unique`.** Traced with `pg_stat_activity` while debugging this
+/// test: the admission transaction's own final `commit` reliably parks the
+/// real backend in `wait_event = 'Client'/'ClientRead'` — PostgreSQL
+/// received the extended-protocol `Parse "commit"` message and is waiting
+/// for the client's next protocol message (`Bind`), which pog's own
+/// connection process never sends once the `Parse` reply is swallowed — so
+/// the transaction never actually reaches `Execute`/commits at all; it
+/// stays open until Grind's own deadline force-closes the client socket,
+/// which cascades through the proxy to closing its upstream socket too,
+/// and PostgreSQL rolls the whole thing back on the disconnect. Confirmed
+/// with zero rows ever appearing on an independent, unproxied connection
+/// across ten seconds of polling, both before and after `submit_unique`
+/// itself returned. This is a genuine, reproducible finding about this
+/// specific transaction shape, not a flaw in the proxy or in T1-T5
+/// (`test/grind_fault_proxy_test.gleam`), which exercise a shorter,
+/// differently-timed transaction (a single acknowledgement `UPDATE`) and
+/// document their own non-determinism (sometimes a transparent recovery,
+/// sometimes `QueueAckUnknown`) rather than a guaranteed commit either.
+/// Documented here rather than silently worked around, matching this
+/// codebase's own practice (see `docs/RECOVERY-EVIDENCE.md`, Increment 33,
+/// "two findings ... rest on premises that did not hold empirically").
+///
+/// (b) Genuinely never reaches PostgreSQL — the real TCP fault proxy
+/// (`test/grind_fault_proxy.erl`, the same mechanism
+/// `test/grind_fault_proxy_test.gleam`'s T1-T5 use for the acknowledgement
+/// path), `OnCommit`/`DropRequest`: the triggering `commit` chunk is never
+/// forwarded, so PostgreSQL never even attempts it — reliable and
+/// deterministic, unlike (a) above, since there is no partially-completed
+/// protocol exchange to get stuck on.
+///
+/// `migrate_with` then upgrades the schema from v11 to v12 — narrowing
+/// `grind_unique_submissions`'s own primary key from
+/// `(storage_owner, submission_id)` to `(submission_id)`-only, among other
+/// changes — while both `PendingSubmission`s are still outstanding,
+/// unreconciled. `reconcile_unique` against the *upgraded* schema then
+/// resolves each correctly: (a) to `Inserted`, with the real job id, not
+/// another `CommitUnknown`; (b) to `CommitUnknown` again — nothing was ever
+/// committed, so there is nothing to find on either schema, never a false
+/// positive.
+pub fn postgres_migrate_upgrade_reconcile_unique_lost_reply_test() {
+  case upgrade_lost_reply_url() {
+    Error(Nil) -> Nil
+    Ok(direct_url) -> run_upgrade_reconcile_unique_lost_reply_test(direct_url)
+  }
+}
+
+fn run_upgrade_reconcile_unique_lost_reply_test(direct_url: String) -> Nil {
+  let assert Ok(direct_validated) =
+    postgres.settings(direct_url) |> postgres.validate
+  let assert Ok(direct_database) = postgres.start(direct_validated)
+  use <- exception.defer(fn() { postgres.close(direct_database) })
+  let direct_connection = postgres.connection(direct_database)
+  require_syncrep_cluster_configured(direct_connection)
+  apply_sql_statements(
+    direct_connection,
+    read_sql_statements_from_file("test/fixtures/schema/v11.sql"),
+  )
+  // Same test-only convenience `run_upgrade_harness_test` uses: today's
+  // application code never writes `storage_owner` at all (see README,
+  // "Isolation"), so `submit_unique`'s own `INSERT` below would otherwise
+  // fail `23502 not_null_violation` against this exact pre-migration column
+  // shape.
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_jobs ALTER COLUMN storage_owner SET DEFAULT 'upgrade-lost-reply-owner'",
+    )
+    |> pog.execute(on: direct_connection)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE grind_unique_submissions ALTER COLUMN storage_owner SET DEFAULT 'upgrade-lost-reply-owner'",
+    )
+    |> pog.execute(on: direct_connection)
+
+  let legacy_worker = legacy_upgrade_worker()
+  let assert Ok(period) =
+    unique.within_milliseconds(3_600_000, unique.FromInsertion)
+  let policy =
+    unique.policy(
+      unique.full_input(),
+      unique.WithinQueue,
+      period,
+      unique.Incomplete,
+    )
+  let direct_database_name = "grind_upgrade_lost_reply"
+
+  // (a) Genuinely committed, reply lost (deferred-constraint SyncRep
+  // trigger; see the module doc comment above for why this half does not
+  // use the TCP fault proxy).
+  let committed_queue = "upgrade-lost-reply-committed"
+  let committed_submission = "upgrade-lost-reply-committed-submission"
+  let cleanup_committed_trigger =
+    install_syncrep_reply_trigger(
+      direct_connection,
+      "grind_test_upgrade_lost_reply_committed",
+      "grind_unique_submissions",
+      "NEW.submission_id = '" <> committed_submission <> "'",
+    )
+  use <- exception.defer(cleanup_committed_trigger)
+
+  let assert Ok(committed_validated) =
+    postgres.settings(direct_url) |> postgres.validate
+  let assert Ok(committed_database) = postgres.start(committed_validated)
+  let committed_reply = process.new_subject()
+  spawn_submit(committed_reply, fn() {
+    submit_keep_existing(
+      committed_database,
+      committed_queue,
+      committed_submission,
+      legacy_worker,
+      21,
+      policy,
+    )
+  })
+  let assert Ok(committed_backend_pid) =
+    wait_for_syncrep_trigger_backend(direct_connection, 300)
+  // The admission transaction reached the database (its own "commit" call
+  // was genuinely mid-flight, parked in SyncRep, when the pool closed) —
+  // genuinely uncertain, not knowably absent.
+  let _ = postgres.close(committed_database)
+  let assert Ok(Error(submission.CommitUnknown(committed_pending))) =
+    process.receive(committed_reply, within: 10_000)
+
+  // The orphaned backend does not go away on its own — PostgreSQL's own
+  // SyncRep wait deliberately does not notice a client disconnect, to avoid
+  // ever partially applying a commit. Terminate and confirm it is gone
+  // *before* migrating: the migration's own DDL needs an `ACCESS EXCLUSIVE`
+  // lock on `grind_unique_submissions`/`grind_jobs`, which this still-open,
+  // still-lock-holding transaction would otherwise block indefinitely.
+  terminate_backend(direct_connection, committed_backend_pid)
+  |> should.equal(True)
+  let assert Ok(Nil) =
+    wait_for_backend_gone(direct_connection, committed_backend_pid, 300)
+
+  // (b) Genuinely never reaches PostgreSQL, via the real TCP fault proxy.
+  let absent_queue = "upgrade-lost-reply-absent"
+  let absent_submission = "upgrade-lost-reply-absent-submission"
+  let #(absent_proxy, absent_proxy_url) =
+    start_lost_reply_proxy(direct_url, direct_database_name)
+  let assert Ok(absent_validated) =
+    postgres.settings(absent_proxy_url)
+    |> postgres.with_pool_size(1)
+    |> postgres.validate
+  let assert Ok(absent_database) = postgres.start(absent_validated)
+  use <- exception.defer(fn() { postgres.close(absent_database) })
+  let absent_notify = process.new_subject()
+  fault_proxy.arm(
+    absent_proxy,
+    fault_proxy.Armed(fault_proxy.OnCommit, fault_proxy.DropRequest),
+    absent_notify,
+  )
+  let absent_reply = process.new_subject()
+  spawn_submit(absent_reply, fn() {
+    submit_keep_existing(
+      absent_database,
+      absent_queue,
+      absent_submission,
+      legacy_worker,
+      22,
+      policy,
+    )
+  })
+  let assert Ok(fault_proxy.CommitSeen(_, _)) =
+    process.receive(absent_notify, within: 5000)
+  let assert Ok(Error(submission.CommitUnknown(absent_pending))) =
+    process.receive(absent_reply, within: 10_000)
+  fault_proxy.stop(absent_proxy)
+
+  // Independent confirmation, on the direct (unproxied) connection, of what
+  // actually happened before ever migrating: (a) committed one real job and
+  // receipt, (b) committed nothing.
+  count_jobs_in_queue(direct_connection, committed_queue) |> should.equal(1)
+  unique_receipt_exists(direct_connection, committed_submission)
+  |> should.equal(True)
+  count_jobs_in_queue(direct_connection, absent_queue) |> should.equal(0)
+  unique_receipt_exists(direct_connection, absent_submission)
+  |> should.equal(False)
+
+  // No lingering `idle in transaction` backend (from either half above, or
+  // (b)'s own client-disconnect-triggered rollback still settling) could
+  // block the migration's own DDL below.
+  wait_for_no_idle_in_transaction(direct_connection, 250) |> should.equal(True)
+
+  // The migration boundary: both `PendingSubmission`s are still outstanding
+  // when the schema moves from v11 to v12.
+  postgres.migrate_with(direct_database, migrations.migrations())
+  |> should.equal(Ok(Nil))
+
+  // (a) resolves correctly post-upgrade: found and committed, with the real
+  // job id — not a fabricated one, and not another `CommitUnknown`.
+  let assert Ok(submission.Inserted(committed_handle)) =
+    postgres.reconcile_unique(direct_database, committed_pending)
+  let assert Ok(real_job_id) =
+    job_id_for_queue(direct_connection, committed_queue)
+  job.id_value(committed_handle) |> should.equal(real_job_id)
+  postgres.arguments(direct_database, committed_handle)
+  |> should.equal(Ok(21))
+
+  // (b) still correctly reports `CommitUnknown` post-upgrade — nothing was
+  // ever committed, so there is nothing to find, on either schema.
+  postgres.reconcile_unique(direct_database, absent_pending)
+  |> should.equal(Error(submission.CommitUnknown(absent_pending)))
+  count_jobs_in_queue(direct_connection, absent_queue) |> should.equal(0)
+
+  mark_database_test_executed("upgrade-reconcile-unique-lost-reply-passed")
 }
 
 /// Automated (not merely manual/psql) proof of `v12_statements`'s own
