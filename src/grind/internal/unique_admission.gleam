@@ -47,7 +47,7 @@ type PolicyPart {
 /// always an insert (or a replayed receipt) — see the module doc comment.
 type Request(input, output, error) {
   Request(
-    storage_owner: String,
+    installation: job.Installation,
     submission_id: submission.SubmissionId,
     queue: String,
     worker: Worker(input, output, error),
@@ -82,7 +82,7 @@ pub type Commit(input, output, error) {
 /// any resource.
 pub fn submit(
   connection: pog.Connection,
-  storage_owner: String,
+  installation: job.Installation,
   lock_wait_ms: Int,
   queue: String,
   submission_id: submission.SubmissionId,
@@ -103,7 +103,7 @@ pub fn submit(
       run(
         connection,
         build_request(
-          storage_owner,
+          installation,
           submission_id,
           queue,
           worker_def,
@@ -137,7 +137,7 @@ pub fn submit(
 /// justification.
 pub fn submit_plain(
   connection: pog.Connection,
-  storage_owner: String,
+  installation: job.Installation,
   lock_wait_ms: Int,
   queue: String,
   submission_id: submission.SubmissionId,
@@ -154,7 +154,7 @@ pub fn submit_plain(
       run(
         connection,
         build_request(
-          storage_owner,
+          installation,
           submission_id,
           queue,
           worker_def,
@@ -196,7 +196,7 @@ pub fn reconcile(
 /// returns `Some(PolicyPart)` for `submit`'s uniqueness case or `None` for
 /// `submit_plain`'s "no policy" case.
 fn build_request(
-  storage_owner: String,
+  installation: job.Installation,
   submission_id: submission.SubmissionId,
   queue: String,
   worker_def: Worker(input, output, error),
@@ -216,7 +216,7 @@ fn build_request(
   let policy = build_policy(input_version, encoded_input)
   let request =
     Request(
-      storage_owner:,
+      installation:,
       submission_id:,
       queue:,
       worker: worker_def,
@@ -314,7 +314,7 @@ fn pending_submission(
   request: Request(input, output, error),
 ) -> submission.PendingSubmission(input, output, error) {
   submission.new_pending_submission(
-    request.storage_owner,
+    request.installation,
     request.submission_id,
     request.worker,
     request.request_sha256,
@@ -372,13 +372,13 @@ fn reconcile_from_receipt(
   #(submission.Admission(input, output, error), job.State),
   submission.SubmitError(input, output, error),
 ) {
-  let storage_owner = submission.pending_submission_storage_owner(pending)
   let worker_def = submission.pending_submission_worker(pending)
   let request_sha256 = submission.pending_submission_request_sha256(pending)
+  let installation = submission.pending_submission_installation(pending)
   case
     find_receipt(
       connection,
-      storage_owner,
+      installation,
       submission.submission_id_value(submission.pending_submission_id(pending)),
       worker_def,
       request_sha256,
@@ -401,6 +401,16 @@ fn reconcile_from_receipt(
     // lookup) means the check itself could not run, which is exactly what
     // `CommitUnknown` documents.
     Error(submission.SubmissionConflict) -> Error(submission.SubmissionConflict)
+    // Never actually produced by `find_receipt`/`classify_query_error` —
+    // `postgres.reconcile_unique` already gates on this before ever calling
+    // into this module (see that function's own doc comment) — but
+    // `submission.SubmitError` is a shared type, so this match must still be
+    // exhaustive. Passed through unchanged rather than folded into
+    // `CommitUnknown`: were this ever reached some other way, misreporting a
+    // wrong-installation handle as merely uncertain would be actively
+    // misleading.
+    Error(submission.HandleFromAnotherInstallation) ->
+      Error(submission.HandleFromAnotherInstallation)
     Error(submission.AdmissionContended)
     | Error(submission.NotCommitted(_))
     | Error(submission.EmptyQueueName)
@@ -464,7 +474,7 @@ fn admission_transaction(
     Some(policy_part) ->
       acquire_lock(
         connection,
-        request.storage_owner,
+        job.installation_schema(request.installation),
         request.worker_id,
         request.worker_version,
         policy_part,
@@ -473,7 +483,7 @@ fn admission_transaction(
   })
   use existing <- result.try(find_receipt(
     connection,
-    request.storage_owner,
+    request.installation,
     submission.submission_id_value(request.submission_id),
     request.worker,
     request.request_sha256,
@@ -519,19 +529,35 @@ fn set_lock_timeout(
 }
 
 /// The domain-wide advisory lock key; see `docs/UNIQUENESS-CONTRACT.md`,
-/// admission transaction step 3. `first_parameter` is the storage owner's
-/// position; worker id, version, key contract, and key JSON follow it.
+/// admission transaction step 3. The configured schema (`postgres.Settings.schema`,
+/// see `postgres.with_schema`) is bound as an ordinary parameter — never
+/// `current_schema()` spliced into the SQL text — so two schemas, now the
+/// whole unit of isolation (see "Isolation" in `README.md`), never share a
+/// lock even though nothing else in this key is schema-specific. Binding the
+/// configured schema deliberately, rather than asking PostgreSQL to resolve
+/// `current_schema()` itself, is what makes this key immune to the `$user`
+/// `search_path`-fallback hazard: `current_schema()` reports the *first*
+/// schema in `search_path` that exists, which need not be the schema
+/// `grind_jobs` actually lives in whenever `search_path` names more than
+/// one schema and the one this pool is meant to use is not first (or was
+/// created after that first entry). `postgres.validate` pins `search_path`
+/// to exactly this one configured schema for every pooled connection, so in
+/// ordinary operation the two already agree by construction — this bound
+/// parameter is the belt to that suspenders, correct even if a future change
+/// ever widened `search_path` again. `first_parameter` is the worker id's
+/// own position, with worker version, key contract, and key JSON following
+/// it, and the schema bound one position before it.
 pub fn lock_key_sql(first_parameter: Int) -> String {
-  "hashtextextended(jsonb_build_array('grind-unique-v1', current_schema(), "
+  "hashtextextended(jsonb_build_array('grind-unique-v1', "
+  <> sql_parameter(first_parameter - 1, "text")
+  <> ", "
   <> sql_parameter(first_parameter, "text")
   <> ", "
   <> sql_parameter(first_parameter + 1, "text")
   <> ", "
   <> sql_parameter(first_parameter + 2, "text")
-  <> ", "
-  <> sql_parameter(first_parameter + 3, "text")
   <> ", encode("
-  <> key_digest_sql(first_parameter + 4)
+  <> key_digest_sql(first_parameter + 3)
   <> ", 'hex'))::text, 0)"
 }
 
@@ -542,8 +568,10 @@ pub fn lock_key_sql(first_parameter: Int) -> String {
 /// re-encode it by hand; `pg_advisory_xact_lock` itself returns `void`,
 /// which `pg_types` cannot decode (see `docs/UNIQUENESS-CONTRACT.md`'s
 /// PostgreSQL driver note), hence the `SELECT true FROM (...)` wrapping.
+/// `schema` is the configured schema (see `lock_key_sql`'s own doc comment
+/// for why it is bound here rather than resolved server-side).
 pub fn lock_query(
-  storage_owner: String,
+  schema: String,
   worker_id: String,
   worker_version: String,
   key_contract: String,
@@ -551,10 +579,10 @@ pub fn lock_query(
 ) -> pog.Query(Bool) {
   pog.query(
     "SELECT true FROM (SELECT pg_advisory_xact_lock("
-    <> lock_key_sql(1)
+    <> lock_key_sql(2)
     <> ")) AS grind_unique_lock",
   )
-  |> pog.parameter(pog.text(storage_owner))
+  |> pog.parameter(pog.text(schema))
   |> pog.parameter(pog.text(worker_id))
   |> pog.parameter(pog.text(worker_version))
   |> pog.parameter(pog.text(key_contract))
@@ -567,14 +595,14 @@ pub fn lock_query(
 
 fn acquire_lock(
   connection: pog.Connection,
-  storage_owner: String,
+  schema: String,
   worker_id: String,
   worker_version: String,
   policy_part: PolicyPart,
 ) -> Result(Nil, submission.SubmitError(input, output, error)) {
   let query =
     lock_query(
-      storage_owner,
+      schema,
       worker_id,
       worker_version,
       policy_part.key_contract,
@@ -628,7 +656,7 @@ pub fn period_predicate(
 /// `SubmissionConflict`.
 fn find_receipt(
   connection: pog.Connection,
-  storage_owner: String,
+  installation: job.Installation,
   submission_id_value: String,
   worker_def: Worker(input, output, error),
   request_sha256: BitArray,
@@ -638,7 +666,7 @@ fn find_receipt(
 ) {
   use returned <- result.try(
     store.call_safely(connection, fn(connection) {
-      sql.find_receipt(connection, storage_owner, submission_id_value)
+      sql.find_receipt(connection, submission_id_value)
     })
     |> result.map_error(classify_query_error),
   )
@@ -648,7 +676,7 @@ fn find_receipt(
       case row.request_sha256 == request_sha256 {
         False -> Error(submission.SubmissionConflict)
         True ->
-          case outcome_of_receipt(worker_def, storage_owner, row) {
+          case outcome_of_receipt(installation, worker_def, row) {
             Ok(outcome_with_state) -> Ok(Some(outcome_with_state))
             Error(Nil) -> Error(submission.SubmissionConflict)
           }
@@ -658,15 +686,14 @@ fn find_receipt(
 }
 
 fn outcome_of_receipt(
+  installation: job.Installation,
   worker_def: Worker(input, output, error),
-  storage_owner: String,
   row: sql.FindReceiptRow,
 ) -> Result(#(submission.Admission(input, output, error), job.State), Nil) {
   use state <- result.try(job.state_of_stored(row.observed_state))
   let conflict =
     submission.new_conflict(
       row.job_id,
-      storage_owner,
       row.job_queue,
       row.worker_id,
       row.worker_version,
@@ -677,7 +704,7 @@ fn outcome_of_receipt(
       Ok(#(
         submission.Inserted(job.new_handle(
           row.job_id,
-          storage_owner,
+          installation,
           row.job_queue,
           worker_def,
         )),
@@ -782,12 +809,12 @@ fn candidate_sql(
   is_reschedule: Bool,
 ) -> String {
   let base =
-    "SELECT id, queue, state, (extract(epoch FROM available_at) * 1000000)::bigint FROM grind_jobs WHERE storage_owner = $1 AND worker_id = $2 AND worker_version = $3 AND unique_key_contract = $4 AND unique_key_sha256 = "
-    <> key_digest_sql(5)
-    <> " AND state = ANY($6::text[])"
+    "SELECT id, queue, state, (extract(epoch FROM available_at) * 1000000)::bigint FROM grind_jobs WHERE worker_id = $1 AND worker_version = $2 AND unique_key_contract = $3 AND unique_key_sha256 = "
+    <> key_digest_sql(4)
+    <> " AND state = ANY($5::text[])"
   let #(scoped, next) = case scope {
-    unique.WithinQueue -> #(base <> " AND queue = $7", 8)
-    unique.AcrossQueues -> #(base, 7)
+    unique.WithinQueue -> #(base <> " AND queue = $6", 7)
+    unique.AcrossQueues -> #(base, 6)
   }
   let with_period = case period {
     unique.Unbounded -> scoped
@@ -810,7 +837,6 @@ fn candidate_sql(
 
 fn bind_candidate_params(
   query: pog.Query(a),
-  storage_owner: String,
   worker_id: String,
   worker_version: String,
   queue: String,
@@ -821,7 +847,6 @@ fn bind_candidate_params(
 ) -> pog.Query(a) {
   let base =
     query
-    |> pog.parameter(pog.text(storage_owner))
     |> pog.parameter(pog.text(worker_id))
     |> pog.parameter(pog.text(worker_version))
     |> pog.parameter(pog.text(policy_part.key_contract))
@@ -855,7 +880,6 @@ fn find_candidate(
   let query =
     pog.query(sql)
     |> bind_candidate_params(
-      request.storage_owner,
       request.worker_id,
       request.worker_version,
       request.queue,
@@ -916,7 +940,6 @@ fn admitted_available_at(state: job.State, ms: Int) -> Option(Int) {
 /// from `submitted_queue` under `AcrossQueues` (column `job_queue`).
 type ReceiptWrite {
   ReceiptWrite(
-    storage_owner: String,
     submission_id: submission.SubmissionId,
     submitted_queue: String,
     worker_id: String,
@@ -935,14 +958,15 @@ type ReceiptWrite {
 /// both `submit`'s policy-bearing requests and `submit_plain`'s "no policy"
 /// requests — the receipt table itself carries no key material either way,
 /// only the fields every request shape already has: the identity needed to
-/// look this receipt back up (`storage_owner`/`submission_id`), enough to
-/// detect a mismatched retry (`request_sha256`), and the outcome to record.
+/// look this receipt back up (`submission_id`, unique on its own now that
+/// one schema is one installation — see "Isolation" in `README.md`), enough
+/// to detect a mismatched retry (`request_sha256`), and the outcome to
+/// record.
 fn record_receipt(
   connection: pog.Connection,
   write: ReceiptWrite,
 ) -> Result(Nil, submission.SubmitError(input, output, error)) {
   let ReceiptWrite(
-    storage_owner:,
     submission_id:,
     submitted_queue:,
     worker_id:,
@@ -957,13 +981,12 @@ fn record_receipt(
   ) = write
   let query =
     pog.query(
-      "INSERT INTO grind_unique_submissions (storage_owner, submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state, rescheduled_from, rescheduled_to) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, "
-      <> to_timestamptz_sql(11, "1000.0")
+      "INSERT INTO grind_unique_submissions (submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state, rescheduled_from, rescheduled_to) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, "
+      <> to_timestamptz_sql(10, "1000.0")
       <> ", "
-      <> to_timestamptz_sql(12, "1000.0")
+      <> to_timestamptz_sql(11, "1000.0")
       <> ")",
     )
-    |> pog.parameter(pog.text(storage_owner))
     |> pog.parameter(pog.text(submission.submission_id_value(submission_id)))
     |> pog.parameter(pog.text(submitted_queue))
     |> pog.parameter(pog.text(worker_id))
@@ -1006,17 +1029,17 @@ fn insert_job(
     None -> pog.null()
   }
   let base_columns =
-    "storage_owner, queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at"
+    "queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at"
   let base_values =
-    "$1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10, "
-    <> to_timestamptz_sql(11, "1000.0")
+    "$1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, "
+    <> to_timestamptz_sql(10, "1000.0")
     <> ", "
-    <> to_timestamptz_sql(12, "1000000.0")
+    <> to_timestamptz_sql(11, "1000000.0")
   let #(columns, values, key_params) = case policy_part {
     None -> #(base_columns, base_values, [])
     Some(PolicyPart(key_contract:, encoded_key:, ..)) -> #(
       base_columns <> ", unique_key_contract, unique_key_sha256",
-      base_values <> ", $13, " <> key_digest_sql(14),
+      base_values <> ", $12, " <> key_digest_sql(13),
       [pog.text(key_contract), pog.text(encoded_key)],
     )
   }
@@ -1028,7 +1051,6 @@ fn insert_job(
       <> values
       <> ") RETURNING id",
     )
-    |> pog.parameter(pog.text(request.storage_owner))
     |> pog.parameter(pog.text(request.queue))
     |> pog.parameter(pog.text(request.worker_id))
     |> pog.parameter(pog.text(request.worker_version))
@@ -1052,7 +1074,6 @@ fn insert_job(
   use _ <- result.try(record_receipt(
     connection,
     ReceiptWrite(
-      storage_owner: request.storage_owner,
       submission_id: request.submission_id,
       submitted_queue: request.queue,
       worker_id: request.worker_id,
@@ -1069,7 +1090,7 @@ fn insert_job(
   Ok(Commit(
     outcome: submission.Inserted(job.new_handle(
       job_id,
-      request.storage_owner,
+      request.installation,
       request.queue,
       request.worker,
     )),
@@ -1094,16 +1115,10 @@ fn decide_conflict(
   case policy_part.on_conflict, candidate.state {
     unique.RescheduleScheduledTo(at), "scheduled" -> {
       let new_ms = job.available_at_unix_milliseconds(at)
-      use _ <- result.try(reschedule_job(
-        connection,
-        request.storage_owner,
-        candidate.id,
-        new_ms,
-      ))
+      use _ <- result.try(reschedule_job(connection, candidate.id, new_ms))
       use _ <- result.try(record_receipt(
         connection,
         ReceiptWrite(
-          storage_owner: request.storage_owner,
           submission_id: request.submission_id,
           submitted_queue: request.queue,
           worker_id: request.worker_id,
@@ -1120,7 +1135,6 @@ fn decide_conflict(
       Ok(Commit(
         outcome: submission.Rescheduled(submission.new_conflict(
           candidate.id,
-          request.storage_owner,
           candidate.queue,
           request.worker_id,
           request.worker_version,
@@ -1139,7 +1153,6 @@ fn decide_conflict(
       use _ <- result.try(record_receipt(
         connection,
         ReceiptWrite(
-          storage_owner: request.storage_owner,
           submission_id: request.submission_id,
           submitted_queue: request.queue,
           worker_id: request.worker_id,
@@ -1156,7 +1169,6 @@ fn decide_conflict(
       Ok(Commit(
         outcome: submission.Existing(submission.new_conflict(
           candidate.id,
-          request.storage_owner,
           candidate.queue,
           request.worker_id,
           request.worker_version,
@@ -1175,13 +1187,12 @@ fn decide_conflict(
 
 fn reschedule_job(
   connection: pog.Connection,
-  storage_owner: String,
   job_id: Int,
   new_ms: Int,
 ) -> Result(Nil, submission.SubmitError(input, output, error)) {
   use _ <- result.try(
     store.call_safely(connection, fn(connection) {
-      sql.reschedule_job(connection, new_ms, job_id, storage_owner)
+      sql.reschedule_job(connection, new_ms, job_id)
     })
     |> result.map_error(classify_query_error),
   )

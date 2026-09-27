@@ -32,7 +32,6 @@ pub type ArgumentsRow {
   ArgumentsRow(
     input: String,
     input_version: String,
-    storage_owner: String,
     queue: String,
     worker_id: String,
     worker_version: String,
@@ -52,21 +51,19 @@ pub fn arguments(
   let decoder = {
     use input <- decode.field(0, decode.string)
     use input_version <- decode.field(1, decode.string)
-    use storage_owner <- decode.field(2, decode.string)
-    use queue <- decode.field(3, decode.string)
-    use worker_id <- decode.field(4, decode.string)
-    use worker_version <- decode.field(5, decode.string)
+    use queue <- decode.field(2, decode.string)
+    use worker_id <- decode.field(3, decode.string)
+    use worker_version <- decode.field(4, decode.string)
     decode.success(ArgumentsRow(
       input:,
       input_version:,
-      storage_owner:,
       queue:,
       worker_id:,
       worker_version:,
     ))
   }
 
-  "SELECT input::text, input_version, storage_owner, queue, worker_id, worker_version FROM grind_jobs WHERE id = $1
+  "SELECT input::text, input_version, queue, worker_id, worker_version FROM grind_jobs WHERE id = $1
 "
   |> pog.query
   |> pog.parameter(pog.int(id))
@@ -100,7 +97,6 @@ pub type BindHandleRow {
 pub fn bind_handle(
   db: pog.Connection,
   id: Int,
-  storage_owner: String,
 ) -> Result(pog.Returned(BindHandleRow), pog.QueryError) {
   let decoder = {
     use queue <- decode.field(0, decode.string)
@@ -119,11 +115,10 @@ pub fn bind_handle(
     ))
   }
 
-  "SELECT queue, worker_id, worker_version, input_version, output_version, error_version FROM grind_jobs WHERE id = $1 AND storage_owner = $2
+  "SELECT queue, worker_id, worker_version, input_version, output_version, error_version FROM grind_jobs WHERE id = $1
 "
   |> pog.query
   |> pog.parameter(pog.int(id))
-  |> pog.parameter(pog.text(storage_owner))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -202,7 +197,6 @@ pub fn cancel_executing(
 ///
 pub type CancelLockRow {
   CancelLockRow(
-    storage_owner: String,
     queue: String,
     worker_id: String,
     worker_version: String,
@@ -221,21 +215,14 @@ pub fn cancel_lock(
   id: Int,
 ) -> Result(pog.Returned(CancelLockRow), pog.QueryError) {
   let decoder = {
-    use storage_owner <- decode.field(0, decode.string)
-    use queue <- decode.field(1, decode.string)
-    use worker_id <- decode.field(2, decode.string)
-    use worker_version <- decode.field(3, decode.string)
-    use state <- decode.field(4, decode.string)
-    decode.success(CancelLockRow(
-      storage_owner:,
-      queue:,
-      worker_id:,
-      worker_version:,
-      state:,
-    ))
+    use queue <- decode.field(0, decode.string)
+    use worker_id <- decode.field(1, decode.string)
+    use worker_version <- decode.field(2, decode.string)
+    use state <- decode.field(3, decode.string)
+    decode.success(CancelLockRow(queue:, worker_id:, worker_version:, state:))
   }
 
-  "SELECT storage_owner, queue, worker_id, worker_version, state FROM grind_jobs WHERE id = $1 FOR NO KEY UPDATE
+  "SELECT queue, worker_id, worker_version, state FROM grind_jobs WHERE id = $1 FOR NO KEY UPDATE
 "
   |> pog.query
   |> pog.parameter(pog.int(id))
@@ -269,7 +256,6 @@ pub type FindReceiptRow {
 ///
 pub fn find_receipt(
   db: pog.Connection,
-  storage_owner: String,
   submission_id: String,
 ) -> Result(pog.Returned(FindReceiptRow), pog.QueryError) {
   let decoder = {
@@ -291,10 +277,9 @@ pub fn find_receipt(
     ))
   }
 
-  "SELECT decision, job_id, job_queue, observed_state, worker_id, worker_version, request_sha256 FROM grind_unique_submissions WHERE storage_owner = $1 AND submission_id = $2
+  "SELECT decision, job_id, job_queue, observed_state, worker_id, worker_version, request_sha256 FROM grind_unique_submissions WHERE submission_id = $1
 "
   |> pog.query
-  |> pog.parameter(pog.text(storage_owner))
   |> pog.parameter(pog.text(submission_id))
   |> pog.returning(decoder)
   |> pog.execute(db)
@@ -308,7 +293,6 @@ pub fn find_receipt(
 ///
 pub type OutcomeRow {
   OutcomeRow(
-    storage_owner: String,
     queue: String,
     worker_id: String,
     worker_version: String,
@@ -333,19 +317,17 @@ pub fn outcome(
   id: Int,
 ) -> Result(pog.Returned(OutcomeRow), pog.QueryError) {
   let decoder = {
-    use storage_owner <- decode.field(0, decode.string)
-    use queue <- decode.field(1, decode.string)
-    use worker_id <- decode.field(2, decode.string)
-    use worker_version <- decode.field(3, decode.string)
-    use state <- decode.field(4, decode.string)
-    use output <- decode.field(5, decode.optional(decode.string))
-    use output_version <- decode.field(6, decode.string)
-    use error <- decode.field(7, decode.optional(decode.string))
-    use error_version <- decode.field(8, decode.optional(decode.string))
-    use failure_description <- decode.field(9, decode.optional(decode.string))
-    use failure_cause <- decode.field(10, decode.optional(decode.string))
+    use queue <- decode.field(0, decode.string)
+    use worker_id <- decode.field(1, decode.string)
+    use worker_version <- decode.field(2, decode.string)
+    use state <- decode.field(3, decode.string)
+    use output <- decode.field(4, decode.optional(decode.string))
+    use output_version <- decode.field(5, decode.string)
+    use error <- decode.field(6, decode.optional(decode.string))
+    use error_version <- decode.field(7, decode.optional(decode.string))
+    use failure_description <- decode.field(8, decode.optional(decode.string))
+    use failure_cause <- decode.field(9, decode.optional(decode.string))
     decode.success(OutcomeRow(
-      storage_owner:,
       queue:,
       worker_id:,
       worker_version:,
@@ -359,7 +341,7 @@ pub fn outcome(
     ))
   }
 
-  "SELECT storage_owner, queue, worker_id, worker_version, state, output, output_version, error, error_version, failure_description, failure_cause FROM grind_jobs WHERE id = $1
+  "SELECT queue, worker_id, worker_version, state, output, output_version, error, error_version, failure_description, failure_cause FROM grind_jobs WHERE id = $1
 "
   |> pog.query
   |> pog.parameter(pog.int(id))
@@ -403,21 +385,19 @@ pub type PruneFinishedRow {
 ///
 pub fn prune_finished(
   db: pog.Connection,
-  storage_owner: String,
+  arg_1: Int,
   arg_2: Int,
-  arg_3: Int,
 ) -> Result(pog.Returned(PruneFinishedRow), pog.QueryError) {
   let decoder = {
     use count <- decode.field(0, decode.int)
     decode.success(PruneFinishedRow(count:))
   }
 
-  "WITH doomed AS (SELECT id FROM grind_jobs WHERE storage_owner = $1 AND finished_at IS NOT NULL AND state IN ('succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'discarded', 'cancelled') AND finished_at < statement_timestamp() - ($2::bigint::double precision * interval '1 millisecond') ORDER BY finished_at, id LIMIT $3 FOR UPDATE SKIP LOCKED), deleted AS (DELETE FROM grind_jobs x USING doomed d WHERE x.id = d.id RETURNING 1) SELECT count(*) FROM deleted
+  "WITH doomed AS (SELECT id FROM grind_jobs WHERE finished_at IS NOT NULL AND state IN ('succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'discarded', 'cancelled') AND finished_at < statement_timestamp() - ($1::bigint::double precision * interval '1 millisecond') ORDER BY finished_at, id LIMIT $2 FOR UPDATE SKIP LOCKED), deleted AS (DELETE FROM grind_jobs x USING doomed d WHERE x.id = d.id RETURNING 1) SELECT count(*) FROM deleted
 "
   |> pog.query
-  |> pog.parameter(pog.text(storage_owner))
+  |> pog.parameter(pog.int(arg_1))
   |> pog.parameter(pog.int(arg_2))
-  |> pog.parameter(pog.int(arg_3))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -430,7 +410,6 @@ pub fn prune_finished(
 ///
 pub type ReconcileAcknowledgementRow {
   ReconcileAcknowledgementRow(
-    storage_owner: String,
     queue: String,
     job_id: Int,
     worker_id: String,
@@ -451,22 +430,19 @@ pub type ReconcileAcknowledgementRow {
 ///
 pub fn reconcile_acknowledgement(
   db: pog.Connection,
-  storage_owner: String,
   command_id: String,
 ) -> Result(pog.Returned(ReconcileAcknowledgementRow), pog.QueryError) {
   let decoder = {
-    use storage_owner <- decode.field(0, decode.string)
-    use queue <- decode.field(1, decode.string)
-    use job_id <- decode.field(2, decode.int)
-    use worker_id <- decode.field(3, decode.string)
-    use worker_version <- decode.field(4, decode.string)
-    use attempt_id <- decode.field(5, decode.int)
-    use attempt_epoch <- decode.field(6, decode.int)
-    use committed_state <- decode.field(7, decode.string)
-    use failure_cause <- decode.field(8, decode.optional(decode.string))
-    use committed_at_unix_ms <- decode.field(9, decode.int)
+    use queue <- decode.field(0, decode.string)
+    use job_id <- decode.field(1, decode.int)
+    use worker_id <- decode.field(2, decode.string)
+    use worker_version <- decode.field(3, decode.string)
+    use attempt_id <- decode.field(4, decode.int)
+    use attempt_epoch <- decode.field(5, decode.int)
+    use committed_state <- decode.field(6, decode.string)
+    use failure_cause <- decode.field(7, decode.optional(decode.string))
+    use committed_at_unix_ms <- decode.field(8, decode.int)
     decode.success(ReconcileAcknowledgementRow(
-      storage_owner:,
       queue:,
       job_id:,
       worker_id:,
@@ -479,10 +455,9 @@ pub fn reconcile_acknowledgement(
     ))
   }
 
-  "SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, committed_state, failure_cause, (extract(epoch FROM committed_at) * 1000)::bigint AS committed_at_unix_ms FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2
+  "SELECT queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, committed_state, failure_cause, (extract(epoch FROM committed_at) * 1000)::bigint AS committed_at_unix_ms FROM grind_job_acknowledgements WHERE command_id = $1
 "
   |> pog.query
-  |> pog.parameter(pog.text(storage_owner))
   |> pog.parameter(pog.text(command_id))
   |> pog.returning(decoder)
   |> pog.execute(db)
@@ -507,28 +482,26 @@ pub type ReleaseUnstartedClaimRow {
 pub fn release_unstarted_claim(
   db: pog.Connection,
   id: Int,
-  storage_owner: String,
   queue: String,
   attempt_id: Int,
   attempt_epoch: Int,
   attempt_owner: String,
-  arg_7: String,
+  arg_6: String,
 ) -> Result(pog.Returned(ReleaseUnstartedClaimRow), pog.QueryError) {
   let decoder = {
     use id <- decode.field(0, decode.int)
     decode.success(ReleaseUnstartedClaimRow(id:))
   }
 
-  "UPDATE grind_jobs SET state = $7, attempt_epoch = attempt_epoch + 1, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0) WHERE id = $1 AND storage_owner = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 RETURNING id
+  "UPDATE grind_jobs SET state = $6, attempt_epoch = attempt_epoch + 1, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0) WHERE id = $1 AND queue = $2 AND state = 'executing' AND attempt_id = $3 AND attempt_epoch = $4 AND attempt_owner = $5 RETURNING id
 "
   |> pog.query
   |> pog.parameter(pog.int(id))
-  |> pog.parameter(pog.text(storage_owner))
   |> pog.parameter(pog.text(queue))
   |> pog.parameter(pog.int(attempt_id))
   |> pog.parameter(pog.int(attempt_epoch))
   |> pog.parameter(pog.text(attempt_owner))
-  |> pog.parameter(pog.text(arg_7))
+  |> pog.parameter(pog.text(arg_6))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -543,16 +516,14 @@ pub fn reschedule_job(
   db: pog.Connection,
   arg_1: Int,
   id: Int,
-  storage_owner: String,
 ) -> Result(pog.Returned(Nil), pog.QueryError) {
   let decoder = decode.map(decode.dynamic, fn(_) { Nil })
 
-  "UPDATE grind_jobs SET available_at = to_timestamp($1::bigint::double precision / 1000.0) WHERE id = $2 AND storage_owner = $3 AND state = 'scheduled'
+  "UPDATE grind_jobs SET available_at = to_timestamp($1::bigint::double precision / 1000.0) WHERE id = $2 AND state = 'scheduled'
 "
   |> pog.query
   |> pog.parameter(pog.int(arg_1))
   |> pog.parameter(pog.int(id))
-  |> pog.parameter(pog.text(storage_owner))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }
@@ -629,7 +600,6 @@ pub fn set_lock_timeout(
 ///
 pub type StateRow {
   StateRow(
-    storage_owner: String,
     queue: String,
     worker_id: String,
     worker_version: String,
@@ -648,21 +618,14 @@ pub fn state(
   id: Int,
 ) -> Result(pog.Returned(StateRow), pog.QueryError) {
   let decoder = {
-    use storage_owner <- decode.field(0, decode.string)
-    use queue <- decode.field(1, decode.string)
-    use worker_id <- decode.field(2, decode.string)
-    use worker_version <- decode.field(3, decode.string)
-    use state <- decode.field(4, decode.string)
-    decode.success(StateRow(
-      storage_owner:,
-      queue:,
-      worker_id:,
-      worker_version:,
-      state:,
-    ))
+    use queue <- decode.field(0, decode.string)
+    use worker_id <- decode.field(1, decode.string)
+    use worker_version <- decode.field(2, decode.string)
+    use state <- decode.field(3, decode.string)
+    decode.success(StateRow(queue:, worker_id:, worker_version:, state:))
   }
 
-  "SELECT storage_owner, queue, worker_id, worker_version, state FROM grind_jobs WHERE id = $1
+  "SELECT queue, worker_id, worker_version, state FROM grind_jobs WHERE id = $1
 "
   |> pog.query
   |> pog.parameter(pog.int(id))

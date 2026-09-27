@@ -1,11 +1,94 @@
 import gleam/option.{type Option, None, Some}
 import grind/worker.{type BusinessFailureCause, type Codec, type Worker}
 
+/// A cheap, in-memory-only, never-persisted identity for one `Database`
+/// value's own installation: the physical database (by OID, not by
+/// whatever host/port/DNS name reached it — see `postgres.start`'s own doc
+/// comment), the configured schema (`postgres.with_schema`), and — when
+/// readable — the enclosing PostgreSQL *cluster*'s own
+/// `pg_control_system().system_identifier` (a value generated once at
+/// `initdb` time, effectively unique per cluster). The cluster identifier
+/// exists to disambiguate two *different* clusters that happen to assign
+/// the identical low OID to their own first user database (a very common
+/// case: a fresh cluster's first created database is conventionally OID
+/// 16384) while both also default to schema `"public"` — without it, two
+/// such clusters' tokens would be indistinguishable from one shared
+/// installation. `pg_control_system()` is a restricted, superuser-adjacent
+/// function in stock PostgreSQL; a role without permission to call it
+/// (an ordinary non-superuser connecting role, the common case for a
+/// least-privilege installation) makes this read fail, silently, at
+/// `postgres.start` — never surfaced as a `StartError`, since this
+/// disambiguation is a best-effort improvement, not something `start`
+/// itself depends on. In that case `same_installation` below falls back to
+/// comparing only the database OID and schema, exactly as before this
+/// field existed: two different physical clusters that collide on OID and
+/// schema can still be indistinguishable to this client-side check when
+/// the cluster identifier could not be read on either side — a residual,
+/// documented gap, not a regression (see `docs/RISKS.md` risk 7). Stamped
+/// onto a `JobHandle`/`PendingSubmission` at mint/bind time so a value
+/// minted against one `Database` can be caught, with a typed error, if it
+/// is later used against a different one — see
+/// `postgres.HandleFromAnotherInstallation` and friends. This is a
+/// client-side sanity check only: the real isolation boundary is the
+/// PostgreSQL schema itself (see README, "Isolation"), which this token
+/// never influences and nothing here is ever written to a row or compared
+/// against one.
+pub opaque type Installation {
+  Installation(
+    database_oid: Int,
+    schema: String,
+    cluster_identifier: Option(Int),
+  )
+}
+
+@internal
+pub fn new_installation(
+  database_oid: Int,
+  schema: String,
+  cluster_identifier: Option(Int),
+) -> Installation {
+  Installation(database_oid:, schema:, cluster_identifier:)
+}
+
+@internal
+pub fn installation_schema(installation: Installation) -> String {
+  let Installation(schema:, ..) = installation
+  schema
+}
+
+/// Whether two `Installation` tokens name the same physical database and
+/// configured schema. When both sides successfully read a cluster
+/// identifier, it must also match — this is what disambiguates two
+/// different clusters that happen to collide on database OID and schema
+/// (see `Installation`'s own doc comment); when either side could not read
+/// one, this falls back to comparing only the database OID and schema,
+/// exactly as it always has. A thin, named wrapper around this fallback
+/// logic (never a plain `==`) so every call site reads as a deliberate
+/// installation check.
+@internal
+pub fn same_installation(a: Installation, b: Installation) -> Bool {
+  let Installation(
+    database_oid: oid_a,
+    schema: schema_a,
+    cluster_identifier: cluster_a,
+  ) = a
+  let Installation(
+    database_oid: oid_b,
+    schema: schema_b,
+    cluster_identifier: cluster_b,
+  ) = b
+  case cluster_a, cluster_b {
+    Some(cluster_a), Some(cluster_b) ->
+      cluster_a == cluster_b && oid_a == oid_b && schema_a == schema_b
+    _, _ -> oid_a == oid_b && schema_a == schema_b
+  }
+}
+
 /// A typed reference to a persisted job. Codecs are retained from its definition.
 pub opaque type JobHandle(input, output, error) {
   JobHandle(
     id: Int,
-    storage_owner: String,
+    installation: Installation,
     queue: String,
     worker_id: String,
     worker_version: String,
@@ -137,7 +220,7 @@ pub fn queue(handle: JobHandle(input, output, error)) -> String {
 @internal
 pub fn new_handle(
   id: Int,
-  storage_owner: String,
+  installation: Installation,
   queue: String,
   worker: Worker(input, output, error),
 ) -> JobHandle(input, output, error) {
@@ -146,7 +229,7 @@ pub fn new_handle(
     metadata
   JobHandle(
     id:,
-    storage_owner:,
+    installation:,
     queue:,
     worker_id:,
     worker_version:,
@@ -160,26 +243,34 @@ pub fn new_handle(
 @internal
 pub fn storage_fields(
   handle: JobHandle(input, output, error),
-) -> #(Int, String, String, String, String, Codec(input)) {
+) -> #(Int, Installation, String, String, String, Codec(input)) {
   let JobHandle(
     id:,
-    storage_owner:,
+    installation:,
     queue:,
     worker_id:,
     worker_version:,
     input:,
     ..,
   ) = handle
-  #(id, storage_owner, queue, worker_id, worker_version, input)
+  #(id, installation, queue, worker_id, worker_version, input)
 }
 
 @internal
 pub fn result_fields(
   handle: JobHandle(input, output, error),
-) -> #(Int, String, String, String, String, Codec(output), Option(Codec(error))) {
+) -> #(
+  Int,
+  Installation,
+  String,
+  String,
+  String,
+  Codec(output),
+  Option(Codec(error)),
+) {
   let JobHandle(
     id:,
-    storage_owner:,
+    installation:,
     queue:,
     worker_id:,
     worker_version:,
@@ -187,7 +278,7 @@ pub fn result_fields(
     error:,
     ..,
   ) = handle
-  #(id, storage_owner, queue, worker_id, worker_version, output, error)
+  #(id, installation, queue, worker_id, worker_version, output, error)
 }
 
 /// Internal identity and persisted codec contract used to resolve an
@@ -195,10 +286,10 @@ pub fn result_fields(
 @internal
 pub fn reconciliation_fields(
   handle: JobHandle(input, output, error),
-) -> #(Int, String, String, String, String, String, Option(String)) {
+) -> #(Int, Installation, String, String, String, String, Option(String)) {
   let JobHandle(
     id:,
-    storage_owner:,
+    installation:,
     queue:,
     worker_id:,
     worker_version:,
@@ -212,7 +303,7 @@ pub fn reconciliation_fields(
   }
   #(
     id,
-    storage_owner,
+    installation,
     queue,
     worker_id,
     worker_version,

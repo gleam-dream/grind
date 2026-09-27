@@ -17,7 +17,7 @@ import grind/job
 import grind/worker.{type Codec}
 
 /// Whether a uniqueness key is scoped to the submitting queue or shared by
-/// every queue in the same storage owner.
+/// every queue in the same schema.
 pub type QueueScope {
   WithinQueue
   AcrossQueues

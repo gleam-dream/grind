@@ -72,7 +72,6 @@ pub fn availability_ms(availability: Availability) -> Option(Int) {
 pub opaque type Conflict {
   Conflict(
     job_id: Int,
-    storage_owner: String,
     queue: String,
     worker_id: String,
     worker_version: String,
@@ -100,13 +99,12 @@ pub fn conflict_state(conflict: Conflict) -> job.State {
 @internal
 pub fn new_conflict(
   job_id: Int,
-  storage_owner: String,
   queue: String,
   worker_id: String,
   worker_version: String,
   state: job.State,
 ) -> Conflict {
-  Conflict(job_id:, storage_owner:, queue:, worker_id:, worker_version:, state:)
+  Conflict(job_id:, queue:, worker_id:, worker_version:, state:)
 }
 
 /// The result of one `submit_unique` or `reconcile_unique` call.
@@ -121,7 +119,7 @@ pub type Admission(input, output, error) {
 /// this same request would have written.
 pub opaque type PendingSubmission(input, output, error) {
   PendingSubmission(
-    storage_owner: String,
+    installation: job.Installation,
     submission_id: SubmissionId,
     worker: Worker(input, output, error),
     request_sha256: BitArray,
@@ -137,20 +135,20 @@ pub fn pending_submission_id(
 
 @internal
 pub fn new_pending_submission(
-  storage_owner: String,
+  installation: job.Installation,
   submission_id: SubmissionId,
   worker: Worker(input, output, error),
   request_sha256: BitArray,
 ) -> PendingSubmission(input, output, error) {
-  PendingSubmission(storage_owner:, submission_id:, worker:, request_sha256:)
+  PendingSubmission(installation:, submission_id:, worker:, request_sha256:)
 }
 
 @internal
-pub fn pending_submission_storage_owner(
+pub fn pending_submission_installation(
   pending: PendingSubmission(input, output, error),
-) -> String {
-  let PendingSubmission(storage_owner:, ..) = pending
-  storage_owner
+) -> job.Installation {
+  let PendingSubmission(installation:, ..) = pending
+  installation
 }
 
 @internal
@@ -233,4 +231,14 @@ pub type SubmitError(input, output, error) {
   /// that identity durably, so a retried request converges on the original
   /// outcome rather than inserting again.
   CommitUnknownWithoutId(pog.QueryError)
+  /// `reconcile_unique` only: this `PendingSubmission` was minted against a
+  /// different `postgres.Database` (a different physical database, or the
+  /// same database under a different configured schema — see
+  /// `postgres.with_schema`) than the one it was just used against. Checked
+  /// before any storage call is made, purely from the two in-memory
+  /// installation tokens — see `grind/job`'s `Installation` type doc comment
+  /// for what this client-side check does and, more importantly, does not
+  /// guarantee (the real isolation boundary is the PostgreSQL schema itself,
+  /// see `README.md`, "Isolation").
+  HandleFromAnotherInstallation
 }

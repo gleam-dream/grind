@@ -108,9 +108,9 @@ pub fn queue_policy_is_checked_before_start_test() {
   |> should.equal(Error(queue.PollIntervalMustBePositive))
 
   queue.default_policy()
-  |> queue.with_maximum_jobs_per_poll(-1)
+  |> queue.with_maximum_batch_jobs(-1)
   |> queue.validate_policy
-  |> should.equal(Error(queue.MaximumJobsPerPollMustBePositive))
+  |> should.equal(Error(queue.MaximumBatchJobsMustBePositive))
 
   queue.default_policy()
   |> queue.with_shutdown_grace(-1)
@@ -129,7 +129,6 @@ fn run_public_consumer_test(url: String) -> Nil {
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_poll_interval(60_000)
-    |> queue.with_maximum_jobs_per_poll(4)
     |> queue.validate_policy
   let assert Ok(settings) =
     postgres.settings(url)
@@ -370,7 +369,6 @@ fn run_effect_crash_uncertainty_test(url: String) -> Nil {
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_poll_interval(20)
-    |> queue.with_maximum_jobs_per_poll(2)
     |> queue.with_maximum_concurrency(2)
     |> queue.with_lease_duration(6100)
     |> queue.validate_policy

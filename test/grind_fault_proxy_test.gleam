@@ -823,7 +823,6 @@ fn run_t3(base_url: String) -> Nil {
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_maximum_concurrency(2)
-    |> queue.with_maximum_jobs_per_poll(2)
     |> queue.with_poll_interval(50)
     |> queue.with_lease_duration(30_000)
     |> queue.validate_policy

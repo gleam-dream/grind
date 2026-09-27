@@ -77,7 +77,7 @@ pub fn quarantine_row_decoder() -> decode.Decoder(
 
 /// Quarantines at most one expired `executing` row in `queue`, run once at
 /// the start of every `attempt.claim_one` (one poll's worth of work).
-/// Scoped only by storage owner and queue — **not** by any registered
+/// Scoped only by queue — **not** by any registered
 /// worker identity or version: an expired lease belonging to a worker
 /// version this consumer no longer registers (after a worker-version bump,
 /// the old version's still-executing row) is quarantined exactly the same
@@ -90,15 +90,14 @@ pub fn quarantine_row_decoder() -> decode.Decoder(
 /// queue at all still leaves that queue's expired rows to the public
 /// `postgres.quarantine_expired`.
 ///
-/// Takes `connection`/`storage_owner`/`forwarder` already extracted from a
-/// `Database` (via `postgres.connection`/`postgres.storage_owner`/
-/// `postgres.forwarder`) rather than the opaque `Database` itself, and
-/// returns the bare `pog.QueryError` rather than a `postgres.QueueRunError`
-/// — this module does not depend on `grind/postgres`, so its caller
-/// (`attempt.claim_one`) wraps the error into `QueueClaimFailed` itself.
+/// Takes `connection`/`forwarder` already extracted from a `Database` (via
+/// `postgres.connection`/`postgres.forwarder`) rather than the opaque
+/// `Database` itself, and returns the bare `pog.QueryError` rather than a
+/// `postgres.QueueRunError` — this module does not depend on
+/// `grind/postgres`, so its caller (`attempt.claim_one`) wraps the error
+/// into `QueueClaimFailed` itself.
 pub fn quarantine_expired_in_queue(
   connection: pog.Connection,
-  storage_owner: String,
   forwarder: Forwarder,
   queue: String,
 ) -> Result(Nil, pog.QueryError) {
@@ -108,13 +107,12 @@ pub fn quarantine_expired_in_queue(
   // same row — see `attempt.claim_registered_job`'s identical reasoning.
   let sql =
     quarantine_update_sql(
-      "SELECT id FROM grind_jobs WHERE storage_owner = $1 AND queue = $2 AND state = 'executing' AND "
+      "SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'executing' AND "
       <> expired_lease_predicate("clock_timestamp()")
       <> " ORDER BY id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1",
     )
   let query =
     pog.query(sql)
-    |> pog.parameter(pog.text(storage_owner))
     |> pog.parameter(pog.text(queue))
     |> pog.returning(quarantine_row_decoder())
   case store.execute_safely(query, on: connection) {

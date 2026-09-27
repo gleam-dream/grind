@@ -5876,3 +5876,760 @@ own orphan-cleanup assertions ride the existing test, adding no new count;
 `postgres_migration_missing_foreign_key_shape_detected_test` is the one new
 test function), 11 passed (consumer), `nix flake check` green, reproduced
 across multiple full runs.
+
+## Increment 26 — automatic polling fills every free slot (docs/RISKS.md risk 6)
+
+**Claim (correctness, red-first)**: automatic-polling throughput used to be
+bounded by `maximum_jobs_per_poll / poll_interval` regardless of
+`maximum_concurrency` — `Poll` reset a per-round claim budget to
+`maximum_jobs_per_poll` (default 1), `fill_automatic_slots` spent it one
+claim at a time, and once it hit zero `continue_if_idle` waited a full
+`poll_interval` even with a backlog still queued. Fixed by removing the
+per-round budget (`ConsumerState.poll_remaining_jobs`) entirely:
+`fill_automatic_slots` now keeps claiming into every free slot until either
+`maximum_concurrency` is reached or a claim finds nothing, and only that
+"found nothing" (or failed, or an unexpected worker exit) outcome routes to
+`continue_if_idle`, which backs off to the next `Poll` timer at the
+configured interval.
+
+Red first, against the pre-fix code at this branch's parent commit
+(`c6ee5cf`, `src/grind/queue.gleam` unmodified): added
+`postgres_automatic_consumer_drains_backlog_without_per_interval_ceiling_test`
+(`test/grind_test.gleam`) — `maximum_concurrency: 10`, a backlog of 50
+near-instant jobs, `poll_interval: 1000`ms — and ran it standalone (a
+disposable single-database Postgres with only
+`GRIND_TEST_QUEUE_DATABASE_URL`/`GRIND_TEST_MARKER` set, not the full
+`scripts/test-postgres.sh` matrix) against the unmodified queue actor:
+
+```
+panic src/gleeunit/should.gleam:10
+test: grind_test.postgres_automatic_consumer_drains_backlog_without_per_interval_ceiling_test
+info:
+5
+should equal
+50
+```
+
+5 of 50 jobs succeeded within the bounded wait (4 poll intervals), matching
+the ceiling's own prediction exactly (one claim at `t = 0, 1000, 2000,
+3000, 4000`ms — five claims, not fifty). All 202 other tests this
+standalone run could reach passed, including the new idle-consumer
+companion test below, confirming the failure is specific to the backlog
+ceiling and not a setup defect.
+
+Green, same test, after the fix: the bounded wait (`4 * poll_interval_ms =
+4000ms`) reaches all 50 `succeeded` rows, and a second, independent
+assertion reads `finished_at` for the whole backlog back from the
+database's own clock (`max(finished_at) - t0`, both timestamps read from
+the same connection, never the test process's local wall clock) and
+requires it stay under `job_count / 2 * poll_interval_ms` (25000ms) — a
+loose bound chosen only to rule out the old ceiling (which would need
+~50000ms for this backlog), not to assert a specific throughput number.
+
+**Companion (behavior-preserving, not red-first)**:
+`postgres_automatic_consumer_waits_full_interval_when_idle_test` proves the
+fix does not turn an idle consumer into a busy loop: after letting an
+automatic consumer with `poll_interval: 700`ms go idle, a job submitted
+mid-interval is still `Queued` at `t_submit + 350`ms (half the interval —
+a busy loop would have claimed it almost immediately) and reaches
+`Succeeded` with `finished_at - t_submit` between 350ms and 1400ms (close
+to, not many multiples of, one interval), both timestamps again read from
+the database's own clock. This test already passed against the pre-fix
+code (the old design never busy-looped; only its per-round _budget_
+throttled unrelated to idleness), so it is committed purely as a
+regression guard for the fix above, not as red-first evidence of its own.
+
+`maximum_jobs_per_poll` was narrowed to `maximum_batch_jobs`
+(`with_maximum_jobs_per_poll` -> `with_maximum_batch_jobs`,
+`PolicyError.MaximumJobsPerPollMustBePositive` ->
+`MaximumBatchJobsMustBePositive`): the field's one remaining, distinct
+meaning is bounding how many jobs one manual `process_available` call
+processes before returning (`run_batch_from`), unrelated to automatic
+polling now that automatic filling depends only on `maximum_concurrency`.
+This is a breaking, pre-release rename — existing automatic-mode tests
+that set the old field purely to work around the per-poll ceiling
+(auto-drain, auto-capacity, free-capacity, fault-proxy T3, and the
+consumer package's `run_public_consumer_test`) simply drop the setting;
+manual-batch tests (`batch-partial`, `batch-policy`) move to
+`with_maximum_batch_jobs`.
+
+Gate: `scripts/test-postgres.sh` green (203 passed root — the 201 from
+Increment 25 plus the two new tests above — 11 passed consumer, pinned
+Oban oracle harness green, Squirrel check green), `gleam check` green for
+both `grind` and `consumer/`, `nix fmt` (one file reformatted, re-verified
+green), `nix flake check` green, `git diff --check` clean. Committed at
+`ac1b20d`.
+
+## Increment 27 — storage owner identifies the database, not the URL (docs/RISKS.md risk 7)
+
+**Privilege check (done before writing any code, per the design question this
+increment had to answer)**: whether `pg_control_system()` needs superuser or
+`pg_read_all_settings`, which would have forced a Grind-owned identity row
+(and a v12 migration change) instead. Verified empirically against a real
+disposable PostgreSQL 16.15 cluster: created an ordinary role granted only
+`CONNECT` on the database (no other grant), and `SELECT
+(pg_control_system()).system_identifier` succeeded identically for that role
+and for the bootstrap superuser. No migration is needed; `storage_owner_identity.sql`
+(new, Squirrel-generated) reads `pg_control_system()`'s `system_identifier`
+plus `current_database()`/`current_schema()` with no `FROM` clause at all.
+
+**Claim (correctness, red-first)**: `storage_owner` was `"<host>:<port>/
+<database>"`, parsed from the connection URL by `validate` before any
+connection existed — two pools reaching the same physical database through
+different endpoints got different, mutually invisible owners. Fixed by
+moving resolution into `start`, after connecting: `resolve_storage_owner`
+reads the database's own identity (or uses an explicit
+`with_storage_owner` override, with no query) instead.
+
+Red first, against the pre-fix code at this branch (the parent commit,
+`ac1b20d`, `src/grind/postgres.gleam` unmodified — the new
+`with_storage_owner`/`StorageOwnerMustNotBeEmpty` surface does not exist yet
+in that code, so only the convergence test, which uses exclusively
+pre-existing public API, could run against it; the override test was
+temporarily removed from the file for this one run and restored
+immediately after). Ran standalone (a disposable single-database Postgres
+with only `GRIND_TEST_DATABASE_URL`/`GRIND_TEST_MARKER` set):
+
+```
+panic src/gleeunit/should.gleam:10
+test: grind_test.postgres_storage_owner_converges_across_different_endpoints_test
+info:
+"127.0.0.1:28347/grind_test"
+should equal
+"localhost:28347/grind_test"
+```
+
+Exactly the predicted shape: two pools reaching the identical database via
+`127.0.0.1` and `localhost` (both resolving to the same disposable cluster)
+got two different, URL-derived owner strings. All 203 other reachable tests
+in that standalone run passed, confirming the failure is specific to this
+claim.
+
+Green, same test, after the fix: `postgres.storage_owner(database_a) ==
+postgres.storage_owner(database_b)`, and a job submitted through
+`database_a` is read back through `database_b` via `postgres.state` with no
+`StorageOwnerMismatch` — the identity call now returns the same
+`system_identifier`/`current_database()`/`current_schema()` triple
+regardless of which host string reached it.
+
+**Companion (new surface, not red-first)**:
+`postgres_storage_owner_override_is_explicit_and_validated_test` covers
+`with_storage_owner` itself — `validate` rejects an empty override with
+`StorageOwnerMustNotBeEmpty`, and a non-empty override is used verbatim as
+the resolved `storage_owner`, with no database query at all. This is new
+public API with no pre-fix equivalent, so it is committed purely as
+coverage for the surface, not as red-first evidence.
+
+**Checked, not changed**: every `grind_fault_proxy_test.gleam` scenario that
+starts a second `Database` against the same underlying cluster (T2, T3, both
+naming their second value `observer`) only ever reads that second value's
+raw `pog.Connection` (`postgres.connection(observer)`) for direct SQL —
+never a typed, owner-checked call (`postgres.state`, `bind_handle`, ...)
+against it. None of them depended on the old URL-derived owner divergence
+between the direct endpoint and the proxy's own port, so none needed any
+change for this fix.
+
+Gate: `scripts/test-postgres.sh` green (205 passed root — the 203 from
+Increment 26 plus the two new tests above — 11 passed consumer, pinned Oban
+oracle harness green, Squirrel check green, including the new
+`storage_owner_identity` query), `gleam check` green for both `grind` and
+`consumer/`, `nix fmt` (one file reformatted, re-verified green), `nix
+flake check` green, `git diff --check` clean. Committed at `fc9454e`.
+
+## Increment 28 — automatic filling yields to the mailbox one claim at a time (docs/RISKS.md risks 4 and 5)
+
+**Claim (correctness, red-first)**: `fill_automatic_slots` used to recurse
+directly through `start_attempt`/`continue_after_start` from inside one
+`Poll` (or `AttemptReturned`) message handler, so a burst that filled every
+free slot up to `maximum_concurrency` did so without ever returning to the
+coordinator's own mailbox in between — each claim, while in flight, still
+blocks the single coordinator process the same way a stalled acknowledgement
+does (`docs/RISKS.md` risk 4), so a burst of slow claims could stall a
+pending `Renew`/`AttemptReturned`/`BeginShutdown` for up to
+`maximum_concurrency × D` instead of one claim's worth, and a `stop` issued
+mid-burst could still let up to `maximum_concurrency` jobs be claimed before
+shutdown took effect. Fixed by replacing the direct recursion with a
+`FillSlots` message: `continue_after_start`'s `Automatic` branch now asks
+`request_fill` to send this coordinator's own incarnation a `FillSlots`
+message (guarded by a new `fill_pending` flag, the same single-outstanding-
+message shape `poll_scheduled` already uses for `Poll`) instead of calling
+`fill_automatic_slots` again directly; `FillSlots` is handled in
+`handle_message` exactly like `Poll` (clears `fill_pending`, then filling
+only if not `shutting_down`). `fill_automatic_slots` itself now performs at
+most one claim per call — filling more than one slot always goes back through
+the mailbox first, so any `Renew`/`AttemptReturned`/`BeginShutdown` message
+already queued ahead of a `FillSlots` is handled first.
+
+Red first, against the pre-fix code at this branch's parent commit (`c3b1e61`,
+`src/grind/queue.gleam` unmodified): added both new tests below to a worktree
+checked out at that commit (test additions only, `queue.gleam` untouched) and
+ran them standalone (a disposable single-database Postgres with only
+`GRIND_TEST_QUEUE_DATABASE_URL`/`GRIND_TEST_MARKER` set, not the full
+`scripts/test-postgres.sh` matrix — configured with
+`synchronous_standby_names=grind_never_standby -c synchronous_commit=local`
+to match the script's own cluster):
+
+```
+panic src/gleeunit/should.gleam:10
+test: grind_test.postgres_automatic_fill_yields_to_shutdown_between_claims_test
+info:
+False
+should equal
+True
+```
+
+`should.be_true(claimed < job_count)` (`claimed < 10`) evaluated `False`: the
+pre-fix coordinator claimed the _entire_ ten-job backlog before `BeginShutdown`
+(sent, and confirmed queued behind the coordinator's still-blocked first
+claim, while the very first claim's own `UPDATE` was held on a test-forced
+`pg_advisory_xact_lock` barrier) ever took effect — exactly the "a stop
+mid-burst still claims up to C jobs" bug this fix closes. All 206 other
+reachable tests in that standalone run passed, including the companion
+hot-loop test below, confirming the failure is specific to this claim.
+
+Green, same tests, after the fix (`nix develop --command gleam test`, twice
+in a row against a freshly recreated database each time, to rule out
+timing flakiness): `postgres_automatic_fill_yields_to_shutdown_between_claims_test`
+now observes `claimed == 1` — only the one claim already genuinely in flight
+when `BeginShutdown` landed completes; `BeginShutdown` is handled (via FIFO
+mailbox order) before the `FillSlots` message that same claim's own
+completion enqueues, so no further claim is ever attempted.
+
+**Companion (behavior-preserving, not red-first)**:
+`postgres_automatic_fill_does_not_hot_loop_on_claim_error_test` proves the
+fix does not turn a failing claim into a hot retry loop: `start_attempt`'s
+`Error` branch already went (and still goes) through
+`finish_without_claim`/`continue_if_idle`, never through `request_fill`, so a
+persistently broken claim (forced by a `BEFORE UPDATE` trigger that always
+raises, after bumping a plain sequence — `nextval` is not rolled back by the
+trigger's own forced abort, unlike an ordinary table write, so it survives to
+count real attempts) is retried at most once per `Poll` interval, never
+faster. This test already passed against the pre-fix code (the old direct
+recursion only ever _added_ claims after a _successful_ one; a failing claim
+already stopped at `continue_if_idle` either way), so it is committed purely
+as a regression guard for the fix, not as red-first evidence of its own.
+
+Also updated: `docs/RISKS.md` risks 4 and 5 now note explicitly that a slow
+or stalled _claim_ is the same kind of coordinator stall a stalled
+acknowledgement is (risk 4), and that the `FillSlots` fix is what makes
+their shared "one stall" derivation actually hold for automatic polling
+(risk 5) — neither risk is fully closed (the multi-sibling
+`maximum_concurrency > 2` gap in risk 5, and the general single-coordinator
+design in risk 4, both remain open); risk 6's evidence paragraph is reworded
+to stop overclaiming its regression tests are purely "database-clock-bound"
+(each still waits out a local, bounded polling loop before reading its actual
+pass/fail evidence from the database's own clock) and drops a stale,
+session-local scratchpad path that was never a real repository artifact.
+`maximum_batch_jobs`'s own doc comment now states plainly that its default of
+1 makes `process_available` handle exactly one job per call, and why the
+default is kept at 1 rather than raised (kept consistent with
+`default_policy`'s own `maximum_concurrency: 1`, both a deliberate,
+conservative, explicit-opt-in default).
+
+Gate: `scripts/test-postgres.sh` green (207 passed root — the 205 from
+Increment 27 plus the two new tests above — 11 passed consumer, pinned Oban
+oracle harness green, Squirrel check green), `gleam check` green for both
+`grind` and `consumer/`, `nix fmt` (no files reformatted), `nix flake check`
+green, `git diff --check` clean.
+
+## Increment 29 — `storage_owner` removed entirely; isolation is the PostgreSQL schema (docs/RISKS.md risk 7, superseding Increment 27)
+
+**Claim (design change, USER DECISION)**: Increment 27 fixed _how_ the
+owner value was derived (from the database's own identity instead of the
+connection URL) but kept the underlying concept — a `storage_owner` column
+on every table, scoped by an application-level value. This increment drops
+the concept itself: isolation between logically distinct Grind
+installations is now simply the PostgreSQL schema a pool's `search_path`
+resolves to (see README, "Isolation"). `storage_owner` is removed from
+`grind_jobs` and every receipt/resolution/submission table, from every
+query (inline SQL and Squirrel-generated), from the unique advisory-lock
+key (which keeps `current_schema()`, spliced literally, so two schemas
+still never share a lock), from `Database`/`JobHandle`/`Conflict`
+metadata, and from every error variant that existed only to report an
+owner mismatch (`StorageOwnerMismatch`, `CancellationStorageOwnerMismatch`,
+`StorageOwnerIdentityUnavailable`, `StorageOwnerMustNotBeEmpty`).
+`postgres.with_storage_owner`, `postgres.storage_owner`, and
+`storage_owner_identity.sql` are deleted outright. `grind_v12` — still
+unreleased, edited in place per `AGENTS.md` — both adds `finished_at`
+(Increment 21) and drops `storage_owner` everywhere, since both belong to
+the same not-yet-shipped version; `grind_v11` (already released, frozen)
+is untouched.
+
+**Schema, before (v11, frozen) → after (v12, this change)**, confirmed
+against a real disposable cluster via `pg_class`/`pg_constraint`, not
+inferred from the DDL text alone:
+
+- `grind_jobs_unique_candidate_idx`: `(storage_owner, worker_id,
+worker_version, unique_key_contract, unique_key_sha256)` →
+  `(worker_id, worker_version, unique_key_contract, unique_key_sha256)`
+  (a non-unique performance index — no collision risk from dropping its
+  leading column).
+- `grind_job_acknowledgements_pkey`: `(storage_owner, command_id)` →
+  `(command_id)`. `_attempt_key`: `(storage_owner, job_id, attempt_id,
+attempt_epoch)` → `(job_id, attempt_id, attempt_epoch)`. Both provably
+  collision-free: `command_id` and `job_id` are derived from `grind_jobs.id`
+  (one `bigserial` sequence) and `grind_attempts_id_seq` (one shared
+  sequence) — never from anything a caller could independently reuse
+  across what used to be different owners.
+- `grind_job_resolutions_pkey`: `(storage_owner, resolution_id)` →
+  `(resolution_id)`. `resolution_id` is an operator-chosen audit label —
+  genuinely collision-risked (see below).
+- `grind_unique_submissions_pkey`: `(storage_owner, submission_id)` →
+  `(submission_id)`. `submission_id` is a caller-chosen idempotency key —
+  genuinely collision-risked (see below).
+- `grind_jobs_finished_idx`/`grind_jobs_claim_idx`/`grind_jobs_quarantine_idx`
+  (Increment 21/22, created fresh by `v12` itself, so edited in place
+  rather than dropped and rebuilt): each loses its leading `storage_owner`
+  column — a single schema's own `grind_jobs` never held more than one
+  distinct value there to begin with, so this is a pure simplification, not
+  a behavior change to what these indexes serve.
+- `pg_class` object count for a fresh `v12` install: still exactly the 20
+  relations `v12_shape()` declares (`grind_schema_migrations` ×2,
+  `grind_jobs` ×6, `grind_job_resolutions` ×3, `grind_job_acknowledgements`
+  ×4, `grind_attempts_id_seq` ×1, `grind_unique_submissions` ×3) — object
+  _names_ are unchanged throughout, only column composition, so
+  `read_schema_generation`'s own shape check needed no changes at all.
+
+**The real collision risk, and why it is narrower than it first looks.**
+Of the four dropped composite keys, only two can actually collide once
+`storage_owner` is gone: `resolution_id` and `submission_id` are
+caller/operator-chosen strings with no structural uniqueness guarantee, so
+two different `storage_owner` values that deliberately shared one physical
+schema on `v11` (via the now-removed `with_storage_owner` override) could
+have coincidentally reused the identical string for unrelated purposes.
+`command_id` and the acknowledgement attempt key are safe by construction
+(derived from globally-unique sequences, never caller input) and needed no
+check. Each of the two at-risk tables gets its own `DO $$ ... RAISE
+EXCEPTION $$` block, immediately before that table's `DROP COLUMN`,
+checking `count(DISTINCT storage_owner) > 1` per key value — **fail loudly
+with a clear, named error, never silently merge** — before either
+`ALTER TABLE ... DROP CONSTRAINT`/`DROP COLUMN` ever runs.
+
+**Red-first evidence for the collision check**, against a real disposable
+cluster seeded with the frozen `v11` fixture (`test/fixtures/schema/v11.sql`)
+plus two rows under different `storage_owner` values sharing one
+`submission_id` (`'shared-sub-id'`) and, separately, one `resolution_id`:
+running `grind_v12`'s own `up` section against each seed produces exactly
+the named, actionable error and touches nothing else:
+
+```
+psql:v12-up.sql:60: ERROR:  grind_v12: two distinct storage owners share a submission_id; dropping storage_owner would silently merge their grind_unique_submissions rows. Resolve this collision manually (rename or remove one side) before migrating.
+```
+
+```
+psql:v12-up.sql:42: ERROR:  grind_v12: two distinct storage owners share a resolution_id; dropping storage_owner would silently merge their grind_job_resolutions rows. Resolve this collision manually (rename or remove one side) before migrating.
+```
+
+(Against the real `postgres.migrate_with` path rather than raw `psql`, the
+whole step's transaction rolls back cleanly on either error — the same
+`MigrationStepFailed(12, error)` shape every other failing step already
+reports — never a partial commit.)
+
+**Mutation evidence**: removing the `submission_id` `DO` block from the
+migration's own statement list and re-running against the identical seeded
+collision still fails closed — never silently merges — but with
+PostgreSQL's own generic constraint error instead of the named one:
+
+```
+psql:v12-up-mutated.sql:65: ERROR:  could not create unique index "grind_unique_submissions_pkey"
+DETAIL:  Key (submission_id)=(shared-sub-id) is duplicated.
+```
+
+This is exactly the distinction the `DO` block exists to make: both paths
+refuse to merge the collision, but only the un-mutated one names the real
+cause (two distinct owners sharing a key) and the remedy, rather than
+leaving an operator to work out from a bare `23505` on a mid-migration
+`ADD CONSTRAINT` what actually went wrong.
+
+**Green (ordinary case, no collision)**: the identical `v12` `up` section
+applied to a `v11` fixture with no cross-owner key collisions (every
+existing installation under the default, non-override owner resolution —
+one schema always had exactly one implicit owner value to begin with)
+completes with no error, confirmed against the frozen upgrade-harness
+fixture's own full seed (six `grind_jobs` states, a real `submit_unique`
+receipt, an acknowledgement, a resolution, and three deliberately orphaned
+receipts from Increment 25 — see `postgres_migrate_upgrade_from_frozen_v11_fixture_test`).
+
+**Red found and fixed during this change, not merely anticipated**: the
+upgrade-harness test's own `submit_unique` seed call (used specifically
+because a hand-written fingerprint could never honestly match what a real
+caller's replay after the upgrade must match) genuinely failed the first
+time this whole change was run against it, since today's application code
+never writes `storage_owner` at all any more, and the frozen `v11` fixture
+still declares it `NOT NULL` with no default:
+
+```
+let assert test/grind_test.gleam:3224
+ test: grind_test.postgres_migrate_upgrade_from_frozen_v11_fixture_test
+value: Error(NotCommitted(PostgresqlError("23502", "not_null_violation", "null value in column \"storage_owner\" of relation \"grind_jobs\" violates not-null constraint")))
+```
+
+Fixed by adding a test-only `ALTER TABLE ... ALTER COLUMN storage_owner SET
+DEFAULT` right after applying the frozen fixture (never touching the frozen
+fixture file itself, which `grind_migrations_conformance_test` still checks
+byte-for-byte) — the same shape a real `v11` database that happened to
+already have a default would have, which the migration must handle
+correctly regardless. Green after the fix, full gate below.
+
+**Isolation tests, replacing the owner-specific ones removed
+(`postgres_handles_are_bound_to_storage_owner_test`,
+`postgres_storage_owner_converges_across_different_endpoints_test`,
+`postgres_storage_owner_override_is_explicit_and_validated_test`,
+`postgres_resolution_rebind_checks_storage_owner_test`)**:
+
+- `postgres_two_schemas_share_a_database_but_stay_isolated_test` — two
+  PostgreSQL roles, each with its own like-named schema (`CREATE SCHEMA
+AUTHORIZATION <role>`, relying on nothing but PostgreSQL's own default
+  `search_path` of `"$user", public` — the "recommended setup" README now
+  documents), sharing one physical database: jobs (row counts, never a
+  cross-schema handle read — two fresh schemas can legitimately mint the
+  identical id, so a count is the correct proof, not a coincidence-prone
+  lookup), uniqueness (the identical key/queue/`SubmissionId` independently
+  admits `Inserted` in both schemas, never contending), quarantine, and
+  retention are each proven isolated per schema.
+- `postgres_two_urls_to_the_same_schema_share_it_test` — the Increment 27
+  convergence idea kept, minus the owner-equality assertion: two URLs
+  (`127.0.0.1` vs `localhost`) asserted genuinely different strings first,
+  then proven to reach the identical schema (a job submitted through one is
+  read back through the other).
+
+**Checked, not changed**: `test/grind_fault_proxy_test.gleam` and the
+`consumer/` package reference no `storage_owner`/`with_storage_owner`
+surface at all (confirmed by search and by `gleam check` passing for both
+with zero changes needed there).
+
+Gate: `scripts/test-postgres.sh` green (205 passed root — replacing, not
+adding to, Increment 28's 207: four owner-specific tests removed, two
+schema-isolation tests added, net −2 plus the `resolution_route_a/b`
+fixture's own now-dead plumbing removed — 11 passed consumer, pinned Oban
+oracle harness green, Squirrel check green), `gleam check` green for both
+`grind` and `consumer/` with zero warnings, `nix fmt` (5 files reformatted,
+re-verified green), `nix flake check` green, `git diff --check` clean. Run
+twice in full after the last formatting pass, both green.
+
+---
+
+## Increment 30 — explicit `Settings.schema`, handle-installation binding, an automated migration-collision test, and a forbidden-columns shape check (independent-review fixes to Increment 29, docs/RISKS.md risk 7)
+
+**Context.** An independent review of Increment 29 (`5c88aa5`) accepted the
+schema-based isolation design but flagged that it still left the schema
+itself _inferred_ rather than configured, left no way to catch a
+`JobHandle`/`PendingSubmission` used against the wrong installation, and had
+only manual/psql evidence (not an automated test) for the v11→v12
+collision-detection `DO` blocks. This increment closes all three, plus a
+"forbidden columns" shape check and several smaller doc/test fixes flagged
+in the same review.
+
+**1. Explicit schema, not inferred.** `postgres.Settings` gains a `schema:
+String` field (default `"public"`) and `postgres.with_schema`;
+`postgres.validate` pins every pooled connection's own `search_path`
+connection parameter to exactly that one configured schema (quoted via a
+new `quote_ident`, doubling embedded `"` characters), unconditionally —
+never left to whatever the connecting role or database would otherwise
+default to. `migrate`/`migrate_with` create the configured schema if absent
+(`ensure_schema_exists`, new `StorageError.SchemaCreationFailed`), checking
+existence first via a plain `pg_namespace` lookup and only ever attempting
+`CREATE SCHEMA IF NOT EXISTS` for a genuinely absent schema (see "Red found
+and fixed" below for why the existence check is not optional). The
+uniqueness admission advisory-lock key
+(`unique_admission.lock_key_sql`/`lock_query`/`acquire_lock`) now binds this
+configured schema as an ordinary SQL parameter instead of splicing
+`current_schema()` into the query text — correct independently of
+`search_path`'s own resolution rules, not merely by relying on the
+connection-parameter pin holding for reasons outside the key's own control
+(see docs/UNIQUENESS-CONTRACT.md and README, "Isolation", both rewritten).
+
+**Red-first evidence — the `$user` `search_path`-fallback hazard is real,
+not hypothetical.** `postgres_user_schema_fallback_shares_one_installation_test`
+(`test/grind_test.gleam`) builds the exact scenario the coordinator named:
+two PostgreSQL roles, each with its own personal, empty schema (`CREATE
+SCHEMA AUTHORIZATION <role>`) ahead of `public` on PostgreSQL's own default
+`search_path` (`"$user", public`), where Grind's real tables live only in
+`public` — neither role ever calls `with_schema`, both simply take the
+`"public"` default. Confirmed directly with `psql` against a throwaway
+cluster, independently of any Grind code, that this is a genuine hazard
+under the _pre-fix_ lock-key formula (`current_schema()` spliced into the
+key, as Increment 29 left it): each role's own `SELECT current_schema()`
+resolves to that role's own personal schema (`current_schema()` reports the
+first schema in `search_path` that merely _exists_, regardless of whether
+it holds any Grind object), while `to_regclass('grind_jobs')` in both
+sessions resolves to the identical `public.grind_jobs` oid — two sessions
+racing the same uniqueness key would therefore acquire _different_
+advisory locks while contending on the same physical table, a genuine
+duplicate-admission defect. After this increment's fix (schema bound
+explicitly, `search_path` pinned to it), the test proves the fix directly
+against real `postgres.submit_unique` calls: `postgres.installation`
+(the new in-memory token, see point 2) is asserted identical for both
+roles' `Database` values, and a call to `submit_unique` with an identical
+key from each role in turn commits exactly one `Inserted` and one
+`Existing` — never two independent rows.
+
+**2. Handle-installation binding.** A new `grind/job.Installation` opaque
+type (this physical database's `pg_database.oid` — read once, cheaply, at
+`postgres.start`, new `StartError.InstallationQueryFailed` — plus the
+configured schema) is stamped onto every `JobHandle` and `PendingSubmission`
+at mint/bind time (`job.new_handle`, `submission.new_pending_submission`,
+both gained an `installation` parameter). `state`, `cancel`, `arguments`,
+`outcome`, `reconcile_acknowledgement`, `resolve_uncertain`, and
+`reconcile_unique` each check the handle's/pending's own installation
+against the `Database` they are called on _before_ any storage call, and
+return a new typed mismatch error on disagreement
+(`postgres.HandleFromAnotherInstallation`,
+`postgres.CancellationFromAnotherInstallation`,
+`postgres.ResolutionFromAnotherInstallation`,
+`submission.HandleFromAnotherInstallation`). This is documented throughout
+as a client-side sanity check only — the real isolation boundary stays the
+PostgreSQL schema itself; nothing about this token is ever persisted or
+compared against a stored value.
+
+**Red-first evidence.**
+`postgres_handle_from_another_installation_is_rejected_test` mints a handle
+against schema A, then calls `state`/`arguments`/`cancel`/`outcome` against
+`Database` B (a genuinely different schema on the same physical database,
+confirmed via `postgres.installation(database_a) != postgres.installation(database_b)`)
+where a same-numeric-id row also happens to exist (each schema mints its
+own id 1 independently) — before this fix, every one of those calls would
+have silently read or mutated schema B's own row (proven implicitly: the
+`storage_fields`/`result_fields`/`reconciliation_fields` tuples this check
+was added to carried no installation information at all prior to this
+increment, so nothing before this change could have distinguished the two
+handles). After the fix, all four calls return the new typed mismatch
+error, and the matching same-schema call (`state(database_a, handle_a)`)
+still succeeds normally, proving the rejection is genuinely about
+installation identity and not a broken handle.
+
+**3. Automated migration-collision test**, replacing Increment 29's
+manual/psql-only evidence:
+`postgres_migration_submission_collision_detected_test` and
+`postgres_migration_resolution_collision_detected_test` each seed the
+frozen v11 fixture (`test/fixtures/schema/v11.sql`) with two distinct
+legacy `storage_owner` values sharing one `submission_id`/`resolution_id`
+(legal under v11's own composite primary key) and assert
+`postgres.migrate` returns `Error(postgres.MigrationStepFailed(12,
+pog.PostgresqlError(_, _, message)))` with the exact named collision
+message, and that the schema marker stays at `11` (the step's own
+transaction rolled back cleanly, never partially applied).
+
+**Red found and fixed while writing these two tests (not merely
+anticipated).** The first draft of both tests seeded their two colliding
+receipt rows referencing `job_id`s with no matching `grind_jobs` row at
+all. `migrate` returned `Ok(Nil)` — a clean, unexpected success:
+
+```
+panic test/grind_test.gleam:3876
+ test: grind_test.postgres_migration_submission_collision_detected_test
+ info: expected MigrationStepFailed(12, _), got Ok(Nil)
+```
+
+Root-caused by inspecting the post-migration table directly (`psql`): both
+seeded rows were gone — zero rows, not two, not one. `v12_statements`'s own
+orphan cleanup (`DELETE FROM grind_unique_submissions r WHERE NOT EXISTS
+(SELECT 1 FROM grind_jobs j WHERE j.id = r.job_id)`, Increment 25) runs
+_before_ the collision `DO` block, and silently swept away both "orphaned"
+receipts (naming a `job_id` that never existed) before the collision they
+seeded was ever checked. Fixed by seeding a real `grind_jobs` row per side
+first (new `seed_legacy_job` helper) and binding its real returned id into
+each receipt insert — confirmed green afterward. This is exactly the kind
+of test-authoring mistake red-first discipline is supposed to catch before
+it ships as a false "the fix works" signal.
+
+**4. Forbidden-columns shape check.** `migrations.Migration` gains a
+`forbidden_columns: List(#(String, String))` field — the inverse of the
+existing `key_columns` "must exist" check. `v12_forbidden_columns()` lists
+`storage_owner` on all four tables it was dropped from.
+`postgres.read_schema_generation`'s own shape validation
+(`validate_expected_shape`, via a new `forbidden_columns_absent`, one
+`information_schema.columns` query joined against an `unnest` of the
+forbidden pairs) now fails closed (`IncompatibleSchema`) if any forbidden
+column is still physically present despite the marker claiming that
+version — catching a stale pre-edit dev database that ran an _older_ copy
+of `v12_statements` (from before `storage_owner` was ever dropped from it)
+whose marker already claims 12 but whose physical shape does not match.
+
+**5. `RISKS.md` #10 — the 6-second figure is now flagged as a lower
+bound**, not re-measured: `grind_v12` was edited in place (Increment 29,
+after the original 6-second figure was measured in Increment 25) to add
+index/primary-key rebuilds on three tables and two full-table `GROUP BY`
+collision scans, none of which have themselves been measured at 2,000,000
+rows. `README.md`'s own mention of the same figure is corrected the same
+way.
+
+**6. Smaller fixes from the same review:**
+
+- A one-sentence lossiness note added to `v12_statements`'s own doc comment:
+  the `down` direction re-adds `storage_owner` as `NOT NULL DEFAULT ''` on
+  every row, never the original per-row value, which the `up` direction
+  already discarded.
+- `docs/UNIQUENESS-CONTRACT.md`'s "Schema v11" section corrected: its claim
+  that `grind_unique_submissions` has "no foreign key ... matching the rest
+  of the schema's convention of no cross-table foreign keys" was accurate
+  for v11 alone but stale once `grind_v12` (documented a few sections later
+  in the same file) deliberately breaks that convention — now says so
+  explicitly and cross-references "Schema v12".
+- `queue.gleam`'s `fill_pending` field doc corrected: it previously claimed
+  `FillSlots` is "sent immediately after every successful automatic claim
+  _that still has free capacity left_", but `request_fill` (via
+  `continue_after_start`) sends it unconditionally after every automatic
+  completion — the capacity check happens only once the message is handled,
+  inside `fill_automatic_slots`. The code was already correct (an extra,
+  harmless dispatch costs one mailbox round-trip, never a wasted claim); only
+  the comment overclaimed a pre-check that was never there.
+- `postgres_two_urls_to_the_same_schema_share_it_test` no longer varies the
+  hostname (`127.0.0.1` vs `localhost`) to prove "two different-looking
+  URLs, same schema" — that construction silently depended on `localhost`
+  resolving to the same IPv4 loopback address this suite's cluster binds,
+  not guaranteed on every machine (an IPv6-first resolver could send
+  `localhost` to `::1`, where nothing listens). Now appends an inert,
+  unrecognized query parameter `pog.url_config` never inspects (confirmed by
+  reading that function: it looks up only `sslmode` by key and ignores
+  every other query parameter), keeping the "genuinely different string,
+  identical target" property without any DNS dependency.
+- `postgres_two_schemas_share_a_database_but_stay_isolated_test` updated to
+  call `with_schema` explicitly for each role, since the `$user`-fallback
+  "recommended setup" it previously demonstrated (zero Grind-specific
+  configuration) is superseded by explicit configuration — the schema
+  itself is unchanged (`CREATE SCHEMA AUTHORIZATION <role>`), only how each
+  pool is told to use it.
+
+**Red found and fixed in the schema-creation path itself (not part of the
+original plan, found while gating this increment).** The very first version
+of `ensure_schema_exists` called `CREATE SCHEMA IF NOT EXISTS` unconditionally
+on every `migrate` call. Against
+`postgres_two_schemas_share_a_database_but_stay_isolated_test` and
+`postgres_handle_from_another_installation_is_rejected_test` — both of
+which use a role that owns its own already-_existing_ schema but holds no
+broader database-level privilege, the least-privilege "recommended setup"
+this same increment's README rewrite describes — this failed:
+
+```
+let assert test/grind_test.gleam:1939
+ test: grind_test.postgres_two_schemas_share_a_database_but_stay_isolated_test
+ code: let assert Ok(Nil) = postgres.migrate(database_a)
+value: Error(SchemaCreationFailed(PostgresqlError("42501", "insufficient_privilege", "permission denied for database grind_owner_a")))
+```
+
+Root cause, confirmed against PostgreSQL's own documented behavior: `CREATE
+SCHEMA`, even with `IF NOT EXISTS`, checks the connecting role's `CREATE`
+privilege on the _database_ before it ever checks whether the schema
+already exists — so a role that owns its own schema but was never granted
+database-level `CREATE` gets `42501` on every single `migrate` call, even
+though nothing would ever actually need creating. Fixed by checking
+existence first via a plain, unprivileged `pg_namespace` lookup
+(`schema_exists`) and only ever attempting `CREATE SCHEMA IF NOT EXISTS`
+for a schema confirmed genuinely absent — preserving "migrate creates the
+schema if absent" while never demanding a privilege an already-provisioned
+least-privilege installation has no reason to hold. Both tests green after
+the fix.
+
+**Gate**: `scripts/test-postgres.sh` green — 209 passed root (four new
+tests: the two collision tests, the `$user`-fallback test, the
+cross-installation-handle test), 11 passed consumer, pinned Oban oracle
+harness green, Squirrel check green. `gleam check` green for both `grind`
+and `consumer/`. `nix fmt` applied and re-verified clean. `nix flake check`
+green. `git diff --check` clean.
+
+---
+
+## Increment 31 — cluster-identifier disambiguation, a concurrent-schema-creation race fix, schema-name validation, and pooler documentation (second-round review fixes to Increment 30)
+
+**Context.** A second independent review of Increment 30 (`c8b0fbb`)
+accepted the design but found the `Installation` token could still
+collide across two _different_ clusters built the same way (identical low
+database OID, both defaulting to schema `"public"`), found
+`ensure_schema_exists`'s own `CREATE SCHEMA IF NOT EXISTS` was not actually
+concurrency-safe, found `Settings.schema` had no length/byte-content
+validation, and asked for `docs/RISKS.md` #18 (connection poolers) and
+`bind_handle`'s own doc comment to be updated. All four are addressed here.
+
+**1. Cluster-identifier disambiguation.** `job.Installation` gains a third
+field, `cluster_identifier: Option(Int)` — `pg_control_system()`'s own
+`system_identifier`, a value generated once at `initdb` time and
+effectively unique per cluster. Read once at `postgres.start`
+(`read_cluster_identifier`), best-effort: `pg_control_system()` is a
+restricted, superuser-adjacent function in stock PostgreSQL, so an
+ordinary non-superuser connecting role (the common, least-privilege case)
+typically cannot call it at all — any failure is swallowed into `None`
+rather than ever failing `start` itself, since this disambiguation is a
+client-side improvement, not something `start` depends on.
+`job.same_installation` now requires the cluster identifier to also match
+when both sides successfully read one; when either side could not, it
+falls back to comparing only the database OID and schema, exactly as
+before this field existed — a documented, residual gap (two different
+clusters could still collide if `pg_control_system()` is unreadable on
+either side), not a regression.
+
+**Evidence.**
+`postgres_installations_differ_across_databases_in_one_cluster_test` proves
+the same-cluster case directly: two genuinely different physical databases
+in the one disposable test cluster (both defaulting to schema `"public"`,
+so the schema component alone cannot distinguish them) get different
+`Installation` tokens — backstopped by the database OID either way,
+whether or not the cluster identifier was itself readable for the
+connecting role. The cross-_cluster_ collision this field exists to fix is
+not independently reproducible from a single disposable test cluster (it
+would need two separately-initialized clusters compared against each
+other); documented instead, in `job.Installation`'s own doc comment and
+`docs/RISKS.md` risk 7.
+
+**2. Concurrent first-time schema creation.** `ensure_schema_exists`'s own
+`CREATE SCHEMA IF NOT EXISTS` is not concurrency-safe on its own: two
+sessions can both run the existence check first, both see the schema
+absent, and both attempt the actual `CREATE` — PostgreSQL's own catalog
+uniqueness check is what actually serialises them, surfacing to the loser
+as a real error (`42P06 duplicate_schema` or `23505 unique_violation`
+depending on timing) rather than the silent no-op `IF NOT EXISTS` might
+suggest. Fixed: on any `CREATE SCHEMA` failure, `ensure_schema_exists`
+re-checks existence and reports `Ok(Nil)` if the schema is now present,
+regardless of which side actually created it.
+
+**Evidence.**
+`postgres_migrate_concurrent_first_time_schema_creation_both_succeed_test`
+spawns two independent pools, both configured with the identical,
+freshly-suffixed (never-before-used) schema name, and calls `migrate` on
+both back-to-back from the same process with no artificial delay between
+them — a real, if not perfectly deterministic, race between two genuine
+PostgreSQL sessions (there is no lockable object to hold a hard barrier on
+before the schema itself exists, unlike the advisory-lock-based barrier
+`postgres_migrate_concurrent_migrators_both_apply_once_test` uses for the
+_versioned-step_ race, which only ever engages after the schema already
+exists). Both calls return `Ok(Nil)`, and the schema ends up at marker
+version 12.
+
+**3. Schema-name validation.** `postgres.validate` now rejects a
+`Settings.schema` that is empty, exceeds PostgreSQL's own 63-byte
+identifier limit (`NAMEDATALEN` 64, minus the terminator — a longer name
+would otherwise be silently truncated by PostgreSQL itself to a different
+schema than the one actually configured), or contains a NUL byte
+(PostgreSQL text values cannot hold one at all; rejecting it outright is
+safer than risking a driver- or C-level truncation silently changing which
+schema is actually used) — all three fold into the existing
+`ConfigError.InvalidSchema` variant, whose doc comment now describes all
+three conditions.
+
+**4. Documentation.** `docs/RISKS.md` risk 18 (no connection pooler
+exercised) extended to name `search_path` as a third startup parameter a
+pooler can silently drop or fail to apply per-checkout — and, specifically
+for PgBouncer, why its transaction pooling mode is the sharpest version of
+this risk: a client's own startup parameters are not necessarily applied
+to whichever physical server connection it is handed per transaction
+unless `search_path` is explicitly added to `track_extra_parameters` and
+kept out of `ignore_startup_parameters`, so a pooler configured this way
+would not error at all — it would simply run queries against whatever
+schema that physical connection already happened to have, silently
+breaking `postgres.with_schema`'s entire isolation guarantee. README's own
+"Isolation" section gained a one-paragraph cross-reference to this same
+risk. `postgres.bind_handle`'s own doc comment gained a note that a bare
+`Int` id (as returned by `job.id_value` and typically what an application
+persists across a restart) carries no `Installation` of its own to check
+against — unlike a live `JobHandle` passed directly between calls, calling
+`bind_handle` against the wrong `Database` for a stored id that happens to
+also name a row there succeeds silently, binding to the wrong row, rather
+than failing the way a live handle used against the wrong `Database` does.
+
+**Gate**: `scripts/test-postgres.sh` green — 211 passed root (two new
+tests: the cross-database-installation test, the concurrent-schema-creation
+test), 11 passed consumer, pinned Oban oracle harness green, Squirrel check
+green, run twice (once piped through `tail`, once with full output capture
+to confirm exit 0 unambiguously). `gleam check` green for both `grind` and
+`consumer/`. `nix fmt` applied and re-verified clean. `nix flake check`
+green. `git diff --check` clean.

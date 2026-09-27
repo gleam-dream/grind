@@ -18,8 +18,8 @@ change without a design decision), **open** (a real gap, no fix scheduled),
 3. [Network-fault coverage stops at a killed backend](#3-network-fault-coverage-stops-at-a-killed-backend)
 4. [Coordinator renewal starvation under several pending acknowledgements](#4-coordinator-renewal-starvation-under-several-pending-acknowledgements)
 5. [Lease-vs-deadline rule has zero margin and does not cover more than two siblings](#5-lease-vs-deadline-rule-has-zero-margin-and-does-not-cover-more-than-two-siblings)
-6. [Default throughput ceiling is low and each claim costs two statements](#6-default-throughput-ceiling-is-low-and-each-claim-costs-two-statements)
-7. [Storage owner is derived from the connection URL, not the database itself](#7-storage-owner-is-derived-from-the-connection-url-not-the-database-itself)
+6. [Each claim costs two statements, one per free slot per round](#6-each-claim-costs-two-statements-one-per-free-slot-per-round)
+7. [`search_path` must point at the intended schema](#7-search_path-must-point-at-the-intended-schema)
 8. [External effects are not exactly-once](#8-external-effects-are-not-exactly-once)
 9. [Retention ends reconciliation and replay guarantees](#9-retention-ends-reconciliation-and-replay-guarantees)
 10. [Large-table migration cost and the `grind_v12` stop-the-world deploy](#10-large-table-migration-cost-and-the-grind_v12-stop-the-world-deploy)
@@ -142,6 +142,23 @@ other active attempt's own renewal tick for as long as it is in flight. With
 more than one stalled acknowledgement queued at once, later renewals wait
 out however many `D`-bounded stalls are ahead of them in the same loop —
 this is not bounded by `queue.LeaseTooShortForDeadline` at all (see risk 5).
+**A slow or stalled claim is the identical kind of stall, not a separate
+concern**: `attempt.claim_one` also runs synchronously on the same message
+loop, so a claim that takes up to `D` to fail (or to hang against an
+unresponsive connection, up to the same bound) blocks every other active
+attempt's renewal for exactly as long, the same as a stalled acknowledgement
+does. Before the `FillSlots`-message fix (`fill_automatic_slots`/
+`request_fill`, `grind/queue`), automatic polling could compound this: a
+single `Poll` recursed directly through up to `maximum_concurrency` claims
+inside one message handler before ever checking the mailbox again, so a
+burst filling every free slot with slow claims could stall a pending
+renewal (or a `BeginShutdown`) for up to `maximum_concurrency × D` instead of
+one claim's worth. The fix bounds that to one claim between mailbox
+checks — `FillSlots` is sent as a message, not called directly, so a
+`Renew`/`AttemptReturned`/`BeginShutdown` already queued is handled before
+the next claim starts — which is exactly the "one stall" case risk 5's own
+derivation already assumes, but does not eliminate the underlying
+one-claim-blocks-the-loop property this risk describes.
 
 **Likelihood / impact.** Low-to-moderate likelihood (needs concurrent
 stalled acknowledgements, which itself needs a database/network fault),
@@ -175,7 +192,15 @@ exactly at the boundary has no slack for anything beyond the one stall the
 formula assumes. The rule also assumes at most one stalled acknowledgement
 ahead of one sibling's renewal: at `maximum_concurrency > 2`, more than one
 sibling's renewal can queue up behind the same stall, and the rule does not
-account for that (see risk 4).
+account for that (see risk 4). The same "one stall" assumption also covers a
+slow claim, not only a stalled acknowledgement (see risk 4's own note on
+this): the `FillSlots`-message fix in `grind/queue` (`fill_automatic_slots`/
+`request_fill`) is what makes that assumption hold for automatic polling
+specifically — before it, a burst filling every free slot with slow claims
+could itself present up to `maximum_concurrency` stalls in a row, not one,
+which this rule's derivation never accounted for at all. The fix closes that
+gap for claims; it does not touch the still-open `maximum_concurrency > 2`
+multi-sibling gap this paragraph already describes.
 
 **Likelihood / impact.** Low likelihood of hitting the exact boundary in
 practice (most deployments set a lease comfortably above the minimum), high
@@ -195,72 +220,162 @@ underlying fix as risk 4.
 
 ---
 
-### 6. Default throughput ceiling is low and each claim costs two statements
+### 6. Each claim costs two statements, one per free slot per round
 
-**What can happen.** Default automatic-polling throughput is bounded by
-`maximum_jobs_per_poll / poll_interval`. With the shipped defaults
-(`maximum_jobs_per_poll = 1`, `poll_interval = 250ms`), one consumer claims
-at most about 4 jobs/second regardless of available worker concurrency —
-raising `maximum_concurrency` alone does not raise throughput unless
-`maximum_jobs_per_poll` and/or `poll_interval` are also tuned. Separately,
-every claim attempt issues two statements against `grind_jobs`: a `LIMIT 1`
+**What can happen.** Automatic polling used to be bounded by
+`maximum_jobs_per_poll / poll_interval` regardless of `maximum_concurrency`
+(with the shipped defaults, `maximum_jobs_per_poll = 1` and
+`poll_interval = 250ms`, one consumer claimed at most about 4 jobs/second no
+matter how high `maximum_concurrency` was set) — this per-poll ceiling is
+fixed: a poll (or a slot freed by a completing job) now keeps claiming into
+every free slot for as long as `maximum_concurrency` allows and jobs are
+available, backing off to the full `poll_interval` only once a claim
+actually finds nothing (Oban-like; see `grind/queue`'s automatic-polling doc
+comments and `docs/RECOVERY-EVIDENCE.md`). `maximum_jobs_per_poll` was
+narrowed to `maximum_batch_jobs` and no longer has any effect on automatic
+polling — it now only bounds how many jobs one manual `process_available`
+call processes before returning (its one remaining, distinct meaning; a
+separate cap here would be redundant with `maximum_concurrency`, which
+already bounds automatic claiming). What remains, unchanged: every claim
+attempt still issues two statements against `grind_jobs` — a `LIMIT 1`
 quarantine scan runs before every claim query, not only when a claim
-actually finds an expired row.
+actually finds an expired row — so a burst that fills many slots in one
+round issues that many quarantine scans; this stays bounded by real claim
+throughput (concurrency and completion rate), never a busy loop with no
+forward progress, since a step that finds nothing to claim always stops and
+waits for the next poll instead of retrying immediately (see
+`fill_automatic_slots`'s doc comment). Recovering `K` quarantined
+(lease-expired) rows still costs `K` separate claims either way.
 
-**Likelihood / impact.** High likelihood of surprising a new deployment
-(default settings look conservative until measured), low-to-moderate impact
-(a tuning problem, not a correctness one — raising the two settings resolves
-it).
+**Likelihood / impact.** Low likelihood now that the per-poll ceiling is
+gone; the residual per-claim quarantine-scan cost is a documented, accepted
+characteristic of claim-time quarantine, not a hidden inefficiency or a
+correctness gap.
 
-**Current mitigation.** Both settings are exposed and validated
-(`queue.with_poll_interval`, `queue.with_jobs_per_poll`); the ceiling and the
-per-claim quarantine-scan cost are a direct, documented consequence of the
-polling design, not a hidden inefficiency.
+**Current mitigation.** `maximum_concurrency` is the only setting that now
+bounds automatic-polling throughput; `poll_interval` only bounds how long an
+idle consumer waits before trying again. `queue.with_maximum_batch_jobs`
+remains for tuning manual batch size, independent of automatic polling.
 
-**Evidence.** Measured in a throwaway benchmark, not in the committed test
-suite — see the bench findings captured during this documentation pass
-(`/private/tmp/claude-501/-code-gleam-dream-grind/437b6ab5-1d50-4d7a-9ecf-bd7c556979f8/scratchpad/bench-plan.md`,
-"Findings"). No committed load-test evidence yet (see risk 17).
+**Evidence.** `postgres_automatic_consumer_drains_backlog_without_per_interval_ceiling_test`
+and `postgres_automatic_consumer_waits_full_interval_when_idle_test`
+(`test/grind_test.gleam`) are committed, deterministic regression coverage
+for the fix and for the no-busy-loop guarantee, respectively — not purely
+"database-clock-bound" (an earlier overclaim in this entry): each test still
+waits out a local, bounded polling loop for the system to reach the state it
+then reads, and only the pass/fail evidence itself (`finished_at` timestamps,
+row counts) is read from the database's own clock rather than the test
+process's. Real load/throughput numbers remain a throwaway benchmark, not
+committed test evidence. No committed load-test evidence yet (see risk 17).
 
-**Status.** Accepted (a tuning trade-off inherent to poll-based claiming) —
-the underlying throughput/latency measurement work itself is open, tracked
-in `docs/RELEASE-READINESS.md` ("Evidence still missing", "Load").
+**Status.** The per-poll ceiling itself is resolved. The per-claim
+quarantine-scan cost is accepted (an inherent cost of claim-time
+quarantine, not a defect) — the underlying throughput/latency measurement
+work itself is open, tracked in `docs/RELEASE-READINESS.md` ("Evidence still
+missing", "Load").
 
 ---
 
-### 7. Storage owner is derived from the connection URL, not the database itself
+### 7. `search_path` must point at the intended schema
 
-**What can happen.** `storage_owner` is computed as
-`"<host>:<port>/<database>"` from the parsed connection URL
-(`postgres.validate`), not from any property of the database itself. Two
-consequences, in opposite directions:
+**What can happen (resolved by removal, twice over).** Three successive
+designs tried to derive an owner value scoping rows within one shared
+schema: first from the connection URL (`"<host>:<port>/<database>"`, which
+conflated different endpoints to the same database and ignored
+`search_path` entirely), then from the database's own identity
+(`pg_control_system()`'s `system_identifier` plus
+`current_database()`/`current_schema()`, or an explicit
+`postgres.with_storage_owner` override). All three added a whole concept —
+a whole schema column, `storage_owner`, on every table — to solve a problem
+PostgreSQL's own schema mechanism already solves on its own.
+`storage_owner` and `with_storage_owner` are removed entirely (see
+`docs/UNIQUENESS-CONTRACT.md`, and `grind_v12`'s own migration comments in
+`src/grind/internal/migrations.gleam`, "Dropping `storage_owner`"):
+isolation between logically distinct Grind installations is now simply the
+PostgreSQL schema a pool's `search_path` resolves to — see README,
+"Isolation". Two pools whose `search_path` resolves to the same schema
+share one installation; two pools whose `search_path` resolves to different
+schemas — in the same physical database or not — are fully isolated, since
+each schema holds its own independent set of `grind_` tables.
 
-- Two pools that reach the exact same physical database through **different**
-  host:port endpoints (a different DNS name, a load balancer, a direct IP
-  versus a hostname, or a connection pooler in front of Postgres) are treated
-  as two different, mutually invisible storage owners — no shared quarantine,
-  no shared uniqueness domain, no shared retention scope, even though they
-  are writing the same rows.
-- Two pools that reach the **same** host:port/database but a different
-  PostgreSQL schema (`search_path`) are treated as the _same_ storage
-  owner — `storage_owner` excludes the schema entirely, so schema-level
-  isolation an application might expect is not provided.
+**The `$user`-fallback hazard this risk originally named, and how it is now
+closed.** An earlier revision of Grind left `search_path` entirely to
+whatever the connecting role or database defaulted to, relying on an
+operator to configure `search_path` explicitly per role. That was a real,
+proven hazard, not merely a hypothetical one: PostgreSQL's own
+`current_schema()` reports the _first_ schema in `search_path` that merely
+_exists_ — not the first one that actually holds any object — so a role
+with its own personal, empty `"$user"` schema (the ordinary default,
+`"$user", public`) ahead of `public` in `search_path`, where Grind's real
+tables actually live, would report a _different_ `current_schema()` value
+per role even though both write to the exact same physical `grind_jobs`
+table. Since the uniqueness admission lock key used to be keyed by
+`current_schema()`, two such roles racing the identical uniqueness key
+could each acquire a _different_ advisory lock and both insert — a genuine
+duplicate-admission defect, not merely a theoretical one; see
+`postgres_user_schema_fallback_shares_one_installation_test`
+(`test/grind_test.gleam`) for the red-then-green proof. `Settings.schema`
+(`postgres.with_schema`, default `"public"`) closes this at its root:
+`postgres.validate` pins every pooled connection's own `search_path`
+connection parameter to exactly this one configured schema, so
+`current_schema()` can only ever resolve to it (or to nothing, before
+`migrate` first creates it) regardless of what a role's own default
+`search_path` would otherwise have been — no role-specific `"$user"`
+schema, however it is configured, can shadow the schema Grind was actually
+told to use. The uniqueness advisory lock key itself no longer even relies
+on `current_schema()` resolving correctly: it binds the configured schema
+as an ordinary SQL parameter (see
+`grind/internal/unique_admission.lock_key_sql`'s own doc comment), so it is
+correct by construction rather than by relying on the connection-parameter
+pin as its only line of defense.
 
-**Likelihood / impact.** Low-to-moderate likelihood (most deployments use
-one stable endpoint per database), high impact if it occurs (silent loss of
-quarantine/uniqueness coordination between what the operator believes is one
-logical database).
+**The residual hazard.** Nothing in Grind can stop an operator from
+deliberately configuring two pools that were _meant_ to be isolated with
+the identical `Settings.schema` value — that is indistinguishable, from
+Grind's own point of view, from a deliberately shared installation, and
+there is no way for `postgres.start`/`postgres.migrate` to know an
+operator's intent, only the schema they were actually told to use. This is
+now a purely a configuration-discipline question (did the operator pass the
+schema they meant to), not a mechanism defect: `postgres.with_schema`'s own
+value is explicit, bound, and enforced identically on every pooled
+connection, with no fallback path left for it to silently diverge from.
 
-**Current mitigation.** None beyond documentation. The same-schema case is
-called out in `docs/UNIQUENESS-CONTRACT.md` ("Failure modes"); the
-different-endpoint case is not documented anywhere else prior to this
-register.
+**Likelihood / impact.** Low likelihood now (an operator has to actively
+misconfigure or omit `with_schema` for two installations that were meant to
+be distinct; the previous `$user`-fallback trap that made this easy to hit
+by accident is closed); still high impact if it occurs (silent, undetected
+sharing of one schema by two applications that believed themselves isolated
+— no error, no observation, just merged job/uniqueness/quarantine/retention
+state).
 
-**Evidence.** Confirmed by source inspection (`postgres.validate`,
-`src/grind/postgres.gleam`); untested (no test exercises two differently
-named endpoints against one physical database).
+**Current mitigation.** `postgres.with_schema` plus `postgres.validate`'s
+own `search_path` connection-parameter pin, described above — no longer
+documentation-only. `docs/UNIQUENESS-CONTRACT.md` and README, "Isolation"
+both state the explicit-schema contract and name the residual
+configuration-discipline hazard.
 
-**Status.** Accepted as a known limitation of the current owner model.
+**Evidence.**
+`postgres_user_schema_fallback_shares_one_installation_test` proves the
+`$user`-fallback hazard this risk originally named is closed (two roles,
+each with its own empty personal schema, neither ever calling
+`with_schema`, converge on one shared installation and one advisory lock).
+`postgres_two_schemas_share_a_database_but_stay_isolated_test` and
+`postgres_two_urls_to_the_same_schema_share_it_test` prove the two
+remaining halves of the mechanism (explicitly distinct schemas isolate; the
+same schema through different connection strings converges).
+`postgres_handle_from_another_installation_is_rejected_test` proves the
+client-side backstop (a handle minted against one schema, used against
+another, is rejected before any storage call) — see `grind/job`'s
+`Installation` type. None of these, nor anything else, proves an operator
+passed `with_schema` the value they actually intended in a real deployment
+— the residual hazard above.
+
+**Status.** The old owner-derivation defect this risk originally named, and
+the `$user`-fallback hazard the schema-based redesign initially left open,
+are both resolved. The residual configuration-discipline hazard (did the
+operator choose distinct schema values for installations meant to be
+distinct) is open and accepted, like risk 11's migration-ownership
+discipline.
 
 ---
 
@@ -342,28 +457,42 @@ choice.
 **What can happen.** `grind_v12` is the first migration whose statements do
 real, size-proportional work: its `ADD COLUMN ... DEFAULT now()`, backfill
 `UPDATE`, and `ADD CONSTRAINT` checks each touch every existing row under one
-`ACCESS EXCLUSIVE` lock. Measured at 2,000,000 rows, `grind_v12` takes
-roughly 6 seconds — a large-enough table can exceed
-`migration_deadline_ms` (default 30000ms) and report `MigrationCommitUnknown(12)`
-with nothing committed; re-running fails the same way until the deadline is
-raised or the file is applied directly outside Grind's deadline-bounded path.
-Separately, `grind_v12` requires a genuine stop-the-world deploy: old
-pre-`finished_at` code writing a terminal state after `grind_v12` commits
-hits `23514`; new `finished_at`-aware code writing against the still-`v11`
-schema hits an undefined-column error. The two schema versions cannot
-coexist with live writers on both sides.
+`ACCESS EXCLUSIVE` lock. Measured at 2,000,000 rows, `grind_v12`'s original
+`finished_at`-backfill statements (`docs/RECOVERY-EVIDENCE.md`, Increment 25)
+took roughly 6 seconds — **treat this figure as a lower bound, not a current
+measurement**: `grind_v12` was later edited in place, before its own release,
+to also drop `storage_owner` (see `src/grind/internal/migrations.gleam`,
+"Dropping `storage_owner`"), adding a second round of `ACCESS EXCLUSIVE`-held
+work the original 6-second figure never included — `DROP INDEX`/`CREATE
+INDEX` rebuilding `grind_jobs_unique_candidate_idx`, a `DROP CONSTRAINT`/`ADD
+CONSTRAINT PRIMARY KEY` rebuild (and the index backing it) on each of the
+three receipt tables, two `GROUP BY ... HAVING count(DISTINCT storage_owner)
+
+> 1`collision scans (one over`grind_unique_submissions`, one over
+`grind_job_resolutions`, each a full scan of that table), and three `DROP
+> COLUMN storage_owner`statements. None of this has been separately measured
+at 2,000,000 rows; the true current cost is`6s + `(this added work), not
+`6s`outright. A large-enough table can exceed`migration_deadline_ms`(default 30000ms) and report`MigrationCommitUnknown(12)`with nothing
+committed; re-running fails the same way until the deadline is raised or the
+file is applied directly outside Grind's deadline-bounded path. Separately,`grind_v12` requires a genuine stop-the-world deploy: old pre-`finished_at`code writing a terminal state after`grind_v12`commits hits`23514`; new
+`finished_at`-aware code writing against the still-`v11` schema hits an
+> undefined-column error. The two schema versions cannot coexist with live
+> writers on both sides.
 
 **Likelihood / impact.** Low likelihood (affects only large, established
 Grind deployments upgrading past v11), high impact where it applies (a
 failed migration on a production-sized table, or a correctness break from a
 rolling deploy across the migration).
 
-**Current mitigation.** The cost and the stop-the-world requirement are both
-explicitly measured and documented, with the exact commands to apply the
-migration as its own deploy step outside normal node boot.
+**Current mitigation.** The stop-the-world requirement is explicitly
+documented, with the exact commands to apply the migration as its own deploy
+step outside normal node boot. The cost figure is explicitly flagged above
+as a lower bound pending a fresh measurement against the current (post-
+`storage_owner`-removal) `grind_v12` statement list.
 
 **Evidence.** `README.md` ("Migrations"); `docs/RECOVERY-EVIDENCE.md`,
-Increment 25, for the measured cascade/backfill timing.
+Increment 25, for the original measured cascade/backfill timing (now a lower
+bound, not a current figure — see above).
 
 **Status.** Accepted — an inherent cost of the schema change, not a defect;
 mitigated by documentation and by running the migration as its own deploy
@@ -599,23 +728,56 @@ lists all three categories explicitly as open.
 ### 18. No connection pooler exercised
 
 **What can happen.** A connection pooler (PgBouncer or similar) placed
-between Grind and PostgreSQL is not exercised by any test. Two of Grind's
+between Grind and PostgreSQL is not exercised by any test. Three of Grind's
 connection-parameter-level defenses are startup parameters
-(`default_transaction_isolation`, `idle_in_transaction_session_timeout`) that
-some poolers can silently drop depending on pooling mode (transaction vs.
-session pooling in particular). `default_transaction_isolation` already has
-an in-transaction fallback pin as defense in depth against exactly this; no
-equivalent in-transaction fallback exists for
-`idle_in_transaction_session_timeout`, since by definition nothing is
-running to set it once a session has already gone idle.
+(`default_transaction_isolation`, `idle_in_transaction_session_timeout`, and
+— since `postgres.with_schema` — `search_path`) that some poolers can
+silently drop or fail to apply per-checkout, depending on pooling mode.
+`default_transaction_isolation` already has an in-transaction fallback pin
+as defense in depth against exactly this; no equivalent in-transaction
+fallback exists for `idle_in_transaction_session_timeout`, since by
+definition nothing is running to set it once a session has already gone
+idle, or for `search_path`, since nothing in Grind re-asserts it once a
+transaction is already under way.
+
+**PgBouncer specifically, and why `search_path` is the sharpest edge of the
+three.** PgBouncer applies a client's own startup parameters to the
+_server_ connection it hands out only under certain configurations: by
+default it can silently **ignore** startup parameters it does not
+recognize or was not told to track (`ignore_startup_parameters`), and even
+when told to track one (`track_extra_parameters`, which must explicitly
+list `search_path` to preserve it at all under PgBouncer's own default
+parameter handling), **transaction pooling mode** hands a client a
+_different_ physical server connection per transaction — one that was
+last configured for whatever startup parameters some _other_ client
+session set on it, not necessarily this one's. A pooler configured this
+way would not error; it would simply run Grind's queries against
+whatever schema that physical connection's `search_path` happens to
+already be set to, silently breaking the entire isolation model
+`postgres.with_schema` depends on (README, "Isolation") — indistinguishable
+from a correctly-isolated installation until two workloads' data
+inexplicably starts mixing. This is a categorically worse failure mode
+than the pre-existing `idle_in_transaction_session_timeout` risk below: a
+dropped timeout loses one backstop; a dropped or stale `search_path` can
+silently point an entire installation at the wrong schema.
 
 **Likelihood / impact.** Moderate likelihood (poolers are common in
-production Postgres deployments), moderate impact if a pooler drops the
-idle-session timeout (loses one specific, independent backstop — the
-checkout deadline and other defenses still apply).
+production Postgres deployments, and PgBouncer's transaction pooling mode
+specifically is a popular, recommended default for high-connection-count
+deployments — exactly where Grind is most likely to be introduced); high
+impact for `search_path` if encountered (silent cross-installation data
+mixing, not merely a lost backstop), moderate impact for the other two.
 
 **Current mitigation.** `default_transaction_isolation`'s in-transaction
-fallback pin. No equivalent exists for the idle-session timeout.
+fallback pin. No equivalent exists for the idle-session timeout or for
+`search_path`. An operator placing PgBouncer (or similar) between Grind and
+PostgreSQL must run it in **session pooling mode**, not transaction pooling,
+and must explicitly configure it to preserve `search_path` (PgBouncer:
+add `search_path` to `track_extra_parameters`, and ensure
+`ignore_startup_parameters` does not include it) — otherwise `postgres.with_schema`'s
+own guarantee does not hold through the pooler. This is documentation-only
+today; nothing in Grind detects or defends against a pooler silently
+misapplying `search_path`.
 
 **Evidence.** Named explicitly in `docs/RECOVERY-EVIDENCE.md` ("Limits", "No
 poolers").

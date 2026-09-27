@@ -8,8 +8,14 @@ Hex.
 The current runnable slice includes typed, versioned worker definitions,
 heterogeneous registration, PostgreSQL admission and typed result reads,
 absolute one-time scheduling, and a supervised queue consumer with bounded
-per-consumer concurrency. Its validated policy separates local worker capacity
-from the maximum jobs claimed per poll. Attempts use database-time leases,
+per-consumer concurrency. Automatic polling is Oban-like: a poll (or a slot
+freed by a completing job) keeps claiming into every free slot for as long as
+`maximum_concurrency` allows and jobs are available, backing off to the full
+`poll_interval` only once a claim actually finds nothing — so throughput is
+not capped below `maximum_concurrency` regardless of how long `poll_interval`
+is. `maximum_batch_jobs` is unrelated to that: it only bounds how many jobs
+one manual `process_available` call processes before returning. Attempts use
+database-time leases,
 fenced acknowledgement receipts, and conservative uncertainty recovery.
 Business failures support a persisted attempt limit, deterministic default or
 definition-bound retry policy, and typed terminal causes; queue handlers can
@@ -35,7 +41,7 @@ per-poll quarantine scan covers every worker id/version in the queue it
 polls, not only the ones it currently registers, so an executing row a
 retired worker version left behind is still quarantined once its lease
 expires; a separate public `postgres.quarantine_expired(database, limit:)`
-sweeps expired executing rows across every queue in a storage owner, for a
+sweeps expired executing rows across every queue in the schema, for a
 queue no consumer polls at all. Grind's schema (baseline v11, current v12
 via `migrate` — see "Migrations" below) installs fresh only into an empty
 schema; a pre-baseline marker (including the prior experimental v10) and a
@@ -43,7 +49,7 @@ partial or tampered Grind schema both fail closed without repair.
 Acknowledgement receipts retain committed attribution and a proposal fingerprint,
 not typed historical proposals. Typed outcome reads return the job's current
 result. `postgres.prune_finished` deletes finished, old-enough jobs and
-their own receipts, scoped to one storage owner and bounded per call;
+their own receipts, scoped to the whole schema and bounded per call;
 `grind/pruner` is a supervised background process that calls it on a timer
 with Oban-shaped defaults — see "Retention" below.
 See [implementation scope](docs/IMPLEMENTATION-SCOPE.md) for the delivered
@@ -111,6 +117,73 @@ let assert Ok(consumer) =
 Customize polling, concurrency, or lease duration by building a `QueuePolicy`
 instead (`queue.default_policy() |> queue.with_poll_interval(...) |> ... |>
 queue.validate_policy`) and passing its `ValidatedPolicy` to `queue.start`.
+
+## Isolation: one installation per schema
+
+Every job, quarantine scan, uniqueness domain, and retention sweep is simply
+whatever `grind_jobs` and its sibling tables hold in one PostgreSQL schema —
+there is no separate owner column scoping rows within one shared schema.
+Which schema is **explicit configuration, not inferred**: `postgres.settings`
+defaults `Settings.schema` to `"public"`; `postgres.with_schema(settings,
+"myschema")` overrides it. `postgres.validate` pins every pooled
+connection's own `search_path` to exactly that one configured schema (a
+`search_path` connection parameter, quoted safely), so it is never left to
+whatever the connecting role or database would otherwise default to. Two
+pools configured with the same schema (through any connection string that
+reaches the same physical database) share the identical installation and
+see each other's jobs; two pools configured with different schemas — in the
+same physical database or not — are fully isolated from each other, because
+Grind installs its own complete set of tables (`grind_jobs` and siblings)
+independently into each schema. The uniqueness domain's own advisory lock
+binds this same configured schema as an ordinary query parameter (never
+`current_schema()` resolved server-side), so it agrees with the schema every
+other query in that pool actually reads and writes by construction, not by
+coincidence.
+
+**Why explicit, not inferred from `search_path`'s own default.** An earlier
+design left `search_path` to whatever the connecting role or database
+defaulted to and merely documented the recommended setup. That was a real,
+fixed defect, not a hypothetical one: PostgreSQL's own default `search_path`
+(`"$user", public`) makes `current_schema()` report the _first_ schema in
+`search_path` that merely _exists_ — not the first one that actually holds
+any Grind table — so a role with its own personal, empty `"$user"` schema
+ahead of `public` (where Grind's real tables actually live) would silently
+compute a different schema identity than another such role, even though
+both operate on the exact same physical table; see
+[docs/RISKS.md](docs/RISKS.md) risk 7 and
+`postgres_user_schema_fallback_shares_one_installation_test`
+(`test/grind_test.gleam`) for the concrete duplicate-admission hazard this
+caused and the proof it is now closed.
+
+**Creating the schema.** `postgres.migrate`/`migrate_with` create the
+configured schema (`CREATE SCHEMA IF NOT EXISTS`, safely quoted) if it does
+not already exist — but only after confirming it is genuinely absent, never
+unconditionally: `CREATE SCHEMA IF NOT EXISTS` itself demands database-level
+`CREATE` privilege from the connecting role even when the schema already
+exists, which the recommended least-privilege setup below deliberately does
+not grant. `postgres.start` and every other call never create a schema —
+against a schema whose tables do not exist yet, they fail with an ordinary
+typed storage error instead (missing-relation errors from the same query
+that would otherwise have run).
+
+**Recommended setup.** Have an administrator create the schema once, owned
+by the role Grind connects as (`CREATE SCHEMA AUTHORIZATION myrole`), and
+pass that same name to `with_schema` — this is the least-privilege shape:
+the connecting role never needs database-level `CREATE`, only ownership of
+its own schema, exactly like
+`postgres_two_schemas_share_a_database_but_stay_isolated_test`
+(`test/grind_test.gleam`) sets itself up. `with_schema`'s own default
+(`"public"`) is fine for a single-installation deployment with no need to
+share a database with another Grind installation. Two installations sharing
+one physical database must pass genuinely distinct schema names to
+`with_schema` — nothing enforces that they were meant to be distinct; see
+[docs/RISKS.md](docs/RISKS.md) risk 7 for the residual configuration-
+discipline hazard this leaves open. **A connection pooler in front of
+PostgreSQL must be configured to preserve `search_path`** — PgBouncer's
+transaction pooling mode in particular can hand a physical server
+connection to a client without applying that client's own startup
+parameters, silently pointing an installation at the wrong schema with no
+error at all; see [docs/RISKS.md](docs/RISKS.md) risk 18.
 
 ## Observations
 
@@ -483,9 +556,15 @@ only creating new, empty objects: its `ADD COLUMN ... DEFAULT now()` and its
 backfill `UPDATE` each rewrite every existing row once, and its `ADD
 CONSTRAINT` (`grind_jobs_finished_at_check`) validates every row again — all
 under the one `ACCESS EXCLUSIVE` lock `ALTER TABLE` already takes for the
-whole step, not merely while acquiring it. Measured at 2,000,000 rows,
-`grind_v12` itself takes roughly 6 seconds; that time is bounded by
-`Settings.migration_deadline_ms` (default 30000ms) for the _entire_ step,
+whole step, not merely while acquiring it. Measured at 2,000,000 rows, this
+`finished_at` portion alone takes roughly 6 seconds — a **lower bound**, not
+`grind_v12`'s full current cost: `grind_v12` was later edited in place,
+before its own release, to also drop `storage_owner` from every table (see
+`docs/RISKS.md` #10 and `src/grind/internal/migrations.gleam`, "Dropping
+`storage_owner`"), adding index/primary-key rebuilds and two full-table
+collision scans that have not themselves been measured at this scale. That
+time is bounded by `Settings.migration_deadline_ms` (default 30000ms) for
+the _entire_ step,
 not by the 2000ms `lock_timeout` above (`lock_timeout` only bounds _waiting_
 to acquire a lock another session already holds; it does nothing once this
 step's own `ALTER`/`UPDATE` has acquired its lock and is doing its own
@@ -533,8 +612,8 @@ A job is prunable once it has finished (reached one of the six terminal
 states — `succeeded`, `business_failed`, `runtime_failed`,
 `contract_mismatch`, `discarded`, `cancelled`) and stayed that way for at
 least a configured age; `postgres.prune_finished` deletes it, scoped to the
-caller's own storage owner (never by queue — retention is a property of the
-whole database):
+caller's own schema (never by queue — retention is a property of the
+whole schema):
 
 ```gleam
 postgres.prune_finished(database, older_than_ms: 60_000, limit: 1_000)
@@ -638,7 +717,7 @@ required to be positive. This is a real trade-off, not a free lunch:
   runs — see `docs/UNIQUENESS-CONTRACT.md`.
 - **`grind_jobs_finished_idx`/`grind_unique_submissions_job_idx`/
   `grind_job_resolutions_job_idx`** (`grind_v12`) back this: the candidate
-  scan orders by `(storage_owner, finished_at, id)`, and each receipt delete
+  scan orders by `(finished_at, id)`, and each receipt delete
   seeks its own table by `job_id` rather than scanning it.
 
 See `docs/UNIQUENESS-CONTRACT.md` for the full interaction with uniqueness

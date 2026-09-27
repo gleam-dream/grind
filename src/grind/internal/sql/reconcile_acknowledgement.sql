@@ -1,1 +1,1 @@
-SELECT storage_owner, queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, committed_state, failure_cause, (extract(epoch FROM committed_at) * 1000)::bigint AS committed_at_unix_ms FROM grind_job_acknowledgements WHERE storage_owner = $1 AND command_id = $2
+SELECT queue, job_id, worker_id, worker_version, attempt_id, attempt_epoch, committed_state, failure_cause, (extract(epoch FROM committed_at) * 1000)::bigint AS committed_at_unix_ms FROM grind_job_acknowledgements WHERE command_id = $1

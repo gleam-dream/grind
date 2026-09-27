@@ -21,7 +21,7 @@ pub opaque type Consumer {
   Consumer(
     subject: process.Subject(Message),
     supervisor_pid: process.Pid,
-    maximum_jobs_per_poll: Int,
+    maximum_batch_jobs: Int,
     shutdown_grace_ms: Int,
     owner_pid: process.Pid,
   )
@@ -39,7 +39,27 @@ pub type Polling {
 pub type QueuePolicy {
   QueuePolicy(
     polling: Polling,
-    maximum_jobs_per_poll: Int,
+    /// Upper bound on how many jobs one `process_available` call processes
+    /// before returning control to the caller — a manual-mode batch size,
+    /// nothing else. It has no effect on automatic (`PollEvery`) polling,
+    /// which always tries to claim into every free slot up to
+    /// `maximum_concurrency` and backs off to `polling`'s interval only once
+    /// a claim finds nothing (see `grind/queue`'s module-level automatic
+    /// polling behavior); before this field was narrowed to this single
+    /// meaning it also throttled automatic polling to at most this many
+    /// claims per `Poll` timer tick, which is what produced the low default
+    /// throughput ceiling documented as risk 6 in `docs/RISKS.md`. **Default:
+    /// 1** (see `default_policy`) — plainly, this means `process_available`
+    /// handles exactly one job per call unless raised with
+    /// `with_maximum_batch_jobs`; a caller relying on `process_available` to
+    /// drain a manual-mode backlog rather than calling `process_one` in its
+    /// own loop needs to raise this explicitly. The default is kept at 1,
+    /// not raised, so that `default_policy`'s manual-mode behavior stays the
+    /// conservative, explicit-opt-in shape it always has been (one call, one
+    /// job, one typed result) rather than a surprising multi-job batch a
+    /// caller did not ask for; `default_policy`'s own `maximum_concurrency`
+    /// is 1 for the identical reason.
+    maximum_batch_jobs: Int,
     maximum_concurrency: Int,
     lease_duration_ms: Int,
     shutdown_grace_ms: Int,
@@ -49,7 +69,7 @@ pub type QueuePolicy {
 pub fn default_policy() -> QueuePolicy {
   QueuePolicy(
     polling: PollEvery(250),
-    maximum_jobs_per_poll: 1,
+    maximum_batch_jobs: 1,
     maximum_concurrency: 1,
     lease_duration_ms: 30_000,
     shutdown_grace_ms: 5000,
@@ -103,11 +123,14 @@ pub fn with_manual_polling(policy: QueuePolicy) -> QueuePolicy {
   QueuePolicy(..policy, polling: Manual)
 }
 
-pub fn with_maximum_jobs_per_poll(
+/// Sets the manual-mode batch size `process_available` processes per call.
+/// Has no effect on automatic (`PollEvery`) polling — see the field's doc
+/// comment on `QueuePolicy`.
+pub fn with_maximum_batch_jobs(
   policy: QueuePolicy,
-  maximum_jobs_per_poll: Int,
+  maximum_batch_jobs: Int,
 ) -> QueuePolicy {
-  QueuePolicy(..policy, maximum_jobs_per_poll:)
+  QueuePolicy(..policy, maximum_batch_jobs:)
 }
 
 /// Sets the maximum number of live worker children owned by this consumer.
@@ -139,7 +162,7 @@ pub fn with_shutdown_grace(
 
 pub type PolicyError {
   PollIntervalMustBePositive
-  MaximumJobsPerPollMustBePositive
+  MaximumBatchJobsMustBePositive
   MaximumConcurrencyMustBePositive
   LeaseDurationMustBePositive
   ShutdownGraceMustBeNonNegative
@@ -148,7 +171,7 @@ pub type PolicyError {
 pub opaque type ValidatedPolicy {
   ValidatedPolicy(
     polling: Polling,
-    maximum_jobs_per_poll: Int,
+    maximum_batch_jobs: Int,
     maximum_concurrency: Int,
     lease_duration_ms: Int,
     shutdown_grace_ms: Int,
@@ -161,7 +184,7 @@ pub fn validate_policy(
 ) -> Result(ValidatedPolicy, PolicyError) {
   let QueuePolicy(
     polling:,
-    maximum_jobs_per_poll:,
+    maximum_batch_jobs:,
     maximum_concurrency:,
     lease_duration_ms:,
     shutdown_grace_ms:,
@@ -173,8 +196,8 @@ pub fn validate_policy(
   case polling_ok {
     False -> Error(PollIntervalMustBePositive)
     True ->
-      case maximum_jobs_per_poll > 0 {
-        False -> Error(MaximumJobsPerPollMustBePositive)
+      case maximum_batch_jobs > 0 {
+        False -> Error(MaximumBatchJobsMustBePositive)
         True ->
           case maximum_concurrency > 0 {
             False -> Error(MaximumConcurrencyMustBePositive)
@@ -187,7 +210,7 @@ pub fn validate_policy(
                     True ->
                       Ok(ValidatedPolicy(
                         polling:,
-                        maximum_jobs_per_poll:,
+                        maximum_batch_jobs:,
                         maximum_concurrency:,
                         lease_duration_ms:,
                         shutdown_grace_ms:,
@@ -320,6 +343,7 @@ pub type RenewalStatus {
 
 type Message {
   Poll
+  FillSlots
   BeginShutdown(process.Subject(ShutdownReply))
   ShutdownGraceExpired(Int)
   ReadShutdownState(process.Subject(Bool))
@@ -469,7 +493,6 @@ type ConsumerState {
     /// `QueueAckStale(_, AckLeaseExpired(..))` rather than retrying forever.
     pending_ack_retry_budget: Int,
     active: List(ActiveAttempt),
-    poll_remaining_jobs: Int,
     /// True while a `Poll` timer is already scheduled against
     /// `incarnation_subject` and has not yet fired. `continue_if_idle` is the
     /// sole scheduler and checks this before arming another one, so free
@@ -477,6 +500,25 @@ type ConsumerState {
     /// attempts are still running never accumulates more than one pending
     /// timer — see its doc comment.
     poll_scheduled: Bool,
+    /// True while a `FillSlots` message is already outstanding in this
+    /// incarnation's own mailbox and has not yet been handled. `request_fill`
+    /// is the sole sender and checks this before sending another, for the
+    /// same single-outstanding-message reason `poll_scheduled` guards `Poll`.
+    /// Unlike `poll_scheduled` (a timer, armed only once idle), `request_fill`
+    /// sends `FillSlots` unconditionally after every successful automatic
+    /// claim — it never itself checks whether free capacity remains; that
+    /// check happens only once the message is actually handled, inside
+    /// `fill_automatic_slots` (`list.length(state.active) < maximum_concurrency`),
+    /// which simply does nothing more (`continue_if_idle`) if none is left.
+    /// Sending unconditionally rather than pre-checking capacity at the send
+    /// site is deliberate, not an oversight: it is what makes a burst that
+    /// fills many slots proceed one claim per message dispatch, returning to
+    /// the mailbox after each one — see `fill_automatic_slots`'s doc comment
+    /// for why this is what keeps `Renew`/`AttemptReturned`/`BeginShutdown`
+    /// from starving behind a whole burst of claims. A harmless extra
+    /// `FillSlots` dispatch once capacity is already full costs one mailbox
+    /// round-trip, never a wasted claim attempt.
+    fill_pending: Bool,
     hooks: Hooks,
     shutting_down: Bool,
     shutdown_generation: Int,
@@ -580,7 +622,7 @@ fn start_configured_consumer_with_handoff(
 ) -> Result(Consumer, StartError) {
   let ValidatedPolicy(
     polling:,
-    maximum_jobs_per_poll:,
+    maximum_batch_jobs:,
     maximum_concurrency: _,
     lease_duration_ms:,
     shutdown_grace_ms:,
@@ -647,8 +689,8 @@ fn start_configured_consumer_with_handoff(
                 renewal_interval_ms:,
                 pending_ack_retry_budget:,
                 active: [],
-                poll_remaining_jobs: 0,
                 poll_scheduled: auto_poll,
+                fill_pending: False,
                 hooks:,
                 shutting_down: False,
                 shutdown_generation: 0,
@@ -696,7 +738,7 @@ fn start_configured_consumer_with_handoff(
           Ok(Consumer(
             subject,
             started.pid,
-            maximum_jobs_per_poll,
+            maximum_batch_jobs,
             shutdown_grace_ms,
             process.self(),
           ))
@@ -883,10 +925,11 @@ fn wait_for_process_one(
   }
 }
 
-/// Processes up to the configured batch size, stopping when no due job remains.
+/// Processes up to the configured batch size (`maximum_batch_jobs`),
+/// stopping when no due job remains.
 pub fn process_available(consumer: Consumer) -> BatchOutcome {
-  let Consumer(maximum_jobs_per_poll:, ..) = consumer
-  run_batch_from(consumer, maximum_jobs_per_poll, 0)
+  let Consumer(maximum_batch_jobs:, ..) = consumer
+  run_batch_from(consumer, maximum_batch_jobs, 0)
 }
 
 fn run_batch_from(
@@ -1018,22 +1061,28 @@ fn handle_message(
       // tracking (or the initial kick `start_polling` sent) — clear it
       // before anything else so `continue_if_idle` is free to arm the next
       // one, on this round or a later one, regardless of which branch below
-      // is taken.
+      // is taken. Filling itself is unconditional (Oban-like): try to claim
+      // into every free slot right away, backing off to the next `Poll`
+      // timer only once a claim actually finds nothing (see
+      // `fill_automatic_slots`/`continue_if_idle`) — there is no separate
+      // per-poll claim budget to reset here any more.
       let state = ConsumerState(..state, poll_scheduled: False)
-      let ValidatedPolicy(maximum_jobs_per_poll:, ..) = state.policy
       case state.shutting_down {
         True -> actor.continue(state)
-        False ->
-          case state.poll_remaining_jobs > 0 {
-            True -> actor.continue(state)
-            False ->
-              fill_automatic_slots(
-                ConsumerState(
-                  ..state,
-                  poll_remaining_jobs: maximum_jobs_per_poll,
-                ),
-              )
-          }
+        False -> fill_automatic_slots(state)
+      }
+    }
+    FillSlots -> {
+      // The one outstanding `FillSlots` message `fill_pending` was tracking:
+      // clear it before anything else, exactly like `Poll` above clears
+      // `poll_scheduled`. A `BeginShutdown` that landed ahead of this message
+      // in the mailbox already set `shutting_down`, so this step correctly
+      // stops filling rather than starting another claim — see
+      // `fill_automatic_slots`'s doc comment.
+      let state = ConsumerState(..state, fill_pending: False)
+      case state.shutting_down {
+        True -> actor.continue(state)
+        False -> fill_automatic_slots(state)
       }
     }
     BeginShutdown(reply) -> begin_shutdown(state, reply)
@@ -1218,14 +1267,6 @@ fn start_attempt(
                   ..state,
                   active: list.prepend(state.active, active),
                 )
-              let state = case completion {
-                ManualCompletion(_) -> state
-                Automatic ->
-                  ConsumerState(
-                    ..state,
-                    poll_remaining_jobs: state.poll_remaining_jobs - 1,
-                  )
-              }
               continue_after_start(state, completion)
             }
           }
@@ -1325,14 +1366,15 @@ fn finish_without_claim(
   completion: Completion,
   result: Result(Bool, ProcessError),
 ) -> actor.Next(ConsumerState, Message) {
-  let state = case completion {
-    ManualCompletion(reply) -> {
-      process.send(reply, result)
-      state
-    }
-    Automatic -> ConsumerState(..state, poll_remaining_jobs: 0)
+  case completion {
+    ManualCompletion(reply) -> process.send(reply, result)
+    Automatic -> Nil
   }
-  continue_after_completion(state)
+  // A claim that found nothing (or failed outright) is exactly "idle": stop
+  // trying to fill more slots this round and let `continue_if_idle` arm the
+  // next `Poll` timer at the full interval, rather than looping straight
+  // back into `fill_automatic_slots`.
+  continue_if_idle(state)
 }
 
 fn finish_attempt(
@@ -1524,28 +1566,66 @@ fn finish_completion(
   case completion {
     ManualCompletion(reply) -> {
       process.send(reply, result)
-      continue_after_completion(state)
+      continue_if_idle(state)
     }
     Automatic ->
       case result {
         Ok(True) -> fill_automatic_slots(state)
-        Ok(False) | Error(_) ->
-          continue_if_idle(ConsumerState(..state, poll_remaining_jobs: 0))
+        Ok(False) | Error(_) -> continue_if_idle(state)
       }
   }
 }
 
+/// Claims into one free slot, if any is free and this consumer is not
+/// shutting down — Oban-like: there is no separate per-poll claim budget, so
+/// a backlog drains as fast as capacity allows instead of at most one claim
+/// (or `maximum_jobs_per_poll`, before this change) per `Poll` timer tick.
+/// Filling *more* than one slot in a row is not done by recursing here
+/// directly: a successful automatic claim that leaves free capacity behind
+/// asks `continue_after_start` to send this coordinator's own incarnation a
+/// `FillSlots` message instead (`request_fill`), so this function itself
+/// only ever performs at most one claim per call. That message goes to the
+/// back of the same mailbox `Renew`, `AttemptReturned`, and `BeginShutdown`
+/// also arrive on, so a burst that fills many slots interleaves with those
+/// messages one claim at a time — each one gets to run between successive
+/// claims, rather than waiting out an entire burst of up to
+/// `maximum_concurrency` claims before this coordinator's message loop comes
+/// up for air again. (An earlier version of this function recursed directly
+/// into `start_attempt`/`continue_after_start` from inside one message
+/// handler, so a burst that filled every free slot could stall a pending
+/// lease renewal or a shutdown request behind all of it — see `docs/RISKS.md`
+/// risks 4 and 5.) `attempt.claim_one`'s own claim-time quarantine scan (see
+/// its doc comment) still runs on every one of these calls; that stays
+/// bounded by real progress, not by wall-clock time, because every call here
+/// either starts a genuine attempt (shrinking the free-slot count by one) or
+/// finds no job and stops immediately via `continue_if_idle` — never
+/// spinning and finding nothing on the same call, so this can never become a
+/// hot loop (see `docs/RISKS.md` risk 6 for the fixed per-claim cost that
+/// remains).
 fn fill_automatic_slots(
   state: ConsumerState,
 ) -> actor.Next(ConsumerState, Message) {
   let ValidatedPolicy(maximum_concurrency:, ..) = state.policy
-  case
-    !state.shutting_down
-    && state.poll_remaining_jobs > 0
-    && list.length(state.active) < maximum_concurrency
-  {
+  case !state.shutting_down && list.length(state.active) < maximum_concurrency {
     True -> start_attempt(state, Automatic)
     False -> continue_if_idle(state)
+  }
+}
+
+/// Asks this coordinator's own incarnation to run `fill_automatic_slots`
+/// again, via a `FillSlots` message rather than a direct call, so any
+/// message already ahead of it in the mailbox (a lease renewal, a worker's
+/// completion, a shutdown request) is handled first. `fill_pending` is the
+/// single-outstanding-message guard: a completion that arrives while a
+/// `FillSlots` is already queued does not send a second one, exactly like
+/// `continue_if_idle`'s `poll_scheduled` guard for `Poll`.
+fn request_fill(state: ConsumerState) -> actor.Next(ConsumerState, Message) {
+  case state.fill_pending {
+    True -> actor.continue(state)
+    False -> {
+      process.send(state.incarnation_subject, FillSlots)
+      actor.continue(ConsumerState(..state, fill_pending: True))
+    }
   }
 }
 
@@ -1555,35 +1635,30 @@ fn continue_after_start(
 ) -> actor.Next(ConsumerState, Message) {
   case completion {
     ManualCompletion(_) -> actor.continue(state)
-    Automatic -> fill_automatic_slots(state)
+    Automatic -> request_fill(state)
   }
 }
 
-fn continue_after_completion(
-  state: ConsumerState,
-) -> actor.Next(ConsumerState, Message) {
-  case state.poll_remaining_jobs > 0 {
-    True -> fill_automatic_slots(state)
-    False -> continue_if_idle(state)
-  }
-}
-
-/// Called at the end of every poll round (this poll's claim batch drained,
-/// or an active attempt just finished). Arms the next `Poll` timer whenever
-/// this consumer is not shutting down, this round is done claiming
-/// (`poll_remaining_jobs == 0`), and free capacity remains
-/// (`active` below `maximum_concurrency`) — not only when `active` is fully
-/// empty. A `maximum_concurrency` above 1 otherwise leaves spare slots idle
-/// for as long as one attempt keeps running: with the old empty-only check,
-/// a newly due job (or the claim-time expired-lease quarantine scan, which
-/// piggybacks on the same claim query) had to wait for every currently
-/// active attempt to finish before the next poll was even scheduled, no
-/// matter how much capacity was actually free in the meantime.
-/// `poll_scheduled` is the single-outstanding-timer guard this relies on: an
-/// active attempt finishing while a timer from an earlier round is already
-/// pending must not arm a second, overlapping one (see the field's doc
-/// comment). Shutdown draining is unaffected — a consumer already shutting
-/// down never re-arms a poll regardless of capacity.
+/// Called at the end of every poll round (a claim just found nothing or
+/// failed, or an active attempt just finished). Arms the next `Poll` timer
+/// whenever this consumer is not shutting down, `auto_poll` is on, no timer
+/// is already outstanding, and free capacity remains (`active` below
+/// `maximum_concurrency`) — not only when `active` is fully empty. A
+/// `maximum_concurrency` above 1 otherwise leaves spare slots idle for as
+/// long as one attempt keeps running: with an empty-only check, a newly due
+/// job (or the claim-time expired-lease quarantine scan, which piggybacks on
+/// the same claim query) had to wait for every currently active attempt to
+/// finish before the next poll was even scheduled, no matter how much
+/// capacity was actually free in the meantime. Reaching this function at all
+/// already means the immediately preceding claim (if any) found nothing to
+/// claim right now — a slot freeing up later calls `fill_automatic_slots`
+/// directly instead, so a fresh claim attempt is never delayed behind this
+/// timer while capacity is genuinely free. `poll_scheduled` is the
+/// single-outstanding-timer guard this relies on: an active attempt
+/// finishing while a timer from an earlier round is already pending must
+/// not arm a second, overlapping one (see the field's doc comment).
+/// Shutdown draining is unaffected — a consumer already shutting down never
+/// re-arms a poll regardless of capacity.
 fn continue_if_idle(
   state: ConsumerState,
 ) -> actor.Next(ConsumerState, Message) {
@@ -1603,7 +1678,6 @@ fn continue_if_idle(
       case
         state.auto_poll
         && !state.poll_scheduled
-        && state.poll_remaining_jobs == 0
         && list.length(state.active) < maximum_concurrency
       {
         True -> {
@@ -1833,11 +1907,11 @@ fn handle_worker_down(
               process.send(reply, Error(QueueWorkerExited))
             Automatic -> Nil
           }
-          let state = case completion {
-            ManualCompletion(_) -> state
-            Automatic -> ConsumerState(..state, poll_remaining_jobs: 0)
-          }
-          continue_after_completion(state)
+          // An unexpected worker exit backs off to the next scheduled poll
+          // the same way an empty/failed claim does, rather than
+          // immediately trying to fill the slot it just freed — see
+          // `continue_if_idle`.
+          continue_if_idle(state)
         }
       }
     process.PortDown(..) -> actor.continue(state)

@@ -54,6 +54,16 @@ pub type Migration {
     statements: List(String),
     shape: List(ExpectedRelation),
     foreign_keys: List(String),
+    /// `#(table_name, column_name)` pairs that must NOT exist once this
+    /// version is genuinely installed — the inverse of `shape`'s
+    /// `key_columns` ("must exist"). Empty for every version before a
+    /// column was ever dropped from an already-released shape. Catches a
+    /// stale database whose `grind_schema_migrations` marker claims this
+    /// version but whose physical shape predates an in-place edit made to
+    /// this version *before* it was ever released — see `v12_statements`'s
+    /// own doc comment ("Dropping `storage_owner`") for the one case this
+    /// exists for today, and AGENTS.md, "Adding a migration".
+    forbidden_columns: List(#(String, String)),
   )
 }
 
@@ -75,8 +85,14 @@ pub fn advisory_lock_statement() -> String {
 @internal
 pub fn migrations() -> List(Migration) {
   [
-    Migration(11, v11_statements(), v11_shape(), []),
-    Migration(12, v12_statements(), v12_shape(), v12_foreign_keys()),
+    Migration(11, v11_statements(), v11_shape(), [], []),
+    Migration(
+      12,
+      v12_statements(),
+      v12_shape(),
+      v12_foreign_keys(),
+      v12_forbidden_columns(),
+    ),
   ]
 }
 
@@ -170,13 +186,18 @@ fn v11_shape() -> List(ExpectedRelation) {
 /// query's own `ORDER BY id` needs `lease_expires_at` in the index at all
 /// (it is only ever a range filter, applied against however many rows the
 /// leading columns already narrowed down to), and `queue` narrows the wrong
-/// direction for the cross-queue sweep, which does not filter by it —
-/// `(storage_owner, id) WHERE state = 'executing'` measured 2.6ms for the
-/// cross-queue sweep and 1.3ms per-queue against a 2M-row `grind_jobs` (no
-/// sort either way, since `id` is already the index order), against 384ms
-/// for `(storage_owner, queue, lease_expires_at, id)` — that shape forces
-/// the cross-queue sweep (no `queue` predicate to seek on) to walk the
-/// primary key across every row instead.
+/// direction for the cross-queue sweep, which does not filter by it — `(id)
+/// WHERE state = 'executing'` measured 2.6ms for the cross-queue sweep and
+/// 1.3ms per-queue against a 2M-row `grind_jobs` (no sort either way, since
+/// `id` is already the index order), against 384ms for `(queue,
+/// lease_expires_at, id)` — that shape forces the cross-queue sweep (no
+/// `queue` predicate to seek on) to walk the primary key across every row
+/// instead. (These three indexes were originally measured, and shipped, with
+/// a leading `storage_owner` column, matching every other index on this
+/// table at the time — see "Dropping `storage_owner`" below for why that
+/// column is gone from all of them now; a single schema's own
+/// `grind_jobs` never held more than one distinct `storage_owner` value to
+/// begin with; per-relation cost was otherwise unaffected by its removal.)
 ///
 /// Each receipt table's own `DELETE ... WHERE NOT EXISTS (SELECT 1 FROM
 /// grind_jobs ...)`, immediately before that table's own `ADD CONSTRAINT
@@ -190,6 +211,57 @@ fn v11_shape() -> List(ExpectedRelation) {
 /// seeded orphan in the frozen v11 upgrade fixture makes this migration
 /// fail with `23503` without these three `DELETE`s, and succeed with the
 /// orphan gone once they run).
+///
+/// **Dropping `storage_owner`.** Isolation between logically distinct Grind
+/// installations is now the PostgreSQL schema (`search_path`) alone, not a
+/// `storage_owner` value scoping rows within one shared schema — see
+/// `docs/UNIQUENESS-CONTRACT.md` and `README.md`, "Isolation". `v11`
+/// (frozen, already released — its own statements cannot change) created
+/// `storage_owner` on `grind_jobs` and every receipt/resolution table, plus
+/// every composite key or index that included it; `v12`, still unreleased
+/// and edited in place for this change, both adds `finished_at` (above) and
+/// removes `storage_owner` everywhere, since both belong to the same
+/// not-yet-shipped version. Every PK/unique constraint/index that included
+/// `storage_owner` is dropped and rebuilt without it:
+/// `grind_jobs_unique_candidate_idx` (a non-unique index — no collision risk
+/// from dropping its leading column), `grind_job_acknowledgements_pkey`
+/// (`(storage_owner, command_id)` -> `(command_id)`) and
+/// `_attempt_key` (`(storage_owner, job_id, attempt_id, attempt_epoch)` ->
+/// `(job_id, attempt_id, attempt_epoch)` — both provably collision-free,
+/// since `command_id` and `job_id` are themselves derived from
+/// `grind_jobs.id` (a single `bigserial` sequence, already unique across
+/// every owner in one physical table) and `grind_attempts_id_seq`
+/// (likewise one shared sequence), never from anything a caller could
+/// independently reuse across owners), `grind_job_resolutions_pkey`
+/// (`(storage_owner, resolution_id)` -> `(resolution_id)`), and
+/// `grind_unique_submissions_pkey` (`(storage_owner, submission_id)` ->
+/// `(submission_id)`). `resolution_id` and `submission_id`, unlike
+/// `command_id`, are caller-chosen strings (an operator's own audit label; a
+/// caller's own idempotency key) with no such structural uniqueness
+/// guarantee: two distinct `storage_owner` values that shared one physical
+/// schema on `v11` specifically to stay mutually isolated (the deliberate,
+/// documented use of the now-removed `postgres.with_storage_owner`
+/// override) could have coincidentally reused the identical string for
+/// unrelated purposes. Dropping `storage_owner` from either table would then
+/// silently merge two different rows onto one now-shared key — so each
+/// table's own `DO` block, immediately before that table's `DROP COLUMN`,
+/// checks for exactly that collision first and fails the whole step closed
+/// with a clear `RAISE EXCEPTION` (never silently merging) before any data
+/// is touched; the ordinary case (no collision — including every fresh v11
+/// install, which only ever had one implicit `storage_owner` value per
+/// schema to begin with under the derived, non-override resolution) passes
+/// through with no observable effect beyond the schema change itself. See
+/// `docs/RECOVERY-EVIDENCE.md` for the frozen-fixture proof of both the
+/// ordinary (no-collision) upgrade and the collision-fails-closed case.
+///
+/// **The down direction is lossy.** `priv/migrations/*.sql`'s own `v12`
+/// `down` section re-adds `storage_owner` as `NOT NULL DEFAULT ''` on every
+/// table (never the original per-row value, which this `up` direction
+/// already discarded) — a v11-era caller reading rows through that
+/// down-migrated schema would see every row as if it belonged to one
+/// `storage_owner: ""` installation, indistinguishable from every other row,
+/// not restored to whatever distinct owners (if any) existed before this
+/// migration first ran.
 fn v12_statements() -> List(String) {
   [
     advisory_lock_statement(),
@@ -201,9 +273,9 @@ fn v12_statements() -> List(String) {
     "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_finished_at_check CHECK ((state IN ("
       <> terminal.states_sql()
       <> ")) = (finished_at IS NOT NULL))",
-    "CREATE INDEX grind_jobs_finished_idx ON grind_jobs (storage_owner, finished_at, id) WHERE finished_at IS NOT NULL",
-    "CREATE INDEX grind_jobs_claim_idx ON grind_jobs (storage_owner, queue, available_at, id) WHERE state IN ('queued', 'scheduled', 'retryable')",
-    "CREATE INDEX grind_jobs_quarantine_idx ON grind_jobs (storage_owner, id) WHERE state = 'executing'",
+    "CREATE INDEX grind_jobs_finished_idx ON grind_jobs (finished_at, id) WHERE finished_at IS NOT NULL",
+    "CREATE INDEX grind_jobs_claim_idx ON grind_jobs (queue, available_at, id) WHERE state IN ('queued', 'scheduled', 'retryable')",
+    "CREATE INDEX grind_jobs_quarantine_idx ON grind_jobs (id) WHERE state = 'executing'",
     "CREATE INDEX grind_job_acknowledgements_job_idx ON grind_job_acknowledgements (job_id)",
     "CREATE INDEX grind_unique_submissions_job_idx ON grind_unique_submissions (job_id)",
     "CREATE INDEX grind_job_resolutions_job_idx ON grind_job_resolutions (job_id)",
@@ -213,6 +285,22 @@ fn v12_statements() -> List(String) {
     "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_job_id_fkey FOREIGN KEY (job_id) REFERENCES grind_jobs (id) ON DELETE CASCADE",
     "ALTER TABLE grind_unique_submissions ADD CONSTRAINT grind_unique_submissions_job_id_fkey FOREIGN KEY (job_id) REFERENCES grind_jobs (id) ON DELETE CASCADE",
     "ALTER TABLE grind_job_resolutions ADD CONSTRAINT grind_job_resolutions_job_id_fkey FOREIGN KEY (job_id) REFERENCES grind_jobs (id) ON DELETE CASCADE",
+    "DROP INDEX grind_jobs_unique_candidate_idx",
+    "CREATE INDEX grind_jobs_unique_candidate_idx ON grind_jobs (worker_id, worker_version, unique_key_contract, unique_key_sha256) WHERE unique_key_sha256 IS NOT NULL",
+    "ALTER TABLE grind_jobs DROP COLUMN storage_owner",
+    "DO $$ BEGIN IF EXISTS (SELECT 1 FROM grind_job_resolutions GROUP BY resolution_id HAVING count(DISTINCT storage_owner) > 1) THEN RAISE EXCEPTION 'grind_v12: two distinct storage owners share a resolution_id; dropping storage_owner would silently merge their grind_job_resolutions rows. Resolve this collision manually (rename or remove one side) before migrating.'; END IF; END $$",
+    "ALTER TABLE grind_job_resolutions DROP CONSTRAINT grind_job_resolutions_pkey",
+    "ALTER TABLE grind_job_resolutions DROP COLUMN storage_owner",
+    "ALTER TABLE grind_job_resolutions ADD CONSTRAINT grind_job_resolutions_pkey PRIMARY KEY (resolution_id)",
+    "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_pkey",
+    "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_attempt_key",
+    "ALTER TABLE grind_job_acknowledgements DROP COLUMN storage_owner",
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_pkey PRIMARY KEY (command_id)",
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_attempt_key UNIQUE (job_id, attempt_id, attempt_epoch)",
+    "DO $$ BEGIN IF EXISTS (SELECT 1 FROM grind_unique_submissions GROUP BY submission_id HAVING count(DISTINCT storage_owner) > 1) THEN RAISE EXCEPTION 'grind_v12: two distinct storage owners share a submission_id; dropping storage_owner would silently merge their grind_unique_submissions rows. Resolve this collision manually (rename or remove one side) before migrating.'; END IF; END $$",
+    "ALTER TABLE grind_unique_submissions DROP CONSTRAINT grind_unique_submissions_pkey",
+    "ALTER TABLE grind_unique_submissions DROP COLUMN storage_owner",
+    "ALTER TABLE grind_unique_submissions ADD CONSTRAINT grind_unique_submissions_pkey PRIMARY KEY (submission_id)",
     "INSERT INTO grind_schema_migrations (version) VALUES (12)",
   ]
 }
@@ -273,5 +361,29 @@ fn v12_foreign_keys() -> List(String) {
     "grind_job_acknowledgements_job_id_fkey",
     "grind_unique_submissions_job_id_fkey",
     "grind_job_resolutions_job_id_fkey",
+  ]
+}
+
+/// `grind_v12`'s own forbidden-column set: `storage_owner`, on every table
+/// it was ever dropped from by this same, not-yet-released version (see
+/// `v12_statements`'s own doc comment, "Dropping `storage_owner`"). Physical
+/// presence here despite a `grind_schema_migrations` marker already claiming
+/// version 12 means this database ran an *older* copy of `v12_statements`
+/// (from before that in-place edit) — a dev database created while this
+/// unreleased version was still being developed, never a genuinely
+/// conforming v12 install. `postgres.read_schema_generation` fails this
+/// closed (`IncompatibleSchema`) rather than trusting the marker alone,
+/// exactly like a missing `shape` relation or `foreign_keys` entry already
+/// does for the opposite case (something the marker claims but the physical
+/// schema lacks). See AGENTS.md, "Adding a migration", for what to do if
+/// this is ever hit: recreate the database and let `postgres.migrate` apply
+/// the current `v12_statements` from scratch — there is no in-place repair
+/// path for an unreleased version edited after being run.
+fn v12_forbidden_columns() -> List(#(String, String)) {
+  [
+    #("grind_jobs", "storage_owner"),
+    #("grind_job_resolutions", "storage_owner"),
+    #("grind_job_acknowledgements", "storage_owner"),
+    #("grind_unique_submissions", "storage_owner"),
   ]
 }

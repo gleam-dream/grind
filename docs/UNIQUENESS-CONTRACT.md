@@ -210,9 +210,8 @@ types**: it builds and returns `grind/submission`'s own public
 `Admission`/`Conflict`/`SubmitError`/`PendingSubmission` values
 directly (via a small set of `@internal` constructors and field accessors on
 the opaque ones — `new_conflict`, `new_pending_submission`, and
-`pending_submission_storage_owner`/`pending_submission_worker`/
-`pending_submission_request_sha256` — rather than an intermediate fields
-record), so
+`pending_submission_worker`/`pending_submission_request_sha256` — rather
+than an intermediate fields record), so
 `submit_unique`/`reconcile_unique` in `grind/postgres` are thin entry points
 that call straight through, not a second translating layer.
 
@@ -491,15 +490,35 @@ Inside one PostgreSQL transaction (`transaction_safely`, the same wrapper
    that test's evidence comes from a _committed_ attempt on the same
    connection, not the contended one.
 3. `pg_advisory_xact_lock` on a domain-wide key: `hashtextextended` of a
-   fixed-order array (`'grind-unique-v1'`, `current_schema()`, storage
-   owner, worker id, worker version, key contract, hex-encoded key digest).
-   The lock key deliberately excludes queue, period, states, and action, so
+   fixed-order array (`'grind-unique-v1'`, the pool's own _configured_
+   schema, worker id, worker version, key contract, hex-encoded key digest)
+   — the configured schema (`postgres.Settings.schema`, see
+   `postgres.with_schema`) is what makes two schemas never share this lock
+   even over the identical key, now that isolation is the schema alone (see
+   README, "Isolation"); no separate owner value is needed in the key at
+   all. This is a **bound query parameter**, not `current_schema()` resolved
+   server-side: binding the value Grind was actually configured with, rather
+   than asking PostgreSQL to resolve it from `search_path`, is what makes
+   this key correct independently of `search_path`'s own resolution rules —
+   `current_schema()` reports the _first_ schema in `search_path` that
+   merely exists, not the first one that holds any Grind table, so two
+   sessions with different personal `"$user"` schemas ahead of the same
+   shared schema in `search_path` could otherwise compute two different
+   `current_schema()` values while both actually reading and writing the
+   identical physical table (see `docs/RISKS.md` risk 7's `$user`-fallback
+   hazard, and `postgres_user_schema_fallback_shares_one_installation_test`
+   in `test/grind_test.gleam`). `postgres.validate` already pins every
+   pooled connection's `search_path` to exactly this one configured schema,
+   so in ordinary operation the bound value and `current_schema()` always
+   agree — binding it directly is simply not relying on that agreement
+   holding for reasons outside this key's own control. The lock key
+   deliberately excludes queue, period, states, and action, so
    every policy submitted against the same key serializes against every
    other — a `WithinQueue` and an `AcrossQueues` policy on the same key
    never run their candidate selection concurrently (proven under a real,
    barrier-forced overlap — `docs/RECOVERY-EVIDENCE.md`, Increment 8).
    Exposed as one query-building function, `@internal
-unique_admission.lock_query(storage_owner, worker_id, worker_version,
+unique_admission.lock_query(schema, worker_id, worker_version,
 key_contract, encoded_key) -> pog.Query(Bool)`, used by both this step
    and any test that needs to hold this exact same lock (built from
    `@internal unique_admission.lock_key_sql`, in turn), so neither
@@ -508,7 +527,7 @@ key_contract, encoded_key) -> pog.Query(Bool)`, used by both this step
    cannot decode (see the PostgreSQL driver note below), so the query is
    wrapped: `SELECT true FROM (SELECT pg_advisory_xact_lock(...)) AS
 grind_unique_lock`.
-4. **Receipt lookup by `(storage_owner, submission_id)`, immediately after
+4. **Receipt lookup by `submission_id` alone, immediately after
    the lock and before any write this transaction might make.** The
    necessary condition is "before any write," not "before candidate
    selection" specifically — those happen to coincide in the unmutated code
@@ -556,7 +575,7 @@ grind_unique_lock`.
    predicate. See "PostgreSQL driver note" below for why this round-trips
    through a bound integer instead of a decoded `timestamptz`, and why
    microseconds rather than milliseconds.
-6. Candidate selection: same storage owner, worker id, worker version, key
+6. Candidate selection: same worker id, worker version, key
    contract, and key digest; `state = ANY($n::text[])` bound from the
    policy's eligible states (a `pog.array` parameter — Grind's own closed
    vocabulary, never caller-supplied text, but bound rather than spliced);
@@ -638,7 +657,7 @@ error is already one of `submit_unique`'s own typed errors (raised directly
 by the callback — `AdmissionContended` on any `55P03` in the
 transaction, or `SubmissionConflict` from a `23505` on the receipt
 table's primary key — a concurrent submitter winning the same
-`(storage_owner, submission_id)` row after this call's own receipt lookup
+`submission_id` row after this call's own receipt lookup
 found nothing. This is a _different_ race from the same-key barrier
 Increment 8 forces (there, the domain lock itself serializes the receipt
 lookup against a same-key concurrent submitter): a `23505` on the receipt
@@ -659,8 +678,8 @@ outside the transaction, on the same `Database` value's pool: a match still
 resolves the call; no receipt yet, _or the lookup itself failing to reach
 the store_, both return `CommitUnknown(pending)` — mirroring the
 acknowledgement path's `reconcile_unknown_ack`'s `Ok(None) | Error(_) ->
-QueueAckUnknown` — carrying everything needed (`storage_owner`,
-`submission_id`, the worker, and the request fingerprint) to retry the same
+QueueAckUnknown` — carrying everything needed (`submission_id`, the worker,
+and the request fingerprint) to retry the same
 lookup later via `reconcile_unique`. `reconcile_unique` shares that exact
 same receipt-lookup function, so it has the identical fail-safe behavior: a
 lookup that cannot reach the store answers "still unknown," never a
@@ -713,9 +732,12 @@ unique_key_contract, unique_key_sha256) WHERE unique_key_sha256 IS NOT NULL`
 (a performance aid for candidate selection; PostgreSQL does not use it to
 enforce anything — the advisory lock does that). A new table,
 `grind_unique_submissions`, keyed `(storage_owner, submission_id)`, has no
-foreign key to `grind_jobs` (matching the rest of the schema's convention of
-no cross-table foreign keys); its `observed_state` column carries the same
-CHECK constraint (the eleven `grind_jobs.state` values) as `grind_jobs.state`
+foreign key to `grind_jobs` at this version (matching the rest of the v11
+schema's convention of no cross-table foreign keys at the time — `grind_v12`
+later breaks this convention deliberately, adding an `ON DELETE CASCADE`
+foreign key to `grind_jobs(id)` on this table and both other receipt tables;
+see "Schema v12" below); its `observed_state` column carries the same CHECK
+constraint (the eleven `grind_jobs.state` values) as `grind_jobs.state`
 itself. The schema marker moves from `10` to `11`.
 
 Recognizing an existing v11 install also cheaply verifies the two
@@ -736,6 +758,18 @@ from a real legacy v10 install by its marker: `IncompatibleSchema`, not
 shape means an install was tampered with or corrupted, not that it
 genuinely predates v11.
 
+**`storage_owner` (this section's own `grind_jobs_unique_candidate_idx` and
+`grind_unique_submissions` key, above) is v11 history, not the current
+shape.** `grind_v12` (unreleased, edited in place — see
+`src/grind/internal/migrations.gleam`, "Dropping `storage_owner`") drops
+the column from every table it appeared on and rebuilds the affected
+index/keys without it: `grind_jobs_unique_candidate_idx` becomes
+`(worker_id, worker_version, unique_key_contract, unique_key_sha256)`, and
+`grind_unique_submissions` is keyed on `submission_id` alone. Isolation
+between logically distinct Grind installations is the PostgreSQL schema
+itself now (see README, "Isolation"), not a value stored on each row — see
+"Failure modes" below and `docs/RISKS.md` risk 7.
+
 ## Failure modes
 
 - **The sampled "now" is a snapshot**, not a live boundary: a row that
@@ -744,10 +778,18 @@ genuinely predates v11.
 - **Uniqueness holds only among `submit_unique` callers.** Nothing prevents
   a plain `submit`/`submit_at` call from adding a row that a
   uniqueness-aware caller never learns about (by design — see Decision 5).
-- **`storage_owner` excludes the PostgreSQL schema** (a pre-existing
-  limitation shared with every other Grind admission/read path, not
-  introduced here): two pools pointed at the same host/port/database but a
-  different `search_path` schema are not distinguished.
+- **Isolation is the explicitly configured PostgreSQL schema**
+  (`postgres.Settings.schema`, `postgres.with_schema`), not a stored value on
+  each row and not merely whatever a pool's `search_path` happens to
+  default to: two pools configured with the same schema share one uniqueness
+  domain; two pools configured with different schemas — in the same physical
+  database or not — are fully isolated, since each schema holds its own
+  independent `grind_unique_submissions` table and the domain advisory lock
+  itself binds this same configured schema as an ordinary parameter (never
+  `current_schema()` resolved server-side — see step 3 above). Nothing
+  validates that an operator passed `with_schema` the value they actually
+  intended for two installations meant to be distinct — see `docs/RISKS.md`
+  risk 7.
 - **`grind_unique_submissions` is unbounded** — nothing in this slice prunes
   or archives old receipts. A pruner is retained backlog, exactly like the
   rest of Grind's plugin/recurring-schedule surface.
@@ -845,15 +887,15 @@ to drift out of sync with the policy-bearing one.
 
 **No domain-wide advisory lock for a `None` request — locking decision and
 justification.** `submit_unique` locks `pg_advisory_xact_lock` on the
-uniqueness key's own domain (storage owner, worker id/version, key
+uniqueness key's own domain (schema, worker id/version, key
 contract, key digest) because its candidate selection must serialize
 against every other submitter of that same key, regardless of
 `SubmissionId`. A `None` request has no key and no candidate selection at
 all — the only correctness property it needs is "the same `SubmissionId`
 never produces two rows," and that is already provided, with no additional
 lock, by PostgreSQL's own unique-index insertion semantics on
-`grind_unique_submissions`'s primary key (`storage_owner`,
-`submission_id`): when two concurrent transactions attempt to insert a
+`grind_unique_submissions`'s primary key (`submission_id`): when two
+concurrent transactions attempt to insert a
 receipt under the same key, the second blocks on the first's
 still-uncommitted row (an ordinary tuple lock wait, not a deadlock — any
 number of concurrent writers of the same `SubmissionId` can queue on that
