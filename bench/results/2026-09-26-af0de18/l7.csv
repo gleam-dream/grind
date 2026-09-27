@@ -1,4 +1,0 @@
-consumers,concurrency,job_count,elapsed_ms,jobs_per_sec,coordinator_mqlen_p50,coordinator_mqlen_p99
-1,50,2000,2688,744.047619047619,45.0,50.0
-5,10,2000,728,2747.252747252747,9.0,10.0
-10,5,2000,515,3883.4951456310678,5.0,6.0

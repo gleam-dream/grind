@@ -16,7 +16,7 @@ set -euo pipefail
 # This script starts its own disposable cluster the same way, but never
 # touches scripts/bench-postgres.sh or scripts/test-postgres.sh.
 #
-# Usage: scripts/bench-matrix.sh [l1|l7|all]  (default: all)
+# Usage: scripts/bench-matrix.sh [l1|l7|l2|l3|l4|l5|l6|all]  (default: all)
 
 what="${1:-all}"
 
@@ -103,6 +103,69 @@ l7_points=(
   "10 5 46000"
 )
 
+# consumers interval_ms filler_rows duration_ms -- reduced from the plan's
+# {1,8} x {10,50,250,1000}ms x {0, 1M} to a representative subset for
+# wall-clock feasibility (documented in docs/PERFORMANCE-EVIDENCE.md).
+l2_points=(
+  "1 50 0 3000"
+  "1 50 100000 3000"
+  "1 250 0 3000"
+  "1 250 100000 3000"
+  "8 50 0 3000"
+  "8 50 100000 3000"
+  "8 250 0 3000"
+  "8 250 100000 3000"
+)
+
+# arrival_per_sec duration_ms -- fixed 4xC10 shape, baked into run_l3 itself.
+l3_points=(
+  "50 5000"
+  "200 5000"
+  "1000 5000"
+)
+
+# submitters mode total_submissions -- reduced total_submissions per mode
+# (documented): hot mode is deliberately small (10 keys means most calls
+# serialize on the same advisory-lock domain); cold uses more since it is
+# the near-zero-contention baseline and is cheap.
+l4_points=(
+  "4 hot 1500"
+  "16 hot 1500"
+  "64 hot 1500"
+  "4 cold 4000"
+  "16 cold 4000"
+  "64 cold 4000"
+)
+
+# pruner_on duration_ms
+l5_points=(
+  "0 2000"
+  "1 2000"
+)
+
+# concurrency job_count cost_ms -- real, unmodified defaults (L=30000,
+# D=4000); cost_ms=25000 spans 2 renewal ticks (L/3=10000ms) per job.
+# job_count is always concurrency*3 (3 claim waves).
+l6t1_points=(
+  "4 12 25000"
+  "10 30 25000"
+  "50 150 25000"
+)
+
+# k_slow_acks d_ms -- C=10 and L=6D/cost=3L are fixed inside run_l6t2
+# itself. d_ms=2000 (scaled down from the real 4000ms default for
+# wall-clock feasibility -- see run_l6t2's own doc comment; the smallest
+# d_ms postgres.validate accepts through setup_with_deadline's own
+# unique_lock_wait scaling is a bit under 1334ms, so 2000 keeps a
+# comfortable margin).
+l6t2_points=(
+  "0 2000"
+  "1 2000"
+  "2 2000"
+  "4 2000"
+  "8 2000"
+)
+
 run_l1_point() {
   local consumers=$1 concurrency=$2 queues=$3 cost_ms=$4 job_count=$5
   echo "== l1 ${consumers}x${concurrency}x${queues}xc${cost_ms} (job_count=$job_count) =="
@@ -133,6 +196,91 @@ run_l7_point() {
   done
 }
 
+run_l2_point() {
+  local consumers=$1 interval_ms=$2 filler_rows=$3 duration_ms=$4
+  echo "== l2 ${consumers}c-i${interval_ms}-f${filler_rows} (duration_ms=$duration_ms) =="
+  echo "  warm-up (discarded)"
+  (
+    cd "$bench_root"
+    GRIND_BENCH_RESULTS_DIR="$warmup_dir" \
+      gleam run -m grind_bench/load -- l2 "$consumers" "$interval_ms" "$filler_rows" "$duration_ms" 0
+  )
+  for repeat in $(seq 1 "$repeats"); do
+    echo "  repeat $repeat"
+    (cd "$bench_root" && gleam run -m grind_bench/load -- l2 "$consumers" "$interval_ms" "$filler_rows" "$duration_ms" "$repeat")
+  done
+}
+
+run_l3_point() {
+  local arrival_per_sec=$1 duration_ms=$2
+  echo "== l3 arrival=${arrival_per_sec}/s (duration_ms=$duration_ms) =="
+  echo "  warm-up (discarded)"
+  (
+    cd "$bench_root"
+    GRIND_BENCH_RESULTS_DIR="$warmup_dir" \
+      gleam run -m grind_bench/load -- l3 "$arrival_per_sec" "$duration_ms" 0
+  )
+  for repeat in $(seq 1 "$repeats"); do
+    echo "  repeat $repeat"
+    (cd "$bench_root" && gleam run -m grind_bench/load -- l3 "$arrival_per_sec" "$duration_ms" "$repeat")
+  done
+}
+
+run_l4_point() {
+  local submitters=$1 mode=$2 total_submissions=$3
+  echo "== l4 ${submitters}x${mode} (total_submissions=$total_submissions) =="
+  echo "  warm-up (discarded)"
+  (
+    cd "$bench_root"
+    GRIND_BENCH_RESULTS_DIR="$warmup_dir" \
+      gleam run -m grind_bench/load -- l4 "$submitters" "$mode" "$total_submissions" 0
+  )
+  for repeat in $(seq 1 "$repeats"); do
+    echo "  repeat $repeat"
+    (cd "$bench_root" && gleam run -m grind_bench/load -- l4 "$submitters" "$mode" "$total_submissions" "$repeat")
+  done
+}
+
+run_l5_point() {
+  local pruner_on=$1 duration_ms=$2
+  echo "== l5 pruner_on=${pruner_on} (duration_ms=$duration_ms) =="
+  echo "  warm-up (discarded)"
+  (
+    cd "$bench_root"
+    GRIND_BENCH_RESULTS_DIR="$warmup_dir" \
+      gleam run -m grind_bench/load -- l5 "$pruner_on" "$duration_ms" 0
+  )
+  for repeat in $(seq 1 "$repeats"); do
+    echo "  repeat $repeat"
+    (cd "$bench_root" && gleam run -m grind_bench/load -- l5 "$pruner_on" "$duration_ms" "$repeat")
+  done
+}
+
+# L6's own points run 2 repeats, no discarded warm-up: each point is
+# considerably more expensive (tens of seconds) than an L1-L5 point, and a
+# threshold decision (T1/T2) needs its own real numbers more than it needs
+# a warm-up run's caches primed -- see docs/PERFORMANCE-EVIDENCE.md for
+# this documented reduction.
+l6_repeats=2
+
+run_l6t1_point() {
+  local concurrency=$1 job_count=$2 cost_ms=$3
+  echo "== l6t1 concurrency=${concurrency} (job_count=$job_count cost_ms=$cost_ms) =="
+  for repeat in $(seq 1 "$l6_repeats"); do
+    echo "  repeat $repeat"
+    (cd "$bench_root" && gleam run -m grind_bench/load -- l6t1 "$concurrency" "$job_count" "$cost_ms" "$repeat")
+  done
+}
+
+run_l6t2_point() {
+  local k_slow_acks=$1 d_ms=$2
+  echo "== l6t2 k=${k_slow_acks} (d_ms=$d_ms) =="
+  for repeat in $(seq 1 "$l6_repeats"); do
+    echo "  repeat $repeat"
+    (cd "$bench_root" && gleam run -m grind_bench/load -- l6t2 "$k_slow_acks" "$d_ms" "$repeat")
+  done
+}
+
 if [[ "$what" == "l1" || "$what" == "all" ]]; then
   for point in "${l1_points[@]}"; do
     run_l1_point $point
@@ -147,6 +295,39 @@ if [[ "$what" == "l7" || "$what" == "all" ]]; then
   (cd "$bench_root" && gleam run -m grind_bench/load -- profile 9000 1 50)
   echo "== profile 5x10 (coordinator profiling, item 11) =="
   (cd "$bench_root" && gleam run -m grind_bench/load -- profile 33000 5 10)
+fi
+
+if [[ "$what" == "l2" || "$what" == "all" ]]; then
+  for point in "${l2_points[@]}"; do
+    run_l2_point $point
+  done
+fi
+
+if [[ "$what" == "l3" || "$what" == "all" ]]; then
+  for point in "${l3_points[@]}"; do
+    run_l3_point $point
+  done
+fi
+
+if [[ "$what" == "l4" || "$what" == "all" ]]; then
+  for point in "${l4_points[@]}"; do
+    run_l4_point $point
+  done
+fi
+
+if [[ "$what" == "l5" || "$what" == "all" ]]; then
+  for point in "${l5_points[@]}"; do
+    run_l5_point $point
+  done
+fi
+
+if [[ "$what" == "l6" || "$what" == "all" ]]; then
+  for point in "${l6t1_points[@]}"; do
+    run_l6t1_point $point
+  done
+  for point in "${l6t2_points[@]}"; do
+    run_l6t2_point $point
+  done
 fi
 
 echo "matrix run complete: $results_dir"

@@ -157,12 +157,18 @@ fn ensure_ledger_schema(
   })
 }
 
-/// Truncates both ledger tables (never drops them) so a fresh smoke/load run
-/// starts from an empty ledger. Grind's own schema is untouched -- a caller
-/// that wants a fully clean Grind installation too calls `postgres.migrate`
-/// against a fresh database instead.
+/// Truncates every ledger table (never drops them) so a fresh smoke/load run
+/// starts from an empty ledger -- including the L6 instrumentation tables
+/// (`grind_bench/instrumentation`), truncated unconditionally here so a
+/// scenario that never installs either trigger still starts from a
+/// guaranteed-empty table, not merely "whatever an unrelated earlier run
+/// left behind." Grind's own schema is untouched -- a caller that wants a
+/// fully clean Grind installation too calls `postgres.migrate` against a
+/// fresh database instead.
 pub fn reset_ledger(connection: pog.Connection) -> Result(Nil, pog.QueryError) {
-  pog.query("TRUNCATE grind_bench.bench_submissions, grind_bench.bench_effects")
+  pog.query(
+    "TRUNCATE grind_bench.bench_submissions, grind_bench.bench_effects, grind_bench.bench_lease_log, grind_bench.bench_slow_ack_targets",
+  )
   |> pog.execute(connection)
   |> result.map(fn(_) { Nil })
 }

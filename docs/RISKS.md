@@ -31,6 +31,7 @@ change without a design decision), **open** (a real gap, no fix scheduled),
 16. [Migration-path gaps: no end-to-end cigogne test, no genuine lost-reply upgrade test](#16-migration-path-gaps-no-end-to-end-cigogne-test-no-genuine-lost-reply-upgrade-test)
 17. [No load, multi-node, or soak evidence yet](#17-no-load-multi-node-or-soak-evidence-yet)
 18. [No connection pooler exercised](#18-no-connection-pooler-exercised)
+19. [Single coordinator process caps per-consumer throughput at high concurrency](#19-single-coordinator-process-caps-per-consumer-throughput-at-high-concurrency)
 
 ---
 
@@ -134,7 +135,74 @@ untested.
 
 ### 4. Coordinator renewal starvation under several pending acknowledgements
 
-**What can happen.** One queue coordinator process serves every attempt
+**Status update (2026-09-27): confirmed real by reproduction, severity
+raised to high.** This was previously an open-but-theoretical risk, derived
+algebraically from the coordinator's own serialization but not reproduced
+under load. An independent reviewer's benchmark reproduction
+(`docs/PERFORMANCE-EVIDENCE.md`, "L6T2") found the effect directly: at
+`C=10`, `L=6D`, `D=2000ms`, `K=5` concurrent slow (but committing)
+acknowledgements quarantined all 5 non-stalled siblings; `K=6` quarantined
+all 4. At real defaults (`D=4000ms`, `L=30000ms`), the reviewer found
+smallest failing setups of: slow acks around 3.2s each that still commit,
+`K≈7`; acks timing out at the `D` bound, `K=5` borderline and `K=6` failing
+(retries make it worse from `K≥3`); and a slow disk adding ~2s to every
+commit at `C=10`, which fails with **no** slow acks (`K`) needed at all. The
+general limit this reproduction derives is `2L/3 ≥ C · D_eff`, i.e.
+`L ≥ 1.5 · C · D` — at `C=10`, `D=4s`, this requires `L ≥ 60s`. **The
+shipped validation rule, `L ≥ 6D`
+(`queue.LeaseTooShortForDeadline`/`minimum_lease_for_deadline`,
+`src/grind/queue.gleam` ~231-272), only covers `C ≤ 2`; it does not hold for
+`C > 2`** — see risk 5, which already named this gap algebraically before
+this reproduction confirmed it empirically.
+
+**The outcome is silent.** A job whose handler already succeeded, but whose
+sibling's renewal or acknowledgement was starved behind the coordinator's
+own serialized queue, ends up `uncertain` — indistinguishable, from the
+outside, from a job that genuinely stalled or crashed. Resolving it needs an
+audited operator decision (`resolve_uncertain`), and replaying it (`AuthorizeReplay`)
+carries the ordinary duplicate-effect risk any replay does (risk 8).
+
+**Two related but distinct starvation modes**, both reaching the same
+outcome: **renewal starvation** (the sibling is still executing when its own
+renewal tick queues up behind the stall) and **ack starvation** (the sibling
+has already finished; its own `AttemptReturned` acknowledgement is queued
+behind the same slow acks that starved it, and its `Renew` messages sit in
+the identical coordinator mailbox). The committed benchmark evidence's own
+`K=8` result (`docs/PERFORMANCE-EVIDENCE.md`, "L6T2") is the second mode,
+ack starvation — not the pending-ack-retry chain (`3D + (N-1)*D`) risk 5's
+derivation describes, which is a distinct mechanism (an ack that itself
+times out and enters the coordinator's own bounded retry loop) that this
+benchmark run never exercised.
+
+**Remedy: owner decision pending, not chosen in this pass.** Three options
+are on the table, none implemented:
+
+1. **A per-consumer renewer process** that also renews finished-but-unacked
+   and pending-ack attempts, with acknowledgements staying serialized on the
+   coordinator as today. This is the reviewer's minimum recommended
+   pre-release fix, and was also the owner's earlier pre-chosen first remedy
+   for this risk. Narrower in scope than option 2 below: it addresses
+   renewal/ack starvation specifically without also addressing risk 19's
+   throughput ceiling.
+2. **Move the acknowledgement into the attempt process itself** — the
+   already-deferred T3 follow-up ("ack from the attempt process",
+   `docs/PERFORMANCE-EVIDENCE.md`, "T3 verdict"; risk 19) and the fuller
+   fix. This addresses both this risk and risk 19's throughput ceiling at
+   once, at the cost of a larger design change touching the proven recovery
+   code in `grind/internal/attempt`.
+3. **Document the limit and tighten validation** to the safe envelope
+   `L ≥ 1.5 · C · D` derived above, without changing the coordinator's own
+   architecture.
+
+**The reviewer recommends against releasing with documentation alone
+(option 3 by itself)** — recorded here as the reviewer's own position, not
+a decision made. Which remedy ships, and when, is an open owner decision;
+see `docs/RELEASE-READINESS.md` for the tracked item. See also risk 19 (the
+T3 coordinator throughput ceiling), which shares the identical root cause
+(one serialized coordinator message loop) and whose "ack from the attempt
+process" remedy is the same as option 2 above.
+
+**What can happen (original description).** One queue coordinator process serves every attempt
 under a `maximum_concurrency > 1` consumer: claim, acknowledgement, and
 lease-renewal SQL all run synchronously on that one process's message loop.
 A stalled acknowledgement (up to `3 × statement_deadline_ms`) blocks every
@@ -160,24 +228,34 @@ the next claim starts — which is exactly the "one stall" case risk 5's own
 derivation already assumes, but does not eliminate the underlying
 one-claim-blocks-the-loop property this risk describes.
 
-**Likelihood / impact.** Low-to-moderate likelihood (needs concurrent
-stalled acknowledgements, which itself needs a database/network fault),
-moderate-to-high impact (a lease can lapse and quarantine a still-live
-attempt purely from coordinator contention, not from the attempt actually
-failing).
+**Likelihood / impact — severity raised to high (2026-09-27).** Previously
+rated low-to-moderate likelihood as a needs-a-fault scenario; the reviewer's
+reproduction (above) shows it needs no fault at all, only ordinary
+committing acknowledgements that are merely slow (a full disk, a busy
+database, a loaded network) at a concurrency and lease/deadline ratio well
+within realistic deployment range (`C=10`, defaults). Impact remains a
+silent `uncertain` outcome requiring audited resolution, with the ordinary
+duplicate-effect risk on replay (risk 8) — now understood to be reachable
+in ordinary operation, not only under an active fault.
 
 **Current mitigation.** `queue.LeaseTooShortForDeadline` bounds the
-single-stall case. The real fix — moving lease renewal and acknowledgement
-off the shared coordinator loop and onto each attempt's own worker process —
-is scoped but not implemented.
+single-stall, `C ≤ 2` case (see risk 5) but is now confirmed insufficient
+for `C > 2` — the reproduction above shows it failing at the shipped
+default lease/deadline ratio once `C` and stall count both rise. No code
+mitigation beyond this exists yet; the three remedy options above are all
+unimplemented, pending the open owner decision.
 
-**Evidence.** Documented, not tested: `README.md` ("Guarantees"),
-`docs/RECOVERY-EVIDENCE.md` ("Acknowledgement deadline", "Limits",
-"Concurrent pending acknowledgements"), `docs/RELEASE-READINESS.md"`
-("Decide on per-attempt storage calls").
+**Evidence.** `docs/PERFORMANCE-EVIDENCE.md`, "L6T2: sibling starvation
+under slow acks (T2)" (committed `K=8` result, reinterpreted as ack
+starvation; reviewer reproduction at `K=5`/`K=6` cited as reviewer runs, not
+committed to this repository). Documented before this reproduction:
+`README.md` ("Guarantees"), `docs/RECOVERY-EVIDENCE.md` ("Acknowledgement
+deadline", "Limits", "Concurrent pending acknowledgements"),
+`docs/RELEASE-READINESS.md` ("Decide on per-attempt storage calls").
 
-**Status.** Open — tracked as a post-release design decision pending
-load-test evidence.
+**Status.** Open, high severity — a post-release design decision (which
+remedy, options 1/2/3 above) pending owner sign-off; the reviewer
+recommends against shipping with option 3 (documentation) alone.
 
 ---
 
@@ -746,6 +824,80 @@ fallback exists for `idle_in_transaction_session_timeout`, since by
 definition nothing is running to set it once a session has already gone
 idle, or for `search_path`, since nothing in Grind re-asserts it once a
 transaction is already under way.
+
+---
+
+### 19. Single coordinator process caps per-consumer throughput at high concurrency
+
+**What can happen.** Every claim, renewal, and acknowledgement for one
+`queue.start` consumer is a synchronous round trip on that consumer's own
+single coordinator process — the same serialization risks 4-6 describe for
+the fault/stall case also caps ordinary, fault-free throughput: one
+coordinator can only have one such round trip in flight at a time, so
+raising `maximum_concurrency` on a single consumer buys idle worker slots,
+not more concurrent database round trips. Measured on 25894a6
+(`docs/PERFORMANCE-EVIDENCE.md`, "T3 verdict", L7): one consumer at
+`maximum_concurrency = 50` reached about 897 jobs/s, while five consumers at
+`maximum_concurrency = 10` each (same total concurrency, same pool) reached
+about 2799 jobs/s — the single coordinator delivered roughly 32% of the
+split-coordinator throughput at identical capacity, well under this
+project's own 70% T3 threshold. PostgreSQL itself was not the constraint:
+server-side CPU stayed under 8% of the whole 12-core benchmark machine even
+in the single-coordinator shape (about 86% of _one_ core, which a single
+serial connection can reach on its own regardless of how much spare
+capacity the other 11 cores hold); a statistical profile of the coordinator
+process itself spent about 76% of its own samples inside `prim_inet:recv0`
+(waiting on the network for PostgreSQL's reply) and about 5% checking out a
+pool connection, versus roughly 0.4ms of measured `pg_stat_statements` exec
+time per job against a measured ~1.1ms wall-clock time per job at that
+shape — the gap is the coordinator's own serial round-trip overhead, not
+server-side work.
+
+**Likelihood / impact.** Certain at high single-consumer concurrency (no
+fault needed, unlike risk 4); impact is a throughput ceiling, not a
+correctness gap — every job still completes correctly, just slower than the
+database could otherwise sustain. Mitigated today by topology: splitting the
+same total concurrency across more consumers or queues (each its own
+coordinator) recovers the throughput this risk otherwise caps.
+
+**Current mitigation.** Documented topology guidance: prefer more consumers
+(or queues) at a moderate `maximum_concurrency` (around 10 per consumer, the
+shape measured to scale close to linearly) over one consumer at very high
+`maximum_concurrency`. No code change yet — the two remedies below are
+deferred by user decision (2026-09-27), tracked as post-release performance
+optimizations, not release blockers:
+
+1. **Batch claim** (following Oban's `fetch_jobs`): one claim statement
+   claims up to the number of free slots at once (`UPDATE ... WHERE id IN
+(SELECT ... LIMIT $demand FOR UPDATE SKIP LOCKED)`) instead of one
+   claim per free slot, and one expired-lease quarantine sweep per poll
+   instead of one per claim. Expected effect: far fewer serial coordinator
+   round trips per job.
+2. **Ack from the attempt process** (following Oban's `executor`): the
+   attempt's own worker process runs the acknowledgement transaction
+   itself and reports only the outcome back to the coordinator, so acks run
+   in parallel, bounded by the pool, instead of serially on the
+   coordinator's own loop. Fencing (attempt id/epoch/owner) stays enforced
+   in SQL, so guarantees are unchanged; the pending-ack retry moves into or
+   beside the attempt process, which touches the proven recovery code in
+   `grind/internal/attempt` — this needs its own design pass and every
+   recovery test (`docs/RECOVERY-EVIDENCE.md`) must stay green.
+
+A renewal-only process per consumer (the plan's first-considered remedy for
+risk 4) would not address this risk: it moves lease renewal off the
+coordinator, not claim or ack, so the single-coordinator claim/ack
+serialization this risk describes would remain. Where lease renewal itself
+should live is being revisited once `docs/PERFORMANCE-EVIDENCE.md`'s L6
+(renewal starvation) T1/T2 results are in.
+
+**Evidence.** `docs/PERFORMANCE-EVIDENCE.md`, "T3 verdict" and "L7:
+coordinator bottleneck" (`bench/results/2026-09-26-25894a6/l7.csv`,
+`profile.csv`, `statements.csv`). `docs/RELEASE-READINESS.md`, "4. Evidence
+still missing" tracks the two deferred remedies above.
+
+**Status.** Open — mitigation is topology guidance only; both remedies are
+tracked, deferred post-release optimizations (user decision, 2026-09-27),
+not scheduled.
 
 **PgBouncer specifically, and why `search_path` is the sharpest edge of the
 three.** PgBouncer applies a client's own startup parameters to the

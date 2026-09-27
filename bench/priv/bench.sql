@@ -45,6 +45,30 @@ CREATE TABLE IF NOT EXISTS grind_bench.bench_effects (
 CREATE INDEX IF NOT EXISTS bench_effects_bench_index_idx
   ON grind_bench.bench_effects (bench_index);
 
+-- L6 instrumentation (grind_bench/instrumentation.gleam). Both tables are
+-- fixed (never per-run-schema-scoped) so the trigger functions created
+-- inside one run's own dynamically-named Grind schema (dropped with that
+-- schema at end-of-run) can reach them by a stable qualified name
+-- regardless of the updating connection's own search_path.
+CREATE TABLE IF NOT EXISTS grind_bench.bench_lease_log (
+  id bigserial PRIMARY KEY,
+  job_id bigint NOT NULL,
+  old_attempt_id bigint,
+  new_attempt_id bigint,
+  old_state text,
+  new_state text NOT NULL,
+  old_lease_expires_at timestamptz,
+  new_lease_expires_at timestamptz,
+  observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX IF NOT EXISTS bench_lease_log_job_id_idx
+  ON grind_bench.bench_lease_log (job_id);
+
+CREATE TABLE IF NOT EXISTS grind_bench.bench_slow_ack_targets (
+  job_id bigint PRIMARY KEY
+);
+
 -- Truncated (never dropped) between runs by `grind_bench.reset_ledger` so a
 -- fresh smoke/load run starts from an empty ledger without re-creating the
 -- schema.

@@ -279,16 +279,130 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
       an unresponsive host is not covered (every injected fault assumes an
       already-established connection) — see `docs/RECOVERY-EVIDENCE.md`,
       Increment 15, "Limits", and `docs/RISKS.md`.
-- [ ] Load: throughput/latency at concurrency > 1, several consumers per
-      database, polling cost and lock contention.
+- [x] Load (L1/L7, throughput and coordinator bottleneck): drain throughput
+      at `maximum_concurrency` 1-50, 1-10 consumers, 1-2 queues, and the
+      `1×C50` vs `5×C10` vs `10×C5` coordinator-bottleneck matrix. See
+      `docs/PERFORMANCE-EVIDENCE.md` ("L1: drain throughput matrix", "L7:
+      coordinator bottleneck", "T3 verdict") and
+      `bench/results/2026-09-26-25894a6/`. **T3 triggered** (`1×C50` reached
+      about 32% of `5×C10`'s throughput at equal total concurrency, under the
+      70% threshold, with PostgreSQL itself at under 8% of the whole
+      benchmark machine's CPU — see `docs/RISKS.md` risk 19): the single
+      coordinator process, not the database, is the throughput ceiling at
+      high per-consumer concurrency. **Remedy deferred by user decision
+      (2026-09-27)**, tracked as post-release performance optimizations, not
+      a release blocker (see the two items below); mitigation until then is
+      topology (more consumers/queues, `maximum_concurrency` around 10 per
+      consumer). Remaining load evidence (polling cost, open-loop latency,
+      unique contention, pruner-concurrent, renewal starvation) is tracked
+      below as items 4-6 of the same evidence pass.
+- [~] **L2-L6 (polling cost, open-loop latency, unique contention,
+  pruner-concurrent, renewal starvation)**: measured on commit `548c31e`
+  (`docs/PERFORMANCE-EVIDENCE.md`). **Every result from this pass is
+  provisional, harness defect tracked** — see the "Harness defects"
+  checklist below (B1-B10) and the "Harness defect tracked (Bn)" notes
+  inline in `docs/PERFORMANCE-EVIDENCE.md`'s own L2-L6 sections. Notably,
+  the run's own CSVs carry `dirty=1` (B9), contradicting this document's
+  earlier "clean, committed tree" claim.
+- [ ] **T2 (renewal/ack starvation): owner decision pending — release
+      blocker per reviewer.** An independent review (2026-09-27) found the
+      committed L6T2 "not triggered" verdict unsound: the setup could not
+      structurally show a stall overlapping a renewal (B1) and its headroom
+      metric is survivor-biased (B2), hiding a real effect the reviewer then
+      reproduced directly (`K=5`/`K=6` at `D=2000`, `L=6D`; smallest failing
+      setups at real defaults: ~3.2s committing slow acks at `K≈7`, acks
+      timing out at `K=6`, a slow disk failing with no `K` needed at
+      `C=10`). The derived safe envelope is `L ≥ 1.5 · C · D`; the shipped
+      `L ≥ 6D` validation rule does not hold for `C > 2`. See
+      `docs/RISKS.md` risk 4 (severity raised to high) and
+      `docs/PERFORMANCE-EVIDENCE.md` ("L6T2") for the full evidence. Three
+      remedy options are recorded, none chosen:
+  1. A per-consumer renewer process that also renews finished-but-unacked
+     and pending-ack attempts (acks stay serialized) — the reviewer's
+     minimum recommended pre-release fix, and the owner's earlier
+     pre-chosen first remedy for this risk.
+  2. Ack from the attempt process (below) — the fuller fix, also addressing
+     T3's own throughput ceiling.
+  3. Document the limit and tighten validation to `L ≥ 1.5 · C · D`.
+
+  **The reviewer recommends against shipping with option 3 (documentation)
+  alone** — recorded as the reviewer's position; whether T2 blocks release,
+  and which remedy ships, is an **open owner decision**, not resolved by
+  this documentation pass.
+
 - [ ] Multi-node: two BEAM nodes on the same queues, killed mid-job.
 - [ ] Soak: atoms, timers, forwarder mailbox, pool connections over time.
+- [ ] The fault-proxy delay/partition modes and `bench-smoke.sh` (bench
+      scope named but not built in this pass, alongside multi-node/soak
+      above).
 - [ ] Decide on per-attempt storage calls (post-release candidate, internal):
       move lease renewal and acknowledgement from the queue coordinator into
       each attempt's worker process so a hung call stalls one job, not its
       siblings. Trade-offs: more pool connections, new stop/drain and
       renewal-vs-quarantine races, per-attempt observation ordering. Decide
-      with load-test evidence on renewal starvation and coordinator throughput.
+      with load-test evidence on renewal starvation (L6, T1/T2 — T2 now
+      triggered, see above) and coordinator throughput (L7, T3 — now
+      measured and triggered, see above).
+
+### Bench harness fixes (tracked, not fixed in this pass)
+
+Found during the 2026-09-27 independent review of `docs/PERFORMANCE-EVIDENCE.md`'s
+L2-L6 evidence (commits `1ad3f0b..eb41667`). None of these are fixed here —
+this is a tracking checklist for a future bench-harness change:
+
+- [ ] **B1.** L6T2 cannot overlap a stall with a renewal: every job is
+      claimed together, costs exactly `3L`, and finishes together, so slow
+      acks always run after every last renewal.
+- [ ] **B2.** The headroom metric is survivor-biased: only a successful
+      renewal writes a lease-log row, so a starved renewal is invisible and
+      minimum headroom can never read below zero. Needs an ack-headroom /
+      uncertain-transition metric instead.
+- [ ] **B3.** L5 never prunes during its own measured traffic window
+      (`pruned_now = 0` throughout); the on/off comparison measures idle
+      pruner polling only.
+- [ ] **B4.** L2's "flat" reading is a call-count artifact; the real
+      per-call cost (`quarantine_total_ms`) rises 1.5-2.5x with 100k filler
+      rows. Ran against 100k filler rows, not the plan's 1M.
+- [ ] **B5.** L3 is closed-loop per pacer (not open-loop) and runs 5-12%
+      under its own nominal rate; `poll_interval=10` inflates DB CPU;
+      claim-to-start latency is not reported.
+- [ ] **B6.** L4's p99 growth tracks submitter count/pool/CPU, not lock
+      contention (cold keys show the same p99 with zero lock waits);
+      `waiting_locks` rests on ~4 samples from a sampler on Grind's own
+      pool; no consumer runs, so admission-vs-claim contention is untested.
+- [ ] **B7.** The L6 instrumentation red/green tests are shallow (red proves
+      only "trigger not installed"; the slow-ack test does not run inside a
+      real ack), and `float_literal_ms` does not zero-pad a ms remainder
+      between 10 and 99 (the values actually used, 1600/3200, are
+      unaffected).
+- [ ] **B8.** T1 is weakly exercised (25s jobs under a 30s lease, 2
+      renewals each, phase-aligned waves, 2 repeats) — verdict unaffected
+      given the ~125x margin, but not proven to a fuller standard.
+- [ ] **B9.** Every row of the 548c31e CSVs has `dirty=1`, contradicting
+      the "clean, committed tree" claim.
+- [ ] **B10.** T2 was never run at the real scale (`D=4000ms`,
+      `L=24000ms`); staggered job costs, `K` in `{3..6}`, and the 1.2D
+      acks-that-time-out variant are still needed.
+
+### Deferred performance optimizations (T3, not bench harness fixes)
+
+- [ ] **Batch claim** (post-release performance optimization, deferred by
+      user decision 2026-09-27, not a release blocker): one claim statement
+      claims up to the number of free slots at once, Oban's `fetch_jobs`
+      shape (`UPDATE` with a `SELECT ... FOR UPDATE SKIP LOCKED LIMIT`
+      subquery bounded by the free-slot count), plus one expired-lease
+      quarantine sweep per poll instead of one per claim. See
+      `docs/RISKS.md` risk 19.
+- [ ] **Ack from the attempt process** (post-release performance
+      optimization, deferred by user decision 2026-09-27, not a release
+      blocker): the attempt's own worker process runs the acknowledgement
+      transaction and reports only the outcome to the coordinator (Oban's
+      `executor` shape), so acks run in parallel, bounded by the pool.
+      Fencing stays in SQL; the pending-ack retry moves into or beside the
+      attempt process, which touches the proven recovery code in
+      `grind/internal/attempt` and needs its own design pass, with every
+      `docs/RECOVERY-EVIDENCE.md` test staying green. See `docs/RISKS.md`
+      risk 19.
 
 ## 5. Packaging and documentation
 
@@ -358,6 +472,23 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
       marked Delivered/Partial/Open accurately. See Oversight commit history
       for the corresponding change.
 - [ ] Organise branch history for merge into `main`.
+
+## After package readiness
+
+Scheduled to start **after** section 5 above (Hex metadata, license review,
+getting-started guide, API docs) is done — a new, separate session, not part
+of this documentation pass:
+
+- [ ] **Comparative benchmark and design-strategy review.** Compare Grind's
+      own benchmarks and design strategy against other job-queue systems.
+      At minimum Oban (the oracle this codebase already tracks); others as
+      the session sees fit — candidates include Sidekiq, good_job, River,
+      pg-boss, graphile-worker, Solid Queue, and Temporal. Cover: what each
+      system measures and publishes, and its own methodology for doing so;
+      architectural strategies (batch fetch, per-job ack, leases/heartbeats,
+      uniqueness, pruning); and first-year roadmap ideas — looking
+      specifically for new ideas Grind could adopt, or new ground Grind
+      could pioneer, not merely parity-checking against Oban.
 
 ## Follow-ups outside Grind
 

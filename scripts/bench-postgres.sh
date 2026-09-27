@@ -118,7 +118,9 @@ for contract in \
   bench-preload-column-missing-red-then-green-passed \
   bench-preload-unmirrored-required-column-red-then-green-passed \
   bench-preload-matches-submit-shape-passed \
-  bench-preload-column-by-column-passed; do
+  bench-preload-column-by-column-passed \
+  bench-instrumentation-lease-log-red-then-green-passed \
+  bench-instrumentation-slow-ack-red-then-green-passed; do
   if ! grep -q "$contract" "$marker"; then
     echo "bench contract did not execute: $contract" >&2
     exit 1

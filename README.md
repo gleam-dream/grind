@@ -426,7 +426,14 @@ real external effect:
   own `D`-bounded renewals are ahead of it in that same queue — not fully
   covered by this rule, since the real fix (moving renewals off the
   coordinator's own loop) is not yet done
-  (`docs/RELEASE-READINESS.md`, "Decide on per-attempt storage calls").
+  (`docs/RELEASE-READINESS.md`, "Decide on per-attempt storage calls"). **An
+  independent benchmark reproduction confirmed this gap is real, not merely
+  theoretical**, at `maximum_concurrency = 10` with ordinary, still-committing
+  slow acknowledgements (no fault needed) — see
+  [docs/RISKS.md](docs/RISKS.md), risk 4, for the reproduction and the
+  derived safe envelope (`L ≥ 1.5 × maximum_concurrency × D`, stricter than
+  the `6 × D` rule above once `maximum_concurrency > 2`); the remedy is an
+  open owner decision, not yet chosen.
 - **In automatic mode, an acknowledgement that comes back `QueueAckUnknown`
   keeps holding its concurrency slot while it retries.** The coordinator
   retries the exact same acknowledgement on its own renewal timer, renewing
@@ -475,7 +482,15 @@ storage call, a migration step, and a uniqueness lock wait may take:
 `queue.start` rejects a lease that does not clear a multiple of
 `statement_deadline` before starting any process
 (`queue.LeaseTooShortForDeadline`) — see "Guarantees" above for the exact
-derivation and its known gap at `maximum_concurrency > 2`.
+derivation and its known gap at `maximum_concurrency > 2`. **This minimum
+(`6 × statement_deadline` at `maximum_concurrency > 1`) is validated, but
+not a proven-safe bound**: an independent benchmark reproduction found it
+insufficient once both concurrency and stalled-acknowledgement count rise
+(reproduced starving siblings at `C=10` with ordinary, still-committing slow
+acknowledgements — no fault needed) and derived a safe envelope of
+`L ≥ 1.5 × maximum_concurrency × statement_deadline` instead. See
+[docs/RISKS.md](docs/RISKS.md), risk 4, for the full evidence and the
+pending remedy decision.
 
 ## Migrations
 
