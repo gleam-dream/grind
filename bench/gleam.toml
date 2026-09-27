@@ -1,0 +1,21 @@
+name = "grind_bench"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.18.0"
+licenses = ["Apache-2.0"]
+description = "Benchmark/load harness for Grind. Not published; depends on grind and sinal by path, like consumer/."
+
+[dependencies]
+grind = { path = ".." }
+sinal = { path = "../../sinal" }
+gleam_stdlib = ">= 0.70.0 and < 1.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
+gleam_json = ">= 3.1.0 and < 4.0.0"
+gleam_time = ">= 1.0.0 and < 2.0.0"
+exception = ">= 2.1.1 and < 3.0.0"
+pog = ">= 4.1.0 and < 4.2.0"
+simplifile = ">= 2.7.0 and < 3.0.0"
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"

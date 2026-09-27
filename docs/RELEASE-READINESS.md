@@ -321,9 +321,7 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
   - `scripts/test-postgres.sh` must fetch dependencies fresh. A cached
     `build/` directory carried over from before the pog fork was dropped
     once silently kept the old fork's compiled artifacts in play even
-    after the manifest moved to vanilla Hex `pog`. Do not reuse a
-    persistent `build/` cache across CI runs unless it is keyed on the
-    manifest's own hash, the workflow's own `actions/cache` step is.
+    after the manifest moved to vanilla Hex `pog`.
   - `scripts/test-postgres.sh` guards this directly: it refuses to run if
     either manifest resolves `pog` from anything but Hex, and
     unconditionally runs `gleam clean` in both the root and consumer
@@ -331,7 +329,26 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
     here, since it trusts the packages record of what is already
     downloaded, not the package directories on disk. This costs a full
     rebuild on every gate run, accepted as the simplest guard that cannot
-    itself drift from how Gleam tracks its own cache.
+    itself drift from how Gleam tracks its own cache. Because of this,
+    `postgres-gate`'s own `actions/cache` step does not cache `grind/build`
+    or `grind/consumer/build` at all — either tree is unconditionally
+    discarded before it could ever be reused, so caching it only cost
+    restore time for no benefit. It caches only what `gleam clean` does not
+    touch: the Elixir oracle's `deps`/`_build` and `sinal/build`, keyed
+    solely on the manifests those two actually depend on
+    (`oracle/mix.lock`, `sinal/manifest.toml`), with no `restore-keys`
+    fallback prefix — a same-OS, different-hash restore would risk reusing
+    a tree built against a different dependency version than the run
+    actually resolves. A separate `DeterminateSystems/magic-nix-cache-action`
+    step caches the Nix store itself (every `nix develop`/`nix flake check`
+    derivation), independent of this Gleam/Mix artifact cache.
+  - `oracle`'s own `mix deps.get --check-locked` needs Hex installed, which
+    `flake.nix`'s dev shell does not provide. `scripts/test-postgres.sh`
+    installs it (`mix local.hex --force --if-missing`) into a script-local
+    `MIX_HOME`/`HEX_HOME` under its own disposable run directory — never the
+    invoking user's real `~/.mix`/`~/.hex` — and points `MIX_REBAR3` at the
+    dev shell's own `rebar3` so no rebar3 build is fetched over the network
+    either.
 - [x] Update Oversight design docs (owner go-ahead given; Oversight is a
       separate repository). `sinal-design.md` now records the bounded
       emitter-side forwarder as delivered in Sinal core (not adapter-owned);

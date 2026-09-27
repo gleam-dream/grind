@@ -1,5 +1,15 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only by default: neither job needs to write to the repository, open
+# issues/PRs, or touch packages — narrowing this closes off a whole class of
+# supply-chain risk (a compromised action in the dependency graph gaining
+# write access) at zero functional cost.
+permissions:
+  contents: read
 
 # Every job below checks out `gleam-dream/sinal` as a sibling directory of
 # this repo's own checkout (`../sinal`, relative to `grind/`): `gleam.toml`
@@ -11,11 +21,20 @@ on: [push, pull_request]
 # CI without a deliberate bump here. See README, and
 # `docs/RELEASE-READINESS.md`, "CI", for why this pin exists and how to
 # update it.
+#
+# `gleam-dream/sinal` must be a *public* repository for this checkout to
+# succeed with no credentials at all (the default `GITHUB_TOKEN` a workflow
+# run gets can never read a different, private repository); if it is ever
+# made private, this step needs a token with read access to it supplied
+# explicitly (`actions/checkout`'s own `token:` input), not just this
+# workflow's ambient permissions.
 env:
   SINAL_REF: f4622b67394965c18091ef95390cfd55ad6502db
 
 jobs:
-  # Fast feedback: format, compile, and the plain `gleam test` run — every
+  # Fast feedback: format, compile (both the root package and the external
+  # `consumer/` package that exercises Grind's own public API from outside
+  # the package boundary), and the plain `gleam test` run — every
   # PostgreSQL-backed test in `test/grind_test.gleam` short-circuits to a
   # no-op here (its own `case database_url() { Error(Nil) -> Nil ... }`
   # guard, since no `GRIND_TEST_*_URL` environment variable is set), so a
@@ -48,6 +67,10 @@ jobs:
         run: gleam build --warnings-as-errors
       - working-directory: grind
         run: gleam test
+      - working-directory: grind/consumer
+        run: gleam deps download
+      - working-directory: grind/consumer
+        run: gleam build --warnings-as-errors
 
   # The real gate: the same disposable-PostgreSQL-cluster script the local
   # development workflow runs (`scripts/test-postgres.sh`), through the
@@ -73,20 +96,34 @@ jobs:
           repository: gleam-dream/sinal
           ref: ${{ env.SINAL_REF }}
           path: sinal
-      - uses: cachix/install-nix-action@v27
-        with:
-          nix_path: nixpkgs=channel:nixos-unstable
+      - uses: cachix/install-nix-action@v31
+      # Caches the Nix store itself (every derivation `nix develop`/
+      # `nix flake check` build or fetch — nixpkgs, the dev shell's own
+      # closure) across runs, independent of the `actions/cache` below,
+      # which only ever covered this repo's own Gleam/Mix build artifacts.
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+      # `scripts/test-postgres.sh` runs `gleam clean` (both `grind/` and
+      # `grind/consumer/`) as its own first step — a guard against a stale
+      # `build/` directory silently reusing a dependency source the current
+      # manifest no longer resolves (see the script's own comment) — so
+      # caching either `build/` directory here would only ever cache a
+      # tree this same job immediately discards; keeping them cached wasted
+      # cache space and cache-restore time for zero benefit every run. Only
+      # `sinal/build` (never `gleam clean`ed by this workflow) and the
+      # Elixir oracle's `deps`/`_build` (Mix does its own incremental
+      # recompilation, unlike `gleam clean`'s unconditional wipe) are
+      # actually worth restoring. Keyed precisely on this run's own
+      # manifest/lock hashes, with no broad `restore-keys` prefix: a
+      # same-OS, different-hash fallback would restore a stale `sinal/build`
+      # or oracle `_build` built against different dependency versions than
+      # this run actually resolves, which is worse than a clean rebuild.
       - uses: actions/cache@v4
         with:
           path: |
-            grind/build
-            grind/consumer/build
             grind/oracle/deps
             grind/oracle/_build
             sinal/build
-          key: ${{ runner.os }}-grind-${{ hashFiles('grind/manifest.toml', 'grind/consumer/manifest.toml', 'grind/oracle/mix.lock', 'sinal/manifest.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-grind-
+          key: ${{ runner.os }}-grind-${{ hashFiles('grind/oracle/mix.lock', 'sinal/manifest.toml') }}
       - name: nix flake check (grind)
         working-directory: grind
         run: nix flake check
