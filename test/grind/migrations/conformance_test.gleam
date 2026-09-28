@@ -314,53 +314,120 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   mark_database_test_executed("cigogne-e2e-migrate-noop-passed")
 }
 
-fn await_advisory_lock_granted(
+/// A 64-bit advisory key appears in `pg_locks` as two unsigned 32-bit halves;
+/// `objsubid = 1` distinguishes it from PostgreSQL's two-key advisory locks.
+/// Both observers below use this same exact key and the current database.
+const migration_lock_identity = "held.locktype = 'advisory' AND held.mode = 'ExclusiveLock' AND held.granted "
+  <> "AND held.database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+  <> "AND held.classid::bigint = ((hashtextextended('grind-migrate-v1:' || current_schema(), 0) >> 32) & 4294967295) "
+  <> "AND held.objid::bigint = (hashtextextended('grind-migrate-v1:' || current_schema(), 0) & 4294967295) "
+  <> "AND held.objsubid = 1"
+
+// Each observation allows 100 sleeps of 20 ms, plus query time. This leaves
+// room to roll back a missing-edge assertion before the connection checkout
+// reaches its default five-second deadline.
+const lock_observation_checks = 100
+
+fn cigogne_blocked_behind_table_holder(
   connection: pog.Connection,
-  checks_remaining: Int,
-) -> Bool {
-  let granted =
+  holder_pid: Int,
+) -> Option(Int) {
+  let assert Ok(returned) =
     pog.query(
-      "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted",
+      "SELECT held.pid FROM pg_locks held "
+      <> "JOIN pg_locks table_wait ON table_wait.pid = held.pid "
+      <> "WHERE "
+      <> migration_lock_identity
+      <> " AND table_wait.locktype = 'relation' "
+      <> "AND table_wait.relation = 'grind_jobs'::regclass "
+      <> "AND table_wait.mode = 'AccessExclusiveLock' AND NOT table_wait.granted "
+      <> "AND $1::int = ANY(pg_blocking_pids(held.pid)) LIMIT 1",
     )
+    |> pog.parameter(pog.int(holder_pid))
+    |> pog.returning({
+      use pid <- decode.field(0, decode.int)
+      decode.success(pid)
+    })
+    |> pog.execute(on: connection)
+  case returned.rows {
+    [pid, ..] -> Some(pid)
+    [] -> None
+  }
+}
+
+fn await_cigogne_held_lock(
+  connection: pog.Connection,
+  holder_pid: Int,
+  checks_remaining: Int,
+) -> Option(Int) {
+  case cigogne_blocked_behind_table_holder(connection, holder_pid) {
+    Some(pid) -> Some(pid)
+    None if checks_remaining > 0 -> {
+      process.sleep(20)
+      await_cigogne_held_lock(connection, holder_pid, checks_remaining - 1)
+    }
+    None -> None
+  }
+}
+
+fn migrate_waiting_on_cigogne(
+  connection: pog.Connection,
+  cigogne_pid: Int,
+) -> Bool {
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT count(*) FROM pg_locks held "
+      <> "JOIN pg_locks waiting ON waiting.database = held.database "
+      <> "AND waiting.classid = held.classid AND waiting.objid = held.objid "
+      <> "AND waiting.objsubid = held.objsubid "
+      <> "WHERE "
+      <> migration_lock_identity
+      <> " AND held.pid = $1::int AND waiting.pid <> held.pid "
+      <> "AND waiting.locktype = 'advisory' AND waiting.mode = 'ExclusiveLock' "
+      <> "AND NOT waiting.granted "
+      <> "AND held.pid = ANY(pg_blocking_pids(waiting.pid))",
+    )
+    |> pog.parameter(pog.int(cigogne_pid))
     |> pog.returning({
       use count <- decode.field(0, decode.int)
       decode.success(count)
     })
     |> pog.execute(on: connection)
-    |> result.map_error(fn(_) { Nil })
-    |> result.try(fn(returned) {
-      case returned.rows {
-        [count] -> Ok(count)
-        _ -> Error(Nil)
-      }
-    })
-  case granted {
-    Ok(count) if count >= 1 -> True
-    _ ->
-      case checks_remaining > 0 {
-        True -> {
-          process.sleep(20)
-          await_advisory_lock_granted(connection, checks_remaining - 1)
-        }
-        False -> False
-      }
+  case returned.rows {
+    [count] -> count == 1
+    _ -> False
+  }
+}
+
+fn await_migrate_waiting_on_cigogne(
+  connection: pog.Connection,
+  cigogne_pid: Int,
+  checks_remaining: Int,
+) -> Bool {
+  case migrate_waiting_on_cigogne(connection, cigogne_pid) {
+    True -> True
+    False if checks_remaining > 0 -> {
+      process.sleep(20)
+      await_migrate_waiting_on_cigogne(
+        connection,
+        cigogne_pid,
+        checks_remaining - 1,
+      )
+    }
+    False -> False
   }
 }
 
 /// Cigogne applies `grind_v11` alone first (synchronously, no race — this is
 /// the realistic "an app has already been running a while" starting point,
 /// not a from-scratch install), then races cigogne applying `grind_v12`
-/// alone against a concurrent `postgres.migrate` caller. `grind_v12`'s own
-/// file begins with the identical advisory-lock statement `migrate` itself
-/// runs (`migrations.advisory_lock_statement()`) — this test only starts
-/// `migrate` once it has *proven*, by polling `pg_locks`, that cigogne's own
-/// session already holds that lock (not merely raced for it), so the
-/// ordering below is a proven fact, not a hopeful race: `migrate` is
-/// guaranteed to queue behind cigogne's still-open transaction, and once
-/// cigogne commits, `migrate`'s own per-step re-read sees `grind_v12`
-/// already applied and skips it — both calls return `Ok(Nil)`, and exactly
-/// one marker row exists per version, never a duplicate-object error from
-/// either side.
+/// alone against a concurrent `postgres.migrate` caller. A test transaction
+/// holds an ACCESS SHARE lock on `grind_jobs`. Cigogne's real v12 migration
+/// first takes the shared advisory key, then waits at its first ALTER TABLE
+/// for that test lock. While it is held there, the test proves Cigogne owns
+/// the exact advisory key and then proves `migrate` waits on that same key,
+/// blocked by Cigogne's backend. Committing the test transaction releases
+/// Cigogne to finish, after which `migrate` re-reads v12 and skips it.
 pub fn cigogne_apply_serializes_with_concurrent_migrate_test() {
   case cigogne_concurrent_url() {
     Error(Nil) -> Nil
@@ -388,12 +455,42 @@ fn run_cigogne_concurrent_test(database_url: String) -> Nil {
   |> should.equal(1)
 
   let cigogne_result = process.new_subject()
-  spawn_submit(cigogne_result, fn() { cigogne.apply(engine_v12) })
-
-  await_advisory_lock_granted(connection, 250) |> should.equal(True)
-
   let migrate_result = process.new_subject()
-  spawn_submit(migrate_result, fn() { postgres.migrate(database) })
+  let assert Ok(Nil) =
+    pog.transaction(connection, fn(holder_connection) {
+      let assert Ok(_) =
+        pog.query("LOCK TABLE grind_jobs IN ACCESS SHARE MODE")
+        |> pog.execute(on: holder_connection)
+      let assert Ok(pid_result) =
+        pog.query("SELECT pg_backend_pid()")
+        |> pog.returning({
+          use pid <- decode.field(0, decode.int)
+          decode.success(pid)
+        })
+        |> pog.execute(on: holder_connection)
+      let assert [holder_pid] = pid_result.rows
+
+      spawn_submit(cigogne_result, fn() { cigogne.apply(engine_v12) })
+      let assert Some(cigogne_pid) =
+        await_cigogne_held_lock(
+          holder_connection,
+          holder_pid,
+          lock_observation_checks,
+        )
+
+      spawn_submit(migrate_result, fn() { postgres.migrate(database) })
+      await_migrate_waiting_on_cigogne(
+        holder_connection,
+        cigogne_pid,
+        lock_observation_checks,
+      )
+      |> should.equal(True)
+      // The table lock remains held until this callback returns, so Cigogne
+      // must still own the advisory lock when we explicitly release it.
+      cigogne_blocked_behind_table_holder(holder_connection, holder_pid)
+      |> should.equal(Some(cigogne_pid))
+      Ok(Nil)
+    })
 
   process.receive(cigogne_result, within: 10_000) |> should.equal(Ok(Ok(Nil)))
   process.receive(migrate_result, within: 10_000) |> should.equal(Ok(Ok(Nil)))
