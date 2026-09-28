@@ -33,6 +33,7 @@ cluster="$root/data"
 started=0
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 bench_root="$repo_root/bench"
+python3 -B -m unittest discover -s "$bench_root/test" -p 'test_*.py'
 
 cleanup() {
   if [[ "${BENCH_KEEP:-0}" == "1" ]]; then
@@ -120,7 +121,11 @@ for contract in \
   bench-preload-matches-submit-shape-passed \
   bench-preload-column-by-column-passed \
   bench-instrumentation-lease-log-red-then-green-passed \
-  bench-instrumentation-slow-ack-red-then-green-passed; do
+  bench-instrumentation-slow-ack-red-then-green-passed \
+  bench-instrumentation-real-ack-delay-passed \
+  bench-instrumentation-per-target-activation-passed \
+  bench-instrumentation-unrenewed-expiry-visible-passed \
+  bench-audit-t2-final-classification-passed; do
   if ! grep -q "$contract" "$marker"; then
     echo "bench contract did not execute: $contract" >&2
     exit 1
@@ -129,7 +134,13 @@ done
 
 echo "bench: audit checker and preload guard mutation tests passed"
 
-results_dir="$bench_root/results/adhoc"
+results_dir="${GRIND_BENCH_RESULTS_DIR:-$root/results}"
+mkdir -p "$results_dir"
+export GRIND_BENCH_COMMIT="$(git -C "$repo_root" rev-parse HEAD)"
+export GRIND_BENCH_DIRTY=0
+[[ -z "$(git -C "$repo_root" status --porcelain)" ]] || export GRIND_BENCH_DIRTY=1
+export GRIND_BENCH_SOURCE_SHA256="$(python3 "$repo_root/scripts/bench-provenance.py" --digest)"
+python3 "$repo_root/scripts/bench-provenance.py" "$results_dir/provenance.json" "$@"
 (
   cd "$bench_root"
   GRIND_BENCH_DATABASE_URL="$bench_database_url" \
@@ -141,3 +152,47 @@ results_dir="$bench_root/results/adhoc"
 )
 
 echo "bench: smoke (1000 jobs) passed"
+
+# Exercise repaired plan/arrival/pruning paths in the gate as well as their
+# instrumentation units. These are activation checks, not a performance matrix.
+for scenario in "l2 1 250 0 500" "l3 50 1000" "l5 0 3000" "l5 1 3000" "l7 40 1 4 1" "profile 40 1 4"; do
+  activation_log="$root/activation-${scenario// /-}.log"
+  (
+    cd "$bench_root"
+    GRIND_BENCH_DATABASE_URL="$bench_database_url" \
+    GRIND_BENCH_CTL_DATABASE_URL="$bench_ctl_database_url" \
+    GRIND_BENCH_RESULTS_DIR="$results_dir" \
+    GRIND_BENCH_POSTGRES_LOG="$root/postgres.log" \
+    GRIND_BENCH_PG_DATA_DIR="$cluster" \
+      gleam run -m grind_bench/load -- $scenario
+  ) | tee "$activation_log"
+  if [[ "$scenario" != l2* ]]; then
+    grep -Eq '^completion_observer_stop_ack polls=([2-9]|[1-9][0-9]+)$' "$activation_log" || {
+      echo "completion observer did not survive multiple queries and acknowledge stop" >&2
+      exit 1
+    }
+  fi
+done
+# Exercise real completion-snapshot SQL and both shared sampler call sites.
+python3 - "$results_dir" <<'PY_CHECK'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+provenance = json.loads((root / "provenance.json").read_text())
+for name in ("l7-1x4-r1.jsonl", "profile-1x4.jsonl"):
+    data = json.loads((root / "raw" / (name + ".drain.json")).read_text())
+    assert data["valid"] and data["outcome"] == "drained", data
+    assert data["drain_timeout_ms"] == provenance["drain_timeout_ms"], data
+    assert data["source_sha256"] == provenance["source_sha256"], data
+    assert data["observer_stopped"] and data["sampler_covers_drain"], data
+    assert data["sampler"]["ticks"] >= 2, data
+    assert data["sampler"]["first_monotonic_ms"] <= data["drain_started_monotonic_ms"], data
+    assert data["sampler"]["last_monotonic_ms"] >= data["drain_ended_monotonic_ms"], data
+    counts = data["completion_snapshot"]
+    for metric in ("submitted", "handler_started", "handler_completed", "durable_observed", "succeeded_receipts", "state:succeeded"):
+        assert counts[metric] == data["expected_jobs"] == 40, (name, metric, data)
+    assert sum(value for key, value in counts.items() if key.startswith("state:")) == 40, data
+PY_CHECK
+[[ "$(python3 "$repo_root/scripts/bench-provenance.py" --digest)" == "$GRIND_BENCH_SOURCE_SHA256" ]] || { echo "source changed during benchmark gate; evidence invalid" >&2; exit 1; }
+echo "bench: query plans, open-loop, prune and full-drain sampling activation passed"

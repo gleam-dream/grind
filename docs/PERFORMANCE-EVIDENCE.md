@@ -1,7 +1,7 @@
 # Performance evidence
 
-Load, coordinator-bottleneck, and (later) multi-node/soak evidence for
-Grind, produced by `bench/` (see `bench/priv/bench.sql`,
+Load, coordinator-bottleneck, and multi-node/soak evidence for
+Grind. Load evidence is produced by `bench/` (see `bench/priv/bench.sql`,
 `bench/src/grind_bench/audit.gleam`, and `bench/src/grind_bench/load.gleam`)
 against a disposable cluster started by `scripts/bench-postgres.sh` /
 `scripts/bench-matrix.sh`.
@@ -11,14 +11,18 @@ environment header says otherwise (see `docs/RISKS.md` #17 and the bench
 planning notes, "User decisions", item 4: laptop runs are the release
 evidence, labeled clearly as such — this is not a dedicated benchmarking
 server, and the bench harness shares CPU with the PostgreSQL server under
-test on the same machine). Raw per-tick JSONL evidence
-(`bench/results/<date>-<commit>/raw/*.jsonl`) is never committed; only the
-percentile/CSV rollups in `bench/results/<date>-<commit>/*.csv` are.
+test on the same machine).
 
-Every table below is computed directly from the committed CSVs at
-`bench/results/2026-09-26-25894a6/` — no numbers from any earlier run are
-carried over (the prior `af0de18` run's evidence has been superseded and
-removed; see "Superseded evidence" at the end of this document).
+Raw per-tick JSONL evidence is retained locally and is not committed. Historical
+CSV rollups are committed under their original result directories. The repaired
+2026-09-28 composite, its source archives, raw files and reports remain local,
+uncommitted exploratory evidence.
+
+The original L1/L7 tables use `bench/results/2026-09-26-25894a6/`; later historical
+sections identify their own snapshots and provisional limits. The final
+“Repaired benchmark composite — 2026-09-28” appendix records current validation.
+It preserves the earlier failed and provisional results rather than treating
+them as accepted measurements of the repaired runtime.
 
 ## Environment
 
@@ -793,3 +797,209 @@ sampling, the statement-split rollup, the coordinator profiler, and the
 "19%" ratio with no DB-CPU measurement at all) is superseded by the
 25894a6 numbers above. That directory has been removed — nothing in this
 document or elsewhere in the repository references it any longer.
+
+## Repaired benchmark composite — 2026-09-28
+
+The repaired composite passed its full numeric, raw-artifact and provenance
+audit. The retained CLI witness records session 6734 exiting 0; the report is
+[composite-audit-v4.json](../bench/results/l7-drain-pair-20260928T091612Z/composite-audit-v4.json).
+This is laptop evidence from frozen dirty trees on 8431b61, not a clean release
+baseline. The owner-approved two-hour resilience run and independent audit also passed.
+
+On 2026-09-28, the owner approved a fresh 7,200-second mixed-fault soak as the
+acceptance target. The run in `resilience/results/repaired-7200s-8YvcJq/` passed:
+actual session 7230 exited 0, followed by independent audit session 97027 exiting 0. The [final audit](../resilience/results/repaired-7200s-8YvcJq/soak-audit-v5.json)
+records 7,202.060719 mixed-fault seconds after warm-up; its independent lower
+bound is 7,202.058878 seconds. All 14 standalone cases and 266 mixed rounds
+passed, with 30 node-kill, worker-kill, request-partition, reply-partition and
+full-partition rounds each, and 29 lost-commit-reply, slow-ACK-delay,
+connection-loss and database-restart rounds each. Existing healthy-job, receipt,
+effect, fencing, audited replay and resource assertions were preserved.
+The [paired M2/M6 comparison](../resilience/results/repaired-7200s-8YvcJq/paired-comparison.json)
+also passed and records Grind's deliberate replay and pruning differences from
+Oban. These remain local exploratory results from dirty, content-pinned inputs.
+
+The audit verified 6,993 primary effects, 520 complete JSONL files and 43,417
+records. Sampled database sessions peaked at 8 against a ceiling of 10; retained
+primary database size peaked at 245,760 bytes. Both primary VMs returned to 104
+processes, one deadline entry and zero sampled mailbox messages. The worker's
+atom count grew by 1,596 under the documented linear allowance for fresh consumer
+starts; indefinite consumer churn is not proven to use bounded atoms. Resource
+samples follow drain/consumer stop and do not directly sample timers or the
+forwarder mailbox. Independent cleanup found no owned processes and confirmed
+removal of the disposable cluster; PostgreSQL completed an immediate shutdown,
+which does not establish graceful BEAM shutdown.
+
+Audit v5 uses pinned causal protocols and controller monotonic order to establish
+fault overlap and authorized replay; independent VM wall timestamps are not a
+shared clock. It retains all source, runtime, duration, outcome and resource
+checks. The final audit SHA-256 is
+`de653b1fd4a7fa8054d9a6bf9113ac65697dfc79e1d509f0302b0ff94dc25c1a`.
+The paired comparison covers M2 and M6 only: Grind waits for audited replay and
+prunes without a leader; Oban's Lifeline rescues automatically and its Peer
+transfers leadership. It does not establish equivalence for every fault.
+
+The earlier 86,400-second attempt in
+`resilience/results/repaired-86400s-o23a23/` remains failed. A retained power log
+confirms a 275-second host software sleep spanning a healthy job's lease expiry;
+the job became `uncertain` with one effect, no receipt and no replay. This is
+consistent with fencing after suspension, not a passed soak. No time from that
+attempt counts toward the fresh run. Day-long endurance remains unverified.
+
+### Scope and provenance
+
+The accepted scope combines the complete baseline and delayed L3/T2 subsets in
+`bench/results/exploratory-matrix-LZVevz/` with the fresh zero/5ms L7 pair in
+`bench/results/l7-drain-pair-20260928T091612Z/`. Main measured profiles retain three
+repeats after discarded warm-up. The original wrapper exited 1 when delayed L7
+exceeded its 60,000ms drain budget. That failure and its artifacts remain
+retained, and the failed delayed arm remains failed. The fresh pair supplies the
+current matched L7 comparison. The original zero-delay L7 rows remain validated
+baseline context; unaffected profiles retain their original evidence.
+
+The old source digest is
+`4b0c3e229246b329a45ab4b52353954d25d577e72833b3f0fdef8013c0df4cf9`;
+the fresh pair uses
+`c48eda5d5034c5d62979463f3f030316b9f7af146650db0823c116831139dddc`.
+Exactly ten reviewed benchmark files changed for the drain repair. All archived
+production source/migrations, root and benchmark manifest/toolchain inputs, and
+Sinal source/manifests are byte-identical. Source archives, original/resume/pair
+drivers, logs and parent-captured terminal results are hash-linked in the
+[composite manifest](../bench/results/l7-drain-pair-20260928T091612Z/composite-manifest.json).
+Neither snapshot is relabeled clean.
+
+The machine has 12 logical CPUs and runs Darwin/arm64, Gleam 1.18.1,
+OTP 28.5.0.6/ERTS 16.4.0.6 and PostgreSQL 16.15. Injected delay is 5ms per direction
+per received TCP chunk, not 5ms round-trip latency. The fresh pair records an
+explicit 600,000ms soft drain budget in both arms and 11 sampler/diagnostic pairs
+per arm. They cover 9000/33000/46000-job main shapes at three repeats and
+9000/33000-job diagnostic shapes. All 306,000 retained jobs per arm have complete
+state, receipt, handler and observed durable-completion accounting. The budget
+neither cancels SQL nor substitutes drain duration for throughput’s durable
+timestamp denominator (`bench/src/grind_bench/load/drain.gleam:68`,
+`bench/src/grind_bench/load/report.gleam:18`).
+
+### Subsequent evidence-formatting incident
+
+On 2026-09-28, whole-repository formatting rewrote 17 retained benchmark JSON
+files. The parent preserved every formatted variant and reconstruction candidate
+under `bench/results/l7-drain-pair-20260928T091612Z/orchestration/formatting-incident-20260928/`.
+Only nine byte sequences with preexisting hash pins were restored; all nine match
+those pins. The eight unpinned files remain formatted, with equivalent candidate
+bytes retained but not applied. The complete incident retention and archived
+v3/v4 package hashes were independently verified. No pin, auditor or acceptance
+criterion changed.
+
+The unchanged composite v4 auditor completed a fresh post-incident re-audit:
+actual session 66728 exited 0, with status `composite_accepted`, no issues and
+empty stderr. Its report is semantically identical to the earlier accepted
+report. Copies of `composite-reaudit-v4.json`, `composite-reaudit-v4.stderr.log` and
+`composite-reaudit-v4-terminal.json`, with their source paths and hashes in
+`post-format-reaudit-retention.json`, are retained in the incident directory.
+`parent-restoration.json` preserves the original restoration action; neither it
+nor the earlier audit result was rewritten.
+
+Permanent formatter exclusions for `bench/results/**`, `oracle/results/**` and
+`resilience/results/**` are implemented in `flake.nix`. All 11,177 retained evidence files were
+byte-identical after formatting the ten reviewed documentation/configuration files. The benchmark re-audit and the separately accepted
+soak audit retain their distinct scopes.
+
+### Repaired harness and liveness evidence
+
+The final gate in `bench/results/repaired-gate-garghm/` passed 38 tests, the
+1,000-job audited smoke and L2/L3/L5/L7/profile activation checks. The deliberate
+1ms timeout in `bench/results/drain-timeout-negative-2w6b1o/` failed as expected,
+retaining three sampler records, acknowledged observer shutdown and final
+completion/state counts. Its 26ms observed drain interval demonstrates the
+budget is soft. The original checker’s stale-log-literal failure and corrected
+`negative-check-v2.json` remain retained; this case is harness validation, not a
+performance result.
+
+B1–B10 repairs and source references are listed in
+[RELEASE-READINESS.md](RELEASE-READINESS.md). The audit checks 240 main CSV rows:
+192 original baseline rows (15 L1, 36 L2, 9 L3, 18 L4, 6 L5, 9 T1, 90 T2 and
+9 L7), 9 delayed L3 rows, 21 delayed T2 rows and 18 fresh L7 rows. The 222 old-source
+rows include the nine validated original zero-delay L7 rows as baseline context;
+the fresh pair's 18 rows supply the current matched L7 comparison.
+
+- L2 verifies actual 0/100k/1M row counts, 18,098 claim calls and 18,098 quarantine
+  calls, with 36 retained untimed production-plan files. Call counts do not prove
+  constant query cost.
+- L3 admits and durably completes 18,750 measured jobs per delay arm at
+  50/200/1000 arrivals/s. Every generator profile passes its capacity, lag and
+  accounting checks. At 1000/s, median observed durable-ACK p99 is 253.647ms
+  without injected delay and 25,644.262ms with delay: valid arrivals do not
+  imply low queueing latency.
+- L4 retains all 18 repeat files and 3,717 lock samples, at least 130 per repeat,
+  with a live consumer and separate sampler connection. These are measurements
+  of admission, CPU and waits; latency growth alone does not identify its cause.
+- L5 records 12,000 handler and durable completions. Each enabled repeat prunes
+  10,000 old rows inside its traffic window; all disabled repeats prune none.
+  SQL `finished_at`/receipt timestamps remain distinct from the independent
+  observer’s durable-completion timestamps (`bench/src/grind_bench/load/maintenance.gleam:191`).
+- T1 observes all 192 attempts and 1,911 renewal samples. Worst renewal lag is
+  15.371ms against L/6=5,000ms; minimum all-attempt headroom is 19,984.037ms.
+  No negative sample or T1 trigger occurs.
+- T2 retains 1,830 classified outcomes across 111 measured rows. All 1,254
+  healthy siblings succeed with one valid receipt; none is quarantined or has
+  negative sampled headroom. Minimum healthy headroom is 10,638.835ms and every
+  row exceeds its own L/10 threshold. All 576 fault targets activate: 288 succeed
+  and 288 become uncertain without receipts. The 90 measured fault rows each observe
+  renewal during slow ACKs, totaling 1,734 such renewals. D=4s, L=16/24/30s,
+  K 0/3–8 and 0.8D/1.2D delays are represented, including selected C50/pool10
+  resource stress and a seven-profile 5ms-delay subset.
+
+The legacy `t2_triggered` field is true in 45 rows because it includes quarantine
+of selected fault targets (`bench/src/grind_bench/load/maintenance.gleam:464`). It is not the
+healthy-sibling verdict. Current acceptance rejects healthy headroom below L/10
+or healthy quarantine (`bench/src/grind_bench/load/maintenance.gleam:561`); all measured rows pass. These
+results test specific bounded-delay configurations, not unconditional liveness
+through arbitrary outages.
+
+### Three adjudicated L2 maintenance incidents
+
+The original frozen auditor rejected six lines in the whole PostgreSQL log:
+three lock waits and three associated autovacuum cancellations. The reviewed v4
+adjudication retains that rejection and verifies the exact pinned incidents,
+statements, waiter/blocker identities, relation/schema, later acquisition and
+source phase:
+
+| Profile                          | Phase                                       | Wait / acquisition time |
+| -------------------------------- | ------------------------------------------- | ----------------------- |
+| C1, 250ms poll, 1M rows, warm-up | `DROP SCHEMA` after emitted result          | 100.604 / 100.685ms     |
+| C8, 50ms poll, 1M rows, repeat 2 | `DROP SCHEMA` after emitted result          | 102.070 / 102.203ms     |
+| C8, 250ms poll, 1M rows, warm-up | `ANALYZE` before checkpoint and measurement | 101.043 / 101.111ms     |
+
+The schema/plan/row linkage and timestamps place these waits outside the measured
+polling/statistics windows (`bench/src/grind_bench/load/open_loop.gleam:146`,
+`:163`, `:195`; `bench/src/grind_bench/load/report.gleam:303`). Earlier autovacuum
+CPU/cache effects are unquantified; database CPU remains aggregate PostgreSQL
+CPU. This is exact phase-specific adjudication, not a general autovacuum
+exception. Every other numeric, raw and provenance check remains unchanged;
+unclassified errors, waits and deadlocks remain invalid. The adjudication
+SHA is `9b187b1f98f887b49ad80aa34d756757c8572fa43b9aa5845ba45d586edc6e15`.
+
+### T3 remains triggered
+
+These are within-pair medians over three measured repeats, with 50 total worker
+slots and a main pool of 50 connections. One reserved renewal connection per
+consumer makes total Grind connections 51/55/60; total connection budgets are
+therefore different. Handler cost is 1ms. The separate harness connections are
+not included in those Grind totals.
+
+| Transport delay     | Shape | Jobs/s, median | Total Grind connections |
+| ------------------- | ----- | -------------: | ----------------------: |
+| 0ms                 | 1×C50 |        1651.07 |                      51 |
+| 0ms                 | 5×C10 |        3872.33 |                      55 |
+| 0ms                 | 10×C5 |        4329.82 |                      60 |
+| 5ms/direction/chunk | 1×C50 |          41.74 |                      51 |
+| 5ms/direction/chunk | 5×C10 |         207.81 |                      55 |
+| 5ms/direction/chunk | 10×C5 |         414.29 |                      60 |
+
+The 1×C50/5×C10 ratios are 42.64% without delay and 20.09% with delay, both below
+T3’s 70% threshold. At 1×C50, median PostgreSQL CPU consumes 14.78% and 3.44% of
+the 12-logical-CPU machine respectively. Diagnostic 1×C50 profiles attribute 69.27%
+and 98.88% of samples to `prim_inet:recv0/3` respectively. The repaired runtime
+still has a coordinator throughput limitation. These are relative topology
+measurements; they are not a controlled speedup over the historical 32% result
+or hardware-independent capacity claims. Batch claiming remains deferred.

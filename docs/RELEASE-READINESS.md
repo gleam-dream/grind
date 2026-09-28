@@ -1,5 +1,35 @@
 # Release readiness
 
+Current work (2026-09-28): executor-owned ACKs, independent reserved renewal,
+first-ACK rollback recovery, startup cleanup and B1–B10 harness repairs are
+implemented in uncommitted exploratory snapshots. The repeated benchmark
+composite is accepted; [RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) records the
+runtime gates and remaining validation. The owner-approved two-hour resilience
+run and its independent audit passed.
+Historical descriptions below of coordinator-owned ACKs, an undecided T2
+remedy or the old concurrency-dependent lease minimum describe the prior
+implementation. No clean release baseline, commit or publication is claimed.
+
+On 2026-09-28, the owner approved a fresh 7,200-second mixed-fault soak as the
+acceptance target. The run in `resilience/results/repaired-7200s-8YvcJq/` passed:
+actual session 7230 exited 0, followed by independent audit session 97027 exiting 0. The [final audit](../resilience/results/repaired-7200s-8YvcJq/soak-audit-v5.json)
+records 7,202.060719 mixed-fault seconds after warm-up; its independent lower
+bound is 7,202.058878 seconds. All 14 standalone cases and 266 mixed rounds
+passed, with 30 node-kill, worker-kill, request-partition, reply-partition and
+full-partition rounds each, and 29 lost-commit-reply, slow-ACK-delay,
+connection-loss and database-restart rounds each. Existing healthy-job, receipt,
+effect, fencing, audited replay and resource assertions were preserved.
+The [paired M2/M6 comparison](../resilience/results/repaired-7200s-8YvcJq/paired-comparison.json)
+also passed and records Grind's deliberate replay and pruning differences from
+Oban. These remain local exploratory results from dirty, content-pinned inputs.
+
+The earlier 86,400-second attempt in
+`resilience/results/repaired-86400s-o23a23/` remains failed. A retained power log
+confirms a 275-second host software sleep spanning a healthy job's lease expiry;
+the job became `uncertain` with one effect, no receipt and no replay. This is
+consistent with fencing after suspension, not a passed soak. No time from that
+attempt counts toward the fresh run. Day-long endurance remains unverified.
+
 Tracks the work between the current experimental slice and a first release of
 Grind, published together with its sibling libraries. Tick an item only when
 its evidence is committed (tests, gate markers, and an entry in
@@ -163,21 +193,20 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
       `gleam.toml`/`consumer/gleam.toml` — the git dependency that previously
       blocked Hex publication is gone.
 - [x] Restored: Grind's own bounded checkout in `grind_postgres_ffi.erl`
-      (`with_deadline`/`with_deadline_ms`, a `pgo:checkout/2` with an explicit
-      `timeout`), `Settings.statement_deadline_ms`/`migration_deadline_ms`
+      (`with_deadline`/`with_deadline_ms`, a `pgo:checkout/2` with one absolute
+      deadline shared across candidate checkouts), `Settings.statement_deadline_ms`/`migration_deadline_ms`
       with their own setters and validation, and the per-pool
       `persistent_term` deadline set in `postgres.start` and cleared in
       `postgres.close`. `docs/RECOVERY-EVIDENCE.md` has the before/after
       fault-proxy numbers for this reversal.
 - [ ] **Remaining risk, accepted:** this couples Grind directly to pog's
       private `Connection` shape (`{pool, Name} | {single_connection, Conn}`)
-      and to `pgo`'s own `checkout`/`checkin`/`break` API, neither of which
-      pog's public contract promises to keep stable. Guarded two ways: the
-      exact version pins above (a routine minor/patch bump cannot silently
-      change either shape without also bumping past the pin), and
-      `pog_connection_pool_shape_test` (`test/grind_test.gleam`), which fails
-      loudly the moment either shape does change instead of this module
-      silently mismatching it.
+      and to pgo's private connection record, checkout/return APIs, pool
+      topology and cache layouts. The version ranges above limit upgrade scope
+      but do not guarantee these private contracts remain stable.
+      `pog_connection_pool_shape_test` (`test/grind_test.gleam`) checks the pog
+      pool tuple; startup/cache and reconnect regressions cover the additional
+      private contracts. Dependency upgrades require review of all of them.
 - [x] Pool name lifetime (plan commit 15, see below): `postgres.validate`
       creates the pool's name once, and every `start` of that same
       `ValidatedSettings` value reuses it — not fresh per `start` — so a
@@ -314,100 +343,83 @@ Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
       coordinator process, not the database, is the throughput ceiling at
       high per-consumer concurrency. **Remedy deferred by user decision
       (2026-09-27)**, tracked as post-release performance optimizations, not
-      a release blocker (see the two items below); mitigation until then is
+      a release blocker; see the current follow-ups below. The mitigation is
       topology (more consumers/queues, `maximum_concurrency` around 10 per
-      consumer). Remaining load evidence (polling cost, open-loop latency,
-      unique contention, pruner-concurrent, renewal starvation) is tracked
-      below as items 4-6 of the same evidence pass.
-- [~] **L2-L6 (polling cost, open-loop latency, unique contention,
-  pruner-concurrent, renewal starvation)**: measured on commit `548c31e`
-  (`docs/PERFORMANCE-EVIDENCE.md`). **Every result from this pass is
-  provisional, harness defect tracked** — see the "Harness defects"
-  checklist below (B1-B10) and the "Harness defect tracked (Bn)" notes
-  inline in `docs/PERFORMANCE-EVIDENCE.md`'s own L2-L6 sections. Notably,
-  the run's own CSVs carry `dirty=1` (B9), contradicting this document's
-  earlier "clean, committed tree" claim.
-- [ ] **T2 (renewal/ack starvation): owner decision pending — release
-      blocker per reviewer.** An independent review (2026-09-27) found the
-      committed L6T2 "not triggered" verdict unsound: the setup could not
-      structurally show a stall overlapping a renewal (B1) and its headroom
-      metric is survivor-biased (B2), hiding a real effect the reviewer then
-      reproduced directly (`K=5`/`K=6` at `D=2000`, `L=6D`; smallest failing
-      setups at real defaults: ~3.2s committing slow acks at `K≈7`, acks
-      timing out at `K=6`, a slow disk failing with no `K` needed at
-      `C=10`). The derived safe envelope is `L ≥ 1.5 · C · D`; the shipped
-      `L ≥ 6D` validation rule does not hold for `C > 2`. See
-      `docs/RISKS.md` risk 4 (severity raised to high) and
-      `docs/PERFORMANCE-EVIDENCE.md` ("L6T2") for the full evidence. Three
-      remedy options are recorded, none chosen:
-  1. A per-consumer renewer process that also renews finished-but-unacked
-     and pending-ack attempts (acks stay serialized) — the reviewer's
-     minimum recommended pre-release fix, and the owner's earlier
-     pre-chosen first remedy for this risk.
-  2. Ack from the attempt process (below) — the fuller fix, also addressing
-     T3's own throughput ceiling.
-  3. Document the limit and tighten validation to `L ≥ 1.5 · C · D`.
+      consumer). This paragraph records the historical `25894a6` result.
+      The repaired L1–L7 evidence is recorded below; T3 remains triggered.
+- [~] **L2–L6 and B1–B10:** repaired and remeasured locally. Composite v4
+  accepts the complete repeated baseline, delayed L3/T2 subsets and fresh
+  matched L7 pair. Its source snapshots are dirty and content-pinned; evidence
+  remains uncommitted. The `548c31e` measurements retain their provisional
+  status. See “Repaired benchmark composite — 2026-09-28” in
+  [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md).
+- [~] **T2 healthy-sibling starvation:** the owner selected executor-owned
+  ACKs and independent reserved renewal. All 1,254 healthy siblings in the
+  repeated zero/5ms-delay profiles succeeded with one valid receipt. Minimum
+  observed healthy headroom was 10,638.835ms; every row exceeded its own L/10
+  threshold, with no healthy quarantine or negative headroom sample. Each
+  of the 576 fault targets activated; 288 succeeded and 288 became uncertain
+  without receipts. These results support the repaired mechanism in the
+  tested configurations, alongside the accepted two-hour mixed-fault soak. The
+  historical reproduction and rejected “not triggered” verdict remain recorded in
+  [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md).
 
-  **The reviewer recommends against shipping with option 3 (documentation)
-  alone** — recorded as the reviewer's position; whether T2 blocks release,
-  and which remedy ships, is an **open owner decision**, not resolved by
-  this documentation pass.
+- [~] **Independent-node and fault coverage:** implemented and locally verified.
+  The accepted two-hour run passed all 14 standalone cases and 266 mixed rounds,
+  including process/node death, backend/server loss, slow ACKs and
+  directional/full transport partitions. The earlier 300-second rehearsal
+  remains retained. The two primary VMs are independent OS processes. The
+  [paired M2/M6 comparison](../resilience/results/repaired-7200s-8YvcJq/paired-comparison.json)
+  also passed; see [RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) for scope and limits.
+- [~] **Soak:** the owner-approved fresh two-hour run and independent audit passed
+  in `resilience/results/repaired-7200s-8YvcJq/`: 7,202.060719 mixed-fault seconds,
+  266 rounds and 6,993 primary effects. The earlier 86,400-second attempt remains
+  failed after host software sleep. None of its elapsed time was carried forward;
+  day-long endurance remains unverified.
+- [~] **Fault-proxy delay/partition modes and benchmark smoke:** implemented.
+  The independent-node rehearsal exercised request, reply and full partitions;
+  the accepted benchmark composite includes matching 5ms transport-delay
+  subsets. `scripts/bench-smoke.sh` delegates to the PostgreSQL benchmark gate;
+  that gate's latest 38-test run and 1,000-job audit passed in
+  `bench/results/repaired-gate-garghm/`.
+- [~] **Per-attempt storage decision:** executor-owned ACKs and independent
+  reserved renewal are implemented under the approved correctness work.
+  The repeated T1/T2 results and accepted two-hour soak support liveness in the
+  tested configurations. T3 still triggers, and batch claiming remains deferred.
 
-- [ ] Multi-node: two BEAM nodes on the same queues, killed mid-job.
-- [ ] Soak: atoms, timers, forwarder mailbox, pool connections over time.
-- [ ] The fault-proxy delay/partition modes and `bench-smoke.sh` (bench
-      scope named but not built in this pass, alongside multi-node/soak
-      above).
-- [ ] Decide on per-attempt storage calls (post-release candidate, internal):
-      move lease renewal and acknowledgement from the queue coordinator into
-      each attempt's worker process so a hung call stalls one job, not its
-      siblings. Trade-offs: more pool connections, new stop/drain and
-      renewal-vs-quarantine races, per-attempt observation ordering. Decide
-      with load-test evidence on renewal starvation (L6, T1/T2 — T2 now
-      triggered, see above) and coordinator throughput (L7, T3 — now
-      measured and triggered, see above).
+### Bench harness fixes — locally verified, uncommitted
 
-### Bench harness fixes (tracked, not fixed in this pass)
+The repaired composite is accepted. These entries remain `[~]` under this
+checklist’s committed-evidence rule. The old B1–B10 descriptions and provisional
+results remain in [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md); they are not
+retroactively accepted. The new results are laptop evidence from dirty,
+content-pinned snapshots. The final PostgreSQL gate passed 38 tests and its
+activation checks in `bench/results/repaired-gate-garghm/`. The separate
+`drain-timeout-negative-2w6b1o/` evidence verifies completion diagnostics and
+sampler coverage are retained when a deliberate 1ms drain budget fails.
 
-Found during the 2026-09-27 independent review of `docs/PERFORMANCE-EVIDENCE.md`'s
-L2-L6 evidence (commits `1ad3f0b..eb41667`). None of these are fixed here —
-this is a tracking checklist for a future bench-harness change:
+| Defect | Repair and retained evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B1     | `[~]` Staggered slow ACKs overlap long healthy handlers. Rollback-proof counters prove activation of every target. All 90 measured fault rows also observed renewal during slow ACKs. A zero renewal-overlap count would limit that stress evidence. Source: `bench/src/grind_bench/instrumentation.gleam:220`, `bench/src/grind_bench/load/maintenance.gleam:407`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| B2     | `[~]` Independent samples cover all healthy attempts, including expired leases; every admitted job has a final state/receipt classification. The 1,830 retained T2 outcomes contain no missing or unfinished job. Source: `bench/src/grind_bench/load/maintenance.gleam:445`, `:465`, `:561`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| B3     | `[~]` All three enabled L5 repeats pruned 10,000 old rows within their traffic windows; disabled repeats pruned none. All 12,000 measured jobs have handler and independently observed durable completions. Source: `bench/src/grind_bench/load/maintenance.gleam:95`, `:109`, `:191`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| B4     | `[~]` All 36 L2 rows verify actual 0/100k/1M table sizes and retain call totals, mean costs and untimed production plans. Three exact setup/cleanup log incidents were adjudicated separately; no claim of flat per-call cost follows from call counts. Source: `bench/src/grind_bench/load/open_loop.gleam:187`, `bench/src/grind_bench/load/plan_evidence.gleam:38`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| B5     | `[~]` Absolute arrival slots use a bounded generator with explicit lag, admission and capacity denominators. All 18 measured L3 rows were valid at 50/200/1000 arrivals/s; each delay arm completed 18,750 jobs. Source: `bench/src/grind_bench/load/arrivals.gleam:86`, `bench/src/grind_bench/load/open_loop.gleam:69`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| B6     | `[~]` L4 keeps a fixed main pool, live consumer and separate sampler connection. All 18 repeats retain distinct raw files: 3,717 lock samples, at least 130 per repeat. Latency alone is not evidence of lock contention. Source: `bench/src/grind_bench/load/admission.gleam:156`, `:199`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| B7     | `[~]` Fractional milliseconds are padded correctly. Database tests cover a real consumer ACK and rollback-proof per-target activation; repeated activation of one target cannot satisfy another. Source: `bench/test/grind_bench_instrumentation_test.gleam:211`, `:221`, `:287`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| B8     | `[~]` T1 uses staggered work of at least 3L, warm-up and three repeats at C4/C10/C50. All 192 attempts were observed, with 1,911 renewal samples; worst lag 15.371ms was below L/6 = 5,000ms. Source: `bench/src/grind_bench/load/maintenance.gleam:247`, `scripts/bench-matrix.sh:179`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| B9     | `[~]` Dirty state, source/Sinal inputs, toolchain, machine, arguments and external drivers are retained and checked before/after execution. Output directories and repeat labels prevent evidence reuse/overwriting. The pre-incident audit accepted exploratory evidence, not a clean release claim. A later formatter changed 17 retained JSON files; nine pinned originals were restored and eight unpinned files remain formatted. The unchanged v4 post-incident re-audit accepted the evidence with no issues (actual session 66728, exit 0). Permanent result-folder formatter exclusions are implemented; all 11,177 retained evidence files remained byte-identical after targeted documentation/configuration formatting. Source: `scripts/bench-provenance.py:8`, `:87`, `:108`; the incident record in the performance appendix. |
+| B10    | `[~]` The baseline covers 26 default-scale T2 profiles plus four selected C50 resource-stress profiles, each with three repeats. D=4s, L=16/24/30s, K 0/3–8 and 0.8D/1.2D ACK delays are represented; seven selected profiles also run with 5ms transport delay. This is a targeted matrix, not every Cartesian combination. Source: `scripts/bench-matrix.sh:188`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
-- [ ] **B1.** L6T2 cannot overlap a stall with a renewal: every job is
-      claimed together, costs exactly `3L`, and finishes together, so slow
-      acks always run after every last renewal.
-- [ ] **B2.** The headroom metric is survivor-biased: only a successful
-      renewal writes a lease-log row, so a starved renewal is invisible and
-      minimum headroom can never read below zero. Needs an ack-headroom /
-      uncertain-transition metric instead.
-- [ ] **B3.** L5 never prunes during its own measured traffic window
-      (`pruned_now = 0` throughout); the on/off comparison measures idle
-      pruner polling only.
-- [ ] **B4.** L2's "flat" reading is a call-count artifact; the real
-      per-call cost (`quarantine_total_ms`) rises 1.5-2.5x with 100k filler
-      rows. Ran against 100k filler rows, not the plan's 1M.
-- [ ] **B5.** L3 is closed-loop per pacer (not open-loop) and runs 5-12%
-      under its own nominal rate; `poll_interval=10` inflates DB CPU;
-      claim-to-start latency is not reported.
-- [ ] **B6.** L4's p99 growth tracks submitter count/pool/CPU, not lock
-      contention (cold keys show the same p99 with zero lock waits);
-      `waiting_locks` rests on ~4 samples from a sampler on Grind's own
-      pool; no consumer runs, so admission-vs-claim contention is untested.
-- [ ] **B7.** The L6 instrumentation red/green tests are shallow (red proves
-      only "trigger not installed"; the slow-ack test does not run inside a
-      real ack), and `float_literal_ms` does not zero-pad a ms remainder
-      between 10 and 99 (the values actually used, 1600/3200, are
-      unaffected).
-- [ ] **B8.** T1 is weakly exercised (25s jobs under a 30s lease, 2
-      renewals each, phase-aligned waves, 2 repeats) — verdict unaffected
-      given the ~125x margin, but not proven to a fuller standard.
-- [ ] **B9.** Every row of the 548c31e CSVs has `dirty=1`, contradicting
-      the "clean, committed tree" claim.
-- [ ] **B10.** T2 was never run at the real scale (`D=4000ms`,
-      `L=24000ms`); staggered job costs, `K` in `{3..6}`, and the 1.2D
-      acks-that-time-out variant are still needed.
+L7 and its diagnostic profiles now share a validated, recorded drain budget and
+retain sampler coverage plus completion diagnostics on failure. The fresh pair
+used 600,000ms in both arms. This soft polling budget does not cancel SQL or
+change the durable-completion throughput denominator. Source:
+`bench/src/grind_bench/load/runtime.gleam:70`,
+`bench/src/grind_bench/load/drain.gleam:68`,
+`bench/src/grind_bench/load/report.gleam:18`.
 
-### Deferred performance optimizations (T3, not bench harness fixes)
+### Performance follow-ups (T3, not bench harness fixes)
 
 - [ ] **Batch claim** (post-release performance optimization, deferred by
       user decision 2026-09-27, not a release blocker): one claim statement
@@ -416,16 +428,13 @@ this is a tracking checklist for a future bench-harness change:
       subquery bounded by the free-slot count), plus one expired-lease
       quarantine sweep per poll instead of one per claim. See
       `docs/RISKS.md` risk 19.
-- [ ] **Ack from the attempt process** (post-release performance
-      optimization, deferred by user decision 2026-09-27, not a release
-      blocker): the attempt's own worker process runs the acknowledgement
-      transaction and reports only the outcome to the coordinator (Oban's
-      `executor` shape), so acks run in parallel, bounded by the pool.
-      Fencing stays in SQL; the pending-ack retry moves into or beside the
-      attempt process, which touches the proven recovery code in
-      `grind/internal/attempt` and needs its own design pass, with every
-      `docs/RECOVERY-EVIDENCE.md` test staying green. See `docs/RISKS.md`
-      risk 19.
+- [~] **Ack from the attempt process:** implemented under the owner-approved
+  correctness work, with independent reserved renewal. Its repeated
+  benchmark evidence and the owner-approved two-hour soak are accepted locally.
+  T3 still triggers in the repaired L7 comparison. Batch claiming remains
+  deferred; executor-owned ACKs did not remove the throughput limitation.
+  See [RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) and the repaired benchmark
+  appendix in [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md).
 
 ## 5. Packaging and documentation
 

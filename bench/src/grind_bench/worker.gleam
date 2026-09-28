@@ -1,14 +1,7 @@
-//// The one bench worker every load scenario submits: it optionally sleeps
-//// for a caller-chosen "job cost" (simulating handler work), then records
-//// one `grind_bench.bench_effects` row through the bench-owned ledger pool
-//// (never through Grind's own pool) before succeeding.
-////
-//// A plain `perform` handler never receives Grind's own job id or attempt
-//// metadata (see `docs/IMPLEMENTATION-SCOPE.md`, "Job lifecycle and attempt
-//// history") -- only a bound retry-policy callback gets a `RetryContext`,
-//// and this worker never fails, so it never runs. `BenchJob.bench_index` is
-//// the application-owned correlation key the ledger and the audit checker
-//// use instead (see `bench/priv/bench.sql`'s own doc comment).
+//// Benchmark worker with separate handler-start and handler-finish times.
+//// The ledger uses an independent pool; it never borrows Grind capacity.
+//// Durable completion is measured by a separate observer after the ACK is
+//// visible, so sleeping, returning, and committing remain distinct events.
 
 import gleam/dynamic/decode
 import gleam/erlang/process
@@ -82,12 +75,25 @@ pub fn build(
   let assert Ok(output) = worker.codec(id <> "-output-v1", json.int, decode.int)
   worker.define(id, "v1", input, output, fn(job) {
     let BenchJob(bench_index:, cost_ms:) = job
+    let delivery_count = next_delivery_count(bench_index)
+    record_effect(ledger, bench_index, delivery_count)
     case cost_ms > 0 {
       True -> process.sleep(cost_ms)
       False -> Nil
     }
-    let delivery_count = next_delivery_count(bench_index)
-    record_effect(ledger, bench_index, delivery_count)
+    let query =
+      pog.query(
+        "UPDATE bench_effects SET finished_at = clock_timestamp() WHERE bench_index = $1 AND delivery_count = $2",
+      )
+      |> pog.parameter(pog.int(bench_index))
+      |> pog.parameter(pog.int(delivery_count))
+    case pog.execute(query, ledger) {
+      Ok(_) -> Nil
+      Error(_) -> {
+        let _ = next_delivery_count(-1)
+        Nil
+      }
+    }
     Ok(bench_index)
   })
 }

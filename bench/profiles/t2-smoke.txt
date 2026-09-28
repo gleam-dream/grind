@@ -1,0 +1,10 @@
+# Activation-only smoke: one execution per row, no performance verdict.
+# K D_ms L_ms ACK_delay_ms concurrency main_pool
+# K=0 has no injected ACK delay; one baseline covers both delay settings.
+0 4000 16000 3200 10 10
+5 4000 16000 3200 10 10
+5 4000 16000 4800 10 10
+8 4000 16000 3200 10 10
+8 4000 16000 4800 10 10
+8 4000 16000 3200 50 10
+8 4000 16000 4800 50 10

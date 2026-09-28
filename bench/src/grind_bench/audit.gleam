@@ -20,6 +20,7 @@
 //// "zero problems found" by an unlucky caller.
 
 import gleam/dynamic/decode
+import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
@@ -534,4 +535,63 @@ fn result_to_violations(outcome: Result(Nil, Violation)) -> List(Violation) {
     Ok(Nil) -> []
     Error(violation) -> [violation]
   }
+}
+
+/// Final T2 classification. Every ledger row is retained, including missing
+/// jobs, incomplete attempts and bad receipts. This worker only succeeds:
+/// a slow-ACK target may instead be quarantined with no acknowledgement.
+pub type FaultCompletion {
+  FaultCompletion(
+    bench_index: Int,
+    job_id: Int,
+    state: String,
+    fault_target: Bool,
+    receipt_count: Int,
+    valid: Bool,
+  )
+}
+
+pub fn fault_completions(
+  ledger: pog.Connection,
+  grind_schema: String,
+  fault_ids: List(Int),
+) -> Result(List(FaultCompletion), AuditError) {
+  let targets = case fault_ids {
+    [] -> "FALSE"
+    ids ->
+      "bs.job_id IN (" <> string.join(list.map(ids, int.to_string), ",") <> ")"
+  }
+  let sql =
+    "WITH classified AS (SELECT bs.bench_index, bs.job_id, COALESCE(j.state, 'missing') AS state, "
+    <> targets
+    <> " AS fault_target, count(a.command_id)::bigint AS receipt_count, "
+    <> "COALESCE(j.output = to_jsonb(bs.bench_index), FALSE) AS output_matches, "
+    <> "COALESCE(bool_and(a.committed_state = j.state AND a.attempt_id = j.attempt_id AND a.attempt_epoch = j.attempt_epoch AND a.queue = j.queue AND a.worker_id = j.worker_id AND a.worker_version = j.worker_version), FALSE) AS receipt_matches "
+    <> "FROM bench_submissions bs LEFT JOIN "
+    <> qualify(grind_schema, "grind_jobs")
+    <> " j ON j.id=bs.job_id LEFT JOIN "
+    <> qualify(grind_schema, "grind_job_acknowledgements")
+    <> " a ON a.job_id=bs.job_id GROUP BY bs.bench_index, bs.job_id, j.id) "
+    <> "SELECT bench_index, job_id, state, fault_target, receipt_count, "
+    <> "((state='succeeded' AND output_matches AND receipt_count=1 AND receipt_matches) OR (fault_target AND state='uncertain' AND receipt_count=0)) AS valid FROM classified ORDER BY bench_index"
+  pog.query(sql)
+  |> pog.returning({
+    use bench_index <- decode.field(0, decode.int)
+    use job_id <- decode.field(1, decode.int)
+    use state <- decode.field(2, decode.string)
+    use fault_target <- decode.field(3, decode.bool)
+    use receipt_count <- decode.field(4, decode.int)
+    use valid <- decode.field(5, decode.bool)
+    decode.success(FaultCompletion(
+      bench_index:,
+      job_id:,
+      state:,
+      fault_target:,
+      receipt_count:,
+      valid:,
+    ))
+  })
+  |> pog.execute(ledger)
+  |> result.map_error(QueryFailed)
+  |> result.map(fn(returned) { returned.rows })
 }

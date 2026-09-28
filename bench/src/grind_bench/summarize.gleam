@@ -21,6 +21,7 @@ pub type Percentiles {
     min: Float,
     p50: Float,
     p90: Float,
+    p95: Float,
     p99: Float,
     max: Float,
     mean: Float,
@@ -55,6 +56,7 @@ pub fn percentiles(values: List(Float)) -> Result(Percentiles, Nil) {
         min:,
         p50: at(0.5),
         p90: at(0.9),
+        p95: at(0.95),
         p99: at(0.99),
         max:,
         mean:,
@@ -115,7 +117,7 @@ pub fn read_field_values(
 /// so several fields/scenarios can accumulate into one committed summary
 /// file across a run.
 pub fn csv_row(scenario: String, field: String, stats: Percentiles) -> String {
-  let Percentiles(count:, min:, p50:, p90:, p99:, max:, mean:) = stats
+  let Percentiles(count:, min:, p50:, p90:, p99:, max:, mean:, ..) = stats
   [
     scenario,
     field,

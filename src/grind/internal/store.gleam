@@ -8,8 +8,7 @@ import pog
 
 // Every Grind storage call funnels through one of these four wrappers,
 // which check out their own connection under a deadline
-// (`set_deadline`/`clear_deadline`, called once from `postgres.start`/
-// `postgres.close`) and run against the pog `Connection` shape
+// owned by `grind/internal/pool`, and run against the pog `Connection` shape
 // `{single_connection, Conn}` rather than letting pog re-checkout with its
 // own unconfigurable, hardcoded default — see `src/grind_postgres_ffi.erl`'s
 // own module documentation for the full mechanism and why it also fixes
@@ -68,22 +67,3 @@ pub fn transaction_or_checkout_failure(
   connection: pog.Connection,
   callback: fn(pog.Connection) -> Result(a, b),
 ) -> Result(Result(a, pog.TransactionError(b)), Nil)
-
-/// Attaches the checkout deadline (milliseconds) `execute_safely`/
-/// `call_safely`/`transaction_safely` bound every storage call against this
-/// pool by, keyed on the pool's own atom name via `persistent_term`. Called
-/// once from `postgres.start`, with the pool's freshly named `Connection`
-/// (always the `{pool, Name}` shape at that point) — *before* that pool's
-/// own supervisor is started, so no in-flight checkout can ever observe
-/// this name with no deadline attached yet.
-@external(erlang, "grind_postgres_ffi", "set_deadline")
-pub fn set_deadline(connection: pog.Connection, deadline_ms: Int) -> Nil
-
-/// Erases the deadline `set_deadline` attached. Called from `postgres.close`
-/// only once its own `stop_supervisor` call confirms this `close` actually
-/// stopped a still-live pool process — never for a stale `Database` handle
-/// whose supervisor had already stopped, since the same pool name may since
-/// have been reused by a fresh `start` of the same `ValidatedSettings`; see
-/// `postgres.close`'s own doc comment.
-@external(erlang, "grind_postgres_ffi", "clear_deadline")
-pub fn clear_deadline(connection: pog.Connection) -> Nil

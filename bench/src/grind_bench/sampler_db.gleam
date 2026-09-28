@@ -130,9 +130,9 @@ fn waiting_lock_count(connection: pog.Connection) -> Int {
     Ok(returned) ->
       case returned.rows {
         [count] -> count
-        _ -> 0
+        _ -> -1
       }
-    Error(_) -> 0
+    Error(_) -> -1
   }
 }
 

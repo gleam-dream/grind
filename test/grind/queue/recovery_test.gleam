@@ -180,7 +180,7 @@ fn run_coordinator_loss_test(database_url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, definition)
   let assert Ok(handle) =
     postgres.submit(database, "coordinator-loss", definition, 91)
-  let lease_duration_ms = 2000
+  let lease_duration_ms = 4008
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_poll_interval(20)

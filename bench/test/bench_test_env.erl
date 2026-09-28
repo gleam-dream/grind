@@ -3,10 +3,22 @@
 %% silently-skipped (missing env var) contract test cannot be mistaken for a
 %% passing one.
 -module(bench_test_env).
--export([database_url/0, schema_drift_url/0, mark/1]).
+-export([database_url/0, schema_drift_url/0, mark/1, with_postgres_log/2]).
 
 database_url() -> env("GRIND_BENCH_TEST_DATABASE_URL").
 schema_drift_url() -> env("GRIND_BENCH_TEST_SCHEMA_DRIFT_URL").
+
+with_postgres_log(Path, Run) ->
+    Name = "GRIND_BENCH_POSTGRES_LOG",
+    Before = os:getenv(Name),
+    os:putenv(Name, unicode:characters_to_list(Path)),
+    try Run()
+    after
+        case Before of
+            false -> os:unsetenv(Name);
+            Value -> os:putenv(Name, Value)
+        end
+    end.
 
 env(Name) ->
     case os:getenv(Name) of

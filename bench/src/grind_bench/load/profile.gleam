@@ -1,6 +1,5 @@
 import gleam/dict
 import gleam/dynamic/decode
-import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/io
@@ -14,46 +13,13 @@ import grind/queue
 import grind/registry
 import grind_bench
 import grind_bench/load/context
+import grind_bench/load/drain as drain_measurement
 import grind_bench/load/observers
 import grind_bench/load/report
 import grind_bench/load/runtime
 import grind_bench/load/workload
 import grind_bench/worker as bench_worker
 import simplifile
-
-pub fn sample_coordinators(
-  pids: List(process.Pid),
-  path: String,
-  interval_ms: Int,
-) -> Nil {
-  let _ = simplifile.create_directory_all(runtime.parent_dir(path))
-  let _ = simplifile.write(to: path, contents: "")
-  sample_loop(pids, path, interval_ms, 100_000)
-}
-
-fn sample_loop(
-  pids: List(process.Pid),
-  path: String,
-  interval_ms: Int,
-  ticks_remaining: Int,
-) -> Nil {
-  case ticks_remaining <= 0 {
-    True -> Nil
-    False -> {
-      process.sleep(interval_ms)
-      let max_len =
-        list.fold(list.map(pids, runtime.message_queue_len), 0, int.max)
-      let line =
-        json.object([
-          #("unix_ms", json.int(runtime.monotonic_ms())),
-          #("message_queue_len_max", json.int(max_len)),
-        ])
-        |> json.to_string
-      let _ = simplifile.append(to: path, contents: line <> "\n")
-      sample_loop(pids, path, interval_ms, ticks_remaining - 1)
-    }
-  }
-}
 
 // -- profile: item 11, statistical coordinator profiling -------------------
 
@@ -82,13 +48,14 @@ fn profile_tick_decoder() -> decode.Decoder(ProfileTick) {
 }
 
 pub fn run_profile(job_count: Int, consumers: Int, concurrency: Int) -> Nil {
+  let drain_timeout_ms = runtime.drain_timeout_ms()
   let total_concurrency = consumers * concurrency
   let harness =
     context.setup(
       int.max(total_concurrency, 10),
       grind_bench.ledger_pool_size_for_concurrency(total_concurrency),
     )
-  let context.Harness(database:, ledger:, drain:) = harness
+  let context.Harness(database:, ledger:, ..) = harness
   let queue_name = "profile-q0"
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.profile.echo")
   let assert Ok(r) = registry.new(queue_name)
@@ -111,6 +78,7 @@ pub fn run_profile(job_count: Int, consumers: Int, concurrency: Int) -> Nil {
     |> queue.with_poll_interval(5)
     |> queue.with_maximum_concurrency(concurrency)
     |> queue.validate_policy
+  let startup_started_ms = runtime.monotonic_ms()
   let consumers_list =
     runtime.int_range(consumers)
     |> list.map(fn(_i) {
@@ -121,22 +89,46 @@ pub fn run_profile(job_count: Int, consumers: Int, concurrency: Int) -> Nil {
 
   let label = int.to_string(consumers) <> "x" <> int.to_string(concurrency)
   let raw_path = runtime.results_dir() <> "/raw/profile-" <> label <> ".jsonl"
-  let sampler_pid =
-    process.spawn_unlinked(fn() {
-      profile_sample_loop(coordinator_pids, raw_path, 2, 100_000)
-    })
-
   let grind_schema = context.schema_of(database)
-  let drained = workload.wait_for_drain(drain, grind_schema, 60_000)
-  process.kill(sampler_pid)
-  list.each(consumers_list, fn(c) {
-    let _ = queue.stop(c)
-    Nil
-  })
+  let drained =
+    drain_measurement.run(
+      harness,
+      consumers_list,
+      drain_measurement.Config(
+        raw_path:,
+        interval_ms: 2,
+        timeout_ms: drain_timeout_ms,
+        expected_jobs: job_count,
+        startup_started_ms:,
+        sample: fn() {
+          let samples =
+            list.filter_map(
+              coordinator_pids,
+              runtime.current_function_and_reductions,
+            )
+          let total_reductions =
+            list.fold(samples, 0, fn(acc, sample) { acc + sample.3 })
+          [
+            #("total_reductions", json.int(total_reductions)),
+            #(
+              "functions",
+              json.array(samples, fn(sample) {
+                let #(module, function, arity, _) = sample
+                json.object([
+                  #("module", json.string(module)),
+                  #("function", json.string(function)),
+                  #("arity", json.int(arity)),
+                ])
+              }),
+            ),
+          ]
+        },
+      ),
+    )
 
   case drained {
     Error(Nil) -> {
-      io.println("profile: timed out waiting for drain")
+      io.println("profile: drain failed; see " <> raw_path <> ".drain.json")
       runtime.halt(1)
     }
     Ok(Nil) -> {
@@ -152,69 +144,6 @@ pub fn run_profile(job_count: Int, consumers: Int, concurrency: Int) -> Nil {
         job_count,
         log_lines_before,
       )
-    }
-  }
-}
-
-fn profile_sample_loop(
-  pids: List(process.Pid),
-  path: String,
-  interval_ms: Int,
-  ticks_remaining: Int,
-) -> Nil {
-  case ticks_remaining <= 0 {
-    True -> Nil
-    False -> {
-      let _ = simplifile.create_directory_all(runtime.parent_dir(path))
-      profile_loop(pids, path, interval_ms, ticks_remaining, True)
-    }
-  }
-}
-
-fn profile_loop(
-  pids: List(process.Pid),
-  path: String,
-  interval_ms: Int,
-  ticks_remaining: Int,
-  first_tick: Bool,
-) -> Nil {
-  case ticks_remaining <= 0 {
-    True -> Nil
-    False -> {
-      case first_tick {
-        True -> {
-          let _ = simplifile.write(to: path, contents: "")
-          Nil
-        }
-        False -> Nil
-      }
-      process.sleep(interval_ms)
-      let samples =
-        list.filter_map(pids, runtime.current_function_and_reductions)
-      let total_reductions =
-        list.fold(samples, 0, fn(acc, sample) {
-          let #(_, _, _, reductions) = sample
-          acc + reductions
-        })
-      let line =
-        json.object([
-          #("unix_ms", json.int(runtime.monotonic_ms())),
-          #("total_reductions", json.int(total_reductions)),
-          #(
-            "functions",
-            json.array(samples, fn(sample) {
-              let #(module, function, arity, _) = sample
-              json.object([
-                #("module", json.string(module)),
-                #("function", json.string(function)),
-                #("arity", json.int(arity)),
-              ])
-            }),
-          ),
-        ])
-        |> json.to_string
-      let _ = simplifile.append(to: path, contents: line <> "\n")
-      profile_loop(pids, path, interval_ms, ticks_remaining - 1, False)
     }
   }
 }

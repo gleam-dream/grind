@@ -1,3 +1,4 @@
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/io
 import gleam/list
@@ -27,6 +28,19 @@ pub fn preload_and_track(
   job_count: Int,
   cost_ms: Int,
 ) -> Nil {
+  preload_varying_cost(database, ledger, worker_def, queues, job_count, fn(_) {
+    cost_ms
+  })
+}
+
+pub fn preload_varying_cost(
+  database: postgres.Database,
+  ledger: pog.Connection,
+  worker_def: runtime.BenchWorker,
+  queues: List(String),
+  job_count: Int,
+  cost: fn(Int) -> Int,
+) -> Nil {
   let meta = worker_versions(worker_def)
   let encode_input = fn(job: preload.PreloadJob) -> String {
     worker.encode_input(
@@ -44,7 +58,8 @@ pub fn preload_and_track(
     case indices {
       [] -> Nil
       _ -> {
-        let jobs = list.map(indices, preload.immediate(_, cost_ms))
+        let jobs =
+          list.map(indices, fn(index) { preload.immediate(index, cost(index)) })
         let assert Ok(pairs) =
           preload.preload(database, queue_name, meta, encode_input, jobs, 500)
         let assert Ok(Nil) = record_submissions(ledger, pairs, queue_name)
@@ -129,7 +144,29 @@ fn poll_drain(
   deadline: Int,
 ) -> Result(Nil, Nil) {
   case audit.check_all_succeeded_with_expected_output(drain, grind_schema) {
-    Ok(Ok(Nil)) -> Ok(Nil)
+    Ok(Ok(Nil)) -> {
+      let query =
+        pog.query(
+          "SELECT count(*) FROM grind_bench.bench_submissions s WHERE NOT EXISTS (SELECT 1 FROM grind_bench.bench_durable_completions d WHERE d.job_id=s.job_id)",
+        )
+        |> pog.returning({
+          use value <- decode.field(0, decode.int)
+          decode.success(value)
+        })
+      let assert Ok(pog.Returned(rows: [missing], ..)) =
+        pog.execute(query, drain)
+      case missing == 0 {
+        True -> Ok(Nil)
+        False ->
+          case runtime.monotonic_ms() >= deadline {
+            True -> Error(Nil)
+            False -> {
+              process.sleep(5)
+              poll_drain(drain, grind_schema, deadline)
+            }
+          }
+      }
+    }
     // Still violations (some job not yet succeeded) -- keep polling, unless
     // the deadline has passed.
     Ok(Error(_)) ->

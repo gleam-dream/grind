@@ -181,7 +181,7 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
     postgres.submit(database, "auto-ack-commit-loss", definition, 41)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1600)
+    |> queue.with_lease_duration(4008)
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)
   use <- exception.defer(fn() {

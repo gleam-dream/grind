@@ -494,7 +494,7 @@ fn run_automatic_drain_test(database_url: String) -> Nil {
     queue.default_policy()
     |> queue.with_poll_interval(20)
     |> queue.with_maximum_concurrency(1)
-    |> queue.with_lease_duration(1600)
+    |> queue.with_lease_duration(4008)
     |> queue.with_shutdown_grace(2000)
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)
@@ -683,7 +683,7 @@ fn run_stale_shutdown_grace_timer_test(database_url: String) -> Nil {
     queue.default_policy()
     |> queue.with_poll_interval(20)
     |> queue.with_maximum_concurrency(1)
-    |> queue.with_lease_duration(15_000)
+    |> queue.with_lease_duration(16_000)
     |> queue.with_shutdown_grace(shutdown_grace_ms)
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)

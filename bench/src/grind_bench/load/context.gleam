@@ -1,5 +1,7 @@
+import gleam/erlang/process
 import gleam/int
 import gleam/io
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import grind/job
 import grind/postgres
@@ -16,18 +18,67 @@ pub type Harness {
     database: postgres.Database,
     ledger: pog.Connection,
     drain: pog.Connection,
+    completion_observer: Option(CompletionObserver),
   )
 }
 
-pub fn setup(pool_size: Int, ledger_pool_size: Int) -> Harness {
-  setup_with_settings(pool_size, ledger_pool_size, fn(settings) { settings })
+pub opaque type CompletionObserver {
+  CompletionObserver(
+    pid: process.Pid,
+    stop: process.Subject(process.Subject(Int)),
+  )
 }
 
-/// Like `setup`, but overrides `postgres.Settings.statement_deadline_ms`
-/// (`D`) before validating -- L6's T2 scenario scales `D` down from the
-/// real 4000ms default for wall-clock feasibility while preserving the
-/// exact `L = 6D` / `cost = 3L` relationships (see `run_l6t2`'s own doc
-/// comment).
+/// Stop the run-owned observer before closing pools or dropping its schema.
+/// The acknowledgement is sent after its last query completes.
+pub fn stop_observer(harness: Harness) -> Nil {
+  case harness.completion_observer {
+    None -> Nil
+    Some(CompletionObserver(pid:, stop:)) -> {
+      let acknowledged = process.new_subject()
+      process.send(stop, acknowledged)
+      case process.receive(acknowledged, within: 5000) {
+        Ok(polls) -> {
+          let assert True = polls > 0
+          let assert 0 =
+            runtime.counter_value(runtime.completion_observer_error_counter)
+          io.println(
+            "completion_observer_stop_ack polls=" <> int.to_string(polls),
+          )
+        }
+        Error(_) -> {
+          process.kill(pid)
+          panic as "completion observer did not acknowledge stop; run evidence is invalid"
+        }
+      }
+    }
+  }
+}
+
+pub fn setup(pool_size: Int, ledger_pool_size: Int) -> Harness {
+  setup_with_settings(
+    pool_size,
+    ledger_pool_size,
+    fn(settings) { settings },
+    True,
+  )
+}
+
+/// Idle/admission-only measurements do not need completion sampling.
+pub fn setup_without_completion_observer(
+  pool_size: Int,
+  ledger_pool_size: Int,
+) -> Harness {
+  setup_with_settings(
+    pool_size,
+    ledger_pool_size,
+    fn(settings) { settings },
+    False,
+  )
+}
+
+/// Overrides the statement deadline for an explicit fault profile. Matrix
+/// validation uses the real D=4000ms default as well as caller-selected D.
 pub fn setup_with_deadline(
   pool_size: Int,
   ledger_pool_size: Int,
@@ -39,18 +90,27 @@ pub fn setup_with_deadline(
   // deadline (4000). A scaled-down `deadline_ms` (L6T2's own reduced `D`)
   // needs a proportionally scaled-down lock wait too, or `setup` itself
   // fails closed before this scenario ever starts.
-  let lock_wait_ms = int.max(1, deadline_ms / 4)
-  setup_with_settings(pool_size, ledger_pool_size, fn(settings) {
-    settings
-    |> postgres.with_statement_deadline(deadline_ms)
-    |> postgres.with_unique_lock_wait(lock_wait_ms)
-  })
+  let lock_wait_ms = case deadline_ms >= 4000 {
+    True -> 2000
+    False -> int.max(1, deadline_ms / 4)
+  }
+  setup_with_settings(
+    pool_size,
+    ledger_pool_size,
+    fn(settings) {
+      settings
+      |> postgres.with_statement_deadline(deadline_ms)
+      |> postgres.with_unique_lock_wait(lock_wait_ms)
+    },
+    True,
+  )
 }
 
 fn setup_with_settings(
   pool_size: Int,
   ledger_pool_size: Int,
   adjust: fn(postgres.Settings) -> postgres.Settings,
+  observe: Bool,
 ) -> Harness {
   let config =
     grind_bench.default_config(runtime.database_url())
@@ -80,7 +140,23 @@ fn setup_with_settings(
       runtime.halt(1)
     }
   }
-  Harness(database:, ledger:, drain:)
+  let completion_observer = case observe {
+    True -> {
+      let ready = process.new_subject()
+      let pid =
+        process.spawn_unlinked(fn() {
+          // Only the receiving process may create this subject. The parent
+          // receives the handle through its own ready subject before returning.
+          let stop = process.new_subject()
+          process.send(ready, stop)
+          observe_completions(drain, schema_of(database), stop, 0)
+        })
+      let assert Ok(stop) = process.receive(ready, within: 5000)
+      Some(CompletionObserver(pid:, stop:))
+    }
+    False -> None
+  }
+  Harness(database:, ledger:, drain:, completion_observer:)
 }
 
 pub fn schema_of(database: postgres.Database) -> String {
@@ -100,5 +176,33 @@ pub fn cleanup_schema(ledger: pog.Connection, grind_schema: String) -> Nil {
       let assert Ok(Nil) = grind_bench.drop_schema(ledger, grind_schema)
       Nil
     }
+  }
+}
+
+// 10 ms sampling gives an explicitly bounded-by-observation upper estimate,
+// not a claim that a SQL timestamp is the instant COMMIT became durable.
+fn observe_completions(
+  drain: pog.Connection,
+  schema: String,
+  stop: process.Subject(process.Subject(Int)),
+  polls: Int,
+) -> Nil {
+  let sql =
+    "INSERT INTO grind_bench.bench_durable_completions (job_id) SELECT a.job_id FROM \""
+    <> schema
+    <> "\".grind_job_acknowledgements a JOIN grind_bench.bench_submissions s ON s.job_id = a.job_id WHERE a.committed_state = 'succeeded' ON CONFLICT DO NOTHING"
+  case pog.execute(pog.query(sql), drain) {
+    Error(error) -> {
+      let _ = runtime.bump(runtime.completion_observer_error_counter)
+      io.println(
+        "completion observer failed; run evidence is invalid: "
+        <> string.inspect(error),
+      )
+    }
+    Ok(_) ->
+      case process.receive(stop, within: 10) {
+        Ok(acknowledged) -> process.send(acknowledged, polls + 1)
+        Error(_) -> observe_completions(drain, schema, stop, polls + 1)
+      }
   }
 }

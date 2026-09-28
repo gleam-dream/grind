@@ -2,6 +2,7 @@ import gleam/erlang/process
 import gleam/float
 import gleam/int
 import gleam/io
+import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
@@ -10,8 +11,8 @@ import grind/queue
 import grind/registry
 import grind_bench
 import grind_bench/load/context
+import grind_bench/load/drain as drain_measurement
 import grind_bench/load/observers
-import grind_bench/load/profile
 import grind_bench/load/report
 import grind_bench/load/runtime
 import grind_bench/load/workload
@@ -25,7 +26,7 @@ pub fn run_smoke(job_count: Int) -> Nil {
   io.println("grind_bench smoke: " <> int.to_string(job_count) <> " jobs")
   let harness =
     context.setup(10, grind_bench.ledger_pool_size_for_concurrency(10))
-  let context.Harness(database:, ledger:, drain:) = harness
+  let context.Harness(database:, ledger:, drain:, ..) = harness
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.smoke.echo")
   let assert Ok(workers) = registry.new("bench-smoke")
   let assert Ok(workers) = registry.register(workers, worker_def)
@@ -52,6 +53,7 @@ pub fn run_smoke(job_count: Int) -> Nil {
 
   let grind_schema = context.schema_of(database)
   let drained = workload.wait_for_drain(drain, grind_schema, 30_000)
+  context.stop_observer(harness)
   let _ = queue.stop(consumer)
 
   case drained {
@@ -97,7 +99,7 @@ pub fn run_l1(
       int.max(total_concurrency, 10),
       grind_bench.ledger_pool_size_for_concurrency(total_concurrency),
     )
-  let context.Harness(database:, ledger:, drain:) = harness
+  let context.Harness(database:, ledger:, drain:, ..) = harness
   let queue_names =
     runtime.int_range(queues_n)
     |> list.map(fn(i) { "l1-q" <> int.to_string(i) })
@@ -135,6 +137,8 @@ pub fn run_l1(
     <> int.to_string(queues_n)
     <> "xc"
     <> int.to_string(cost_ms)
+    <> "-r"
+    <> int.to_string(repeat)
   let beam_raw_path =
     runtime.results_dir() <> "/raw/l1-" <> label <> "-beam.jsonl"
   let db_raw_path = runtime.results_dir() <> "/raw/l1-" <> label <> "-db.jsonl"
@@ -153,11 +157,12 @@ pub fn run_l1(
     process.spawn_unlinked(fn() { sampler_beam.run(beam_raw_path, 1000, 300) })
   let db_sampler_pid =
     process.spawn_unlinked(fn() {
-      sampler_db.run(postgres.connection(database), db_raw_path, 1000, 300)
+      sampler_db.run(drain, db_raw_path, 1000, 300)
     })
 
   let grind_schema = context.schema_of(database)
   let drained = workload.wait_for_drain(drain, grind_schema, 60_000)
+  context.stop_observer(harness)
   process.kill(beam_sampler_pid)
   process.kill(db_sampler_pid)
   list.each(consumers_list, fn(c) {
@@ -198,16 +203,19 @@ pub fn run_l1(
             int.to_string(job_count),
             int.to_string(elapsed_ms),
             float.to_string(jobs_per_sec),
-            int.to_string(total_concurrency),
+            int.to_string(int.max(total_concurrency, 10)),
             int.to_string(cpu_ms_delta),
             float.to_string(cpu_pct),
+            int.to_string(int.max(total_concurrency, 10)),
+            int.to_string(consumers),
+            int.to_string(int.max(total_concurrency, 10) + consumers),
           ],
           ",",
         )
       report.write_row(
         runtime.results_dir() <> "/l1.csv",
         runtime.provenance_header_prefix()
-          <> ",repeat,consumers,concurrency,queues,cost_ms,job_count,elapsed_ms,jobs_per_sec,pool_size,db_cpu_ms,db_cpu_pct_of_core",
+          <> ",repeat,consumers,concurrency,queues,cost_ms,job_count,elapsed_ms,jobs_per_sec,pool_size,db_cpu_ms,db_cpu_pct_of_core,main_pool_size,reserved_renewal_connections,total_grind_connections",
         row,
       )
       io.println("l1 " <> row)
@@ -253,13 +261,14 @@ pub fn run_l7(
   concurrency: Int,
   repeat: Int,
 ) -> Nil {
+  let drain_timeout_ms = runtime.drain_timeout_ms()
   let total_concurrency = consumers * concurrency
   let harness =
     context.setup(
       int.max(total_concurrency, 10),
       grind_bench.ledger_pool_size_for_concurrency(total_concurrency),
     )
-  let context.Harness(database:, ledger:, drain:) = harness
+  let context.Harness(database:, ledger:, ..) = harness
   let queue_name = "l7-q0"
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l7.echo")
   let assert Ok(r) = registry.new(queue_name)
@@ -285,6 +294,7 @@ pub fn run_l7(
 
   let cpu_before = report.cpu_ms_now()
 
+  let startup_started_ms = runtime.monotonic_ms()
   let consumers_list =
     runtime.int_range(consumers)
     |> list.map(fn(_i) {
@@ -299,29 +309,38 @@ pub fn run_l7(
     <> int.to_string(consumers)
     <> "x"
     <> int.to_string(concurrency)
+    <> "-r"
+    <> int.to_string(repeat)
     <> ".jsonl"
-  // `process.spawn_unlinked` + `process.kill` (not a `Subject`-based "stop"
-  // message): a `gleam_erlang` `Subject` can only be received from by the
-  // process that created it, so a subject created here could never be
-  // received on inside the spawned sampler process -- see
-  // `grind_bench/sampler_beam.run`'s own doc comment for the same trap
-  // found and fixed there first.
-  let sampler_pid =
-    process.spawn_unlinked(fn() {
-      profile.sample_coordinators(coordinator_pids, raw_path, 20)
-    })
-
   let grind_schema = context.schema_of(database)
-  let drained = workload.wait_for_drain(drain, grind_schema, 60_000)
-  process.kill(sampler_pid)
-  list.each(consumers_list, fn(c) {
-    let _ = queue.stop(c)
-    Nil
-  })
+  let drained =
+    drain_measurement.run(
+      harness,
+      consumers_list,
+      drain_measurement.Config(
+        raw_path:,
+        interval_ms: 20,
+        timeout_ms: drain_timeout_ms,
+        expected_jobs: job_count,
+        startup_started_ms:,
+        sample: fn() {
+          [
+            #(
+              "message_queue_len_max",
+              json.int(list.fold(
+                list.map(coordinator_pids, runtime.message_queue_len),
+                0,
+                int.max,
+              )),
+            ),
+          ]
+        },
+      ),
+    )
 
   case drained {
     Error(Nil) -> {
-      io.println("l7: timed out waiting for drain")
+      io.println("l7: drain failed; see " <> raw_path <> ".drain.json")
       runtime.halt(1)
     }
     Ok(Nil) -> {
@@ -362,13 +381,16 @@ pub fn run_l7(
             float.to_string(mqlen_p99),
             int.to_string(cpu_ms_delta),
             float.to_string(cpu_pct),
+            int.to_string(int.max(total_concurrency, 10)),
+            int.to_string(consumers),
+            int.to_string(int.max(total_concurrency, 10) + consumers),
           ],
           ",",
         )
       report.write_row(
         runtime.results_dir() <> "/l7.csv",
         runtime.provenance_header_prefix()
-          <> ",repeat,consumers,concurrency,job_count,elapsed_ms,jobs_per_sec,coordinator_mqlen_p50,coordinator_mqlen_p99,db_cpu_ms,db_cpu_pct_of_core",
+          <> ",repeat,consumers,concurrency,job_count,elapsed_ms,jobs_per_sec,coordinator_mqlen_p50,coordinator_mqlen_p99,db_cpu_ms,db_cpu_pct_of_core,main_pool_size,reserved_renewal_connections,total_grind_connections",
         row,
       )
       io.println("l7 " <> row)

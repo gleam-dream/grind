@@ -1,0 +1,511 @@
+{
+  "version": 1,
+  "oracle": {
+    "version": "2.24.1",
+    "commit": "64b8481e5383f6bc46b7a5284e4ced3202dec9d5",
+    "engine": "Oban.Engines.Basic"
+  },
+  "normalization": {
+    "states": {
+      "completed": "succeeded",
+      "queued": "available"
+    },
+    "excluded": ["generated identifiers", "absolute timestamps"],
+    "clock": "Database future/due relation; no absolute cross-process timestamp equality.",
+    "completion": "Read the committed row after public drain/process calls. Worker invocation counts alone never establish completion.",
+    "configured_delay": "Before/after PostgreSQL clock bracket around the public action; persisted due time must equal configured delay within that bracket plus 20ms clock tolerance; bracket spans over 5000ms fail."
+  },
+  "scenarios": [
+    {
+      "id": "success",
+      "kind": "success",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1
+      },
+      "expected": {
+        "grind": {
+          "state": "succeeded",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1,
+          "value": 42
+        },
+        "oban": {
+          "state": "succeeded",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1,
+          "value": 42
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "business-failure",
+      "kind": "failure",
+      "classification": "intentional-grind-semantics",
+      "reason": "Grind preserves a typed terminal business failure; Oban Basic discards the exhausted job.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1
+      },
+      "expected": {
+        "grind": {
+          "state": "business_failed",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1
+        },
+        "oban": {
+          "state": "discarded",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "first-retry",
+      "kind": "failure",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 2,
+        "delay_ms": 60000,
+        "runs": 1,
+        "verify_delay": true
+      },
+      "expected": {
+        "grind": {
+          "state": "retryable",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": true,
+          "executions": 1,
+          "delay_matches": true
+        },
+        "oban": {
+          "state": "retryable",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": true,
+          "executions": 1,
+          "delay_matches": true
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "retry-exhaustion",
+      "kind": "failure",
+      "classification": "intentional-grind-semantics",
+      "reason": "Grind preserves a typed terminal business failure; Oban Basic discards the exhausted job.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 2,
+        "delay_ms": 0,
+        "runs": 2
+      },
+      "expected": {
+        "grind": {
+          "state": "business_failed",
+          "attempt": 2,
+          "snoozes": 0,
+          "future": false,
+          "executions": 2
+        },
+        "oban": {
+          "state": "discarded",
+          "attempt": 2,
+          "snoozes": 0,
+          "future": false,
+          "executions": 2
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "snooze",
+      "kind": "snooze",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1,
+        "verify_delay": true
+      },
+      "expected": {
+        "grind": {
+          "state": "scheduled",
+          "attempt": 0,
+          "snoozes": 1,
+          "future": true,
+          "executions": 1,
+          "delay_matches": true
+        },
+        "oban": {
+          "state": "scheduled",
+          "attempt": 0,
+          "snoozes": 1,
+          "future": true,
+          "executions": 1,
+          "delay_matches": true
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "cancel-before-run",
+      "kind": "cancel",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1
+      },
+      "expected": {
+        "grind": {
+          "state": "cancelled",
+          "attempt": 0,
+          "snoozes": 0,
+          "future": false,
+          "executions": 0
+        },
+        "oban": {
+          "state": "cancelled",
+          "attempt": 0,
+          "snoozes": 0,
+          "future": false,
+          "executions": 0
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "scheduled-not-due",
+      "kind": "future",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1,
+        "verify_delay": true
+      },
+      "expected": {
+        "grind": {
+          "state": "scheduled",
+          "attempt": 0,
+          "snoozes": 0,
+          "future": true,
+          "executions": 0,
+          "delay_matches": true
+        },
+        "oban": {
+          "state": "scheduled",
+          "attempt": 0,
+          "snoozes": 0,
+          "future": true,
+          "executions": 0,
+          "delay_matches": true
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "scheduled-due",
+      "kind": "past",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1
+      },
+      "expected": {
+        "grind": {
+          "state": "succeeded",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1
+        },
+        "oban": {
+          "state": "succeeded",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "explicit-discard",
+      "kind": "discard",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1
+      },
+      "expected": {
+        "grind": {
+          "state": "discarded",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1
+        },
+        "oban": {
+          "state": "discarded",
+          "attempt": 1,
+          "snoozes": 0,
+          "future": false,
+          "executions": 1
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "unique-duplicate",
+      "kind": "unique",
+      "classification": "equivalent",
+      "reason": "Equivalent only for the fields observed by this scenario.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 0
+      },
+      "expected": {
+        "grind": {
+          "state": "available",
+          "attempt": 0,
+          "snoozes": 0,
+          "future": false,
+          "executions": 0,
+          "reused": true
+        },
+        "oban": {
+          "state": "available",
+          "attempt": 0,
+          "snoozes": 0,
+          "future": false,
+          "executions": 0,
+          "reused": true
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/queues/executor.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "prune-old-terminal",
+      "kind": "prune",
+      "classification": "equivalent",
+      "reason": "Old completed rows are deleted, recent completed rows retained.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1,
+        "scheduled_age_ms": 120000,
+        "finished_age_ms": 120000,
+        "retention_ms": 60000
+      },
+      "expected": {
+        "grind": {
+          "old_deleted": true,
+          "young_survived": true,
+          "deleted": 1
+        },
+        "oban": {
+          "old_deleted": true,
+          "young_survived": true,
+          "deleted": 1
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/engines/basic.ex",
+        "oracle/deps/oban/test/oban/pruner_test.exs"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    },
+    {
+      "id": "prune-completed-age",
+      "kind": "prune",
+      "classification": "intentional-grind-semantics",
+      "reason": "Grind retains every terminal state from finished_at. Oban Basic ages completed rows from scheduled_at.",
+      "parameters": {
+        "value": 41,
+        "max_attempts": 1,
+        "delay_ms": 60000,
+        "runs": 1,
+        "scheduled_age_ms": 120000,
+        "finished_age_ms": 10000,
+        "retention_ms": 60000
+      },
+      "expected": {
+        "grind": {
+          "old_deleted": false,
+          "young_survived": true,
+          "deleted": 0
+        },
+        "oban": {
+          "old_deleted": true,
+          "young_survived": true,
+          "deleted": 1
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/engines/basic.ex",
+        "oracle/deps/oban/test/oban/pruner_test.exs"
+      ],
+      "grind_adapter": "test/grind/oracle/paired.gleam",
+      "oban_adapter": "oracle/paired.exs"
+    }
+  ],
+  "gaps": [
+    {
+      "id": "fenced-expiry-and-audited-replay",
+      "classification": "intentional-grind-semantics",
+      "reason": "Grind never automatically re-executes an expired ambiguous attempt; configured Oban Lifeline rescues aged attempts. Independent-VM M2 expectations and adapters live in oracle/fault-scenarios.json; those separate executions are not counted among this catalog's twelve paired cases.",
+      "sources": [
+        "src/grind/internal/lease.gleam",
+        "oracle/deps/oban/lib/oban/lifeline.ex",
+        "oracle/fault-scenarios.json"
+      ]
+    },
+    {
+      "id": "durable-ack-and-admission-receipts",
+      "classification": "intentional-grind-semantics",
+      "reason": "Grind has durable caller reconciliation identities absent from Oban Basic; dedicated Grind fault tests remain authoritative.",
+      "sources": [
+        "src/grind/submission.gleam",
+        "test/grind/queue/ack_failure_test.gleam"
+      ]
+    },
+    {
+      "id": "unique-json-and-opt-in",
+      "classification": "intentional-grind-semantics",
+      "reason": "Grind exact encoded key equality and opt-in participation differ from Oban JSON containment and visibility of ordinary jobs.",
+      "sources": [
+        "docs/UNIQUENESS-CONTRACT.md",
+        "oracle/deps/oban/lib/oban/engines/basic.ex"
+      ]
+    },
+    {
+      "id": "default-backoff",
+      "classification": "intentional-grind-semantics",
+      "reason": "Grind exponential backoff differs from Oban polynomial jitter; paired retry cases explicitly configure equal delays.",
+      "sources": [
+        "src/grind/worker.gleam",
+        "oracle/deps/oban/lib/oban/worker.ex"
+      ]
+    },
+    {
+      "id": "priority-and-queue-controls",
+      "classification": "missing-accidental-divergence",
+      "reason": "Priorities and pause/scale are Oban capabilities with no equivalent Grind surface. No passing scenario is claimed.",
+      "sources": ["src/grind/queue.gleam", "oracle/deps/oban/lib/oban.ex"]
+    },
+    {
+      "id": "transaction-enqueue-and-testing-helpers",
+      "classification": "deferred",
+      "reason": "Approved before-1.0 API work, not an initial-release parity prerequisite.",
+      "sources": [
+        "src/grind/postgres.gleam",
+        "oracle/deps/oban/lib/oban/testing.ex"
+      ]
+    },
+    {
+      "id": "cron-reindexer-peer-notifiers",
+      "classification": "deferred",
+      "reason": "Owner explicitly deferred feature parity for Cron, Reindexer, leader election, and notification infrastructure. oracle/fault-scenarios.json separately specifies Oban M6 Peer failover against Grind's intentional concurrent-pruning design.",
+      "sources": [
+        "oracle/deps/oban/lib/oban/cron.ex",
+        "oracle/deps/oban/lib/oban/reindexer.ex",
+        "oracle/deps/oban/lib/oban/peer.ex",
+        "oracle/deps/oban/lib/oban/notifier.ex",
+        "oracle/fault-scenarios.json"
+      ]
+    },
+    {
+      "id": "multi-node-faults-and-throughput",
+      "classification": "missing-accidental-divergence",
+      "reason": "This deterministic behavior adapter does not measure node/connection loss, slow commit, pool starvation, or throughput. Dedicated resilience and benchmark suites must supply those release proofs.",
+      "sources": ["docs/RELEASE-READINESS.md", "scripts/bench-matrix.sh"]
+    }
+  ]
+}

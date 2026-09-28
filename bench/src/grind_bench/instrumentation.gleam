@@ -175,7 +175,8 @@ pub fn install_slow_ack(
     <> function_name
     <> "() RETURNS trigger AS $$ BEGIN "
     <> "IF EXISTS (SELECT 1 FROM grind_bench.bench_slow_ack_targets t WHERE t.job_id = NEW.job_id) THEN "
-    <> "PERFORM pg_sleep("
+    <> "PERFORM nextval('grind_bench.bench_slow_ack_activations'); "
+    <> "PERFORM nextval(format('%I.%I', TG_TABLE_SCHEMA, 'bench_slow_ack_target_' || NEW.job_id)::regclass); PERFORM pg_sleep("
     <> delay_seconds_literal
     <> "); END IF; RETURN NEW; END; $$ LANGUAGE plpgsql"
   let trigger_sql =
@@ -191,16 +192,16 @@ pub fn install_slow_ack(
 /// `delay_ms` as a PostgreSQL `double precision` seconds literal
 /// (`pg_sleep` takes seconds) -- e.g. `800` -> `"0.800"`. Always 3 decimal
 /// places, integer millisecond precision throughout this module.
-fn float_literal_ms(delay_ms: Int) -> String {
+pub fn float_literal_ms(delay_ms: Int) -> String {
   let whole = delay_ms / 1000
   let remainder = delay_ms % 1000
   let remainder_str = case remainder < 10 {
-    True ->
+    True -> "00" <> int.to_string(remainder)
+    False ->
       case remainder < 100 {
-        True -> "00" <> int.to_string(remainder)
-        False -> "0" <> int.to_string(remainder)
+        True -> "0" <> int.to_string(remainder)
+        False -> int.to_string(remainder)
       }
-    False -> int.to_string(remainder)
   }
   int.to_string(whole) <> "." <> remainder_str
 }
@@ -218,9 +219,21 @@ pub fn drop_slow_ack(
 
 pub fn mark_slow_ack_targets(
   ledger: pog.Connection,
+  grind_schema: String,
   job_ids: List(Int),
 ) -> Result(Nil, pog.QueryError) {
+  // This untimed setup replaces the target set and resets its witnesses.
+  // Sequences live in the run schema, so CASCADE also removes them after a
+  // crashed run even when reset_ledger has already discarded the target IDs.
+  use Nil <- result.try(clear_slow_ack_targets(ledger, grind_schema))
   list.try_each(job_ids, fn(job_id) {
+    let assert True = job_id > 0
+    use Nil <- result.try(exec(
+      ledger,
+      "CREATE SEQUENCE "
+        <> slow_ack_target_sequence(grind_schema, job_id)
+        <> " MINVALUE 0 START 0",
+    ))
     exec(
       ledger,
       "INSERT INTO grind_bench.bench_slow_ack_targets (job_id) VALUES ("
@@ -232,6 +245,121 @@ pub fn mark_slow_ack_targets(
 
 pub fn clear_slow_ack_targets(
   ledger: pog.Connection,
+  grind_schema: String,
 ) -> Result(Nil, pog.QueryError) {
+  let query =
+    pog.query(
+      "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relkind = 'S' AND c.relname ~ '^bench_slow_ack_target_[0-9]+$'",
+    )
+    |> pog.parameter(pog.text(grind_schema))
+    |> pog.returning(decode.at([0], decode.string))
+  use returned <- result.try(pog.execute(query, ledger))
+  use Nil <- result.try(
+    list.try_each(returned.rows, fn(name) {
+      exec(ledger, "DROP SEQUENCE " <> qualify(grind_schema, name))
+    }),
+  )
   exec(ledger, "TRUNCATE grind_bench.bench_slow_ack_targets")
+}
+
+fn slow_ack_target_sequence(grind_schema: String, job_id: Int) -> String {
+  qualify(grind_schema, "bench_slow_ack_target_" <> int.to_string(job_id))
+}
+
+/// One rollback-proof count per selected job. Repeated activations of one
+/// job never provide evidence that another target reached its slow ACK.
+pub fn slow_ack_target_activations(
+  ledger: pog.Connection,
+  grind_schema: String,
+  job_ids: List(Int),
+) -> Result(List(#(Int, Int)), pog.QueryError) {
+  list.try_map(job_ids, fn(job_id) {
+    let query =
+      pog.query(
+        "SELECT CASE WHEN is_called THEN last_value + 1 ELSE 0 END FROM "
+        <> slow_ack_target_sequence(grind_schema, job_id),
+      )
+      |> pog.returning(decode.at([0], decode.int))
+    use returned <- result.try(pog.execute(query, ledger))
+    let assert [count] = returned.rows
+    Ok(#(job_id, count))
+  })
+}
+
+/// One sample for every tracked attempt, independently of renewal success.
+/// The observer uses its own pool; negative executing headroom remains visible.
+pub fn sample_leases(
+  ledger: pog.Connection,
+  schema: String,
+) -> Result(Nil, pog.QueryError) {
+  exec(
+    ledger,
+    "INSERT INTO grind_bench.bench_lease_samples (job_id, attempt_id, state, headroom_ms, handler_running, slow_acks) "
+      <> "SELECT j.id, j.attempt_id, j.state, extract(epoch FROM (j.lease_expires_at - clock_timestamp())) * 1000.0, "
+      <> "EXISTS (SELECT 1 FROM grind_bench.bench_effects e WHERE e.bench_index = s.bench_index AND e.finished_at IS NULL), "
+      <> "(SELECT count(*)::int FROM pg_stat_activity WHERE wait_event = 'PgSleep' AND query LIKE '%grind_job_acknowledgements%') "
+      <> "FROM "
+      <> qualify(schema, "grind_jobs")
+      <> " j JOIN grind_bench.bench_submissions s ON s.job_id = j.id WHERE j.attempt_id IS NOT NULL",
+  )
+}
+
+pub type LeaseEvidence {
+  LeaseEvidence(
+    attempts: Int,
+    minimum_headroom_ms: Float,
+    negative_samples: Int,
+    overlap_samples: Int,
+    renewals_during_slow_ack: Int,
+  )
+}
+
+pub fn lease_evidence(
+  ledger: pog.Connection,
+  job_ids: List(Int),
+) -> Result(LeaseEvidence, pog.QueryError) {
+  let query =
+    pog.query(
+      "SELECT count(DISTINCT (s.job_id, s.attempt_id)), coalesce(min(s.headroom_ms) FILTER (WHERE s.state = 'executing'), -1.0)::float8, "
+      <> "count(*) FILTER (WHERE s.state = 'executing' AND s.headroom_ms <= 0), "
+      <> "count(*) FILTER (WHERE s.handler_running AND s.slow_acks > 0), "
+      <> "(SELECT count(*) FROM grind_bench.bench_lease_log l WHERE l.job_id = ANY($1) AND l.old_state = 'executing' AND l.new_state = 'executing' AND l.new_lease_expires_at > l.old_lease_expires_at AND EXISTS (SELECT 1 FROM grind_bench.bench_lease_samples x WHERE x.slow_acks > 0 AND abs(extract(epoch FROM (x.sampled_at-l.observed_at))) < 0.1)) "
+      <> "FROM grind_bench.bench_lease_samples s WHERE s.job_id = ANY($1)",
+    )
+    |> pog.parameter(pog.array(pog.int, job_ids))
+    |> pog.returning({
+      use attempts <- decode.field(0, decode.int)
+      use minimum_headroom_ms <- decode.field(1, decode.float)
+      use negative_samples <- decode.field(2, decode.int)
+      use overlap_samples <- decode.field(3, decode.int)
+      use renewals_during_slow_ack <- decode.field(4, decode.int)
+      decode.success(LeaseEvidence(
+        attempts:,
+        minimum_headroom_ms:,
+        negative_samples:,
+        overlap_samples:,
+        renewals_during_slow_ack:,
+      ))
+    })
+  use returned <- result.try(pog.execute(query, ledger))
+  let assert [evidence] = returned.rows
+  Ok(evidence)
+}
+
+/// nextval is not rolled back: this proves the injected slow ACK executed
+/// even when its acknowledgement transaction times out or rolls back.
+pub fn slow_ack_activations(
+  ledger: pog.Connection,
+) -> Result(Int, pog.QueryError) {
+  let query =
+    pog.query(
+      "SELECT CASE WHEN is_called THEN last_value + 1 ELSE 0 END FROM grind_bench.bench_slow_ack_activations",
+    )
+    |> pog.returning({
+      use value <- decode.field(0, decode.int)
+      decode.success(value)
+    })
+  use returned <- result.try(pog.execute(query, ledger))
+  let assert [count] = returned.rows
+  Ok(count)
 }

@@ -7,10 +7,11 @@ import gleam/json
 import gleam/list
 import gleam/string
 import grind/postgres
+import grind/queue
+import grind/registry
 import grind/submission
 import grind/unique
 import grind/worker
-import grind_bench
 import grind_bench/audit
 import grind_bench/load/context
 import grind_bench/load/observers
@@ -152,35 +153,29 @@ fn l4_submit_loop(
   }
 }
 
-/// Unique-admission contention: `submitters` parallel processes each
-/// hammering `submit_unique` (`KeepExisting`, `WhileRetained`,
-/// `IncompleteOrSucceeded`) against either 10 "hot" keys (`mode = "hot"`,
-/// deterministic `index % 10` -- heavy, sustained contention on a handful
-/// of keys) or a pool of up to 10,000 deterministically distinct "cold"
-/// keys (`mode = "cold"`, `index` used directly, never repeated within one
-/// run -- near-zero contention by construction, the baseline). No consumer
-/// runs at all: this scenario measures the admission SQL layer alone, not
-/// job execution. "I2 + one row per key": hot mode asserts exactly 10
-/// `grind_jobs` rows exist under its own queue no matter how many
-/// submitters or submissions ran (`KeepExisting` always keeps the first);
-/// cold mode asserts the row count equals the `Inserted` count (no
-/// duplicate/lost row for a distinct key).
+/// Hot/cold admission comparison at a fixed pool size of 80 and a live C10
+/// consumer. The observer uses its own connection and requires at least 30
+/// lock samples. Latency, CPU and actual lock waits are separate evidence;
+/// increasing latency alone is never labelled advisory-lock contention.
 pub fn run_l4(
   submitters: Int,
   mode: String,
   total_submissions: Int,
   repeat: Int,
 ) -> Nil {
-  let harness =
-    context.setup(
-      int.max(submitters, 10),
-      grind_bench.ledger_pool_size_for_concurrency(submitters),
-    )
-  let context.Harness(database:, ledger: _ledger, drain:) = harness
+  let harness = context.setup_without_completion_observer(80, 8)
+  let context.Harness(database:, ledger: _ledger, drain:, ..) = harness
   let queue_name = "l4-" <> mode
   let worker_def = l4_worker("bench.l4." <> mode)
   observers.attach_audit_observers("l4-" <> mode)
   let log_lines_before = report.postgres_log_lines_before()
+  let assert Ok(workers) = registry.new(queue_name)
+  let assert Ok(workers) = registry.register(workers, worker_def)
+  let assert Ok(consumer_policy) =
+    queue.default_policy()
+    |> queue.with_maximum_concurrency(10)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start(database, workers, consumer_policy)
 
   let assert Ok(key) =
     unique.selected("l4-key", fn(x) { x }, {
@@ -207,12 +202,15 @@ pub fn run_l4(
     <> int.to_string(submitters)
     <> "-"
     <> mode
+    <> "-r"
+    <> int.to_string(repeat)
     <> ".jsonl"
   let db_sampler_pid =
     process.spawn_unlinked(fn() {
-      sampler_db.run(postgres.connection(database), db_raw_path, 50, 600)
+      sampler_db.run(drain, db_raw_path, 10, 60_000)
     })
 
+  let cpu_before = report.cpu_ms_now()
   let before_ms = runtime.monotonic_ms()
   let done = process.new_subject()
   runtime.int_range(submitters)
@@ -238,6 +236,19 @@ pub fn run_l4(
   let total_acc = collect_l4(done, submitters, L4Acc(0, 0, 0, 0, []))
   let elapsed_ms = runtime.monotonic_ms() - before_ms
   process.kill(db_sampler_pid)
+  let _ = queue.stop(consumer)
+  let assert Ok(lock_samples) =
+    summarize.read_field_values(db_raw_path, "waiting_locks")
+  let assert True =
+    list.length(lock_samples) >= 30
+    && list.all(lock_samples, fn(value) { value >=. 0.0 })
+  let cpu_after = report.cpu_ms_now()
+  let #(cpu_ms, cpu_pct) = case
+    report.cpu_delta(cpu_before, cpu_after, elapsed_ms)
+  {
+    Ok(value) -> value
+    Error(Nil) -> #(-1, -1.0)
+  }
 
   let L4Acc(inserted:, existing:, contended:, other_errors:, latencies_ms:) =
     total_acc
@@ -268,20 +279,33 @@ pub fn run_l4(
         report.percentile_field(stats, "p99"),
         report.percentile_field(stats, "max"),
         int.to_string(row_count),
+        "80",
+        "10",
+        int.to_string(list.length(lock_samples)),
+        int.to_string(cpu_ms),
+        float.to_string(cpu_pct),
+        "80",
+        "1",
+        "81",
       ],
       ",",
     )
   report.write_row(
     runtime.results_dir() <> "/l4.csv",
     runtime.provenance_header_prefix()
-      <> ",repeat,submitters,mode,total_submissions,elapsed_ms,inserted,existing,contended,other_errors,admissions_per_sec,contended_rate,latency_p50_ms,latency_p99_ms,latency_max_ms,row_count",
+      <> ",repeat,submitters,mode,total_submissions,elapsed_ms,inserted,existing,contended,other_errors,admissions_per_sec,contended_rate,latency_p50_ms,latency_p99_ms,latency_max_ms,row_count,pool_size,consumer_concurrency,lock_samples,db_cpu_ms,db_cpu_pct,main_pool_size,reserved_renewal_connections,total_grind_connections",
     row,
   )
   io.println("l4 " <> row)
   report.summarize_field_to_csv(
     db_raw_path,
     "waiting_locks",
-    "l4-" <> int.to_string(submitters) <> "-" <> mode,
+    "l4-"
+      <> int.to_string(submitters)
+      <> "-"
+      <> mode
+      <> "-r"
+      <> int.to_string(repeat),
   )
 
   let one_row_per_key_ok = case mode {
@@ -301,13 +325,14 @@ pub fn run_l4(
   context.cleanup_schema(drain, grind_schema)
   case
     one_row_per_key_ok
+    && other_errors == 0
     && quarantine_count == 0
     && forwarder_drop_count == 0
     && log_result == Ok(Nil)
   {
     True ->
       io.println(
-        "l4: reduced audit PASSED (one row per key; I3/I6/I7; no consumer ran, I1/I2/I4/I5 not applicable)",
+        "l4: reduced audit PASSED (one row per key; I3/I6/I7; consumer active; admission identity audit, I1/I2/I4/I5 not asserted)",
       )
     False -> {
       io.println(

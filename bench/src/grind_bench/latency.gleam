@@ -20,7 +20,8 @@ fn qualify(schema: String, table: String) -> String {
 }
 
 /// Milliseconds from `grind_jobs.inserted_at` to `grind_jobs.finished_at`,
-/// one row per finished bench-tracked job.
+/// one row per finished bench-tracked job. Both timestamps are written
+/// inside transactions; this is not durable completion latency.
 pub fn insert_to_finish_ms(
   ledger: pog.Connection,
   grind_schema: String,
@@ -36,8 +37,9 @@ pub fn insert_to_finish_ms(
 
 /// Milliseconds from `bench_effects.started_at` (the handler's own
 /// dispatch, the closest DB timestamp to "claimed and started" the
-/// public/ledger schema offers) to the job's own committed `succeeded`
-/// acknowledgement.
+/// public/ledger schema offers) to the SQL timestamp stored in a succeeded
+/// receipt. That timestamp precedes transaction COMMIT and is not a durable
+/// completion timestamp; use `insert_to_observed_ack_ms` for visibility.
 pub fn start_to_ack_ms(
   ledger: pog.Connection,
   grind_schema: String,
@@ -65,4 +67,35 @@ fn run_float_query(
       decode.success(value)
     })
   pog.execute(query, ledger) |> result.map(fn(returned) { returned.rows })
+}
+
+/// Handler completion is separate from independently observed durable ACK.
+pub fn handler_duration_ms(
+  ledger: pog.Connection,
+) -> Result(List(Float), pog.QueryError) {
+  run_float_query(
+    ledger,
+    "SELECT extract(epoch FROM (finished_at-started_at))*1000.0 FROM bench_effects WHERE finished_at IS NOT NULL",
+  )
+}
+
+pub fn claim_to_start_ms(
+  ledger: pog.Connection,
+) -> Result(List(Float), pog.QueryError) {
+  run_float_query(
+    ledger,
+    "SELECT extract(epoch FROM (e.started_at-l.observed_at))*1000.0 FROM grind_bench.bench_lease_log l JOIN bench_submissions s ON s.job_id=l.job_id JOIN bench_effects e ON e.bench_index=s.bench_index WHERE l.new_state='executing' AND l.old_state <> 'executing'",
+  )
+}
+
+pub fn insert_to_observed_ack_ms(
+  ledger: pog.Connection,
+  grind_schema: String,
+) -> Result(List(Float), pog.QueryError) {
+  run_float_query(
+    ledger,
+    "SELECT extract(epoch FROM (d.observed_at-j.inserted_at))*1000.0 FROM grind_bench.bench_durable_completions d JOIN "
+      <> qualify(grind_schema, "grind_jobs")
+      <> " j ON j.id=d.job_id",
+  )
 }

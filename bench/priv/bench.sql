@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS grind_bench.bench_effects (
   bench_index bigint NOT NULL,
   delivery_count integer NOT NULL,
   node text NOT NULL,
-  started_at timestamptz NOT NULL DEFAULT clock_timestamp()
+  started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  finished_at timestamptz
 );
 
 CREATE INDEX IF NOT EXISTS bench_effects_bench_index_idx
@@ -72,3 +73,26 @@ CREATE TABLE IF NOT EXISTS grind_bench.bench_slow_ack_targets (
 -- Truncated (never dropped) between runs by `grind_bench.reset_ledger` so a
 -- fresh smoke/load run starts from an empty ledger without re-creating the
 -- schema.
+
+ALTER TABLE grind_bench.bench_effects ADD COLUMN IF NOT EXISTS finished_at timestamptz;
+
+-- Samples are written through the observer pool, including attempts whose
+-- renewal never reaches PostgreSQL. They are evidence of headroom at the
+-- sampling instant, not an inferred successful-renewal denominator.
+CREATE TABLE IF NOT EXISTS grind_bench.bench_lease_samples (
+  job_id bigint NOT NULL,
+  attempt_id bigint,
+  state text NOT NULL,
+  headroom_ms double precision,
+  handler_running boolean NOT NULL,
+  slow_acks integer NOT NULL,
+  sampled_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE SEQUENCE IF NOT EXISTS grind_bench.bench_slow_ack_activations MINVALUE 0 START 0;
+
+-- Independent first visibility observation; no FK means pruning cannot erase
+-- timing evidence. This is an upper bound on durable commit, by observer lag.
+CREATE TABLE IF NOT EXISTS grind_bench.bench_durable_completions (
+  job_id bigint PRIMARY KEY,
+  observed_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);

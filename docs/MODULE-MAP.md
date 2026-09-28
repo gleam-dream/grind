@@ -8,24 +8,33 @@ keeps the names and commit references used when each claim was tested.
 | Responsibility                                                         | Implementation                                                                                                                                                                                     | Tests                                                                                                                                                                                           |
 | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Typed jobs and workers                                                 | [job](../src/grind/job.gleam), [worker](../src/grind/worker.gleam)                                                                                                                                 | [Worker policy](../test/grind/worker/), [consumer policy](../consumer/test/grind_consumer/policy_test.gleam)                                                                                    |
-| Database settings, pool lifecycle and public storage API               | [postgres](../src/grind/postgres.gleam)                                                                                                                                                            | [Database](../test/grind/database/), [consumer storage](../consumer/test/grind_consumer/storage_test.gleam)                                                                                     |
+| Database settings, pool lifecycle and public storage API               | [postgres](../src/grind/postgres.gleam), [pool lifetime](../src/grind/internal/pool.gleam), [owner FFI](../src/grind_pool_ffi.erl)                                                                 | [Database](../test/grind/database/), [startup and cache drain](../test/grind/database/startup_test.gleam), [consumer storage](../consumer/test/grind_consumer/storage_test.gleam)               |
 | Audited resolution of uncertain jobs                                   | [Resolution protocol](../src/grind/internal/postgres/resolution.gleam), [resolution queries](../src/grind/internal/postgres/resolution_queries.gleam)                                              | [Resolution](../test/grind/queue/resolution_test.gleam), [resolved observations](../test/grind/observations/resolved_test.gleam)                                                                |
 | Handle binding, arguments, state, outcome and acknowledgement receipts | [Job reads](../src/grind/internal/postgres/job_reads.gleam)                                                                                                                                        | [Database identity](../test/grind/database/identity_test.gleam), [queue outcomes](../test/grind/queue/outcomes_test.gleam), [acknowledgements](../test/grind/queue/acknowledgements_test.gleam) |
 | Migration execution and schema checks                                  | [Migration runner](../src/grind/internal/postgres/migration.gleam), [schema probe](../src/grind/internal/postgres/schema_probe.gleam), [migration catalog](../src/grind/internal/migrations.gleam) | [Migrations](../test/grind/migrations/)                                                                                                                                                         |
 | Admission and uniqueness                                               | [Public storage API](../src/grind/postgres.gleam), [unique admission](../src/grind/internal/unique_admission.gleam), [request and query helpers](../src/grind/internal/unique_admission/)          | [Submission](../test/grind/submission/), [uniqueness](../test/grind/unique/)                                                                                                                    |
-| Consumer supervision and coordinator lifecycle                         | [Queue](../src/grind/queue.gleam), [queue helpers](../src/grind/internal/queue/)                                                                                                                   | [Queue](../test/grind/queue/), [consumer execution](../consumer/test/grind_consumer/execution_test.gleam)                                                                                       |
-| Claims, execution, leases and acknowledgements                         | [Attempt](../src/grind/internal/attempt.gleam), [lease](../src/grind/internal/lease.gleam), [acknowledgement protocol](../src/grind/internal/attempt/acknowledgement.gleam)                        | [Claims](../test/grind/queue/claims_test.gleam), [leases](../test/grind/queue/leases_test.gleam), [ack failures](../test/grind/queue/ack_failure_test.gleam)                                    |
+| Consumer supervision, capacity and shutdown                            | [Queue](../src/grind/queue.gleam), [queue helpers](../src/grind/internal/queue/)                                                                                                                   | [Queue](../test/grind/queue/), [consumer lifecycle](../test/grind/queue/lifecycle_test.gleam), [consumer execution](../consumer/test/grind_consumer/execution_test.gleam)                       |
+| Claims and fenced storage operations                                   | [Attempt](../src/grind/internal/attempt.gleam), [lease](../src/grind/internal/lease.gleam), [acknowledgement protocol](../src/grind/internal/attempt/acknowledgement.gleam)                        | [Claims](../test/grind/queue/claims_test.gleam), [leases](../test/grind/queue/leases_test.gleam), [ack failures](../test/grind/queue/ack_failure_test.gleam)                                    |
+| Handler execution and attempt-owned ACK/reconciliation                 | [Attempt process](../src/grind/internal/queue/worker.gleam), [active-attempt bookkeeping](../src/grind/internal/queue/active.gleam)                                                                | [Executor regressions](../test/grind/queue/executor_test.gleam), [shutdown](../test/grind/queue/shutdown_test.gleam)                                                                            |
+| Independent renewal through a reserved connection                      | [Renewer](../src/grind/internal/queue/renewer.gleam), [timing](../src/grind/internal/queue/timing.gleam), [batch renewal SQL](../src/grind/internal/attempt.gleam)                                 | [Renewer lifecycle](../test/grind/queue/renewer_test.gleam), [slow ACKs and pool saturation](../test/grind/queue/executor_test.gleam)                                                           |
 | Event records and wire codecs                                          | [Observation](../src/grind/observation.gleam), [shared wire codecs](../src/grind/internal/observation/wire.gleam)                                                                                  | [Observations](../test/grind/observations/)                                                                                                                                                     |
 | Pruning and retention                                                  | [Pruner](../src/grind/pruner.gleam), [public pruning operation](../src/grind/postgres.gleam)                                                                                                       | [Retention](../test/grind/retention/)                                                                                                                                                           |
-| PostgreSQL checkout deadlines                                          | [Store](../src/grind/internal/store.gleam), [checkout FFI](../src/grind_postgres_ffi.erl)                                                                                                          | [Fault-proxy scenarios](../test/grind_fault_proxy_test.gleam)                                                                                                                                   |
+| PostgreSQL checkout deadlines and connection recovery                  | [Store](../src/grind/internal/store.gleam), [checkout FFI](../src/grind_postgres_ffi.erl)                                                                                                          | [Fault-proxy scenarios](../test/grind_fault_proxy_test.gleam), [stale-holder recovery](../test/grind/database/reconnect_test.gleam)                                                             |
 
 Public constructors and entry points remain in their public modules. Internal
 PostgreSQL modules own operation implementations; the facade translates their
-results where needed to preserve public types. Queue claims, renewals and
-acknowledgements still run through one coordinator. Module extraction did not
-change that process topology or resolve T2/T3; see
-[release readiness](RELEASE-READINESS.md) and
-[performance evidence](PERFORMANCE-EVIDENCE.md).
+results where needed to preserve public types. The coordinator owns claims,
+local capacity and shutdown. Each attempt owns its handler and acknowledgement
+retries. A separate renewer uses a reserved connection for fenced lease updates;
+its batch skips locked rows so one ACK cannot delay a sibling's renewal.
+
+The pool lifetime owner tracks admitted Grind calls and waits for its exact
+pool subtree and those callers before removing owned cache/deadline entries.
+This is a cooperative-shutdown and failed-start-unwind contract; raw internal
+pog callers must drain themselves, and forcibly killing the owner loses that
+cleanup guarantee. See [release execution](RELEASE-EXECUTION.md) for current
+validation. The coordinator's claim path still has the deferred T3 throughput
+limitation.
 
 Static SQL comes from [query files](../src/grind/internal/sql/) and is generated
 into [sql.gleam](../src/grind/internal/sql.gleam). Follow [AGENTS.md](../AGENTS.md)
@@ -40,9 +49,17 @@ for query generation and migration changes.
 - [Benchmark CLI](../bench/src/grind_bench/load.gleam) dispatches to
   [workloads and reporting](../bench/src/grind_bench/load/).
   [Audit checks](../bench/src/grind_bench/audit.gleam) validate execution evidence.
-- [Oracle ledger](../oracle/ORACLE-LEDGER.md) records the pinned Oban comparison
-  and current test baseline. [Recovery evidence](RECOVERY-EVIDENCE.md#topic-index)
-  records fault mechanisms and historical validation.
-- Run the database gate with `nix develop --command bash scripts/test-postgres.sh`
-  and the benchmark gate with `nix develop --command bash scripts/bench-postgres.sh`.
+- [Shared oracle scenarios](../oracle/scenarios.json), [fault scenarios](../oracle/fault-scenarios.json)
+  and the [oracle ledger](../oracle/ORACLE-LEDGER.md) define the pinned Oban
+  comparison and current test baseline.
+- The [resilience harness](../resilience/README.md) runs independent BEAM VMs,
+  destructive faults and mixed-workload soak assertions. The approved two-hour
+  run passed fourteen standalone cases and 266 mixed fault rounds; its reviewed
+  causal audit and final paired M2/M6 comparison pass. The failed first
+  86,400-second attempt remains retained separately, and day-long endurance
+  is unverified. [Recovery evidence](RECOVERY-EVIDENCE.md#topic-index) records
+  exact counts, resource limits, cleanup and the auditor correction.
+- Run the database gate with `nix develop --command bash scripts/test-postgres.sh`,
+  the benchmark gate with `nix develop --command bash scripts/bench-postgres.sh`,
+  and resilience with `nix develop --command bash scripts/test-resilience.sh`.
   Run them sequentially: the database gate cleans build artifacts.

@@ -10,9 +10,12 @@ import grind/postgres
 import grind/queue
 import grind/registry
 import grind_bench
+import grind_bench/instrumentation
 import grind_bench/latency
+import grind_bench/load/arrivals
 import grind_bench/load/context
 import grind_bench/load/observers
+import grind_bench/load/plan_evidence
 import grind_bench/load/report
 import grind_bench/load/runtime
 import grind_bench/load/workload
@@ -21,29 +24,8 @@ import grind_bench/summarize
 import grind_bench/worker as bench_worker
 import pog
 
-fn wait_for_n(subject: process.Subject(a), n: Int) -> Nil {
-  case n <= 0 {
-    True -> Nil
-    False -> {
-      let assert Ok(_) = process.receive(subject, within: 120_000)
-      wait_for_n(subject, n - 1)
-    }
-  }
-}
-
-/// Open-loop submission (L3, L5): `parallelism` independent, unlinked
-/// processes each submit their own equal share of `arrival_per_sec *
-/// duration_ms / 1000` jobs, paced at roughly `arrival_per_sec /
-/// parallelism` jobs/sec each, through the real `postgres.submit` path
-/// (never `grind_bench/preload`'s bulk insert -- an open-loop arrival
-/// process is exactly the one-row-at-a-time real submission path a real
-/// application would use). `parallelism` scales with the target rate (one
-/// pacer per ~50/s) so no single pacer process's own submit-call latency
-/// caps the achievable rate. Returns the total job count actually
-/// submitted (`per_worker * parallelism`, which can be a few jobs short of
-/// the nominal `arrival_per_sec * duration_ms / 1000` from integer
-/// division -- always used as the caller's own "how many did I actually
-/// submit" ground truth, never the nominal target).
+/// Absolute arrival slots, bounded submitters, and complete accounting. An
+/// overloaded generator writes its denominators before failing the run.
 pub fn run_open_loop(
   database: postgres.Database,
   ledger: pog.Connection,
@@ -52,82 +34,97 @@ pub fn run_open_loop(
   arrival_per_sec: Int,
   duration_ms: Int,
 ) -> Int {
-  let parallelism = int.max(1, arrival_per_sec / 50)
-  let total_jobs = arrival_per_sec * duration_ms / 1000
-  let per_worker = int.max(1, total_jobs / parallelism)
-  let interval_ms = int.max(1, duration_ms / per_worker)
-  let done = process.new_subject()
-  runtime.int_range(parallelism)
-  |> list.each(fn(worker_index) {
-    let start_index = worker_index * per_worker
-    let _ =
-      process.spawn_unlinked(fn() {
-        open_loop_submit_loop(
-          database,
-          ledger,
-          worker_def,
-          queue_name,
-          start_index,
-          per_worker,
-          interval_ms,
-        )
-        process.send(done, Nil)
-      })
-    Nil
-  })
-  wait_for_n(done, parallelism)
-  per_worker * parallelism
-}
-
-fn open_loop_submit_loop(
-  database: postgres.Database,
-  ledger: pog.Connection,
-  worker_def: runtime.BenchWorker,
-  queue_name: String,
-  index: Int,
-  remaining: Int,
-  interval_ms: Int,
-) -> Nil {
-  case remaining <= 0 {
-    True -> Nil
-    False -> {
-      let assert Ok(handle) =
+  let max_inflight = case runtime.getenv("GRIND_BENCH_MAX_INFLIGHT") {
+    Ok(value) -> {
+      let assert Ok(limit) = int.parse(value)
+      limit
+    }
+    Error(Nil) -> 256
+  }
+  let run =
+    arrivals.generate(arrival_per_sec, duration_ms, max_inflight, fn(index) {
+      case
         postgres.submit(
           database,
           queue_name,
           worker_def,
-          bench_worker.BenchJob(bench_index: index, cost_ms: 0),
+          bench_worker.BenchJob(index, 0),
         )
-      let job_id = job.id_value(handle)
-      let assert Ok(Nil) =
-        workload.record_submissions(ledger, [#(index, job_id)], queue_name)
-      process.sleep(interval_ms)
-      open_loop_submit_loop(
-        database,
-        ledger,
-        worker_def,
-        queue_name,
-        index + 1,
-        remaining - 1,
-        interval_ms,
-      )
-    }
+      {
+        Ok(handle) ->
+          workload.record_submissions(
+            ledger,
+            [#(index, job.id_value(handle))],
+            queue_name,
+          )
+          |> result.map_error(fn(_) { Nil })
+        Error(_) -> Error(Nil)
+      }
+    })
+  let stats = summarize.percentiles(run.lags_ms)
+  let max_lag = case stats {
+    Ok(summarize.Percentiles(max:, ..)) -> max
+    Error(Nil) -> 0.0
   }
+  let lag_valid = max_lag <=. int.to_float(int.max(20, duration_ms / 50))
+  let generator_valid = run.capacity_limited == 0 && lag_valid
+  let complete =
+    run.scheduled == run.dispatched + run.capacity_limited
+    && run.dispatched == run.admitted + run.failed + run.unfinished
+  let status = case generator_valid, run.failed == 0 && run.unfinished == 0 {
+    False, _ -> "generator_limited"
+    True, False -> "admission_failed"
+    True, True -> "valid"
+  }
+  report.write_row(
+    runtime.results_dir() <> "/arrivals.csv",
+    runtime.provenance_header_prefix()
+      <> ",queue,offered_per_sec,duration_ms,scheduled,dispatched,admitted,failed_or_unrecorded,unfinished,capacity_limited,max_inflight,max_outstanding,offered_elapsed_ms,generator_lag_p99_ms,generator_lag_max_ms,generator_valid,status",
+    string.join(
+      [
+        runtime.provenance_prefix(),
+        queue_name,
+        int.to_string(arrival_per_sec),
+        int.to_string(duration_ms),
+        int.to_string(run.scheduled),
+        int.to_string(run.dispatched),
+        int.to_string(run.admitted),
+        int.to_string(run.failed),
+        int.to_string(run.unfinished),
+        int.to_string(run.capacity_limited),
+        int.to_string(max_inflight),
+        int.to_string(run.max_outstanding),
+        int.to_string(run.offered_elapsed_ms),
+        report.percentile_field(stats, "p99"),
+        float.to_string(max_lag),
+        report.bool_str(generator_valid),
+        status,
+      ],
+      ",",
+    ),
+  )
+  io.println(
+    "arrivals "
+    <> status
+    <> " scheduled="
+    <> int.to_string(run.scheduled)
+    <> " dispatched="
+    <> int.to_string(run.dispatched)
+    <> " admitted="
+    <> int.to_string(run.admitted)
+    <> " capacity_limited="
+    <> int.to_string(run.capacity_limited),
+  )
+  let assert True =
+    complete && generator_valid && run.failed == 0 && run.unfinished == 0
+  run.admitted
 }
 
 // -- L2: polling cost --------------------------------------------------------
 
-/// Idle consumers polling an empty queue (never fed) for a fixed
-/// observation window, with `filler_rows` already-`succeeded` rows bulk
-/// inserted first (a stand-in for "a large table of finished jobs" -- see
-/// `insert_filler_succeeded`) -- the plan's "empty queue then 1M finished
-/// rows" reduced to a representative point count and filler-row count for
-/// wall-clock feasibility (documented in `docs/PERFORMANCE-EVIDENCE.md`).
-/// Relaxes I1/I2/I3(quarantine only, still checks I3's forwarder-adjacent
-/// zero-quarantine expectation via the driver counter)/I5: no bench-tracked
-/// job is ever submitted, so those checks (which all assume a submitted,
-/// ledger-tracked job) are vacuous rather than meaningful here -- see
-/// `reduced_audit_and_report`.
+/// Idle pollers against zero, 100k or a million retained rows. Report call counts
+/// and execution time per call separately; constant counts do not establish
+/// constant scan cost. This scenario submits no bench-tracked jobs.
 pub fn run_l2(
   consumers: Int,
   interval_ms: Int,
@@ -136,16 +133,21 @@ pub fn run_l2(
   repeat: Int,
 ) -> Nil {
   let harness =
-    context.setup(
+    context.setup_without_completion_observer(
       int.max(consumers, 10),
       grind_bench.ledger_pool_size_for_concurrency(consumers),
     )
-  let context.Harness(database:, ledger:, drain:) = harness
+  let context.Harness(database:, ledger:, drain:, ..) = harness
   let connection = postgres.connection(database)
   case filler_rows > 0 {
     True -> report.insert_filler_succeeded(connection, filler_rows)
     False -> Nil
   }
+  workload.analyze_and_checkpoint(database, ledger)
+  let actual_rows = plan_evidence.count_rows(connection)
+  let assert True =
+    actual_rows.total == filler_rows
+    && actual_rows.retained_succeeded == filler_rows
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l2.echo")
   let assert Ok(registry_) = registry.new("l2-probe")
   let assert Ok(registry_) = registry.register(registry_, worker_def)
@@ -190,6 +192,10 @@ pub fn run_l2(
   let duration_sec = int.to_float(duration_ms) /. 1000.0
   let claims_per_sec = int.to_float(claim_calls) /. duration_sec
   let quarantine_per_sec = int.to_float(quarantine_calls) /. duration_sec
+  // Timing/statistics snapshots have ended. Probe the same table with
+  // PostgreSQL's runtime EXPLAIN instrumentation only after measurement.
+  let plan_path =
+    plan_evidence.capture(database, registry_, filler_rows, actual_rows, repeat)
 
   let row =
     string.join(
@@ -204,17 +210,27 @@ pub fn run_l2(
         float.to_string(claim_ms),
         int.to_string(quarantine_calls),
         float.to_string(quarantine_ms),
+        float.to_string(claim_ms /. int.to_float(int.max(claim_calls, 1))),
+        float.to_string(
+          quarantine_ms /. int.to_float(int.max(quarantine_calls, 1)),
+        ),
         float.to_string(claims_per_sec),
         float.to_string(quarantine_per_sec),
         int.to_string(cpu_ms_delta),
         float.to_string(cpu_pct),
+        int.to_string(actual_rows.total),
+        int.to_string(actual_rows.retained_succeeded),
+        int.to_string(int.max(consumers, 10)),
+        int.to_string(consumers),
+        int.to_string(int.max(consumers, 10) + consumers),
+        plan_path,
       ],
       ",",
     )
   report.write_row(
     runtime.results_dir() <> "/l2.csv",
     runtime.provenance_header_prefix()
-      <> ",repeat,consumers,interval_ms,filler_rows,duration_ms,claim_calls,claim_total_ms,quarantine_calls,quarantine_total_ms,claims_per_sec,quarantine_per_sec,db_cpu_ms,db_cpu_pct_of_core",
+      <> ",repeat,consumers,interval_ms,filler_rows,duration_ms,claim_calls,claim_total_ms,quarantine_calls,quarantine_total_ms,claim_mean_ms,quarantine_mean_ms,claims_per_sec,quarantine_per_sec,db_cpu_ms,db_cpu_pct_of_core,actual_total_rows,actual_retained_succeeded_rows,main_pool_size,reserved_renewal_connections,total_grind_connections,untimed_plan_path",
     row,
   )
   io.println("l2 " <> row)
@@ -228,7 +244,9 @@ pub fn run_l2(
 /// scenario), then a full drain and the standard I1-I7 audit (no
 /// relaxation -- this is an ordinary healthy run, just paced by arrival
 /// rather than preloaded). Reports per-job insert->finish and
-/// start->ack percentiles from `grind_bench/latency`.
+/// start->ack percentiles plus handler duration, claim-to-start latency and
+/// independently observed durable-ACK latency. Observation adds up to the
+/// sampling/checkout lag; SQL timestamps alone are not COMMIT timestamps.
 pub fn run_l3(arrival_per_sec: Int, duration_ms: Int, repeat: Int) -> Nil {
   let consumers = 4
   let concurrency = 10
@@ -238,7 +256,12 @@ pub fn run_l3(arrival_per_sec: Int, duration_ms: Int, repeat: Int) -> Nil {
       int.max(total_concurrency, 10),
       grind_bench.ledger_pool_size_for_concurrency(total_concurrency),
     )
-  let context.Harness(database:, ledger:, drain:) = harness
+  let context.Harness(database:, ledger:, drain:, ..) = harness
+  let assert Ok(Nil) =
+    instrumentation.install_lease_log(
+      postgres.connection(database),
+      context.schema_of(database),
+    )
   let queue_name = "l3-q0"
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l3.echo")
   let assert Ok(registry_) = registry.new(queue_name)
@@ -248,7 +271,6 @@ pub fn run_l3(arrival_per_sec: Int, duration_ms: Int, repeat: Int) -> Nil {
 
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_poll_interval(10)
     |> queue.with_maximum_concurrency(concurrency)
     |> queue.validate_policy
   let consumers_list =
@@ -272,6 +294,7 @@ pub fn run_l3(arrival_per_sec: Int, duration_ms: Int, repeat: Int) -> Nil {
 
   let grind_schema = context.schema_of(database)
   let drained = workload.wait_for_drain(drain, grind_schema, 60_000)
+  context.stop_observer(harness)
   list.each(consumers_list, fn(c) {
     let _ = queue.stop(c)
     Nil
@@ -296,6 +319,14 @@ pub fn run_l3(arrival_per_sec: Int, duration_ms: Int, repeat: Int) -> Nil {
       let assert Ok(insert_finish) =
         latency.insert_to_finish_ms(ledger, grind_schema)
       let assert Ok(start_ack) = latency.start_to_ack_ms(ledger, grind_schema)
+      let assert Ok(claim_start) = latency.claim_to_start_ms(ledger)
+      let assert Ok(handler_duration) = latency.handler_duration_ms(ledger)
+      let assert Ok(observed_ack) =
+        latency.insert_to_observed_ack_ms(ledger, grind_schema)
+      let assert True =
+        list.length(claim_start) == job_count
+        && list.length(handler_duration) == job_count
+        && list.length(observed_ack) == job_count
       let insert_finish_stats = summarize.percentiles(insert_finish)
       let start_ack_stats = summarize.percentiles(start_ack)
       let row =
@@ -315,15 +346,25 @@ pub fn run_l3(arrival_per_sec: Int, duration_ms: Int, repeat: Int) -> Nil {
             report.percentile_field(start_ack_stats, "p50"),
             report.percentile_field(start_ack_stats, "p99"),
             report.percentile_field(start_ack_stats, "max"),
+            report.percentile_field(summarize.percentiles(claim_start), "p99"),
+            report.percentile_field(
+              summarize.percentiles(handler_duration),
+              "p99",
+            ),
+            report.percentile_field(summarize.percentiles(observed_ack), "p99"),
             int.to_string(cpu_ms_delta),
             float.to_string(cpu_pct),
+            int.to_string(list.length(observed_ack)),
+            int.to_string(int.max(total_concurrency, 10)),
+            int.to_string(consumers),
+            int.to_string(int.max(total_concurrency, 10) + consumers),
           ],
           ",",
         )
       report.write_row(
         runtime.results_dir() <> "/l3.csv",
         runtime.provenance_header_prefix()
-          <> ",repeat,arrival_per_sec,consumers,concurrency,duration_ms,job_count,elapsed_ms,insert_to_finish_p50,insert_to_finish_p99,insert_to_finish_max,start_to_ack_p50,start_to_ack_p99,start_to_ack_max,db_cpu_ms,db_cpu_pct_of_core",
+          <> ",repeat,arrival_per_sec,consumers,concurrency,duration_ms,job_count,elapsed_ms,insert_to_sql_finished_at_p50_ms,insert_to_sql_finished_at_p99_ms,insert_to_sql_finished_at_max_ms,handler_start_to_sql_receipt_timestamp_p50_ms,handler_start_to_sql_receipt_timestamp_p99_ms,handler_start_to_sql_receipt_timestamp_max_ms,claim_to_start_p99,handler_duration_p99,insert_to_observed_ack_p99,db_cpu_ms,db_cpu_pct_of_core,durable_completion_count,main_pool_size,reserved_renewal_connections,total_grind_connections",
         row,
       )
       io.println("l3 " <> row)

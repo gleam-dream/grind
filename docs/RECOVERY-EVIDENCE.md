@@ -36,17 +36,20 @@ from the runs they describe. Later entries may supersede earlier mechanisms.
 Use the [module map](MODULE-MAP.md) for current code locations and the
 [oracle ledger](../oracle/ORACLE-LEDGER.md#last-full-run) for the current gate baseline.
 
-| Topic                                  | Evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Coordinator recovery and shutdown      | [Owner recovery](#increment-1--coordinatorowner-recovery-commit-399838f); [Scheduled wakeup and forced shutdown](#increment-4--real-scheduled-wakeup-forced-shutdown-with-pool-cleanup)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| Acknowledgement and audited resolution | [Lost commit replies](#increment-2--a-genuinely-successful-ack-commit-whose-reply-disappears); [Expired leases](#increment-3--lease-expiry-through-the-production-acknowledgement); [Concurrent resolution](#concurrent-audited-resolution)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Unique admission                       | [Sequential identity](#increment-6--uniqueness-admission-schema-v11-pure-policy-validation-sequential-identity); [Scope, states, periods and receipts](#increment-7--uniqueness-admission-queue-scope-state-eligibility-period-boundaries-at-database-time-and-receipt-idempotency-approved-plan-increments-47); [Concurrent admission](#increment-8--concurrent-admission-under-a-real-barrier-forced-overlap); [Contention](#increment-9--contention); [Rescheduling](#increment-10--rescheduling); [Uncertain commits](#increment-11--uncertain-admission-commits); [Selected keys](#increment-12--uniqueness-selected-keys)                                                                                                                                                                                                                                                           |
-| Observations                           | [Acknowledged events](#acknowledged-observation--grind-job-acknowledged-round-1); [Other lifecycle events](#round-2-observations--grind-job-admittedclaimedquarantinedresolvedcancellationreleasedcontract_mismatch)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| Automatic acknowledgement retry        | [Retry and renewal bounds](#independent-review-follow-up-reconcile_unique-conflict-passthrough-free-capacity-polling-and-automatic-ack-unknown-retry)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| Connection faults and deadlines        | [Fault-proxy scenarios](#increment-15--acknowledgement-deadline-a-real-fault-proxy-a-grind-owned-checkout-deadline-and-three-defects-it-surfaced); [Checkout restoration](#increment-18--pog-dependency-dropping-the-fork-restoring-grinds-own-checkout); [Pool close ownership](#increment-19--close-erasing-a-live-pools-checkout-deadline-independent-review-at-f42e6c0)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| Migrations and retention               | [Migration protocol](#increment-16--migration-mechanism-versioned-steps-advisory-lock-upgrade-harness); [Migration lock deadlines](#increment-20--migration-steps-own-lock-waits-are-now-bounded); [Terminal timestamps](#increment-21--schema-v12-grind_jobsfinished_at-records-when-a-job-finished); [Pruning and admission races](#increment-23--retention-prune_finished-the-supervised-pruner-and-the-for-key-share-admission-race-it-exposed); [Cascade and timer review](#increment-24--independent-review-of-increment-23-on-delete-cascade-lock-mode-contention-and-a-real-timer-leak); [Cigogne and upgrade faults](#increment-34--end-to-end-cigogne-interop-and-a-genuine-upgrade-boundary-lost-reply-reconcile_unique-docsrelease-readinessmd-migration-gaps-docsrisksmd-risk-16); [Controlled lock barrier](#cigogne-migration-serialization--test-controlled-lock-barrier) |
-| Capacity and schema isolation          | [Fill free slots](#increment-26--automatic-polling-fills-every-free-slot-docsrisksmd-risk-6); [Yield between claims](#increment-28--automatic-filling-yields-to-the-mailbox-one-claim-at-a-time-docsrisksmd-risks-4-and-5); [Schema isolation](#increment-29--storage_owner-removed-entirely-isolation-is-the-postgresql-schema-docsrisksmd-risk-7-superseding-increment-27); [Handle installation binding](#increment-30--explicit-settingsschema-handle-installation-binding-an-automated-migration-collision-test-and-a-forbidden-columns-shape-check-independent-review-fixes-to-increment-29-docsrisksmd-risk-7); [Cluster identity and schema races](#increment-31--cluster-identifier-disambiguation-a-concurrent-schema-creation-race-fix-schema-name-validation-and-pooler-documentation-second-round-review-fixes-to-increment-30)                                              |
-| Gate and CI                            | [PostgreSQL CI gate](#increment-32--ci-actually-runs-the-postgresql-gate-docsrelease-readinessmd-packaging-and-documentation); [Gate robustness](#increment-33--ciscript-robustness-and-test-first-coverage-for-increment-3132s-own-review-findings)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Topic                                            | Evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Coordinator recovery and shutdown                | [Owner recovery](#increment-1--coordinatorowner-recovery-commit-399838f); [Scheduled wakeup and forced shutdown](#increment-4--real-scheduled-wakeup-forced-shutdown-with-pool-cleanup)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Acknowledgement and audited resolution           | [Lost commit replies](#increment-2--a-genuinely-successful-ack-commit-whose-reply-disappears); [Expired leases](#increment-3--lease-expiry-through-the-production-acknowledgement); [Concurrent resolution](#concurrent-audited-resolution)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Unique admission                                 | [Sequential identity](#increment-6--uniqueness-admission-schema-v11-pure-policy-validation-sequential-identity); [Scope, states, periods and receipts](#increment-7--uniqueness-admission-queue-scope-state-eligibility-period-boundaries-at-database-time-and-receipt-idempotency-approved-plan-increments-47); [Concurrent admission](#increment-8--concurrent-admission-under-a-real-barrier-forced-overlap); [Contention](#increment-9--contention); [Rescheduling](#increment-10--rescheduling); [Uncertain commits](#increment-11--uncertain-admission-commits); [Selected keys](#increment-12--uniqueness-selected-keys)                                                                                                                                                                                                                                                           |
+| Observations                                     | [Acknowledged events](#acknowledged-observation--grind-job-acknowledged-round-1); [Other lifecycle events](#round-2-observations--grind-job-admittedclaimedquarantinedresolvedcancellationreleasedcontract_mismatch)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Automatic acknowledgement retry                  | [Retry and renewal bounds](#independent-review-follow-up-reconcile_unique-conflict-passthrough-free-capacity-polling-and-automatic-ack-unknown-retry)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Connection faults and deadlines                  | [Fault-proxy scenarios](#increment-15--acknowledgement-deadline-a-real-fault-proxy-a-grind-owned-checkout-deadline-and-three-defects-it-surfaced); [Checkout restoration](#increment-18--pog-dependency-dropping-the-fork-restoring-grinds-own-checkout); [Pool close ownership](#increment-19--close-erasing-a-live-pools-checkout-deadline-independent-review-at-f42e6c0)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Migrations and retention                         | [Migration protocol](#increment-16--migration-mechanism-versioned-steps-advisory-lock-upgrade-harness); [Migration lock deadlines](#increment-20--migration-steps-own-lock-waits-are-now-bounded); [Terminal timestamps](#increment-21--schema-v12-grind_jobsfinished_at-records-when-a-job-finished); [Pruning and admission races](#increment-23--retention-prune_finished-the-supervised-pruner-and-the-for-key-share-admission-race-it-exposed); [Cascade and timer review](#increment-24--independent-review-of-increment-23-on-delete-cascade-lock-mode-contention-and-a-real-timer-leak); [Cigogne and upgrade faults](#increment-34--end-to-end-cigogne-interop-and-a-genuine-upgrade-boundary-lost-reply-reconcile_unique-docsrelease-readinessmd-migration-gaps-docsrisksmd-risk-16); [Controlled lock barrier](#cigogne-migration-serialization--test-controlled-lock-barrier) |
+| Capacity and schema isolation                    | [Fill free slots](#increment-26--automatic-polling-fills-every-free-slot-docsrisksmd-risk-6); [Yield between claims](#increment-28--automatic-filling-yields-to-the-mailbox-one-claim-at-a-time-docsrisksmd-risks-4-and-5); [Schema isolation](#increment-29--storage_owner-removed-entirely-isolation-is-the-postgresql-schema-docsrisksmd-risk-7-superseding-increment-27); [Handle installation binding](#increment-30--explicit-settingsschema-handle-installation-binding-an-automated-migration-collision-test-and-a-forbidden-columns-shape-check-independent-review-fixes-to-increment-29-docsrisksmd-risk-7); [Cluster identity and schema races](#increment-31--cluster-identifier-disambiguation-a-concurrent-schema-creation-race-fix-schema-name-validation-and-pooler-documentation-second-round-review-fixes-to-increment-30)                                              |
+| Gate and CI                                      | [PostgreSQL CI gate](#increment-32--ci-actually-runs-the-postgresql-gate-docsrelease-readinessmd-packaging-and-documentation); [Gate robustness](#increment-33--ciscript-robustness-and-test-first-coverage-for-increment-3132s-own-review-findings)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Executor ACK, reserved renewal and pool lifetime | [Current runtime and regressions](#executor-acknowledgements-reserved-renewal-and-resource-lifetime--2026-09-28)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Endurance and host suspension                    | [Failed first long soak and prospective duration](#host-suspension-during-the-first-full-soak--2026-09-28)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Two-hour soak and audit correction               | [Final duration, accounting, resources and audit](#two-hour-mixed-soak-and-final-audit--2026-09-28)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 ## Increment 1 — coordinator/owner recovery (commit `399838f`)
 
@@ -7213,3 +7216,215 @@ were unchanged throughout these controls.
 The full PostgreSQL gate passed: 228 root tests, 11 consumer tests, static SQL
 regeneration checks, and the pinned Oban oracle. Independent review found no
 blocking issue in the final test and documentation.
+
+## Executor acknowledgements, reserved renewal and resource lifetime — 2026-09-28
+
+The owner-approved runtime change moves automatic acknowledgement and
+reconciliation to the supervised attempt process. The coordinator retains
+capacity until the attempt settles. A separate renewer uses one reserved
+connection per consumer and skips locked rows; ordinary claim and ACK
+traffic cannot consume that connection. Attempt, epoch, owner, state and
+live database-time lease fences remain in the SQL path. A lost reply
+reconciles the same command and retained proposal; it never re-executes
+the handler automatically.
+
+The complete PostgreSQL gate passed 246 root tests, 11 consumer tests and
+12 paired core scenarios, including the required database execution
+markers and ledger checks. The log is retained at
+`bench/results/repaired-gate-oy4M9w/validation/grind-full-gate-v4.log`.
+These are local uncommitted results on 8431b61. The separate release
+execution ledger records source snapshots and later benchmark evidence.
+
+| Recovery claim                                                      | Fault and synchronization                                                                                                                                                                                                     | Observable result                                                                                                                                                                                                                 |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| First known ACK rollback retains the proposal                       | `test/grind/queue/executor_test.gleam:19` installs a real acknowledgement trigger. A sequence survives rollback and makes only the first terminal update raise SQLSTATE `40001`.                                              | Shutdown drains through the retry; the stored typed output is 42 for input 41, and the handler invocation subject has no second message.                                                                                          |
+| Slow ACKs cannot serialize unrelated renewal behind the coordinator | `executor_test.gleam:92` holds handlers behind explicit subjects, releases the selected completions near renewal time, and observes the real trigger's activation. Healthy handlers remain active past their original leases. | Healthy siblings finish successfully and no second handler invocation appears. The repeated T2 matrix adds per-target activation and all-attempt headroom/state/receipt accounting.                                               |
+| Saturating the ordinary pool does not consume renewal capacity      | `executor_test.gleam:194` occupies the only ordinary connection for eight seconds. A separate connection observes the active PostgreSQL sleep before checking the lease.                                                      | The job remains executing after 6.5 seconds and its lease has advanced by more than three seconds. It then finishes once with the expected output.                                                                                |
+| An ambiguous committed ACK reconciles the original command          | `test/grind/queue/ack_failure_test.gleam:439` retains the existing committed-reply-loss regression; the independent-node M4 case cuts the COMMIT reply and observes a durable receipt while the old VM is stopped.            | A replacement VM reconciles that receipt and the effect count remains one. Quarantine without a receipt remains a different result.                                                                                               |
+| Failed startup releases ownership before returning an error         | `test/grind/database/startup_test.gleam:24` drops the installation-query reply; other tests at `:70`, `:98` and `:117` force duplicate registration, pool-child failure and later-child failure.                              | The failed start returns no live owned resource tree. Identical settings can be retried. Unrelated registered processes and already-running pools retain their identity and deadline.                                             |
+| Cleanup waits for real cache writers                                | Tests at `startup_test.gleam:214`, `:230` and `:234` hold the internal type writer or an admitted managed application call across teardown, then release it or kill the caller.                                               | Owned cache/deadline state disappears only after writers cannot repopulate it; a live sibling stays usable. The independent `validation/cache-probe/` retains the reproduced races and repaired result.                           |
+| Stale pgo holders do not trap recovery after connection loss        | `test/grind/database/reconnect_test.gleam` covers a dead owner, a live owner with a closed socket, multiple stale holders and a pause that consumes the original checkout deadline.                                           | Stale holders are retired before SQL executes. The callback runs at most once; its error classification is preserved, and selecting another holder does not reset the deadline. Red and green logs are retained in `validation/`. |
+| Consumer teardown removes only its own normal EXIT message          | `test/grind/queue/lifecycle_test.gleam:13` exercises stop in a caller trapping exits, alongside an unrelated child exit. `renewer_test.gleam:7` checks normal coordinator death.                                              | Stop leaves the unrelated EXIT available, and the renewer does not survive its coordinator.                                                                                                                                       |
+
+The lifetime owner waits for the exact internal supervisor and admitted
+managed calls before purging caches. A stalled application call may make
+public close return `StopTimedOut` after six seconds; the owner continues
+cleanup when that call finishes or dies. It never kills an application
+caller to obtain a clean-stop result. Raw internal pog callers must arrange
+their own drain, and forcibly killing the lifetime owner is outside this
+cleanup contract.
+
+Renewal remains bounded by ownership and failure semantics. A returned
+proposal has a bounded renewal lifetime; reconciliation can still find a
+committed receipt afterward, but an expired lease cannot authorize a fresh
+write. The `L >= 4D` rule assumes an established, progressing reserved
+connection. It does not bound initial connection, every pool checkout wait,
+OS scheduling or a lock held on that attempt's own row. Loss of live
+ownership still leads to quarantine and attributed `AuthorizeReplay`.
+
+The independent-node rehearsal at
+`resilience/results/repaired-300s-jBvw19` passed fourteen standalone cases
+and eighteen mixed fault rounds. Its retained M2/M6 comparison classifies
+Grind's explicit replay and concurrent pruning against Oban's automatic
+Lifeline rescue and Peer-mediated pruning. It does not claim equal rescue
+timing or exactly-once external effects. Its resource checks cover both primary
+VMs after drain: fixed bounds on processes, memory, aggregate mailboxes,
+owned deadline/type/query entries and database retention; atoms instead
+have the documented allowance of three per fresh consumer start plus a
+fixed warmup margin. The rehearsal observed 108 additional worker atoms
+across 36 starts. It does not establish bounded atoms under indefinite
+churn. Active timers and the forwarder mailbox/drop metrics are not directly
+sampled. This was rehearsal evidence; the completed two-hour run is recorded
+separately below.
+
+## Host suspension during the first full soak — 2026-09-28
+
+The first 86,400-second attempt in
+`resilience/results/repaired-86400s-o23a23` failed. It completed fourteen
+standalone cases and 162 complete mixed rounds. The nested fault in round
+163 passed, but the primary healthy job did not reach `succeeded`.
+
+The host power log records software sleep from 08:27:08 to 08:31:43 São Paulo
+time: 275 seconds, spanning job 4878's lease expiry at 08:27:38.751176.
+PostgreSQL quarantined that job at 08:31:43.364664. Its final row is
+`uncertain`, with one effect, no acknowledgement receipt and no replay.
+Those outcomes preserve the live-lease fence while the required healthy-job
+success assertion correctly fails. Reserved renewal cannot progress during
+whole-host suspension.
+
+The actual process exit is 1. The frozen source and driver compare unchanged,
+and the disposable processes and PostgreSQL cluster were removed. The retained
+`orchestration/failure-diagnosis.md` links the power records, database snapshot,
+effect records and cleanup evidence. `failure-evidence-sha256.json` identifies
+the checked failure artifacts. The logged soak-case duration includes warmup;
+this failed attempt provides no full-duration acceptance.
+
+Controller, BEAM and database clock records diverged across sleep. Ordering
+across that interval must use the retained protocol barriers and controller
+event sequence rather than assume all wall timestamps remain aligned. The
+evidence does not include every renewal or ACK return. It establishes the
+host suspension and durable fencing outcome, without requiring a change to
+the fencing rule.
+
+The owner changed the prospective acceptance duration to 7,200 seconds on
+2026-09-28. All fault, effect, receipt, fencing, audited replay and resource
+assertions remain unchanged; the duration policy and its focused tests are
+the only harness changes. The timed interval begins after warmup, and all
+nine fault types still run at least twice. The fresh run has a separate
+source snapshot and completed as recorded below. The failed first attempt
+remains retained history and contributed no time toward the new acceptance
+target. Day-long endurance remains unverified.
+
+## Two-hour mixed soak and final audit — 2026-09-28
+
+The approved fresh run in `resilience/results/repaired-7200s-8YvcJq`
+completed with actual session 7230 exit 0. All 281 results passed: fourteen
+standalone scenarios, 266 nested fault cases and the final soak result.
+The mixed-workload clock began after warmup and reached 7,202.060718916939
+seconds. The independent controller-monotonic bracket is
+7,202.058878458 to 7,202.105857583 seconds; its lower bound independently
+exceeds the approved 7,200-second target. The enclosing soak-case elapsed
+value includes warmup and is not used as the mixed-workload duration.
+
+| Nested fault                | Completed rounds |
+| --------------------------- | ---------------: |
+| VM kill                     |               30 |
+| Worker-process kill         |               30 |
+| Request-only partition      |               30 |
+| Reply-only partition        |               30 |
+| Bidirectional partition     |               30 |
+| Lost COMMIT reply           |               29 |
+| Slow ACK with network delay |               29 |
+| Connection loss             |               29 |
+| PostgreSQL restart          |               29 |
+
+Each primary round retained 27 terminal jobs, 42 unique receipts and 26 effects.
+Across 266 rounds, that is 7,182 jobs, 11,172 receipts and 6,916 effects; 77 warmup
+effects bring the primary total to 6,993. These totals exclude the separately
+audited nested cases. Every nested case retained its actual fault witnesses,
+job/receipt/resolution rows and effects. Audited replay after a killed
+attempt still permits one explicit additional effect; no exactly-once
+external-effect guarantee is inferred.
+
+The primary admin VM (PID 99993) and worker VM (PID 112) remained the same
+independent VMs throughout. Every drained sample had 104 processes, one
+checkout-deadline entry and 797 type-cache entries per VM. Query-cache
+entries stayed at 21 for admin and 22 for worker; aggregate and owner
+mailboxes and synthetic worker ETS entries were empty.
+
+| Resource               |      Admin |     Worker |
+| ---------------------- | ---------: | ---------: |
+| Memory baseline, bytes | 57,415,191 | 58,616,640 |
+| Maximum memory, bytes  | 57,836,519 | 59,186,600 |
+| Final memory, bytes    | 57,517,791 | 58,649,784 |
+| Atom baseline          |     14,863 |     15,086 |
+| Final atoms            |     14,863 |     16,682 |
+
+The worker's 1,596 additional atoms match 532 fresh consumer starts at three
+atoms per start. All fixed resource bounds passed; this linear allocation
+is not bounded atom use under indefinite churn. Samples are taken after
+drain and consumer stop; active timers and the Sinal forwarder's own
+mailbox/drop metrics are not directly measured. Database sessions peaked
+at eight, below the audit ceiling of ten derived from the recorded main
+pool sizes plus two; the original exact database-baseline sample was not
+retained. Primary table/index/TOAST storage after pruning peaked at 245,760
+bytes against the fixed 16 MiB bound.
+
+The final audit checked 278 archived source files and 600 runtime files,
+including exact file sets and hashes. The wrapper source digest is
+`b15a8da75e7213928bcc31fc0ed00efd790107f56e3e5ca04cf8d3e739d6a6f7`;
+the runtime digest is
+`450e50494e11516e9ac5d75fc488f82c6a3347c07fb309013d4d42badaa24a5b`.
+It fully parsed 520 JSONL files containing 43,417 records, with a check that
+rejects partial trailing records. The dirty source remains labeled exploratory; completing
+the approved duration does not relabel it as a clean release-candidate run.
+
+**Auditor correction.** The original v4 audit exited 1 at
+`round-233-healthy primary did not span fault`. Its predicate compared a
+BEAM wall timestamp with a controller wall timestamp. Independent review
+found the same mismatch in round 234 and a 128.905084 ms change between wall
+and monotonic intervals in the controller around round 233. The callback's
+recorded wall time even preceded the retained release-file timestamp,
+although the frozen handler cannot return through that barrier before the
+file exists. This invalid clock comparison did not demonstrate an early
+handler return.
+
+Reviewed v5 binds each primary job to its exact retained release file,
+the matching effect/completion callback identity and file append order,
+and controller-monotonic fsync→fault→schema-drain→clean-stop order.
+The pinned runner creates that file only after the nested case and schema
+drain return. Its replay check likewise uses the pre-replay effect count,
+explicit request/resolution order, actual VM identities and old/new durable
+attempt fences instead of comparing wall clocks across VMs. Three exact
+harness source hashes bind these causal protocols to the archived source.
+
+No workload, duration, fault, accounting, resource or source/runtime
+requirement was relaxed. Both auditor versions, the original failed audit,
+the independent diagnosis and the reviewed diff remain in `orchestration/`.
+The final v5 audit ran as session 97027 and exited 0. Its report is
+`soak-audit-v5.json`, SHA256
+`de653b1fd4a7fa8054d9a6bf9113ac65697dfc79e1d509f0302b0ff94dc25c1a`.
+Detailed fault reconstruction covers every nested case; the independent
+standalone check covers passing results with matching start/completion
+events. Nested schema cleanup is checked through each retained post-TRUNCATE
+marker and its identity/order, not a second database query.
+
+**Paired result and cleanup.** `paired-comparison.json` passes M2/M6 against
+`oracle/results/20260928T015525Z-23535`. It classifies Grind's quarantine and
+attributed replay against Oban's automatic Lifeline rescue, and Grind's
+concurrent locked-row pruning against Oban's Peer failover. It does not claim
+equal recovery timing or general feature equivalence.
+
+Independent and parent cleanup reports found no exact retained BEAM node,
+runtime, runner or PGDATA process identities. The disposable PGDATA and
+cluster directory were absent. `run/postgres.log:920`–`:921` records the
+final PostgreSQL process receiving an immediate shutdown request and
+confirming shutdown. This establishes process absence and completed
+immediate PostgreSQL shutdown, not graceful BEAM OS shutdown; the harness
+can fall back to killing a VM after its public exit request. The retained
+reports are `orchestration/independent-final-cleanup.json` and
+`orchestration/parent-cleanup-verification.json`.
+
+The approved two-hour requirement is satisfied within this recorded scope.
+The failed 24-hour attempt remains failed, and day-long endurance remains
+unverified.

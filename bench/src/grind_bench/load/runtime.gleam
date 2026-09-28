@@ -60,8 +60,44 @@ pub const forwarder_drop_counter = -3
 /// scheme as the three above.
 pub const l4_submission_counter = -4
 
+/// Any completion-observer query failure invalidates the run.
+pub const completion_observer_error_counter = -5
+
 pub fn results_dir() -> String {
   result.unwrap(getenv("GRIND_BENCH_RESULTS_DIR"), "results/adhoc")
+}
+
+/// Only L7 and diagnostic profiles use this budget. It is a drain wait bound,
+/// not the throughput denominator or the statement/lease timeout.
+pub fn drain_timeout_ms() -> Int {
+  case parse_drain_timeout_ms(getenv("GRIND_BENCH_DRAIN_TIMEOUT_MS")) {
+    Ok(value) -> value
+    Error(Nil) ->
+      panic as "GRIND_BENCH_DRAIN_TIMEOUT_MS must be a positive decimal integer"
+  }
+}
+
+/// Unset means the historical 60-second budget; explicit empty/invalid input
+/// must fail rather than quietly selecting a different experiment.
+pub fn parse_drain_timeout_ms(raw: Result(String, Nil)) -> Result(Int, Nil) {
+  case raw {
+    Error(Nil) -> Ok(60_000)
+    Ok(text) -> {
+      let digits = string.to_graphemes(text)
+      let decimal =
+        text != ""
+        && list.all(digits, fn(char) {
+          list.contains(
+            ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+            char,
+          )
+        })
+      case decimal, int.parse(text) {
+        True, Ok(value) if value > 0 -> Ok(value)
+        _, _ -> Error(Nil)
+      }
+    }
+  }
 }
 
 pub fn database_url() -> String {
@@ -88,7 +124,7 @@ fn provenance_commit() -> String {
 }
 
 fn provenance_dirty() -> String {
-  result.unwrap(getenv("GRIND_BENCH_DIRTY"), "0")
+  result.unwrap(getenv("GRIND_BENCH_DIRTY"), "unknown")
 }
 
 pub fn provenance_prefix() -> String {
@@ -97,10 +133,14 @@ pub fn provenance_prefix() -> String {
   <> provenance_dirty()
   <> ","
   <> int.to_string(wall_clock_unix_ms())
+  <> ","
+  <> result.unwrap(getenv("GRIND_BENCH_SOURCE_SHA256"), "unknown")
+  <> ","
+  <> result.unwrap(getenv("GRIND_BENCH_NETWORK_DELAY_MS"), "0")
 }
 
 pub fn provenance_header_prefix() -> String {
-  "commit,dirty,timestamp_unix_ms"
+  "commit,dirty,timestamp_unix_ms,source_sha256,network_delay_ms"
 }
 
 /// `0, 1, .. count - 1` as a list -- `gleam/list` has no `range` in the

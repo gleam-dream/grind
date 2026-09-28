@@ -337,12 +337,11 @@ pub fn postgres_claimed_observation_precedes_acknowledged_test() {
   }
 }
 
-/// A coordinator's `[grind, job, claimed]` for one attempt always arrives
-/// before that same attempt's `[grind, job, acknowledged]`: both are emitted
-/// by the same producer (the queue actor claiming, then acknowledging, one
-/// attempt) through the one `Forwarder` a `Database` owns, and
-/// `sinal/forwarder` guarantees per-producer FIFO delivery — proven here by
-/// receiving both, tagged by their shared `attempt_id`, in that exact order.
+/// This scenario observes `[grind, job, claimed]` before
+/// `[grind, job, acknowledged]`, matched by their shared `attempt_id`.
+/// The coordinator emits the claim and the attempt process emits the ACK.
+/// Sinal's per-producer FIFO contract does not guarantee order across those
+/// producers; this test records the sequence observed in this scenario.
 fn run_claimed_precedes_acknowledged_test(database_url: String) -> Nil {
   let assert Ok(validated) =
     postgres.settings(database_url) |> postgres.validate

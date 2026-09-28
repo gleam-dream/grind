@@ -6,9 +6,13 @@ root="$(mktemp -d "${TMPDIR:-/tmp}/grind-postgres.XXXXXX")"
 cluster="$root/data"
 started=0
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+oracle_results=${GRIND_ORACLE_RESULTS_ROOT:-"$repo_root/oracle/results/core-$(date -u +%Y%m%dT%H%M%SZ)-$$"}
 cleanup() {
   if [[ "$started" == 1 ]]; then
     pg_ctl -D "$cluster" -m immediate stop >/dev/null
+  fi
+  if [[ -d "$oracle_results" && -f "$root/postgres.log" ]]; then
+    cp "$root/postgres.log" "$oracle_results/postgres.log"
   fi
   rm -rf "$root"
 }
@@ -53,6 +57,8 @@ started=1
 createdb -h 127.0.0.1 -p "$port" -U grind grind_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_queue_test
 createdb -h 127.0.0.1 -p "$port" -U grind oban_test
+createdb -h 127.0.0.1 -p "$port" -U grind grind_oracle_test
+createdb -h 127.0.0.1 -p "$port" -U grind oban_paired_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_owner_a
 createdb -h 127.0.0.1 -p "$port" -U grind grind_user_schema_fallback
 createdb -h 127.0.0.1 -p "$port" -U grind grind_migration_collision_submissions
@@ -175,7 +181,7 @@ for contract in admission-read-passed two-schemas-share-database-isolated two-ur
     exit 1
   fi
   done
-  for contract in cancel-running-ack-wins cancel-after-completion-preserved cancel-running-uncertain-compact-receipt cancel-running-worker-cancel-compact-receipt cancel-pending-expiry-quarantined; do
+  for contract in cancel-running-ack-wins cancel-after-completion-preserved cancel-running-uncertain-compact-receipt cancel-running-worker-cancel-compact-receipt cancel-pending-expiry-quarantined startup-lookup-failure-releases-resources duplicate-start-preserves-live-pool later-start-failure-releases-resources first-ack-rollback-retried-without-rerun slow-acks-independent-healthy-renewal saturated-pool-independent-renewal consumer-stop-normal-exit-cleaned closed-pool-type-cache-owned-cleanup reserved-pool-cache-owned-cleanup close-waits-internal-type-writer close-waits-managed-query-cache-writer close-releases-dead-managed-caller retires-dead-connection-holder retires-closed-socket-holder multiple-stale-holders-callback-once stale-holder-original-deadline; do
     if ! grep -q "$contract" "$root/database-test-ran"; then
       echo "PostgreSQL integration contract did not execute: $contract" >&2
       exit 1
@@ -205,6 +211,10 @@ for contract in admission-read-passed two-schemas-share-database-isolated two-ur
   GRIND_OBAN_TEST_DATABASE_URL="postgres://grind@127.0.0.1:$port/oban_test?sslmode=disable" \
   GRIND_ORACLE_MARKER="$root/oracle-test-ran" \
     mix run run.exs
+  GRIND_ORACLE_DATABASE_URL="postgres://grind@127.0.0.1:$port/grind_oracle_test?sslmode=disable" \
+  GRIND_OBAN_TEST_DATABASE_URL="postgres://grind@127.0.0.1:$port/oban_paired_test?sslmode=disable" \
+  GRIND_ORACLE_RESULTS_ROOT="$oracle_results" \
+    bash "$repo_root/scripts/run-paired-oracle.sh"
 )
 if ! grep -q "oban-oracle-passed" "$root/oracle-test-ran"; then
   echo "pinned Oban oracle harness did not execute" >&2

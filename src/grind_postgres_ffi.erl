@@ -1,4 +1,5 @@
 -module(grind_postgres_ffi).
+-include_lib("pgo/src/pgo_internal.hrl").
 -export([
     call_safely/2,
     execute_safely/2,
@@ -6,9 +7,7 @@
     stop_supervisor/1,
     transaction_safely/2,
     transaction_or_checkout_failure/2,
-    migration_transaction_safely/3,
-    set_deadline/2,
-    clear_deadline/1
+    migration_transaction_safely/3
 ]).
 
 %% Grind's own checkout deadline (`postgres.Settings.statement_deadline_ms`;
@@ -22,7 +21,7 @@
 %% `pgo_handler:extended_query/4`). Every Grind storage call already funnels
 %% through `execute_safely/2`, `call_safely/2`, `transaction_safely/2` or
 %% `transaction_or_checkout_failure/2` below, so this module does its own
-%% bounded `pgo:checkout/2` up front — passing an explicit `timeout` option
+%% bounded `pgo:checkout/2` up front — passing an explicit `deadline` option
 %% arms `pgo_pool`'s own absolute deadline timer (`pgo_pool.erl`,
 %% `abs_timeout/2` + `start_deadline/5`), which force-closes the checked-out
 %% socket if it is *still held* when the deadline elapses, regardless of what
@@ -35,33 +34,17 @@
 %% build/packages/pog/src/pog.erl and pog_ffi.erl), so `pog:execute/2` and
 %% `pog:transaction/2` never re-checkout with pog's own unconfigurable
 %% default. This couples Grind directly to pog's private `Connection` shape
-%% and to `pgo`'s own checkout/checkin/break API — accepted deliberately
+%% and to `pgo`'s private connection record and checkout/return APIs — accepted
+%% deliberately
 %% (user decision: no fork), guarded by pinning both dependencies to a tight
 %% version range in gleam.toml and by `pog_connection_pool_shape_test`
 %% (test/grind_test.gleam), which fails loudly the moment a pog/pgo upgrade
 %% changes either shape instead of this module silently mismatching it. The
 %% deadline is attached to a pool by its atom name (an
 %% `erlang:process.Name` — itself just an atom; `gleam_erlang_ffi:new_name/1`)
-%% via `persistent_term`, set once in `postgres.start` and cleared in
-%% `postgres.close`, rather than threaded through every one of Grind's
-%% storage call sites.
--define(DEFAULT_DEADLINE_MS, 5000).
-
-%% Both take the pog `Connection` a freshly started `Database` always holds
-%% (always the `Pool` shape at this point, never a `SingleConnection`) rather
-%% than a bare pool name, so `postgres.start`/`postgres.close` can pass the
-%% same connection value they already have in scope.
-set_deadline({pool, PoolName}, DeadlineMs) ->
-    persistent_term:put({grind_pg_deadline, PoolName}, DeadlineMs),
-    nil.
-
-clear_deadline({pool, PoolName}) ->
-    catch persistent_term:erase({grind_pg_deadline, PoolName}),
-    nil.
-
-deadline_for(PoolName) ->
-    persistent_term:get({grind_pg_deadline, PoolName}, ?DEFAULT_DEADLINE_MS).
-
+%% via `persistent_term`, owned by the supervised deadline process in
+%% `grind_pool_ffi`. The owner starts before the pool and stops after it,
+%% including failed startup. It is not threaded through storage call sites.
 %% Runs `Fun` (which receives both the `Connection` shape to actually issue
 %% the call against, and the raw pgo `Conn` term underneath it, needed to
 %% `pgo:break/1` it on a post-checkout protocol crash — see
@@ -75,17 +58,54 @@ deadline_for(PoolName) ->
 %% different shapes here (a bare `pog.QueryError` vs. a
 %% `pog.TransactionError`), so it is not baked in here.
 with_deadline({pool, PoolName}, Fun, OnCheckoutFailure) ->
-    with_deadline_ms(PoolName, deadline_for(PoolName), Fun, OnCheckoutFailure);
+    with_deadline_ms(PoolName, configured, Fun, OnCheckoutFailure);
 with_deadline(SingleConnection = {single_connection, Conn}, Fun, _OnCheckoutFailure) ->
     Fun(SingleConnection, Conn).
 
-with_deadline_ms(PoolName, DeadlineMs, Fun, OnCheckoutFailure) ->
-    try pgo:checkout(PoolName, [{timeout, DeadlineMs}]) of
+%% pgo writes its query cache in the application caller, even after the pool
+%% and socket owner have stopped. Register before checkout and release only
+%% after checkin: the lifecycle owner cannot purge or reopen the pool while
+%% a managed caller can still write old cache entries. A missing or closing
+%% owner rejects the call before any database work is sent.
+with_deadline_ms(PoolName, Deadline, Fun, OnCheckoutFailure) ->
+    case grind_pool_ffi:acquire(PoolName) of
+        {ok, Owner, Token, ConfiguredDeadlineMs} ->
+            DeadlineMs = case Deadline of
+                configured -> ConfiguredDeadlineMs;
+                ExplicitDeadlineMs -> ExplicitDeadlineMs
+            end,
+            ExpiresAt = erlang:monotonic_time(millisecond) + DeadlineMs,
+            try checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure)
+            after grind_pool_ffi:release(Owner, Token)
+            end;
+        {error, closed} -> OnCheckoutFailure()
+    end.
+
+%% A crashed or reconnected pgo connection can leave its old holder queued.
+%% Checking it back in recycles that dead socket forever. Retire unusable
+%% candidates before sending any SQL, sharing one absolute deadline across
+%% all candidates. This retries admission only: Fun is never retried here.
+checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure) ->
+    case erlang:monotonic_time(millisecond) < ExpiresAt of
+        false -> OnCheckoutFailure();
+        true -> checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure)
+    end.
+
+checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure) ->
+    try pgo:checkout(PoolName, [{timeout, infinity}, {deadline, ExpiresAt}]) of
         {ok, Ref, Conn} ->
-            try
-                Fun({single_connection, Conn}, Conn)
-            after
-                catch pgo:checkin(Ref, Conn)
+            case connection_usable(Conn, ExpiresAt) andalso
+                 erlang:monotonic_time(millisecond) < ExpiresAt of
+                true ->
+                    try Fun({single_connection, Conn}, Conn)
+                    after
+                        %% Cleanup cannot change a result or prove whether an
+                        %% earlier command committed. Ambiguity stays ambiguous.
+                        catch return_connection(Ref, Conn, ExpiresAt)
+                    end;
+                false ->
+                    retire_connection(Ref, Conn),
+                    checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure)
             end;
         {error, _Reason} ->
             %% Covers every checkout-time rejection pgo can return here,
@@ -104,6 +124,65 @@ with_deadline_ms(PoolName, DeadlineMs, Fun, OnCheckoutFailure) ->
     catch
         exit:{_Reason, {pgo_pool, checkout, _Details}} ->
             OnCheckoutFailure()
+    end.
+
+return_connection(Ref, Conn, ExpiresAt) ->
+    case connection_usable(Conn, ExpiresAt) of
+        true -> pgo:checkin(Ref, Conn);
+        false -> retire_connection(Ref, Conn)
+    end.
+
+retire_connection(Ref, Conn) ->
+    %% break/1 only casts to the connection owner; it cannot remove a holder
+    %% whose owner is dead or has already advanced to a replacement socket.
+    catch pgo_pool:disconnect(Ref, {error, closed}, Conn, []),
+    ok.
+
+connection_usable(#conn{owner = Owner, socket = Socket,
+                        socket_module = Module}, ExpiresAt) ->
+    Remaining = ExpiresAt - erlang:monotonic_time(millisecond),
+    is_process_alive(Owner) andalso Remaining > 0 andalso
+        socket_usable(Module, Socket, ExpiresAt).
+
+socket_usable(gen_tcp, Socket, _ExpiresAt) when is_port(Socket) ->
+    socket_options_available(fun() -> inet:getopts(Socket, [active]) end);
+socket_usable(gen_tcp, Socket, ExpiresAt) ->
+    bounded_socket_probe(fun() -> inet:getopts(Socket, [active]) end, ExpiresAt);
+socket_usable(ssl, Socket, ExpiresAt) ->
+    bounded_socket_probe(fun() -> ssl:getopts(Socket, [active]) end, ExpiresAt).
+
+bounded_socket_probe(GetOptions, ExpiresAt) ->
+    %% TLS and gen_tcp's socket backend use infinite synchronous calls for
+    %% getopts. A separate watchdog bounds the probe and notices caller death;
+    %% its linked worker dies with it even if getopts never returns.
+    Caller = self(),
+    {Probe, Monitor} = spawn_monitor(fun() ->
+        CallerMonitor = monitor(process, Caller),
+        Watchdog = self(),
+        Worker = spawn_link(fun() ->
+            Watchdog ! {self(), socket_options_available(GetOptions)}
+        end),
+        Result = receive
+            {Worker, Available} -> Available;
+            {'DOWN', CallerMonitor, process, Caller, _Reason} -> false
+        after max(0, ExpiresAt - erlang:monotonic_time(millisecond)) -> false
+        end,
+        exit({socket_probe, Result})
+    end),
+    receive
+        {'DOWN', Monitor, process, Probe, {socket_probe, Result}} -> Result;
+        {'DOWN', Monitor, process, Probe, _Reason} -> false
+    after max(0, ExpiresAt - erlang:monotonic_time(millisecond)) ->
+        exit(Probe, kill),
+        demonitor(Monitor, [flush]),
+        false
+    end.
+
+socket_options_available(GetOptions) ->
+    try GetOptions() of
+        {ok, _Options} -> true;
+        {error, _Reason} -> false
+    catch _:_ -> false
     end.
 
 %% Defends the *post-checkout* half of DEFECT 2: `pgo_handler:extended_query/4`
@@ -223,7 +302,7 @@ transaction_or_checkout_failure(Connection, Callback) ->
 %% instead of the shared per-pool deadline — a schema migration's DDL step
 %% can legitimately need longer than an ordinary job-lifecycle statement.
 %% `DeadlineMs` is always the caller-supplied migration deadline, never the
-%% one `set_deadline/2` attached to the pool.
+%% deadline owner's shared value for the pool.
 migration_transaction_safely(Connection, DeadlineMs, Callback) ->
     case Connection of
         {pool, PoolName} ->
@@ -241,28 +320,32 @@ migration_transaction_safely(Connection, DeadlineMs, Callback) ->
 
 stop_consumer_supervisor(Pid) ->
     case erlang:is_process_alive(Pid) of
-        false -> {ok, nil};
+        false -> consumer_stopped(Pid);
         true ->
             try gen_server:stop(Pid, normal, 6000) of
-                _ -> {ok, nil}
+                _ -> consumer_stopped(Pid)
             catch
-                exit:{noproc, _} -> {ok, nil};
-                exit:noproc -> {ok, nil};
+                exit:{noproc, _} -> consumer_stopped(Pid);
+                exit:noproc -> consumer_stopped(Pid);
                 exit:timeout -> {error, nil}
             end
     end.
 
+%% Keep the ownership link until shutdown is confirmed: a timed-out stop
+%% must still let owner death tear down its consumer. Once stopped, unlink
+%% and consume only this supervisor's normal exit notification, which a
+%% trapping caller would otherwise retain on every start/stop cycle.
+consumer_stopped(Pid) ->
+    unlink(Pid),
+    receive {'EXIT', Pid, normal} -> ok after 0 -> ok end,
+    {ok, nil}.
+
 %% Reports whether this call itself stopped a still-live process
-%% (`{ok, true}`) or found it already gone (`{ok, false}`) — `postgres.close`
-%% uses this to decide whether erasing this pool name's `persistent_term`
-%% deadline entry is actually safe (see `set_deadline`/`clear_deadline`
-%% above and `postgres.close`'s own doc comment): a stale `Database` handle
-%% whose supervisor already stopped must not erase a *different*, currently
-%% live pool that has since reused the same registered name. `exit:timeout`
+%% (`{ok, true}`) or found it already gone (`{ok, false}`). The deadline
+%% owner child handles cleanup as part of the tree's shutdown. `exit:timeout`
 %% (the 6000ms bound elapsed without `gen_server:stop` confirming shutdown)
-%% is reported as `{error, nil}` rather than crashing the caller and leaving
-%% the name's own deadline entry cleared out from under a pool that may
-%% still be alive.
+%% is reported as `{error, nil}` rather than crashing the caller. A deadline
+%% owner is never cleared independently of the pool it bounds.
 stop_supervisor(Pid) ->
     unlink(Pid),
     case erlang:is_process_alive(Pid) of

@@ -22,13 +22,10 @@ pub fn next_shutdown_generation(
 }
 
 pub fn minimum_lease_for_deadline(
-  maximum_concurrency: Int,
+  _maximum_concurrency: Int,
   statement_deadline_ms: Int,
 ) -> Int {
-  case maximum_concurrency > 1 {
-    True -> 6 * statement_deadline_ms
-    False -> 3 * statement_deadline_ms / 2
-  }
+  4 * statement_deadline_ms
 }
 
 pub fn start_polling(

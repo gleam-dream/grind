@@ -757,3 +757,58 @@ pub fn quarantine_and_forwarder_drop_counters_bumped_by_real_events_test() {
   mark("bench-audit-quarantine-real-wiring-passed")
   mark("bench-audit-forwarder-dropped-real-wiring-passed")
 }
+
+/// The T2 audit must not turn incomplete jobs or mismatched receipts into
+/// a healthy result merely because their effects were written once.
+pub fn t2_final_classification_red_then_green_test() {
+  case database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let TestHarness(database:, ledger:) = setup(url)
+      use <- exception.defer(fn() { teardown(database, ledger) })
+      let schema = schema_of(database)
+      let connection = postgres.connection(database)
+      let healthy = admit_job(database, "t2-healthy")
+      let slow = admit_job(database, "t2-slow")
+      record_submission(ledger, healthy)
+      record_submission(ledger, slow)
+      let assert Ok([a, b]) = audit.fault_completions(ledger, schema, [slow])
+      a.valid |> should.be_false
+      b.valid |> should.be_false
+      raw_exec(
+        connection,
+        "UPDATE grind_jobs SET worker_id='bench-audit', worker_version='v1', attempt_id=1, attempt_epoch=0 WHERE id IN ("
+          <> int_str(healthy)
+          <> ","
+          <> int_str(slow)
+          <> ")",
+      )
+      set_succeeded_with_output(connection, healthy)
+      set_state(connection, slow, "uncertain")
+      // Missing healthy receipt remains invalid, while expected uncertainty
+      // is classified rather than excluded from the denominator.
+      let assert Ok([a, b]) = audit.fault_completions(ledger, schema, [slow])
+      a.valid |> should.be_false
+      b.valid |> should.be_true
+      insert_ack(connection, healthy, 1, "succeeded", "t2")
+      let assert Ok([a, b]) = audit.fault_completions(ledger, schema, [slow])
+      a.valid |> should.be_true
+      b.valid |> should.be_true
+      // A stale receipt for an uncertain target is inconsistent.
+      insert_ack(connection, slow, 1, "succeeded", "t2")
+      let assert Ok([_, b]) = audit.fault_completions(ledger, schema, [slow])
+      b.valid |> should.be_false
+      raw_exec(
+        connection,
+        "DELETE FROM grind_job_acknowledgements WHERE job_id=" <> int_str(slow),
+      )
+      // Healthy uncertainty is never acceptable, even in the fault suite.
+      let assert Ok([_, b]) = audit.fault_completions(ledger, schema, [])
+      b.valid |> should.be_false
+      set_state(connection, slow, "executing")
+      let assert Ok([_, b]) = audit.fault_completions(ledger, schema, [slow])
+      b.valid |> should.be_false
+      mark("bench-audit-t2-final-classification-passed")
+    }
+  }
+}

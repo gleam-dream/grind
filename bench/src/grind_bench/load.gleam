@@ -19,10 +19,8 @@
 ////
 ////   l7 <job_count> <consumers> <concurrency> [repeat]
 ////     One point of the coordinator-bottleneck matrix: like `l1` but always
-////     one queue and `cost_ms` fixed at 1 (the plan's "0 ms jobs, delay 1
-////     ms" -- this harness has one lever for simulated handler work, so
-////     both L1's "job cost" and L7's "delay" map onto the same `cost_ms`;
-////     see this task's own final report for that simplification). Each
+////     one queue and `cost_ms` fixed at 1. This is handler cost; network
+////     delay is a separate transport axis and must never be inferred from it. Each
 ////     consumer's own coordinator `Pid` (`@internal
 ////     queue.coordinator_pid`) is sampled for `message_queue_len` every
 ////     20ms for the run's own duration. Appends one row to
@@ -179,6 +177,24 @@ pub fn main() -> Nil {
       maintenance.run_l6t2(
         parse_or_panic(k_slow_acks),
         parse_or_panic(d_ms),
+        parse_or_panic(repeat),
+      )
+    ["l6t2", k, d, lease, delay, repeat] ->
+      maintenance.run_l6t2_profile(
+        parse_or_panic(k),
+        parse_or_panic(d),
+        parse_or_panic(lease),
+        parse_or_panic(delay),
+        parse_or_panic(repeat),
+      )
+    ["l6t2", k, d, lease, delay, concurrency, pool, repeat] ->
+      maintenance.run_l6t2_resources(
+        parse_or_panic(k),
+        parse_or_panic(d),
+        parse_or_panic(lease),
+        parse_or_panic(delay),
+        parse_or_panic(concurrency),
+        parse_or_panic(pool),
         parse_or_panic(repeat),
       )
     other -> {

@@ -15,6 +15,7 @@ import gleam/result
 import gleam/string
 import grind/internal/lease
 import grind/internal/migrations
+import grind/internal/pool
 import grind/internal/postgres/job_reads as postgres_job_reads
 import grind/internal/postgres/migration as postgres_migration
 import grind/internal/postgres/resolution as postgres_resolution
@@ -51,7 +52,7 @@ pub type Settings {
 /// `statement_deadline_ms` defaults to 4000, not pog's own hardcoded
 /// 5000 — chosen so the default `unique_lock_wait_ms` (2000) clears
 /// `validate`'s own margin against it, and so `queue.start`'s lease rule
-/// (`6 * statement_deadline_ms` at `maximum_concurrency > 1`) stays
+/// (`4 * statement_deadline_ms`, independently of concurrency) stays
 /// comfortably under `queue.default_policy`'s 30 000 ms lease without
 /// having to raise that default. See docs/RELEASE-READINESS.md,
 /// "Acknowledgement deadline".
@@ -202,8 +203,8 @@ pub type ConfigError {
 pub opaque type ValidatedSettings {
   ValidatedSettings(
     pog.Config,
+    forwarder: Forwarder,
     unique_lock_wait_ms: Int,
-    observation_capacity: Int,
     statement_deadline_ms: Int,
     migration_deadline_ms: Int,
     schema: String,
@@ -268,12 +269,12 @@ const migration_lock_timeout_ms = 2000
 const migration_lock_timeout_margin_ms = 1000
 
 /// Checks the URL and pool bound before any PostgreSQL process is started.
-/// Each successful call creates one new Erlang atom for the pool's own name
+/// Each successful call creates Erlang atoms for the pool and forwarder names
 /// (`process.new_name`, below) — atoms are never garbage-collected or
 /// reclaimed by the runtime, so calling `validate` in a hot loop (rather than
 /// once per logical database and reusing the resulting `ValidatedSettings`
-/// across `start`/`close` cycles) leaks one atom per call for the life of
-/// the node.
+/// across `start`/`close` cycles) retains those atoms for the life of the node.
+/// The first start also creates one stable deadline-owner name per pool.
 ///
 /// Every pooled connection is also given a `default_transaction_isolation
 /// = 'read committed'` startup parameter (`pog.connection_parameter`),
@@ -371,8 +372,8 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
                 name: "search_path",
                 value: quote_ident(settings.schema),
               ),
+            forwarder: validated_forwarder(settings.observation_capacity),
             unique_lock_wait_ms: settings.unique_lock_wait_ms,
-            observation_capacity: settings.observation_capacity,
             statement_deadline_ms: settings.statement_deadline_ms,
             migration_deadline_ms: settings.migration_deadline_ms,
             schema: settings.schema,
@@ -381,9 +382,16 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
   }
 }
 
+fn validated_forwarder(capacity: Int) -> Forwarder {
+  let name = process.new_name("grind_postgres_observation_forwarder")
+  let assert Ok(fwd) = forwarder.new(name, capacity)
+  fwd
+}
+
 pub opaque type Database {
   Database(
     connection: pog.Connection,
+    config: pog.Config,
     supervisor_pid: process.Pid,
     installation: job.Installation,
     unique_lock_wait_ms: Int,
@@ -419,11 +427,9 @@ pub type StartError {
   /// The pool started, but the one-time query reading this database's own
   /// OID (`current_database()`, used to build this `Database`'s in-memory
   /// `Installation` token — see `grind/job`'s doc comment for that type)
-  /// failed or its reply was lost. The pool itself is left running; a
-  /// caller may retry `start` (after `close`ing this attempt's pool, to
-  /// avoid `PoolStartFailed` on the retry's own `start` — see `start`'s own
-  /// doc comment on reusing `ValidatedSettings`' pool name) once the store
-  /// is reachable.
+  /// failed or its reply was lost. The pool, forwarder, and deadline owner
+  /// are stopped before this error returns. Retry the same validated
+  /// settings once the store is reachable; there is no handle to close.
   InstallationQueryFailed(pog.QueryError)
 }
 
@@ -452,8 +458,9 @@ pub type StartError {
 /// `sinal/forwarder.Forwarder`
 /// — see `grind/observation` for the events it carries — nested under its
 /// own dedicated supervisor, added to the root as a `Temporary` child.
-/// `observation_capacity` was already checked positive by `validate`, so
-/// `forwarder.new` cannot fail here.
+/// `validate` already allocated the forwarder's name and shared counters,
+/// which are reused across starts so retained handles address the same
+/// bounded forwarder after a close/reopen cycle.
 ///
 /// The nesting matters: a handler attached to an observation event that
 /// itself exits or is killed (rather than merely raising, which native
@@ -481,15 +488,13 @@ pub type StartError {
 pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
   let ValidatedSettings(
     config,
+    forwarder: fwd,
     unique_lock_wait_ms:,
-    observation_capacity:,
     statement_deadline_ms:,
     migration_deadline_ms:,
     schema:,
   ) = settings
   let pog.Config(pool_name:, ..) = config
-  let forwarder_name = process.new_name("grind_postgres_observation_forwarder")
-  let assert Ok(fwd) = forwarder.new(forwarder_name, observation_capacity)
   let forwarder_supervisor =
     static_supervisor.new(static_supervisor.OneForOne)
     |> static_supervisor.add(forwarder.supervised(fwd))
@@ -497,22 +502,20 @@ pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
     |> supervision.restart(supervision.Temporary)
   let supervisor =
     static_supervisor.new(static_supervisor.OneForOne)
-    |> static_supervisor.add(pog.supervised(config))
+    |> static_supervisor.add(pool.supervised(config, statement_deadline_ms))
     |> static_supervisor.add(forwarder_supervisor)
   let connection = pog.named_connection(pool_name)
-  // Attached before the pool itself starts accepting checkouts, so no
-  // in-flight checkout against this pool's name can ever run before a
-  // deadline is attached and silently fall back to the FFI's own hardcoded
-  // default (5000ms).
-  store.set_deadline(connection, statement_deadline_ms)
-  case static_supervisor.start(supervisor) {
+  case pool.start_unlinked(fn() { static_supervisor.start(supervisor) }) {
     Ok(started) -> {
-      process.unlink(started.pid)
       case read_database_oid(connection) {
-        Error(error) -> Error(InstallationQueryFailed(error))
+        Error(error) -> {
+          pool.abort_start(started.pid)
+          Error(InstallationQueryFailed(error))
+        }
         Ok(database_oid) ->
           Ok(Database(
             connection,
+            config,
             started.pid,
             job.new_installation(
               database_oid,
@@ -642,44 +645,45 @@ fn has_pg_control_system_privilege(connection: pog.Connection) -> Bool {
 pub type CloseError {
   /// The pool's supervisor did not confirm its own shutdown within the FFI's
   /// own bounded wait (6000ms, `src/grind_postgres_ffi.erl`). The pool
-  /// process may still be terminating; this `Database` value's own deadline
-  /// entry is left in place rather than risking erasing a name a fresh
-  /// `start` may since have reused (see `close`'s own doc comment).
+  /// process may still be terminating. Its supervised deadline owner
+  /// retains the deadline until the pool has stopped.
   StopTimedOut
 }
 
 /// Stops the pool process owned by this `Database` value. `Ok(True)` means
 /// this call actually stopped a still-live process; `Ok(False)` means it was
-/// already gone. `close` only erases the pool's own deadline entry in the
-/// first case — see `close`'s own doc comment for why.
+/// already gone. The deadline owner's own shutdown erases its entry.
 @external(erlang, "grind_postgres_ffi", "stop_supervisor")
 fn stop_supervisor(pid: process.Pid) -> Result(Bool, Nil)
 
 /// Stops this `Database`'s own PostgreSQL pool and observation forwarder,
-/// and erases the checkout deadline `start` attached to the pool's name —
-/// but only when this call itself is the one that actually stopped a live
-/// process. `ValidatedSettings` reuses the same pool name across every
-/// `start`/`close` cycle (see `validate`), so calling `close` on a stale
-/// `Database` handle whose supervisor has already stopped (kept around
-/// after an intervening `start` reopened the same `ValidatedSettings` under
-/// a fresh supervisor) is a no-op here rather than erasing the *live*
-/// pool's deadline entry out from under it. Before this, that erasure ran
-/// unconditionally: a stray double-`close` on an old handle silently
-/// downgraded a still-running pool's every subsequent storage call to the
-/// FFI's own hardcoded 5000ms default until that pool was itself closed.
+/// and its checkout deadline owner. The owner starts before the pool and
+/// stops after it, so stale Database handles cannot erase a reopened pool's
+/// deadline. A duplicate start fails before changing the live owner's entry.
+/// Cooperative shutdown waits for the pool's internal children and admitted
+/// Grind storage calls before removing their caches. Stop consumers before
+/// closing their database. Direct use of the internal raw pog connection must
+/// also finish first; it bypasses Grind's call tracking.
 /// Returns `Error(StopTimedOut)` if the supervisor does not confirm its own
-/// shutdown in time; the deadline is left in place in that case too, since
-/// the pool may still be alive.
+/// shutdown in time; cleanup continues without killing application callers.
+/// The owner retains its registration and deadline until tracked calls drain.
 pub fn close(database: Database) -> Result(Nil, CloseError) {
-  let Database(supervisor_pid:, connection:, ..) = database
+  let Database(supervisor_pid:, ..) = database
   case stop_supervisor(supervisor_pid) {
     Error(Nil) -> Error(StopTimedOut)
-    Ok(True) -> {
-      store.clear_deadline(connection)
-      Ok(Nil)
-    }
-    Ok(False) -> Ok(Nil)
+    Ok(_) -> Ok(Nil)
   }
+}
+
+/// A consumer's dedicated renewal pool shares the database connection
+/// settings but has its own registered name and reserved connection.
+@internal
+pub fn renewal_pool_config(
+  database: Database,
+  pool_name: process.Name(pog.Message),
+) -> pog.Config {
+  let Database(config:, ..) = database
+  pog.Config(..config, pool_name:, pool_size: 1)
 }
 
 pub type StorageError {

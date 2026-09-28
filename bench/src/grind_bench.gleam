@@ -167,7 +167,7 @@ fn ensure_ledger_schema(
 /// fresh database instead.
 pub fn reset_ledger(connection: pog.Connection) -> Result(Nil, pog.QueryError) {
   pog.query(
-    "TRUNCATE grind_bench.bench_submissions, grind_bench.bench_effects, grind_bench.bench_lease_log, grind_bench.bench_slow_ack_targets",
+    "TRUNCATE grind_bench.bench_submissions, grind_bench.bench_effects, grind_bench.bench_lease_log, grind_bench.bench_slow_ack_targets, grind_bench.bench_lease_samples, grind_bench.bench_durable_completions",
   )
   |> pog.execute(connection)
   |> result.map(fn(_) { Nil })

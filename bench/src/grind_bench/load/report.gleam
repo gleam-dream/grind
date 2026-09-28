@@ -17,16 +17,14 @@ import simplifile
 
 pub fn timestamps_ms(
   ledger: pog.Connection,
-  grind_schema: String,
+  _grind_schema: String,
 ) -> Result(#(Int, Int), Nil) {
   use t0 <- result.try(unix_ms_query(
     "SELECT (extract(epoch FROM min(started_at)) * 1000)::bigint FROM bench_effects",
     ledger,
   ))
   let sql =
-    "SELECT (extract(epoch FROM max(j.finished_at)) * 1000)::bigint FROM bench_submissions bs JOIN \""
-    <> grind_schema
-    <> "\".\"grind_jobs\" j ON j.id = bs.job_id"
+    "SELECT (extract(epoch FROM max(d.observed_at)) * 1000)::bigint FROM grind_bench.bench_durable_completions d JOIN bench_submissions s ON s.job_id=d.job_id"
   use t_end <- result.try(unix_ms_query(sql, ledger))
   Ok(#(t0, t_end))
 }
@@ -47,28 +45,35 @@ fn unix_ms_query(sql: String, ledger: pog.Connection) -> Result(Int, Nil) {
 /// Item 6/I6: `GRIND_BENCH_POSTGRES_LOG`'s own line count right now --
 /// captured before a run starts so `postgres_log_window` can slice off
 /// exactly the lines written during the run, with no `log_line_prefix`
-/// timestamp parsing required. `0` if the env var is unset or the file does
-/// not exist yet (a fresh disposable cluster's log starts empty).
+/// timestamp parsing required. `0` if the env var is unset. An explicitly
+/// configured unreadable log invalidates the run instead of skipping I6.
 pub fn postgres_log_lines_before() -> Int {
   case runtime.getenv("GRIND_BENCH_POSTGRES_LOG") {
     Error(Nil) -> 0
     Ok(path) ->
       case simplifile.read(path) {
-        Error(_) -> 0
-        Ok(content) -> list.length(string.split(content, "\n"))
+        Error(_) ->
+          panic as "configured PostgreSQL log is unreadable; run evidence is invalid"
+        Ok(content) ->
+          case string.ends_with(content, "\n") || content == "" {
+            True -> list.length(string.split(content, "\n")) - 1
+            False -> list.length(string.split(content, "\n"))
+          }
       }
   }
 }
 
 /// `Error(Nil)`: `GRIND_BENCH_POSTGRES_LOG` is unset (I6's log scan is
 /// skipped entirely, not failed -- see `audit.run`'s own `postgres_log_window`
-/// parameter). `Ok(lines)`: every log line written since `lines_before`.
+/// parameter). An explicitly configured unreadable log invalidates the run.
+/// `Ok(lines)`: every log line written since `lines_before`.
 pub fn postgres_log_window(lines_before: Int) -> Result(List(String), Nil) {
   case runtime.getenv("GRIND_BENCH_POSTGRES_LOG") {
     Error(Nil) -> Error(Nil)
     Ok(path) ->
       case simplifile.read(path) {
-        Error(_) -> Error(Nil)
+        Error(_) ->
+          panic as "configured PostgreSQL log is unreadable; run evidence is invalid"
         Ok(content) -> Ok(list.drop(string.split(content, "\n"), lines_before))
       }
   }
@@ -181,9 +186,10 @@ pub fn percentile_field(
 ) -> String {
   case stats {
     Error(Nil) -> "-1"
-    Ok(summarize.Percentiles(p50:, p99:, max:, ..)) ->
+    Ok(summarize.Percentiles(p50:, p95:, p99:, max:, ..)) ->
       case which {
         "p50" -> float.to_string(p50)
+        "p95" -> float.to_string(p95)
         "p99" -> float.to_string(p99)
         "max" -> float.to_string(max)
         _ -> "-1"
@@ -243,8 +249,20 @@ pub fn submitted_job_ids_ordered(
 /// -- L2's own stand-in for "a large table of already-finished jobs"
 /// without paying real preload/drain cost for rows nothing ever claims (a
 /// terminal-state row is never selected by `attempt.claim_one`). One
-/// statement, `generate_series`-driven, rather than a chunked loop.
+/// bounded batch at a time, so a million-row preload cannot hit the
+/// driver deadline for a single enormous insert.
 pub fn insert_filler_succeeded(connection: pog.Connection, count: Int) -> Nil {
+  case count <= 0 {
+    True -> Nil
+    False -> {
+      let batch = int.min(count, 10_000)
+      insert_filler_batch(connection, batch)
+      insert_filler_succeeded(connection, count - batch)
+    }
+  }
+}
+
+fn insert_filler_batch(connection: pog.Connection, count: Int) -> Nil {
   let query =
     pog.query(
       "INSERT INTO grind_jobs (queue, worker_id, worker_version, input_version, input, output_version, output, max_attempts, state, available_at, finished_at) "

@@ -734,11 +734,10 @@ fn run_t5(base_url: String) -> Nil {
 
 /// T3: automatic consumer, `maximum_concurrency: 2`. A's own acknowledgement
 /// `COMMIT` is `drop_request`'d; B runs on a sibling attempt under the same
-/// coordinator. B's own renewal must survive the stall A's stuck ack call
-/// causes on the coordinator's single message loop (README, "The
-/// coordinator runs claim and acknowledgement SQL synchronously"), and A
-/// must eventually converge to `Succeeded` through the automatic
-/// pending-ack retry (queue.gleam), not get stuck `executing` forever.
+/// coordinator. Each attempt owns its acknowledgement, so B must finish
+/// while A is still waiting for its first checkout deadline. A must then
+/// settle its retained proposal through the automatic retry without
+/// invoking either handler again.
 pub fn fault_proxy_t3_concurrent_divergence_test() {
   case fault_proxy_url() {
     Error(Nil) -> Nil
@@ -819,6 +818,10 @@ fn run_t3(base_url: String) -> Nil {
     postgres.submit(database, "fault-proxy-t3", definition_a, 1)
   let assert Ok(handle_b) =
     postgres.submit(database, "fault-proxy-t3", definition_b, 2)
+  let assert Ok(observed_a) =
+    postgres.bind_handle(observer, definition_a, job.id_value(handle_a))
+  let assert Ok(observed_b) =
+    postgres.bind_handle(observer, definition_b, job.id_value(handle_b))
 
   let assert Ok(policy) =
     queue.default_policy()
@@ -855,9 +858,12 @@ fn run_t3(base_url: String) -> Nil {
     process.receive(notify, within: 3000)
   process.send(release_b, Nil)
 
-  wait_for_job_state(database, handle_b, job.Succeeded, 10_000)
+  wait_for_job_state(observer, observed_b, job.Succeeded, 10_000)
   |> should.equal(True)
   let b_elapsed = monotonic_ms() - start_ms
+  { b_elapsed < postgres.statement_deadline_ms(database) }
+  |> should.equal(True)
+  postgres.state(observer, observed_a) |> should.equal(Ok(job.Executing))
   io.println(
     "T3: B succeeded in "
     <> int.to_string(b_elapsed)
@@ -866,8 +872,29 @@ fn run_t3(base_url: String) -> Nil {
 
   clear_stuck_backend(observer_connection)
 
-  wait_for_job_state(database, handle_a, job.Succeeded, 15_000)
-  |> should.equal(True)
+  // The failed transaction and its receipt lookup each have their own
+  // checkout deadline. The retry timer starts after both calls return;
+  // measuring from B's now-independent completion must include both.
+  let retry_budget_ms =
+    2 * postgres.statement_deadline_ms(database) + 30_000 / 3 + 2000
+  let settled =
+    wait_for_job_state(observer, observed_a, job.Succeeded, retry_budget_ms)
+  case settled {
+    True -> Nil
+    False -> {
+      io.println(string.inspect(postgres.state(observer, observed_a)))
+      io.println(
+        "T3 unsettled after " <> int.to_string(monotonic_ms() - start_ms),
+      )
+      Nil
+    }
+  }
+  settled |> should.equal(True)
+  postgres.outcome(observer, observed_a)
+  |> should.equal(Ok(job.SucceededWith("a-1")))
+  postgres.outcome(observer, observed_b)
+  |> should.equal(Ok(job.SucceededWith("b-2")))
+  process.receive(started, within: 50) |> should.equal(Error(Nil))
   let a_elapsed = monotonic_ms() - start_ms
   io.println(
     "T3: A converged to Succeeded via the automatic pending-ack retry in "

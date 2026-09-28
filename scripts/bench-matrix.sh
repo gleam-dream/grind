@@ -19,24 +19,45 @@ set -euo pipefail
 # Usage: scripts/bench-matrix.sh [l1|l7|l2|l3|l4|l5|l6|all]  (default: all)
 
 what="${1:-all}"
+case "$what" in
+  l1|l2|l3|l4|l5|l6|l6t1|l6t2|l7|all) ;;
+  *) echo "unknown matrix: $what" >&2; exit 2 ;;
+esac
 
 port=${GRIND_BENCH_PGPORT:-$((20000 + RANDOM % 20000))}
 root="$(mktemp -d "${TMPDIR:-/tmp}/grind-bench-matrix.XXXXXX")"
 cluster="$root/data"
 started=0
+results_reserved=0
+delay_proxy_pid=""
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 bench_root="$repo_root/bench"
 
 cleanup() {
+  local status=$?
+  # Retain warm-up context on any matrix failure. It may include earlier
+  # successful warm-ups; logs and diagnostic outcomes identify the failed phase.
+  if [[ "$status" != 0 && "$results_reserved" == 1 && -d "${warmup_dir:-}" ]]; then
+    mkdir "$results_dir/warmup-results-on-failure" || status=1
+    cp -R "$warmup_dir/." "$results_dir/warmup-results-on-failure/" || status=1
+  fi
+  if [[ -n "$delay_proxy_pid" ]]; then kill "$delay_proxy_pid" 2>/dev/null || true; fi
   if [[ "${BENCH_KEEP:-0}" == "1" ]]; then
+    if [[ "$results_reserved" == 1 ]]; then
+      cp "$root/postgres.log" "$results_dir/postgres.log" || status=1
+    fi
     echo "BENCH_KEEP=1: leaving cluster running at 127.0.0.1:$port (data dir: $cluster)"
     echo "  stop it later with: pg_ctl -D '$cluster' -m immediate stop"
-    return
+    return "$status"
   fi
   if [[ "$started" == 1 ]]; then
-    pg_ctl -D "$cluster" -m immediate stop >/dev/null
+    pg_ctl -D "$cluster" -m immediate stop >/dev/null || status=1
+  fi
+  if [[ "$results_reserved" == 1 ]]; then
+    cp "$root/postgres.log" "$results_dir/postgres.log" || status=1
   fi
   rm -rf "$root"
+  return "$status"
 }
 trap cleanup EXIT
 
@@ -67,6 +88,19 @@ printf 'Disposable PostgreSQL %s at 127.0.0.1:%s (matrix run)\n' "$(postgres --v
 
 export GRIND_BENCH_DATABASE_URL="postgres://grind_a@127.0.0.1:$port/grind_bench?sslmode=disable"
 export GRIND_BENCH_CTL_DATABASE_URL="postgres://grind_ctl@127.0.0.1:$port/grind_bench?sslmode=disable"
+export GRIND_BENCH_NETWORK_DELAY_MS="${GRIND_BENCH_NETWORK_DELAY_MS:-0}"
+if [[ "$GRIND_BENCH_NETWORK_DELAY_MS" != "0" ]]; then
+  proxy_port=$((port + 1))
+  python3 "$bench_root/network_delay.py" --listen-port "$proxy_port" --upstream-port "$port" --delay-ms "$GRIND_BENCH_NETWORK_DELAY_MS" --ready "$root/proxy-ready" &
+  delay_proxy_pid=$!
+  for _ in $(seq 1 100); do
+    [[ -f "$root/proxy-ready" ]] && break
+    kill -0 "$delay_proxy_pid"
+    sleep 0.05
+  done
+  [[ -f "$root/proxy-ready" ]] || { echo "delay proxy did not start" >&2; exit 1; }
+  export GRIND_BENCH_DATABASE_URL="postgres://grind_a@127.0.0.1:$proxy_port/grind_bench?sslmode=disable"
+fi
 export GRIND_BENCH_POSTGRES_LOG="$root/postgres.log"
 export GRIND_BENCH_PG_DATA_DIR="$cluster"
 export GRIND_BENCH_COMMIT="$(cd "$repo_root" && git rev-parse --short HEAD)"
@@ -76,16 +110,21 @@ else
   export GRIND_BENCH_DIRTY=0
 fi
 
-results_dir="$bench_root/results/$(date +%Y-%m-%d)-${GRIND_BENCH_COMMIT}"
+results_dir="${GRIND_BENCH_RESULTS_DIR:-$bench_root/results/$(date +%Y-%m-%dT%H%M%S)-${GRIND_BENCH_COMMIT}}"
 warmup_dir="$root/warmup-results"
 export GRIND_BENCH_RESULTS_DIR="$results_dir"
-mkdir -p "$results_dir" "$warmup_dir"
+python3 "$repo_root/scripts/bench-provenance.py" --reserve-dir "$results_dir"
+results_reserved=1
+mkdir -p "$warmup_dir"
 
+export GRIND_BENCH_SOURCE_SHA256="$(python3 "$repo_root/scripts/bench-provenance.py" --digest)"
+python3 "$repo_root/scripts/bench-provenance.py" "$results_dir/provenance.json" "$@"
 echo "commit=$GRIND_BENCH_COMMIT dirty=$GRIND_BENCH_DIRTY results_dir=$results_dir"
 
 (cd "$bench_root" && gleam build)
 
-repeats=3
+repeats=${GRIND_BENCH_REPEATS:-3}
+[[ "$repeats" -ge 3 ]] || { echo "at least three measured repeats required" >&2; exit 1; }
 
 # consumers concurrency queues cost_ms job_count
 l1_points=(
@@ -103,18 +142,20 @@ l7_points=(
   "10 5 46000"
 )
 
-# consumers interval_ms filler_rows duration_ms -- reduced from the plan's
-# {1,8} x {10,50,250,1000}ms x {0, 1M} to a representative subset for
-# wall-clock feasibility (documented in docs/PERFORMANCE-EVIDENCE.md).
+# Zero, 100k and one million retained rows; actual counts and plans are retained.
 l2_points=(
-  "1 50 0 3000"
-  "1 50 100000 3000"
-  "1 250 0 3000"
-  "1 250 100000 3000"
-  "8 50 0 3000"
-  "8 50 100000 3000"
-  "8 250 0 3000"
-  "8 250 100000 3000"
+  "1 50 0 10000"
+  "1 50 100000 10000"
+  "1 50 1000000 10000"
+  "1 250 0 10000"
+  "1 250 100000 10000"
+  "1 250 1000000 10000"
+  "8 50 0 10000"
+  "8 50 100000 10000"
+  "8 50 1000000 10000"
+  "8 250 0 10000"
+  "8 250 100000 10000"
+  "8 250 1000000 10000"
 )
 
 # arrival_per_sec duration_ms -- fixed 4xC10 shape, baked into run_l3 itself.
@@ -124,47 +165,65 @@ l3_points=(
   "1000 5000"
 )
 
-# submitters mode total_submissions -- reduced total_submissions per mode
-# (documented): hot mode is deliberately small (10 keys means most calls
-# serialize on the same advisory-lock domain); cold uses more since it is
-# the near-zero-contention baseline and is cheap.
+# Fixed resource budget and equal work; enough duration for lock sampling.
 l4_points=(
-  "4 hot 1500"
-  "16 hot 1500"
-  "64 hot 1500"
-  "4 cold 4000"
-  "16 cold 4000"
-  "64 cold 4000"
+  "4 hot 40000"
+  "16 hot 40000"
+  "64 hot 40000"
+  "4 cold 40000"
+  "16 cold 40000"
+  "64 cold 40000"
 )
 
 # pruner_on duration_ms
 l5_points=(
-  "0 2000"
-  "1 2000"
+  "0 10000"
+  "1 10000"
 )
 
-# concurrency job_count cost_ms -- real, unmodified defaults (L=30000,
-# D=4000); cost_ms=25000 spans 2 renewal ticks (L/3=10000ms) per job.
-# job_count is always concurrency*3 (3 claim waves).
+# Minimum 3L handler duration, staggered across one further lease.
 l6t1_points=(
-  "4 12 25000"
-  "10 30 25000"
-  "50 150 25000"
+  "4 4 90000"
+  "10 10 90000"
+  "50 50 90000"
 )
 
-# k_slow_acks d_ms -- C=10 and L=6D/cost=3L are fixed inside run_l6t2
-# itself. d_ms=2000 (scaled down from the real 4000ms default for
-# wall-clock feasibility -- see run_l6t2's own doc comment; the smallest
-# d_ms postgres.validate accepts through setup_with_deadline's own
-# unique_lock_wait scaling is a bit under 1334ms, so 2000 keeps a
-# comfortable margin).
-l6t2_points=(
-  "0 2000"
-  "1 2000"
-  "2 2000"
-  "4 2000"
-  "8 2000"
-)
+# Targeted default-scale profiles: K sweep at the actual minimum 4D,
+# representative boundary cases at the former minimum and default lease.
+# Every tuple is k deadline lease delay concurrency main_pool; each consumer
+# also reserves one renewal connection, reported separately in the CSV.
+l6t2_points=()
+for delay in 3200 4800; do
+  for k in 0 3 4 5 6 7 8; do
+    l6t2_points+=("$k 4000 16000 $delay 10 10")
+  done
+  for lease in 24000 30000; do
+    for k in 0 5 8; do
+      l6t2_points+=("$k 4000 $lease $delay 10 10")
+    done
+  done
+done
+# Opt-in selected stress points, not a cartesian expansion of every axis.
+if [[ "${GRIND_BENCH_T2_STRESS:-0}" == "1" ]]; then
+  l6t2_points+=(
+    "8 4000 16000 3200 50 50"
+    "8 4000 16000 4800 50 50"
+    "8 4000 16000 3200 50 10"
+    "8 4000 16000 4800 50 10"
+  )
+fi
+# An explicit file can select a reproducible subset or extra resource shapes.
+# Rows contain exactly: K D L ACK_delay concurrency main_pool (positive ints).
+if [[ -n "${GRIND_BENCH_T2_PROFILES:-}" ]]; then
+  cp "$GRIND_BENCH_T2_PROFILES" "$results_dir/t2-profiles.txt"
+  l6t2_points=()
+  while read -r k d lease delay concurrency pool extra; do
+    [[ -z "${k:-}" || "$k" == \#* ]] && continue
+    [[ -z "${extra:-}" && "$k $d $lease $delay $concurrency $pool" =~ ^[0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+\ [0-9]+$ ]] || { echo "invalid T2 profile row" >&2; exit 1; }
+    l6t2_points+=("$k $d $lease $delay $concurrency $pool")
+  done < "$results_dir/t2-profiles.txt"
+  [[ "${#l6t2_points[@]}" -gt 0 ]] || { echo "empty T2 profile file" >&2; exit 1; }
+fi
 
 run_l1_point() {
   local consumers=$1 concurrency=$2 queues=$3 cost_ms=$4 job_count=$5
@@ -256,16 +315,13 @@ run_l5_point() {
   done
 }
 
-# L6's own points run 2 repeats, no discarded warm-up: each point is
-# considerably more expensive (tens of seconds) than an L1-L5 point, and a
-# threshold decision (T1/T2) needs its own real numbers more than it needs
-# a warm-up run's caches primed -- see docs/PERFORMANCE-EVIDENCE.md for
-# this documented reduction.
-l6_repeats=2
+# Every point discards a warm-up and keeps at least three repeats.
+l6_repeats=$repeats
 
 run_l6t1_point() {
   local concurrency=$1 job_count=$2 cost_ms=$3
   echo "== l6t1 concurrency=${concurrency} (job_count=$job_count cost_ms=$cost_ms) =="
+  (cd "$bench_root" && GRIND_BENCH_RESULTS_DIR="$warmup_dir" gleam run -m grind_bench/load -- l6t1 "$concurrency" "$job_count" "$cost_ms" 0)
   for repeat in $(seq 1 "$l6_repeats"); do
     echo "  repeat $repeat"
     (cd "$bench_root" && gleam run -m grind_bench/load -- l6t1 "$concurrency" "$job_count" "$cost_ms" "$repeat")
@@ -273,11 +329,12 @@ run_l6t1_point() {
 }
 
 run_l6t2_point() {
-  local k_slow_acks=$1 d_ms=$2
-  echo "== l6t2 k=${k_slow_acks} (d_ms=$d_ms) =="
+  local k_slow_acks=$1 d_ms=$2 lease=$3 delay=$4 concurrency=$5 pool=$6
+  echo "== l6t2 k=$k_slow_acks D=$d_ms L=$lease delay=$delay C=$concurrency main_pool=$pool renewal_pool=1 =="
+  (cd "$bench_root" && GRIND_BENCH_RESULTS_DIR="$warmup_dir" gleam run -m grind_bench/load -- l6t2 "$k_slow_acks" "$d_ms" "$lease" "$delay" "$concurrency" "$pool" 0)
   for repeat in $(seq 1 "$l6_repeats"); do
     echo "  repeat $repeat"
-    (cd "$bench_root" && gleam run -m grind_bench/load -- l6t2 "$k_slow_acks" "$d_ms" "$repeat")
+    (cd "$bench_root" && gleam run -m grind_bench/load -- l6t2 "$k_slow_acks" "$d_ms" "$lease" "$delay" "$concurrency" "$pool" "$repeat")
   done
 }
 
@@ -321,13 +378,16 @@ if [[ "$what" == "l5" || "$what" == "all" ]]; then
   done
 fi
 
-if [[ "$what" == "l6" || "$what" == "all" ]]; then
+if [[ "$what" == "l6" || "$what" == "l6t1" || "$what" == "all" ]]; then
   for point in "${l6t1_points[@]}"; do
     run_l6t1_point $point
   done
+fi
+if [[ "$what" == "l6" || "$what" == "l6t2" || "$what" == "all" ]]; then
   for point in "${l6t2_points[@]}"; do
     run_l6t2_point $point
   done
 fi
 
+[[ "$(python3 "$repo_root/scripts/bench-provenance.py" --digest)" == "$GRIND_BENCH_SOURCE_SHA256" ]] || { echo "source changed during matrix; evidence invalid" >&2; exit 1; }
 echo "matrix run complete: $results_dir"

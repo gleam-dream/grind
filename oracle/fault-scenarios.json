@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "oracle": {
+    "version": "2.24.1",
+    "commit": "64b8481e5383f6bc46b7a5284e4ced3202dec9d5",
+    "engine": "Oban.Engines.Basic"
+  },
+  "evidence_contract": "Independent named BEAM operating-system processes; fsynced effects before a file barrier; confirmed OS death; committed database rows establish terminal state. Oban results alone do not count as a paired Grind run.",
+  "adapters": {
+    "grind": "resilience/run.py",
+    "oban": "oracle/faults.py"
+  },
+  "scenarios": [
+    {
+      "id": "M2",
+      "classification": "intentional-grind-semantics",
+      "reason": "Configured Oban Lifeline automatically rescues aged executing jobs. Grind quarantines an expired ambiguous attempt and requires attributed AuthorizeReplay before another effect.",
+      "activation": "SIGKILL the VM after its fsynced effect, before handler return or acknowledgement.",
+      "expected": {
+        "oban": {
+          "effects_before_kill": 1,
+          "effects_before_operator_replay": 2,
+          "final_effects": 2,
+          "final_state": "completed",
+          "final_attempt": 2,
+          "lifeline_rescue_observed": true,
+          "independent_worker_vms": 2
+        },
+        "grind": {
+          "effects_before_kill": 1,
+          "effects_before_operator_replay": 1,
+          "state_before_operator_replay": "uncertain",
+          "final_effects": 2,
+          "final_state": "succeeded",
+          "attributed_replay_rows": 1
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/lifeline.ex",
+        "oracle/deps/oban/lib/oban/engines/basic.ex",
+        "resilience/run.py"
+      ]
+    },
+    {
+      "id": "M6",
+      "classification": "intentional-grind-semantics",
+      "reason": "Oban Database Peer elects one maintenance leader and Pruner checks leadership. Grind has no leader; concurrent node-local pruning uses SKIP LOCKED. These fixtures validate different maintenance architectures rather than equal election behavior.",
+      "activation": "Witness old leader maintenance, SIGKILL that VM, then wait for genuine peer lease expiration and survivor maintenance.",
+      "expected": {
+        "oban": {
+          "initial_leaders": 1,
+          "leader_changed_after_kill": true,
+          "old_leader_pruned_seed": true,
+          "survivor_pruned_seed": true,
+          "final_job_count": 0,
+          "independent_vms": 2
+        },
+        "grind": {
+          "leader_election": false,
+          "concurrent_unlocked_deletes": 19,
+          "locked_row_survived": true,
+          "after_unlock_deletes": 1,
+          "final_jobs": 0,
+          "final_receipts": 0
+        }
+      },
+      "sources": [
+        "oracle/deps/oban/lib/oban/peers/database.ex",
+        "oracle/deps/oban/lib/oban/pruner.ex",
+        "resilience/run.py"
+      ]
+    }
+  ]
+}

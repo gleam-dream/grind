@@ -34,7 +34,8 @@ pub opaque type ClaimedJob {
 }
 
 /// Atomically claims one due row without running its handler in the caller.
-/// The queue actor owns renewal and acknowledgement after this boundary.
+/// The attempt process owns acknowledgement; its consumer's independent
+/// renewer extends the live lease after this boundary.
 pub fn claim_one(
   database: Database,
   queue: String,
@@ -88,6 +89,59 @@ fn claim_previous_state(claim: Claim) -> String {
 pub type Renewal {
   Renewed
   LeaseLost
+}
+
+/// A skipped row is still live but locked, typically by its own ACK.
+/// Skipping it preserves progress for the rest of the renewal batch.
+pub type BatchRenewal {
+  BatchRenewed
+  BatchLocked
+  BatchLeaseLost
+}
+
+/// Renews one consumer's leases in one bounded checkout on its reserved
+/// connection. The candidate lock never waits for an acknowledgement's row.
+/// Both candidate selection and update retain the live database-time fence.
+pub fn renew_many(
+  connection: pog.Connection,
+  queue: String,
+  owner: String,
+  claims: List(ClaimedJob),
+  lease_duration_ms: Int,
+) -> Result(List(#(Int, Int, BatchRenewal)), pog.QueryError) {
+  let identities = list.map(claims, claim_identity)
+  let live = lease.live_lease_predicate("clock_timestamp()")
+  let query =
+    pog.query(
+      "WITH fences AS (SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::bigint[]) AS f(id, attempt_id, epoch)), locked AS MATERIALIZED (SELECT j.id FROM grind_jobs j JOIN fences f ON j.id = f.id AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch WHERE j.queue = $4 AND j.attempt_owner = $5 AND j.state = 'executing' AND "
+      <> live
+      <> " FOR NO KEY UPDATE OF j SKIP LOCKED), renewed AS (UPDATE grind_jobs j SET lease_expires_at = clock_timestamp() + ($6::double precision * interval '1 millisecond') FROM locked l WHERE j.id = l.id AND "
+      <> live
+      <> " RETURNING j.id) SELECT f.attempt_id, f.epoch, CASE WHEN r.id IS NOT NULL THEN 1 WHEN j.state = 'executing' AND j.queue = $4 AND j.attempt_owner = $5 AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch AND "
+      <> live
+      <> " THEN 2 ELSE 0 END FROM fences f LEFT JOIN renewed r ON r.id = f.id LEFT JOIN grind_jobs j ON j.id = f.id",
+    )
+    |> pog.parameter(pog.array(pog.int, list.map(identities, fn(x) { x.0 })))
+    |> pog.parameter(pog.array(pog.int, list.map(identities, fn(x) { x.1 })))
+    |> pog.parameter(pog.array(pog.int, list.map(identities, fn(x) { x.2 })))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.text(owner))
+    |> pog.parameter(pog.int(lease_duration_ms))
+    |> pog.returning({
+      use attempt_id <- decode.field(0, decode.int)
+      use epoch <- decode.field(1, decode.int)
+      use status <- decode.field(2, decode.int)
+      let status = case status {
+        1 -> BatchRenewed
+        2 -> BatchLocked
+        _ -> BatchLeaseLost
+      }
+      decode.success(#(attempt_id, epoch, status))
+    })
+  case store.execute_safely(query, on: connection) {
+    Error(error) -> Error(error)
+    Ok(returned) -> Ok(returned.rows)
+  }
 }
 
 /// Extends the current lease using PostgreSQL's clock and current row values.

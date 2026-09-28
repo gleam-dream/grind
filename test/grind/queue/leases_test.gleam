@@ -77,7 +77,7 @@ fn run_lease_renewal_test(database_url: String) -> Nil {
     postgres.submit(database, "lease-renewal", slow_worker, 7)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1600)
+    |> queue.with_lease_duration(4008)
     |> queue.with_manual_polling
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)
@@ -142,7 +142,7 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
     postgres.submit(database, "lease-renewal-loss", slow_worker, 7)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1600)
+    |> queue.with_lease_duration(4008)
     |> queue.with_manual_polling
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)
@@ -155,7 +155,7 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
   let connection = postgres.connection(database)
   force_lease_expired(connection, job.id_value(handle))
   |> should.equal(Ok(Nil))
-  await_renewal_lost(consumer, 100) |> should.equal(True)
+  await_renewal_lost(consumer, 200) |> should.equal(True)
   queue.process_one(consumer) |> should.equal(Error(queue.QueueBusy))
 
   process.send(release, ReleaseAttempt)
@@ -209,7 +209,7 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
     postgres.submit(database, "renewal-storage-error", slow_worker, 18)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1600)
+    |> queue.with_lease_duration(4008)
     |> queue.with_manual_polling
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)
@@ -247,7 +247,7 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
       |> pog.execute(on: connection)
     Nil
   })
-  await_renewal_status(consumer, queue.LeaseRenewalUnknown, 100)
+  await_renewal_status(consumer, queue.LeaseRenewalUnknown, 300)
   |> should.equal(True)
   queue.process_one(consumer) |> should.equal(Error(queue.QueueBusy))
   let assert Ok(_) =
@@ -256,7 +256,7 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
   let assert Ok(_) =
     pog.query("DROP FUNCTION grind_test_reject_renewal()")
     |> pog.execute(on: connection)
-  await_renewal_status(consumer, queue.LeaseRenewalConfirmed, 100)
+  await_renewal_status(consumer, queue.LeaseRenewalConfirmed, 300)
   |> should.equal(True)
   process.send(release, ReleaseAttempt)
   process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
@@ -299,7 +299,7 @@ fn run_closed_pool_renewal_test(database_url: String) -> Nil {
     postgres.submit(database, "closed-pool-renewal", slow_worker, 19)
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_lease_duration(1600)
+    |> queue.with_lease_duration(4008)
     |> queue.with_manual_polling
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)
@@ -312,18 +312,30 @@ fn run_closed_pool_renewal_test(database_url: String) -> Nil {
   let assert Ok(FirstAttemptStarted(release)) =
     process.receive(started, within: 5000)
 
-  // A missing named pool used to let pgo_pool:checkout exit through Pog and
-  // kill the queue coordinator. The typed consumer must retain the active
-  // claim, report uncertainty, and recover after the same pool is reopened.
+  // Closing the ordinary pool must not stop the independently owned renewal
+  // connection. Observe real lease progress while public storage is unavailable,
+  // then reopen the same pool to acknowledge the original execution.
+  let assert Ok(observer_settings) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(observer) = postgres.start(observer_settings)
+  use <- exception.defer(fn() { postgres.close(observer) })
+  let observer_connection = postgres.connection(observer)
+  let assert Ok(initial_expiry) =
+    lease_expiration(observer_connection, job.id_value(handle))
   let _ = postgres.close(database)
   postgres.state(database, handle)
   |> should.equal(Error(postgres.JobReadQueryFailed(pog.ConnectionUnavailable)))
-  await_renewal_status(consumer, queue.LeaseRenewalUnknown, 100)
+  await_later_lease_expiry(
+    observer_connection,
+    job.id_value(handle),
+    initial_expiry + 50,
+    125,
+  )
   |> should.equal(True)
   queue.process_one(consumer) |> should.equal(Error(queue.QueueBusy))
   let assert Ok(reopened_database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(reopened_database) })
-  await_renewal_status(consumer, queue.LeaseRenewalConfirmed, 100)
+  await_renewal_status(consumer, queue.LeaseRenewalConfirmed, 300)
   |> should.equal(True)
   process.send(release, ReleaseAttempt)
   process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))

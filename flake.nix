@@ -26,6 +26,9 @@
           settings.global.excludes = [
             "**/*.pdf"
             ".render/**"
+            "bench/results/**"
+            "oracle/results/**"
+            "resilience/results/**"
           ];
           programs.gleam.enable = true;
           programs.mix-format.enable = true;
@@ -43,6 +46,7 @@
             beam28Packages.erlang
             elixirPackage
             postgresql_16
+            python3
             rebar3
           ];
         };

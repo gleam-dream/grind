@@ -374,14 +374,16 @@ real external effect:
   `consumer/test/grind_consumer/recovery_test.gleam`'s dedup-key job): the worker looks
   up its own application-owned dedup record before performing its effect,
   never relying on Grind's attempt/delivery counts alone.
-- **The coordinator runs claim and acknowledgement SQL synchronously, bounded
-  by a Grind-owned checkout deadline — for a connection already in hand.**
+- **Storage calls use a Grind-owned checkout deadline.** Claims run in
+  the coordinator, acknowledgements in their attempt processes, and lease
+  renewal in a separate actor with a reserved one-connection pool per consumer.
   `postgres.with_statement_deadline` (default 4000ms, `D`, validated positive) is
   enforced by Grind's own `grind_postgres_ffi.erl`, which checks out a
-  connection from pog's own pool itself (`pgo:checkout/2`, an explicit
-  `timeout` option) and runs the call against that single checked-out
-  connection, rather than letting pog re-checkout with its own
-  unconfigurable, hardcoded default — for every Grind storage call: inline
+  connection from pog's own pool itself (`pgo:checkout/2`, with `timeout`
+  set to `infinity` and one absolute `deadline` shared across candidate
+  checkouts). It retires unusable candidates before invoking the storage
+  operation at most once against one checked-out connection. This applies
+  to every Grind storage call: inline
   SQL, every Squirrel-generated call, and a whole `pog.transaction` including
   its own `BEGIN`/`COMMIT`. A real TCP fault-proxy test proves a dropped
   `COMMIT` reply, a dropped `BEGIN` reply, a request that never reaches
@@ -389,11 +391,12 @@ real external effect:
   roughly this bound instead of hanging indefinitely
   (`docs/RECOVERY-EVIDENCE.md`, "Acknowledgement deadline"). Grind depends on
   vanilla `pog` from Hex, pinned to a tight range (`gleam.toml`) because this
-  couples Grind directly to pog's private `Connection` shape and to `pgo`'s
-  own checkout/checkin/break API — a deliberate decision (no fork), guarded
-  by that pin plus `pog_connection_pool_shape_test`
-  (`test/grind_test.gleam`), which fails loudly if a pog/pgo upgrade ever
-  changes either shape instead of this silently mismatching it. This
+  couples Grind directly to pog's private `Connection` shape, pgo's private
+  connection record and checkout/return APIs, and its pool topology and cache
+  layouts. The version ranges limit upgrade scope but cannot guarantee those
+  contracts remain stable. `pog_connection_pool_shape_test`
+  (`test/grind_test.gleam`) checks the pog pool tuple; startup/cache and
+  reconnect regressions cover the additional private contracts. This
   deadline does not bound the pool's own _initial_
   connect (a `gen_tcp:connect` to an unresponsive, not
   connection-refusing, host has no deadline of its own either way), and a
@@ -407,43 +410,28 @@ real external effect:
   caller's own `pog.transaction` against the same named pool) clears it — a
   separate, independent bound from the checkout deadline, covering the case
   the checkout deadline alone does not (the client-side socket was never
-  actually stuck). While any of this is in flight, it still blocks that
-  coordinator's single message loop until it returns or errors — including
-  every other active attempt's own lease-renewal tick under the same
-  `maximum_concurrency > 1` consumer, since one coordinator process serves
-  all of them.
-  `queue.start` rejects a lease that does not
-  clear a multiple of this deadline before starting any process
-  (`queue.LeaseTooShortForDeadline`: `6 × D` at `maximum_concurrency > 1`,
-  `1.5 × D` at `maximum_concurrency` of exactly 1 — both derived with zero
-  algebraic margin at the minimum itself, from a renewal timer firing every
-  `L / 3` and a stalled pending acknowledgement occupying the coordinator
-  for up to `3 × D`; see `queue.LeaseTooShortForDeadline`'s own doc comment
-  for the full derivation). Even a lease that clears this rule assumes at
-  most one stalled acknowledgement ahead of one sibling's renewal: at
-  `maximum_concurrency > 2`, more than one sibling's renewal can queue up
-  behind the same stall, each also waiting out however many other siblings'
-  own `D`-bounded renewals are ahead of it in that same queue — not fully
-  covered by this rule, since the real fix (moving renewals off the
-  coordinator's own loop) is not yet done
-  (`docs/RELEASE-READINESS.md`, "Decide on per-attempt storage calls"). **An
-  independent benchmark reproduction confirmed this gap is real, not merely
-  theoretical**, at `maximum_concurrency = 10` with ordinary, still-committing
-  slow acknowledgements (no fault needed) — see
-  [docs/RISKS.md](docs/RISKS.md), risk 4, for the reproduction and the
-  derived safe envelope (`L ≥ 1.5 × maximum_concurrency × D`, stricter than
-  the `6 × D` rule above once `maximum_concurrency > 2`); the remedy is an
-  open owner decision, not yet chosen.
-- **In automatic mode, an acknowledgement that comes back `QueueAckUnknown`
-  keeps holding its concurrency slot while it retries.** The coordinator
-  retries the exact same acknowledgement on its own renewal timer, renewing
-  the lease first for roughly one lease duration's worth of ticks, until a
-  known outcome commits it or that bound is spent — a persistently failing
-  commit then lets the lease lapse and ends up `uncertain`, the same
-  recovery path an unattended crash already relies on. Either way the slot
-  stays occupied (and counted against `maximum_concurrency`) until it
-  resolves; a manual `process_one` caller is unaffected and still gets
-  `QueueAckUnknown` back synchronously, as always.
+  actually stuck).
+  The reserved renewal pool uses the same database and session configuration,
+  but claims, admissions and acknowledgements cannot check out its connection.
+  Renewal updates the consumer's live attempts in one statement and skips
+  rows locked by acknowledgements. A slow ACK therefore cannot hold up a
+  healthy sibling's renewal. Each consumer adds one PostgreSQL connection;
+  include it when sizing the database's connection budget.
+  `queue.start` requires `L ≥ 4 × D`, independently of concurrency, for a
+  renewal cadence of `L / 3`. The next timer is armed before the current
+  database call, so query duration does not extend every interval. This is
+  a bound for progressing storage calls, not a guarantee through arbitrary
+  scheduler stalls, a database outage, or contention on the same job's row.
+  Expired ownership still fails closed and requires audited recovery.
+- **Automatic acknowledgements retain the completed proposal and concurrency
+  slot through retry.** The attempt process retries both a known rollback
+  (`QueueAckFailed`) and an ambiguous result (`QueueAckUnknown`) with the same
+  command identity. It never invokes the handler again. The independent
+  renewer continues for at most one lease duration after receiving the
+  completion notice. After that, retries may reconcile a committed receipt,
+  but cannot write through an expired fence. A persistently unresolved job
+  eventually becomes `uncertain` when an expiry sweep reaches it. Manual
+  `process_one` calls still return their explicit acknowledgement errors.
 - **Observations are best-effort, never a system of record.** See
   "Observations" above for the full delivery semantics; do not build
   anything that must not be lost or double-counted on an attached handler.
@@ -465,7 +453,7 @@ storage call, a migration step, and a uniqueness lock wait may take:
   transaction including its own `BEGIN`/`COMMIT` — against a half-open or
   otherwise unresponsive connection. Enforced by Grind's own bounded checkout
   in `grind_postgres_ffi.erl`, not by pog/pgo's own unconfigurable default;
-  see "The coordinator runs claim and acknowledgement SQL synchronously..."
+  see "Storage calls use a Grind-owned checkout deadline"
   under "Guarantees" above for the full mechanism and its limits (it does not
   bound the pool's initial connect, and a queued checkout is bounded by
   pgo's own overload shedding instead).
@@ -479,18 +467,13 @@ storage call, a migration step, and a uniqueness lock wait may take:
   (`UniqueLockWaitTooCloseToDeadline` otherwise), so contention surfaces as
   `AdmissionContended` rather than a raw timeout.
 
-`queue.start` rejects a lease that does not clear a multiple of
-`statement_deadline` before starting any process
-(`queue.LeaseTooShortForDeadline`) — see "Guarantees" above for the exact
-derivation and its known gap at `maximum_concurrency > 2`. **This minimum
-(`6 × statement_deadline` at `maximum_concurrency > 1`) is validated, but
-not a proven-safe bound**: an independent benchmark reproduction found it
-insufficient once both concurrency and stalled-acknowledgement count rise
-(reproduced starving siblings at `C=10` with ordinary, still-committing slow
-acknowledgements — no fault needed) and derived a safe envelope of
-`L ≥ 1.5 × maximum_concurrency × statement_deadline` instead. See
-[docs/RISKS.md](docs/RISKS.md), risk 4, for the full evidence and the
-pending remedy decision.
+`queue.start` rejects a lease shorter than `4 × statement_deadline` before
+starting any process (`queue.LeaseTooShortForDeadline`). This minimum is
+independent of `maximum_concurrency`: renewal has its own actor, reserved
+connection, and batch statement. The old coordinator timing rule and its T2
+reproduction remain in [PERFORMANCE-EVIDENCE.md](docs/PERFORMANCE-EVIDENCE.md)
+as historical evidence. Current implementation and validation progress are
+tracked in [RELEASE-EXECUTION.md](docs/RELEASE-EXECUTION.md).
 
 ## Migrations
 
@@ -831,3 +814,10 @@ The pinned oracle source, commit, licenses, normalized observations, deliberate
 differences, and per-behavior evidence categories are recorded in
 [oracle/ORACLE-LEDGER.md](oracle/ORACLE-LEDGER.md). The separate
 [consumer package](consumer/README.md) imports only public Grind modules.
+
+The PostgreSQL gate also checks the oracle ledger and compares a shared catalog
+of paired Grind/Oban scenarios. It retains results and source/catalog hashes under
+`oracle/results/`. Independent-node fault scenarios and the long mixed soak live
+in the [resilience harness](resilience/README.md); load and durable-completion
+measurements live in the [benchmark harness](bench/README.md). Current acceptance
+status is recorded in [the release execution ledger](docs/RELEASE-EXECUTION.md).

@@ -1,5 +1,14 @@
 # Risk register
 
+Current work (2026-09-28): automatic acknowledgements and reconciliation now
+run in the attempt process. A separate renewer uses a reserved connection per
+consumer. The complete root/consumer/paired gate, retained benchmark composite
+and approved two-hour soak pass within their recorded evidence scope. See
+[RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) for source snapshots, validation
+and the owner-approved scope. Historical subsections below preserve the old
+coordinator measurements and decisions; they do not describe current topology.
+Dirty source runs remain exploratory evidence.
+
 A standing inventory of Grind's known correctness, durability, and operational
 risks. Each entry is a real, currently-accepted trade-off or an open gap — not
 a hypothetical. Entries come from `README.md` ("Guarantees and
@@ -17,19 +26,19 @@ change without a design decision), **open** (a real gap, no fix scheduled),
 2. [pog's rollback crashes on a failed rollback](#2-pogs-rollback-crashes-on-a-failed-rollback)
 3. [Network-fault coverage stops at a killed backend](#3-network-fault-coverage-stops-at-a-killed-backend)
 4. [Coordinator renewal starvation under several pending acknowledgements](#4-coordinator-renewal-starvation-under-several-pending-acknowledgements)
-5. [Lease-vs-deadline rule has zero margin and does not cover more than two siblings](#5-lease-vs-deadline-rule-has-zero-margin-and-does-not-cover-more-than-two-siblings)
+5. [Lease timing depends on progressing storage and scheduling](#5-lease-timing-depends-on-progressing-storage-and-scheduling)
 6. [Each claim costs two statements, one per free slot per round](#6-each-claim-costs-two-statements-one-per-free-slot-per-round)
 7. [`search_path` must point at the intended schema](#7-search_path-must-point-at-the-intended-schema)
 8. [External effects are not exactly-once](#8-external-effects-are-not-exactly-once)
 9. [Retention ends reconciliation and replay guarantees](#9-retention-ends-reconciliation-and-replay-guarantees)
 10. [Large-table migration cost and the `grind_v12` stop-the-world deploy](#10-large-table-migration-cost-and-the-grind_v12-stop-the-world-deploy)
 11. [Mixing cigogne and `postgres.migrate` on one database](#11-mixing-cigogne-and-postgresmigrate-on-one-database)
-12. [Atom growth from repeated validate/start calls](#12-atom-growth-from-repeated-validatestart-calls)
+12. [Atom growth from repeated validation and consumer starts](#12-atom-growth-from-repeated-validation-and-consumer-starts)
 13. [Sinal forwarder delivery is best-effort](#13-sinal-forwarder-delivery-is-best-effort)
 14. [Plain `submit`/`submit_at` are not retry-safe](#14-plain-submitsubmit_at-are-not-retry-safe)
 15. [Untested different-key/same-`SubmissionId` race](#15-untested-different-keysame-submissionid-race)
 16. [Migration-path gaps: no end-to-end cigogne test, no genuine lost-reply upgrade test](#16-migration-path-gaps-no-end-to-end-cigogne-test-no-genuine-lost-reply-upgrade-test)
-17. [No load, multi-node, or soak evidence yet](#17-no-load-multi-node-or-soak-evidence-yet)
+17. [Endurance evidence has a finite duration and deployment scope](#17-endurance-evidence-has-a-finite-duration-and-deployment-scope)
 18. [No connection pooler exercised](#18-no-connection-pooler-exercised)
 19. [Single coordinator process caps per-consumer throughput at high concurrency](#19-single-coordinator-process-caps-per-consumer-throughput-at-high-concurrency)
 
@@ -38,25 +47,45 @@ change without a design decision), **open** (a real gap, no fix scheduled),
 ### 1. Coupling to pog's private `Connection` shape
 
 **What can happen.** Grind's own bounded checkout
-(`grind_postgres_ffi.erl`) calls `pgo:checkout/2`/`checkin`/`break` directly
+(`grind_postgres_ffi.erl`) calls pgo's checkout/return APIs directly
 and pattern-matches pog's private `Connection` representation
 (`{pool, Name} | {single_connection, Conn}`) to reach the underlying `pgo`
-pool. Neither shape is part of pog's public contract. A pog/pgo upgrade that
-changes either one silently breaks Grind's deadline enforcement instead of
-failing to compile.
+pool. Neither shape is part of pog's public contract. Pool shutdown also removes
+that pool's entries from the private `pg_types_table` and `pgo_query_cache` ETS
+tables after the pool's internal children and tracked Grind calls finish.
+Capturing that internal supervisor also depends on pgo's process topology.
+Recovery checks the private pgo connection record and retires unusable checkout
+holders through `pgo_pool:disconnect/4`; merely breaking the connection cannot
+remove an old holder whose owner has died or reconnected.
+The pinned driver also assumes the default TCP port backend. An independent
+probe with `-kernel inet_backend socket` failed in its type-loader close path;
+the alternate socket backend is unsupported by this dependency version.
+A dependency upgrade that changes these shapes can break deadline enforcement
+or cache cleanup without failing to compile.
 
 **Likelihood / impact.** Low likelihood (both dependencies are pinned to
 narrow ranges), high impact if it happens silently (deadlines stop applying
 without any visible error).
 
 **Current mitigation.** `gleam.toml` pins `pog` to `>= 4.1.0 and < 4.2.0` and
-`pgo` to `>= 0.20.0 and < 0.21.0` — a routine minor/patch bump inside the
-pinned range cannot change either shape without also bumping past the pin.
-`pog_connection_pool_shape_test` independently asserts the exact shape at
-test time.
+`pgo` to `>= 0.20.0 and < 0.21.0`. These ranges limit upgrade scope but do not
+guarantee private representations remain stable. `pog_connection_pool_shape_test`
+independently asserts the connection shape. Startup/cache regressions require
+positive entries in both private cache tables, then prove scoped cleanup and
+continued operation of a live sibling pool.
+
+Cooperative close and failed-start unwind are the cleanup boundary. Direct
+queries through the internal raw pog connection bypass call tracking and must
+be drained by their caller. Forcibly killing the lifecycle owner loses its
+tracking state; cleanup after that kill is not guaranteed. Deterministic probes
+found that merely waiting for the registered pool, or even all its children,
+is insufficient: application callers can still write the shared query cache.
+The tracked-call repair and its current validation status are recorded in
+[RELEASE-EXECUTION.md](RELEASE-EXECUTION.md).
 
 **Evidence.** `test/grind_test.gleam`'s `pog_connection_pool_shape_test`
-fails loudly the moment either shape changes.
+checks the pog pool tuple. Startup/cache and reconnect regressions exercise
+the additional private contracts; the shape test alone does not cover them.
 
 **Status.** Accepted — a deliberate decision (no fork of pog) documented in
 `docs/RELEASE-READINESS.md` ("2b. pog dependency") and `README.md`
@@ -78,11 +107,11 @@ happens (the caller process crashes rather than getting a typed error, so
 Grind's own conservative "unknown" classification never runs).
 
 **Current mitigation.** None inside Grind — this is upstream pog behavior,
-outside Grind's own transaction-callback code. Grind's coordinator is a
-supervised process, so a crash here is contained by OTP supervision and
-surfaces as worker/coordinator death, which existing recovery paths (lease
-expiry, quarantine) already handle — but the specific `CommitUnknown`
-classification for this exact case is bypassed by the crash.
+outside Grind's own transaction-callback code. Automatic acknowledgements
+now run in the supervised attempt process; claims still run in the
+coordinator. A crash in either path is handled through process supervision,
+lease expiry and quarantine, but the specific `CommitUnknown` classification
+for this exact case is bypassed by the crash.
 
 **Evidence.** Untested — noted as a known, pre-existing upstream behavior in
 `docs/RELEASE-READINESS.md` ("2b. pog dependency", "Known, pre-existing
@@ -94,6 +123,15 @@ sense that no red/green test exercises this exact path.
 ---
 
 ### 3. Network-fault coverage stops at a killed backend
+
+**Current evidence update (2026-09-28).** The release execution ledger now
+records independent-node directional partitions with bounded buffering and
+ordered healing, network delay, connection loss and PostgreSQL restart. An
+independent encrypted PostgreSQL probe also passed healthy TLS execution,
+bounded preflight with a suspended TLS controller, caller-death cleanup and
+recovery. The approved two-hour soak now passes; encrypted network-fault
+coverage remains pending. The paragraphs below describe the earlier evidence
+baseline.
 
 **What can happen.** All of Grind's fault-injection evidence for the
 checkout deadline uses a real TCP fault proxy on `127.0.0.1` (dropped
@@ -134,6 +172,43 @@ untested.
 ---
 
 ### 4. Coordinator renewal starvation under several pending acknowledgements
+
+**Current implementation (2026-09-28).** The owner approved both attempt-owned
+acknowledgements and independent renewal. Each attempt retains its completed
+proposal and concurrency slot through automatic ACK/reconciliation retries;
+it does not invoke the handler again. A separate renewer uses one reserved
+PostgreSQL connection per consumer and renews live attempts in a batch with
+`SKIP LOCKED`, so an ACK row lock does not block a sibling's renewal.
+Ordinary pool saturation cannot consume the reserved connection.
+
+The old coordinator-wide starvation mechanism below has been removed. This
+does not promise liveness during database outages, arbitrary OS scheduling
+stalls, initial connection/reconnection delays, or contention on the same
+attempt's row. Returned proposals remain eligible for renewal for at most
+one lease duration after the completion notice. An expired fence cannot
+write a fresh acknowledgement; a retained committed receipt can still be
+reconciled. Quarantine and audited replay remain the recovery boundary.
+
+**Current evidence.** The executor regressions cover first-ACK rollback,
+slow ACKs alongside live siblings, and saturation of the ordinary pool.
+The accepted benchmark composite at
+`bench/results/l7-drain-pair-20260928T091612Z/composite-audit-v4.json`
+includes 1,254 healthy sibling jobs, all succeeded with one receipt.
+Its 576 selected slow-ACK targets split into 288 successes and 288 quarantines
+under the defined below/above-deadline profiles. These are finite tested
+configurations, not an unconditional liveness guarantee. See the latest
+[recovery evidence](RECOVERY-EVIDENCE.md#executor-acknowledgements-reserved-renewal-and-resource-lifetime--2026-09-28).
+
+**Current status.** Mitigated — the selected architecture and regressions
+are implemented. The approved two-hour soak passed 266 mixed fault rounds;
+its scope and remaining limits are recorded in risk 17 and the latest
+recovery evidence.
+
+#### Historical coordinator design and reproduction, 2026-09-27
+
+The text below records the earlier implementation, its observed failures
+and the remedy options before the owner's decision. Its references to an
+unimplemented remedy and `L >= 6D` are historical.
 
 **Status update (2026-09-27): confirmed real by reproduction, severity
 raised to high.** This was previously an open-but-theoretical risk, derived
@@ -259,7 +334,37 @@ recommends against shipping with option 3 (documentation) alone.
 
 ---
 
-### 5. Lease-vs-deadline rule has zero margin and does not cover more than two siblings
+### 5. Lease timing depends on progressing storage and scheduling
+
+**Current rule.** `queue.start` requires `L >= 4D`, independent of concurrency,
+where `L` is the lease duration and `D` is the storage deadline. The reserved
+renewer runs every `L / 3` and arms its next timer before starting the current
+database operation. It uses one batch statement and skips locked rows.
+The timing argument leaves storage margin at the first-renewal boundary and
+in steady state; it assumes an established, progressing reserved connection.
+
+**Remaining risk.** The rule does not bound every initial connection or
+reconnection delay, contended checkout wait, OS scheduling pause, or lock on
+that attempt's own row. Fencing rejects an expired attempt even when its
+handler is otherwise healthy. The failed first long soak demonstrates this
+boundary: a 275-second host software sleep crossed a healthy job's lease
+expiry; the job became `uncertain` with one effect and no receipt or replay.
+The assertions correctly failed that run.
+
+**Current evidence.** `src/grind/internal/queue/timing.gleam` enforces the
+minimum; `test/grind/queue/executor_test.gleam` exercises independent renewal
+under slow ACKs and ordinary-pool saturation. The [lease timing argument](RELEASE-EXECUTION.md#lease-timing)
+and the [host-suspension evidence](RECOVERY-EVIDENCE.md#host-suspension-during-the-first-full-soak--2026-09-28)
+state the supported limits.
+
+**Current status.** Mitigated — the former concurrency-dependent rule is
+replaced. Unbounded storage or host suspension still requires quarantine
+and an explicit recovery decision.
+
+#### Historical zero-margin and multi-sibling rule
+
+The following derivation records the superseded coordinator-owned path.
+Its `6D`/`1.5D` thresholds and open multi-sibling gap are not current validation.
 
 **What can happen.** `queue.LeaseTooShortForDeadline` requires a lease of at
 least `6 × D` (`maximum_concurrency > 1`) or `1.5 × D` (`maximum_concurrency`
@@ -622,38 +727,48 @@ not mechanically enforced.
 
 ---
 
-### 12. Atom growth from repeated validate/start calls
+### 12. Atom growth from repeated validation and consumer starts
 
-**What can happen.** Erlang atoms are never garbage-collected. Several
-Grind code paths create at least one atom on each call: `postgres.validate`
-creates the pool's `process.Name` once per distinct `ValidatedSettings`
-value (though it is reused, not recreated, on repeated `start`/`close`
-cycles against the _same_ validated settings — see `docs/RELEASE-READINESS.md`,
-"2b"); `grind/observation`'s descriptor constructors build native atom
-lists per call (`job_event_name`, `atom.create` for each event's name
-components); each `queue.start`/`pruner.start` also creates process names for
-its own supervision tree. A caller that repeatedly builds _fresh_
-`ValidatedSettings` values (rather than reusing one) — or that calls a
-descriptor-constructing function in a hot loop rather than once at setup —
-grows the atom table without bound over a long-running node's lifetime,
-eventually crashing the VM (the atom table has a fixed maximum size).
+**What can happen.** Erlang retains atoms for the lifetime of a VM. Each
+successful `postgres.validate` creates unique pool and forwarder names.
+Reusing the same `ValidatedSettings` reuses those names; the first start
+creates a stable deadline-owner name for that pool. Each fresh public
+`queue.start` creates three registration atoms: coordinator, reserved
+renewal pool, and that pool's deadline owner. Supervised child restarts
+reuse those names. Fresh pruner starts or child-specification construction
+also allocate a unique pruner name.
 
-**Likelihood / impact.** Low likelihood under the documented usage pattern
-(construct settings/descriptors once at application startup, reuse the
-resulting value) — high impact if violated on a long-lived node (an
-unrecoverable VM crash, not a graceful failure).
+Event descriptors use a fixed vocabulary of atom names. Reconstructing a
+descriptor reuses the same atoms after first use; it does not cause
+unbounded atom growth. The earlier register incorrectly attributed
+per-call growth to these fixed descriptor names.
 
-**Current mitigation.** Pool-name reuse across repeated `start` calls for
-the same `ValidatedSettings` (fixed in the same change that dropped the pog
-fork — see `docs/RELEASE-READINESS.md`, "2b", "Pool name lifetime").
-Everything else relies on the documented calling convention (validate
-once, register workers once, build event descriptors once) rather than a
-mechanical guard.
+**Likelihood / impact.** Repeated fresh lifecycle construction grows the
+atom table permanently. Exhausting the VM's atom limit crashes the VM.
+Long-lived supervision trees and reused validated database settings avoid
+repeated allocation during ordinary restarts. Fresh consumer start/stop
+churn remains an allocation path.
 
-**Evidence.** Not measured — `docs/RELEASE-READINESS.md` ("Evidence still
-missing", "Soak") lists atom growth as untested over time.
+**Current mitigation.** Reuse validated settings and existing supervised
+children. There is no bound on cumulative atoms under indefinite creation
+of fresh consumer handles.
 
-**Status.** Open — no soak test exists to bound or disprove this.
+**Evidence.** The completed rehearsal at
+`resilience/results/repaired-300s-jBvw19` observed 108 additional worker
+atoms across 36 fresh consumer starts. `resilience/run.py` checks the
+documented three-atoms-per-start rate, with a fixed 64-atom warmup margin;
+it does not prove that cumulative atom use is bounded. The completed
+two-hour run at `resilience/results/repaired-7200s-8YvcJq` observed another
+1,596 worker atoms across 532 fresh starts (15,086 to 16,682), exactly three
+per start. The admin VM stayed at 14,863 atoms. This confirms the allocation
+rate for that run, not a fixed lifetime bound.
+
+The allocations are in `postgres.validate`, `queue.start`,
+`grind_pool_ffi:start_deadline_owner/2`, and the pruner constructors.
+`grind/observation` constructs descriptors from fixed names; `atom.create`
+only inserts a new atom when that string does not already exist.
+
+**Status.** Open — measured lifecycle allocation, documented and monitored.
 
 ---
 
@@ -788,33 +903,56 @@ proxy's `OnCommit`/`DropReply` does not produce a genuine commit for
 
 ---
 
-### 17. No load, multi-node, or soak evidence yet
+### 17. Endurance evidence has a finite duration and deployment scope
 
-**What can happen.** Four categories of evidence that would matter for a
-production deployment have not been produced:
+**Current evidence.** Load and independent-node results now exist. The
+accepted exploratory benchmark composite is
+`bench/results/l7-drain-pair-20260928T091612Z/composite-audit-v4.json`.
+The initial complete rehearsal at `resilience/results/repaired-300s-jBvw19`
+passed fourteen standalone cases and eighteen mixed fault rounds.
 
-- **Load**: throughput/latency at `maximum_concurrency > 1`, several
-  consumers against one database, polling cost, and lock contention under
-  realistic concurrency are not measured in the committed test suite (see
-  risk 6 for the one informal benchmark taken during this documentation
-  pass).
-- **Multi-node**: two BEAM nodes claiming from the same queues, with one
-  killed mid-job, is not exercised.
-- **Soak**: atom growth (risk 12), timer accumulation, forwarder mailbox
-  growth, and pool connection behavior over a long-running process are not
-  measured over time.
-- **TLS/pooler-fronted deployments**: see risks 3 and 18.
+The owner-approved two-hour run at
+`resilience/results/repaired-7200s-8YvcJq` passed all fourteen standalone
+cases and 266 mixed rounds. The actual runner exit was zero. The final
+independent `soak-audit-v5.json` reports 7,202.060719 seconds after warmup;
+its independent monotonic lower bound is 7,202.058878 seconds. The same two
+primary VMs spanned the run, and each of the nine fault types ran 29 or 30
+times. Its final M2/M6 comparison against the pinned Oban evidence also passes.
 
-**Likelihood / impact.** Certain to matter eventually for any production
-deployment beyond a single node/single consumer; impact is unknown precisely
-because the evidence does not exist yet — that is the risk.
+The retained v4 audit rejected an invalid comparison between BEAM and
+controller wall-clock timestamps. Reviewed v5 verifies the existing release
+barriers, callback identities, controller monotonic order and durable replay
+fences. Workload, duration, fault, accounting and resource requirements were
+unchanged. Both audit versions, the original rejection and the reviewed
+diff remain retained.
 
-**Current mitigation.** None yet; this evidence is planned, not produced.
+**Measured limits.** Every drained sample had 104 processes, one deadline
+entry and 797 type-cache entries per primary VM. Query-cache entries stayed
+at 21 for admin and 22 for worker; owner and aggregate mailboxes and synthetic worker ETS
+entries stayed empty. Peak memory was 57,836,519 bytes for admin and 59,186,600 bytes for worker;
+peak database sessions were eight and primary retained storage 245,760 bytes.
+These observations passed the existing fixed bounds. Worker atoms instead
+grew by 1,596 across 532 fresh consumer starts, exactly three per start (risk 12).
+Active timers and the forwarder mailbox/drop metrics are not directly
+sampled; bounded atoms under indefinite churn are not established.
 
-**Evidence.** `docs/RELEASE-READINESS.md` ("4. Evidence still missing")
-lists all three categories explicitly as open.
+**Historical failure.** The prior 86,400-second attempt in
+`resilience/results/repaired-86400s-o23a23` remains failed after host
+software sleep crossed a lease deadline. Its elapsed time contributed
+nothing to the fresh run. Day-long endurance remains unverified.
 
-**Status.** Open — planned.
+**Deployment limits.** Dirty source snapshots remain exploratory evidence,
+not a clean release-candidate run. The separate TLS probe establishes
+bounded local preflight and recovery for its tested cases, not encrypted
+partition coverage. Connection poolers and initial connection hangs remain
+separate gaps (risks 3 and 18). Final process absence and completed immediate
+PostgreSQL shutdown were checked independently; public exit acknowledgements
+alone do not prove graceful OS shutdown.
+
+**Status.** The approved-duration requirement is satisfied for this frozen
+exploratory run. Broader deployment coverage remains open. See
+[release execution](RELEASE-EXECUTION.md#approved-soak-duration-2026-09-28)
+and the [completed soak evidence](RECOVERY-EVIDENCE.md#two-hour-mixed-soak-and-final-audit--2026-09-28).
 
 ---
 
@@ -833,9 +971,81 @@ definition nothing is running to set it once a session has already gone
 idle, or for `search_path`, since nothing in Grind re-asserts it once a
 transaction is already under way.
 
+**PgBouncer specifically, and why `search_path` is the sharpest edge of the
+three.** PgBouncer applies a client's own startup parameters to the
+_server_ connection it hands out only under certain configurations: by
+default it can silently **ignore** startup parameters it does not
+recognize or was not told to track (`ignore_startup_parameters`), and even
+when told to track one (`track_extra_parameters`, which must explicitly
+list `search_path` to preserve it at all under PgBouncer's own default
+parameter handling), **transaction pooling mode** hands a client a
+_different_ physical server connection per transaction — one that was
+last configured for whatever startup parameters some _other_ client
+session set on it, not necessarily this one's. A pooler configured this
+way would not error; it would simply run Grind's queries against
+whatever schema that physical connection's `search_path` happens to
+already be set to, silently breaking the entire isolation model
+`postgres.with_schema` depends on (README, "Isolation") — indistinguishable
+from a correctly-isolated installation until two workloads' data
+inexplicably starts mixing. This is a categorically worse failure mode
+than the pre-existing `idle_in_transaction_session_timeout` risk below: a
+dropped timeout loses one backstop; a dropped or stale `search_path` can
+silently point an entire installation at the wrong schema.
+
+**Likelihood / impact.** Moderate likelihood (poolers are common in
+production Postgres deployments, and PgBouncer's transaction pooling mode
+specifically is a popular, recommended default for high-connection-count
+deployments — exactly where Grind is most likely to be introduced); high
+impact for `search_path` if encountered (silent cross-installation data
+mixing, not merely a lost backstop), moderate impact for the other two.
+
+**Current mitigation.** `default_transaction_isolation`'s in-transaction
+fallback pin. No equivalent exists for the idle-session timeout or for
+`search_path`. An operator placing PgBouncer (or similar) between Grind and
+PostgreSQL must run it in **session pooling mode**, not transaction pooling,
+and must explicitly configure it to preserve `search_path` (PgBouncer:
+add `search_path` to `track_extra_parameters`, and ensure
+`ignore_startup_parameters` does not include it) — otherwise `postgres.with_schema`'s
+own guarantee does not hold through the pooler. This is documentation-only
+today; nothing in Grind detects or defends against a pooler silently
+misapplying `search_path`.
+
+**Evidence.** Named explicitly in `docs/RECOVERY-EVIDENCE.md` ("Limits", "No
+poolers").
+
+**Status.** Open.
+
 ---
 
 ### 19. Single coordinator process caps per-consumer throughput at high concurrency
+
+**Current topology and result.** The coordinator still claims one job at a
+time, with an expired-lease quarantine scan before each claim. Attempts now
+write their own ACKs and reconciliation calls; a reserved renewer performs
+batch renewals independently. The old description of every ACK and renewal
+passing through the coordinator is superseded.
+
+The fresh matched L7 pair in
+`bench/results/l7-drain-pair-20260928T091612Z/composite-audit-v4.json`
+reports median one-C50/five-C10 throughput ratios of approximately 0.426
+without added delay and 0.201 with the configured delay. Both remain below
+the existing 0.70 T3 threshold. These results establish a remaining
+single-consumer throughput limitation in those configurations. They are
+not a controlled before/after speedup comparison with the original 0.32
+measurement below.
+
+**Current mitigation and status.** Open — split total concurrency across
+several consumers where measured workload results support it, and budget
+one reserved renewal connection per consumer. Attempt-owned ACK is already
+implemented for correctness. Batch claiming and broader claim-path
+optimization remain deferred performance work; the historical second remedy
+below is no longer pending.
+
+#### Historical serialized coordinator profile and deferred remedies
+
+The following measurements and remedy list describe the original topology
+at the cited source revision. Preserve them as evidence of the original
+bottleneck, not as a description of current ACK or renewal ownership.
 
 **What can happen.** Every claim, renewal, and acknowledgement for one
 `queue.start` consumer is a synchronous round trip on that consumer's own
@@ -906,47 +1116,3 @@ still missing" tracks the two deferred remedies above.
 **Status.** Open — mitigation is topology guidance only; both remedies are
 tracked, deferred post-release optimizations (user decision, 2026-09-27),
 not scheduled.
-
-**PgBouncer specifically, and why `search_path` is the sharpest edge of the
-three.** PgBouncer applies a client's own startup parameters to the
-_server_ connection it hands out only under certain configurations: by
-default it can silently **ignore** startup parameters it does not
-recognize or was not told to track (`ignore_startup_parameters`), and even
-when told to track one (`track_extra_parameters`, which must explicitly
-list `search_path` to preserve it at all under PgBouncer's own default
-parameter handling), **transaction pooling mode** hands a client a
-_different_ physical server connection per transaction — one that was
-last configured for whatever startup parameters some _other_ client
-session set on it, not necessarily this one's. A pooler configured this
-way would not error; it would simply run Grind's queries against
-whatever schema that physical connection's `search_path` happens to
-already be set to, silently breaking the entire isolation model
-`postgres.with_schema` depends on (README, "Isolation") — indistinguishable
-from a correctly-isolated installation until two workloads' data
-inexplicably starts mixing. This is a categorically worse failure mode
-than the pre-existing `idle_in_transaction_session_timeout` risk below: a
-dropped timeout loses one backstop; a dropped or stale `search_path` can
-silently point an entire installation at the wrong schema.
-
-**Likelihood / impact.** Moderate likelihood (poolers are common in
-production Postgres deployments, and PgBouncer's transaction pooling mode
-specifically is a popular, recommended default for high-connection-count
-deployments — exactly where Grind is most likely to be introduced); high
-impact for `search_path` if encountered (silent cross-installation data
-mixing, not merely a lost backstop), moderate impact for the other two.
-
-**Current mitigation.** `default_transaction_isolation`'s in-transaction
-fallback pin. No equivalent exists for the idle-session timeout or for
-`search_path`. An operator placing PgBouncer (or similar) between Grind and
-PostgreSQL must run it in **session pooling mode**, not transaction pooling,
-and must explicitly configure it to preserve `search_path` (PgBouncer:
-add `search_path` to `track_extra_parameters`, and ensure
-`ignore_startup_parameters` does not include it) — otherwise `postgres.with_schema`'s
-own guarantee does not hold through the pooler. This is documentation-only
-today; nothing in Grind detects or defends against a pooler silently
-misapplying `search_path`.
-
-**Evidence.** Named explicitly in `docs/RECOVERY-EVIDENCE.md` ("Limits", "No
-poolers").
-
-**Status.** Open.
