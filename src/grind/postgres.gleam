@@ -123,7 +123,7 @@ pub fn with_migration_deadline(
   Settings(..settings, migration_deadline_ms: milliseconds)
 }
 
-/// Sets the bounded number of `[grind, job, *]` observations the package's
+/// Sets the bounded number of lifecycle, pruning and diagnostic observations the package's
 /// own `sinal/forwarder.Forwarder` holds in flight at once. Exceeding it
 /// drops the observation and is reported once per drain via
 /// `sinal/forwarder.dropped_event` (`[sinal, forwarder, dropped]`); it never
@@ -456,7 +456,7 @@ pub type StartError {
 /// this `Database` performs is simply whatever `grind_jobs` and its sibling
 /// tables in that one schema hold. Also starts this `Database`'s own
 /// `sinal/forwarder.Forwarder`
-/// — see `grind/observation` for the events it carries — nested under its
+/// — see `grind/observation` and `grind/diagnostic` for its events — nested under its
 /// own dedicated supervisor, added to the root as a `Temporary` child.
 /// `validate` already allocated the forwarder's name and shared counters,
 /// which are reused across starts so retained handles address the same

@@ -12,8 +12,10 @@ import gleam/otp/static_supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import grind/diagnostic
 import grind/internal/attempt
 import grind/internal/consumer_hooks.{type Hooks}
+import grind/internal/diagnostics
 import grind/internal/pool
 import grind/internal/queue/active.{type ActiveAttempt, ActiveAttempt} as queue_active
 import grind/internal/queue/handoff as queue_handoff
@@ -23,6 +25,7 @@ import grind/internal/queue/worker as queue_worker
 import grind/postgres.{type Database}
 import grind/registry.{type Registry}
 import pog
+import sinal/forwarder
 
 /// An independently supervised consumer for one configured queue. The process
 /// that starts the consumer owns its supervisor and must also stop it.
@@ -336,6 +339,7 @@ type Message {
   RenewalObserved(attempt_id: Int, epoch: Int, status: queue_renewer.Status)
   ReadRenewalStatus(reply: process.Subject(Option(RenewalStatus)))
   ProcessOne(reply: process.Subject(Result(Bool, ProcessError)))
+  AttemptAcknowledging(id: Int, attempt_id: Int, epoch: Int)
   AttemptFinished(
     id: Int,
     attempt_id: Int,
@@ -578,7 +582,7 @@ fn start_configured_consumer_with_handoff(
         Error(error) -> Error(string.inspect(error))
         Ok(started_factory) -> {
           use started_renewer <- result.try(
-            queue_renewer.start(
+            queue_renewer.start_observed(
               renewal_connection,
               queue_name,
               attempt_owner,
@@ -590,6 +594,7 @@ fn start_configured_consumer_with_handoff(
                   RenewalObserved(attempt_id, epoch, status),
                 )
               },
+              postgres.forwarder(database),
             )
             |> result.map_error(string.inspect),
           )
@@ -621,7 +626,8 @@ fn start_configured_consumer_with_handoff(
                 shutting_down: False,
                 shutdown_generation: 0,
                 shutdown_replies: [],
-              ),
+              )
+              |> emit_capacity,
             )
             |> actor.selecting(selector)
             |> actor.returning(subject),
@@ -1007,6 +1013,31 @@ fn handle_message(
           }
       }
     }
+    AttemptAcknowledging(id, attempt_id, epoch) -> {
+      case queue_active.find_active(state.active, id, attempt_id, epoch) {
+        Error(Nil) -> actor.continue(state)
+        Ok(active) ->
+          case active.phase {
+            diagnostic.AcknowledgementPending -> actor.continue(state)
+            diagnostic.HandlerRunning -> {
+              let active_attempts =
+                queue_active.replace_active(
+                  state.active,
+                  id,
+                  attempt_id,
+                  epoch,
+                  ActiveAttempt(
+                    ..active,
+                    phase: diagnostic.AcknowledgementPending,
+                  ),
+                )
+              actor.continue(emit_capacity(
+                ConsumerState(..state, active: active_attempts),
+              ))
+            }
+          }
+      }
+    }
     AttemptFinished(id, attempt_id, epoch, result) ->
       finish_attempt(state, id, attempt_id, epoch, result)
     WorkerDown(down) -> handle_worker_down(state, down)
@@ -1017,6 +1048,10 @@ fn begin_shutdown(
   state: ConsumerState,
   reply: process.Subject(ShutdownReply),
 ) -> actor.Next(ConsumerState, Message) {
+  let state = case state.shutting_down {
+    True -> state
+    False -> emit_capacity(ConsumerState(..state, shutting_down: True))
+  }
   case list.is_empty(state.active) {
     True -> {
       process.send(reply, ShutdownDrained)
@@ -1094,6 +1129,7 @@ fn start_attempt(
         queue_worker.WorkerRequest(
           queue_subject: incarnation_subject,
           claimed:,
+          on_acknowledging: AttemptAcknowledging,
           on_complete: AttemptFinished,
           database:,
           queue:,
@@ -1132,12 +1168,14 @@ fn start_attempt(
                   monitor:,
                   completion:,
                   renewal_status: LeaseRenewalConfirmed,
+                  phase: diagnostic.HandlerRunning,
                 )
               let state =
                 ConsumerState(
                   ..state,
                   active: list.prepend(state.active, active),
                 )
+                |> emit_capacity
               continue_after_start(state, completion)
             }
           }
@@ -1271,6 +1309,7 @@ fn finish_attempt(
             epoch,
           ),
         )
+        |> emit_capacity
       finish_completion(
         state,
         active.completion,
@@ -1456,6 +1495,7 @@ fn handle_worker_down(
                 epoch,
               ),
             )
+            |> emit_capacity
           case completion {
             ManualCompletion(reply) ->
               process.send(reply, Error(QueueWorkerExited))
@@ -1484,4 +1524,33 @@ fn schedule_next_poll(state: ConsumerState) -> Nil {
     poll_interval_ms,
     Poll,
   )
+}
+
+/// Counts the coordinator's own fenced ledger, never global queue depth.
+fn emit_capacity(state: ConsumerState) -> ConsumerState {
+  let ValidatedPolicy(maximum_concurrency:, ..) = state.policy
+  let active = list.length(state.active)
+  let ack_pending =
+    state.active
+    |> list.filter(fn(entry) {
+      entry.phase == diagnostic.AcknowledgementPending
+    })
+    |> list.length
+  let _ =
+    forwarder.emit(
+      postgres.forwarder(state.database),
+      diagnostic.capacity(),
+      diagnostic.CapacityMeasurements(
+        maximum: maximum_concurrency,
+        active:,
+        running: active - ack_pending,
+        ack_pending:,
+        available: maximum_concurrency - active,
+      ),
+      diagnostic.CapacityMetadata(
+        queue: diagnostics.queue_ref(state.queue, state.attempt_owner),
+        draining: state.shutting_down,
+      ),
+    )
+  state
 }

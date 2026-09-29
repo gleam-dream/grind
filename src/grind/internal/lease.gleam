@@ -101,6 +101,14 @@ pub fn quarantine_expired_in_queue(
   forwarder: Forwarder,
   queue: String,
 ) -> Result(Nil, pog.QueryError) {
+  quarantine_expired_in_queue_measured(connection, forwarder, queue).value
+}
+
+pub fn quarantine_expired_in_queue_measured(
+  connection: pog.Connection,
+  forwarder: Forwarder,
+  queue: String,
+) -> store.Measured(Result(Nil, pog.QueryError)) {
   // `FOR NO KEY UPDATE`: `quarantine_update_sql`'s own `UPDATE` never
   // touches `id`, so this candidate lock does not need to conflict with a
   // concurrent `unique_admission.candidate_sql`'s `FOR KEY SHARE` on the
@@ -115,13 +123,19 @@ pub fn quarantine_expired_in_queue(
     pog.query(sql)
     |> pog.parameter(pog.text(queue))
     |> pog.returning(quarantine_row_decoder())
-  case store.execute_safely(query, on: connection) {
+  let measured = store.execute_measured(query, on: connection)
+  let value = case measured.value {
     Error(error) -> Error(error)
     Ok(returned) -> {
       list.each(returned.rows, fn(row) { emit_quarantined(forwarder, row) })
       Ok(Nil)
     }
   }
+  store.Measured(
+    value:,
+    call_duration_us: measured.call_duration_us,
+    checkout: measured.checkout,
+  )
 }
 
 /// Builds and forwards `[grind, job, quarantined]` for one row a quarantine

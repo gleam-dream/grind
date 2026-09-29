@@ -188,6 +188,13 @@ for contract in admission-read-passed two-schemas-share-database-isolated two-ur
     fi
   done
 
+  for contract in diagnostic-capacity-worker-death measured-checkout-stale-candidates measured-checkout-contention measured-checkout-original-deadline measured-checkout-nested-and-rollback measured-checkout-exception-cleanup diagnostic-ack-rollback-retry-capacity diagnostic-renewal-database-headroom diagnostic-renewal-failure-recovery diagnostic-local-capacity-transitions diagnostic-ack-reconciled-after-lost-reply diagnostic-renewal-skipped-lock diagnostic-blocked-overflow-does-not-stall diagnostic-claim-stage-failures diagnostic-completion-budget-once diagnostic-ack-unknown-retry; do
+    if ! grep -q "$contract" "$root/database-test-ran"; then
+      echo "PostgreSQL diagnostic contract did not execute: $contract" >&2
+      exit 1
+    fi
+  done
+
   (
   cd "$repo_root/oracle"
   # Hex is not preinstalled anywhere this gate's own toolchain provides —
@@ -229,7 +236,7 @@ consumer_bad_url="postgres://grind@127.0.0.1:$port/grind_database_missing?sslmod
   GRIND_CONSUMER_TEST_MARKER="$root/consumer-test-ran" \
     gleam test
 )
-for contract in two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed consumer-unique-admission-existing-conflict-retry-passed consumer-unique-reschedule-across-queues-passed consumer-observes-acknowledged-passed consumer-observes-claimed-passed consumer-submit-with-id-retry-passed consumer-prune-finished-passed; do
+for contract in consumer-observes-capacity-passed two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed consumer-unique-admission-existing-conflict-retry-passed consumer-unique-reschedule-across-queues-passed consumer-observes-acknowledged-passed consumer-observes-claimed-passed consumer-submit-with-id-retry-passed consumer-prune-finished-passed; do
   if ! grep -q "$contract" "$root/consumer-test-ran"; then
     echo "external-consumer integration contract did not execute: $contract" >&2
     exit 1

@@ -6,6 +6,7 @@ import gleam/json
 import gleam/otp/actor
 import gleam/result
 import gleeunit/should
+import grind/diagnostic
 import grind/internal/consumer_hooks
 import grind/job
 import grind/postgres
@@ -15,9 +16,11 @@ import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt, spawn_lock_holder,
 }
 import grind/support/consumer.{manual_policy}
+import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/lease_queries.{attempt_count_for}
 import grind/support/lock_wait.{await_claim_waiting_on_advisory}
+import grind/support/observers.{detach}
 import grind/support/queue_signals.{
   ConcurrentClaimWorkerStarted, WorkerDeathStarted, WorkerInvoked,
 }
@@ -478,6 +481,11 @@ fn run_temporary_worker_death_test(database_url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, definition)
   let assert Ok(handle) =
     postgres.submit(database, "worker-death", definition, 31)
+  let #(capacity, attachment) =
+    diagnostics.capture("worker-death", diagnostic.capacity(), fn(meta) {
+      meta.queue.queue == "worker-death"
+    })
+  use <- exception.defer(fn() { detach(attachment) })
   let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
 
@@ -493,10 +501,20 @@ fn run_temporary_worker_death_test(database_url: String) -> Nil {
     Nil
   })
   process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
+  let assert Ok(#(occupied, _)) =
+    diagnostics.await(capacity, fn(sample) { sample.0.active == 1 }, 5000)
+  occupied.running |> should.equal(1)
+  occupied.ack_pending |> should.equal(0)
   process.kill(worker_pid)
   process.receive(reply, within: 5000)
   |> should.equal(Ok(Error(queue.QueueWorkerExited)))
   postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+  let assert Ok(#(empty, _)) = process.receive(capacity, 5000)
+  empty.active |> should.equal(0)
+  empty.running |> should.equal(0)
+  empty.ack_pending |> should.equal(0)
+  empty.available |> should.equal(empty.maximum)
+  mark_database_test_executed("diagnostic-capacity-worker-death")
 
   let connection = postgres.connection(database)
   let assert Ok(_) =

@@ -4,8 +4,9 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleeunit/should
+import grind/diagnostic
 import grind/internal/attempt
 import grind/job
 import grind/observation
@@ -41,16 +42,10 @@ pub fn postgres_acknowledged_observation_overflow_reports_dropped_test() {
   }
 }
 
-/// Overflow: a `Database` started with `observation_capacity(1)` and a
-/// gate-blocked acknowledged handler holds the forwarder's single in-flight
-/// slot; job B's own `[grind, job, claimed]` and `[grind, job, acknowledged]`
-/// observations are both forwarded while that slot is still held (one
-/// `Forwarder` per `Database` carries every `[grind, job, *]` event, not one
-/// per event kind), so both exceed capacity and are dropped — coalesced into
-/// one `[sinal, forwarder, dropped]` report with `rejected: 2` — never
-/// affecting either job's committed state. Job A's own `claimed` observation
-/// is not among them: it is emitted and drained before A's `acknowledged`
-/// handler ever blocks the forwarder.
+/// One real checkout diagnostic blocks the shared forwarder. The following
+/// empty candidate query, two admissions, and six events per completed job
+/// are rejected while its only slot is occupied: exactly fifteen drops.
+/// Handler execution and durable ACKs continue through the blocked subscriber.
 fn run_acknowledged_observation_overflow_reports_dropped_test(
   database_url: String,
 ) -> Nil {
@@ -75,22 +70,21 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
     )
   let assert Ok(workers) = registry.new("observation-overflow")
   let assert Ok(workers) = registry.register(workers, definition)
-  let assert Ok(handle_a) =
-    postgres.submit(database, "observation-overflow", definition, 1)
-  let assert Ok(handle_b) =
-    postgres.submit(database, "observation-overflow", definition, 2)
-
-  // See the isolation test above: the release gate is created *inside* the
-  // handler so it is owned by the forwarder process that receives it.
   let gate_entered = process.new_subject()
-  let acknowledged_attachment =
-    attach_acknowledged_observer("overflow", fn(_measurements, _metadata) {
-      let gate = process.new_subject()
-      process.send(gate_entered, OverflowGateEntered(gate))
-      let assert Ok(Nil) = process.receive(gate, within: 10_000)
-      Nil
+  let assert Ok(id) = sinal.handler_id("diagnostic-overflow-gate")
+  let assert Ok(attachment) =
+    sinal.observe(id, diagnostic.checkout(), fn(_, metadata) {
+      case metadata.queue.queue == "observation-overflow" {
+        False -> Nil
+        True -> {
+          let gate = process.new_subject()
+          process.send(gate_entered, OverflowGateEntered(gate))
+          let assert Ok(Nil) = process.receive(gate, within: 10_000)
+          Nil
+        }
+      }
     })
-  use <- exception.defer(fn() { detach(acknowledged_attachment) })
+  use <- exception.defer(fn() { detach(attachment) })
   let dropped_signal = process.new_subject()
   let dropped_attachment =
     attach_dropped_observer("overflow", fn(measurements, metadata) {
@@ -98,26 +92,52 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
     })
   use <- exception.defer(fn() { detach(dropped_attachment) })
 
-  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
-  use <- exception.defer(fn() { queue.stop(consumer) })
-
-  // Job A occupies the forwarder's only in-flight slot and blocks there.
-  queue.process_one(consumer) |> should.equal(Ok(True))
+  // The first operation emits a real quarantine checkout diagnostic. No
+  // admission or coordinator event can race it for the initial free slot.
+  attempt.claim_one(
+    database,
+    "observation-overflow",
+    workers,
+    "overflow-owner",
+    30_000,
+  )
+  |> should.equal(Ok(None))
   let assert Ok(OverflowGateEntered(gate)) =
     process.receive(gate_entered, within: 5000)
-
-  // Job B's own acknowledgement still commits normally; only its forwarded
-  // observation is dropped for exceeding capacity while A's slot is held.
-  queue.process_one(consumer) |> should.equal(Ok(True))
+  use <- exception.defer(fn() { process.send(gate, Nil) })
+  let assert Ok(handle_a) =
+    postgres.submit(database, "observation-overflow", definition, 1)
+  let assert Ok(handle_b) =
+    postgres.submit(database, "observation-overflow", definition, 2)
+  list.each([handle_a, handle_b], fn(_) {
+    let assert Ok(Some(claimed)) =
+      attempt.claim_one(
+        database,
+        "observation-overflow",
+        workers,
+        "overflow-owner",
+        30_000,
+      )
+    let execution = attempt.execute_claim(claimed)
+    attempt.acknowledge(
+      database,
+      "observation-overflow",
+      "overflow-owner",
+      claimed,
+      execution,
+    )
+    |> should.equal(Ok(True))
+  })
 
   process.send(gate, Nil)
   let assert Ok(DroppedSignal(dropped_measurements, dropped_metadata)) =
     process.receive(dropped_signal, within: 10_000)
-  dropped_measurements.rejected |> should.equal(2)
+  dropped_measurements.rejected |> should.equal(15)
   dropped_metadata.forwarder |> should.not_equal("")
 
   postgres.state(database, handle_a) |> should.equal(Ok(job.Succeeded))
   postgres.state(database, handle_b) |> should.equal(Ok(job.Succeeded))
+  mark_database_test_executed("diagnostic-blocked-overflow-does-not-stall")
   mark_database_test_executed(
     "acknowledged-observation-overflow-reports-dropped-passed",
   )

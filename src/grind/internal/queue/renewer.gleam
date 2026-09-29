@@ -3,9 +3,13 @@
 
 import gleam/erlang/process
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
+import grind/diagnostic
 import grind/internal/attempt
+import grind/internal/diagnostics
 import pog
+import sinal/forwarder.{type Forwarder}
 
 pub type Status {
   Confirmed
@@ -25,6 +29,7 @@ type Phase {
   Running
   Acknowledging(renew_until: Int)
   OwnershipLost
+  CompletionBudgetFinished
 }
 
 type Entry {
@@ -40,6 +45,7 @@ type Entry {
 type State {
   State(
     connection: pog.Connection,
+    forwarder: Option(Forwarder),
     queue: String,
     owner: String,
     lease_ms: Int,
@@ -62,6 +68,46 @@ pub fn start(
   interval_ms: Int,
   on_status: fn(Int, Int, Status) -> Nil,
 ) -> Result(actor.Started(process.Subject(Message)), actor.StartError) {
+  start_with_forwarder(
+    connection,
+    queue,
+    owner,
+    lease_ms,
+    interval_ms,
+    on_status,
+    None,
+  )
+}
+
+pub fn start_observed(
+  connection: pog.Connection,
+  queue: String,
+  owner: String,
+  lease_ms: Int,
+  interval_ms: Int,
+  on_status: fn(Int, Int, Status) -> Nil,
+  forwarder: Forwarder,
+) -> Result(actor.Started(process.Subject(Message)), actor.StartError) {
+  start_with_forwarder(
+    connection,
+    queue,
+    owner,
+    lease_ms,
+    interval_ms,
+    on_status,
+    Some(forwarder),
+  )
+}
+
+fn start_with_forwarder(
+  connection: pog.Connection,
+  queue: String,
+  owner: String,
+  lease_ms: Int,
+  interval_ms: Int,
+  on_status: fn(Int, Int, Status) -> Nil,
+  forwarder: Option(Forwarder),
+) -> Result(actor.Started(process.Subject(Message)), actor.StartError) {
   let parent = process.self()
   actor.new_with_initialiser(1000, fn(subject) {
     let _ = process.send_after(subject, interval_ms, Tick)
@@ -69,6 +115,7 @@ pub fn start(
       actor.initialised(
         State(
           connection:,
+          forwarder:,
           queue:,
           owner:,
           lease_ms:,
@@ -151,28 +198,62 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
 
 fn renew(state: State) -> State {
   let now = monotonic_ms()
+  let entries =
+    list.map(state.entries, fn(entry) {
+      case entry.phase {
+        Acknowledging(until) if now >= until -> {
+          emit_renewal(
+            state,
+            entry,
+            diagnostic.CompletionBudgetExhausted,
+            0,
+            None,
+          )
+          Entry(..entry, phase: CompletionBudgetFinished)
+        }
+        _ -> entry
+      }
+    })
+  let state = State(..state, entries:)
   let eligible =
     list.filter(state.entries, fn(entry) {
       case entry.phase {
-        Running -> True
-        Acknowledging(until) -> now < until
-        OwnershipLost -> False
+        Running | Acknowledging(_) -> True
+        OwnershipLost | CompletionBudgetFinished -> False
       }
     })
   case eligible {
     [] -> state
-    _ ->
-      case
-        attempt.renew_many(
+    _ -> {
+      let measured =
+        attempt.renew_many_observed(
           state.connection,
           state.queue,
           state.owner,
           list.map(eligible, fn(entry) { entry.claim }),
           state.lease_ms,
         )
-      {
+      let result = case state.forwarder {
+        None -> measured.value
+        Some(fwd) ->
+          diagnostics.checkout(
+            fwd,
+            diagnostics.queue_ref(state.queue, state.owner),
+            diagnostic.LeaseRenewal,
+            diagnostic.ReservedPool,
+            measured,
+          )
+      }
+      case result {
         Error(_) -> {
           list.each(eligible, fn(entry) {
+            emit_renewal(
+              state,
+              entry,
+              diagnostic.StorageFailed,
+              measured.call_duration_us,
+              None,
+            )
             state.on_status(entry.attempt_id, entry.epoch, Unknown)
           })
           state
@@ -182,23 +263,80 @@ fn renew(state: State) -> State {
             list.map(state.entries, fn(entry) {
               case
                 list.find(results, fn(result) {
-                  result.0 == entry.attempt_id && result.1 == entry.epoch
+                  result.attempt_id == entry.attempt_id
+                  && result.epoch == entry.epoch
                 })
               {
                 Error(Nil) -> entry
-                Ok(#(_, _, attempt.BatchLocked)) -> entry
-                Ok(#(_, _, attempt.BatchRenewed)) -> {
-                  state.on_status(entry.attempt_id, entry.epoch, Confirmed)
-                  entry
-                }
-                Ok(#(_, _, attempt.BatchLeaseLost)) -> {
-                  state.on_status(entry.attempt_id, entry.epoch, Lost)
-                  Entry(..entry, phase: OwnershipLost)
+                Ok(result) -> {
+                  let outcome = case result.status {
+                    attempt.BatchLocked -> diagnostic.SkippedLocked
+                    attempt.BatchRenewed -> diagnostic.Renewed
+                    attempt.BatchLeaseLost -> diagnostic.LiveFenceUnavailable
+                  }
+                  emit_renewal(
+                    state,
+                    entry,
+                    outcome,
+                    measured.call_duration_us,
+                    result.remaining_lease_ms,
+                  )
+                  case result.status {
+                    attempt.BatchLocked -> entry
+                    attempt.BatchRenewed -> {
+                      state.on_status(entry.attempt_id, entry.epoch, Confirmed)
+                      entry
+                    }
+                    attempt.BatchLeaseLost -> {
+                      state.on_status(entry.attempt_id, entry.epoch, Lost)
+                      Entry(..entry, phase: OwnershipLost)
+                    }
+                  }
                 }
               }
             })
           State(..state, entries:)
         }
       }
+    }
+  }
+}
+
+fn emit_renewal(
+  state: State,
+  entry: Entry,
+  outcome: diagnostic.RenewalOutcome,
+  duration_us: Int,
+  remaining_lease_ms: Option(Int),
+) -> Nil {
+  case state.forwarder {
+    None -> Nil
+    Some(fwd) -> {
+      let phase = case entry.phase {
+        Running -> diagnostic.HandlerRunning
+        Acknowledging(_) | CompletionBudgetFinished | OwnershipLost ->
+          diagnostic.AcknowledgementPending
+      }
+      let _ =
+        forwarder.emit(
+          fwd,
+          diagnostic.renewal(),
+          diagnostic.RenewalMeasurements(
+            count: 1,
+            duration_us:,
+            remaining_lease_ms:,
+          ),
+          diagnostic.RenewalMetadata(
+            context: attempt.diagnostic_context(
+              entry.claim,
+              state.queue,
+              state.owner,
+            ),
+            phase:,
+            outcome:,
+          ),
+        )
+      Nil
+    }
   }
 }

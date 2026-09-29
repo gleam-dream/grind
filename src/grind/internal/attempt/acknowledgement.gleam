@@ -5,12 +5,15 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import grind/diagnostic
+import grind/internal/diagnostics
 import grind/internal/lease
 import grind/internal/store
 import grind/job
 import grind/postgres
 import grind/worker
 import pog
+import sinal/forwarder.{type Forwarder}
 
 pub type Claim {
   Claim(
@@ -76,6 +79,8 @@ pub fn resolve_ack_transaction_result(
     AckCommit,
     pog.TransactionError(postgres.QueueRunError),
   ),
+  forwarder: Forwarder,
+  reference: diagnostic.QueueRef,
 ) -> Result(AckCommit, postgres.QueueRunError) {
   case transaction_result {
     Ok(commit) -> Ok(commit)
@@ -89,6 +94,8 @@ pub fn resolve_ack_transaction_result(
         command_id,
         proposal,
         execution,
+        forwarder,
+        reference,
       )
   }
 }
@@ -101,15 +108,18 @@ fn reconcile_unknown_ack(
   command_id: String,
   proposal: AckProposal,
   execution: worker.Execution,
+  forwarder: Forwarder,
+  reference: diagnostic.QueueRef,
 ) -> Result(AckCommit, postgres.QueueRunError) {
   case
-    matching_acknowledgement(
+    matching_acknowledgement_observed(
       connection,
       queue,
       attempt_owner,
       claim,
       command_id,
       proposal,
+      Some(#(forwarder, reference)),
     )
   {
     Ok(Some(#(True, committed_state, failure_cause))) ->
@@ -546,6 +556,26 @@ fn matching_acknowledgement(
   command_id: String,
   proposal: AckProposal,
 ) -> Result(Option(#(Bool, String, Option(String))), postgres.QueueRunError) {
+  matching_acknowledgement_observed(
+    connection,
+    queue,
+    attempt_owner,
+    claim,
+    command_id,
+    proposal,
+    None,
+  )
+}
+
+fn matching_acknowledgement_observed(
+  connection: pog.Connection,
+  queue: String,
+  attempt_owner: String,
+  claim: Claim,
+  command_id: String,
+  proposal: AckProposal,
+  observer: Option(#(Forwarder, diagnostic.QueueRef)),
+) -> Result(Option(#(Bool, String, Option(String))), postgres.QueueRunError) {
   let Claim(id:, attempt_id:, epoch:, worker_id:, worker_version:, ..) = claim
   let AckProposal(
     proposed_state:,
@@ -588,7 +618,18 @@ fn matching_acknowledgement(
       )
       decode.success(#(matches, committed_state, committed_failure_cause))
     })
-  case store.execute_safely(query, on: connection) {
+  let queried = case observer {
+    None -> store.execute_safely(query, on: connection)
+    Some(#(forwarder, reference)) ->
+      diagnostics.checkout(
+        forwarder,
+        reference,
+        diagnostic.ReconcileAcknowledgement,
+        diagnostic.MainPool,
+        store.execute_measured(query, on: connection),
+      )
+  }
+  case queried {
     Error(error) -> Error(postgres.QueueAckFailed(error))
     Ok(returned) ->
       case returned.rows {

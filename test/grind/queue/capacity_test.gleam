@@ -5,13 +5,16 @@ import gleam/int
 import gleam/json
 import gleam/result
 import gleeunit/should
+import grind/diagnostic
 import grind/job
 import grind/postgres
 import grind/queue
 import grind/registry
 import grind/support/concurrency.{ReleaseAttempt}
+import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/job_state.{job_finished_at_ms, wait_for_job_state}
+import grind/support/observers.{detach}
 import grind/support/queue_signals.{CapacityWorkerStarted}
 import grind/support/queue_timing.{database_time_ms}
 import grind/support/worker_failure.{AccountMissing}
@@ -60,6 +63,11 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
     postgres.submit(database, "consumer-capacity", definition, 2)
   let assert Ok(third_handle) =
     postgres.submit(database, "consumer-capacity", definition, 3)
+  let #(capacity, attachment) =
+    diagnostics.capture("capacity", diagnostic.capacity(), fn(meta) {
+      meta.queue.queue == "consumer-capacity"
+    })
+  use <- exception.defer(fn() { detach(attachment) })
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_maximum_concurrency(2)
@@ -93,6 +101,13 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
   queue.process_one(consumer) |> should.equal(Error(queue.QueueBusy))
   process.receive(started, within: 0) |> should.equal(Error(Nil))
   postgres.state(database, third_handle) |> should.equal(Ok(job.Queued))
+  let assert Ok(#(initial, identity)) = process.receive(capacity, 5000)
+  initial |> should.equal(diagnostic.CapacityMeasurements(2, 0, 0, 0, 2))
+  identity.draining |> should.equal(False)
+  let assert Ok(#(one, _)) = process.receive(capacity, 5000)
+  one |> should.equal(diagnostic.CapacityMeasurements(2, 1, 1, 0, 1))
+  let assert Ok(#(full, _)) = process.receive(capacity, 5000)
+  full |> should.equal(diagnostic.CapacityMeasurements(2, 2, 2, 0, 0))
 
   process.send(first_release, ReleaseAttempt)
   process.send(second_release, ReleaseAttempt)
@@ -100,6 +115,10 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
   process.receive(second_reply, within: 5000) |> should.equal(Ok(Ok(True)))
   postgres.state(database, first_handle) |> should.equal(Ok(job.Succeeded))
   postgres.state(database, second_handle) |> should.equal(Ok(job.Succeeded))
+  let assert Ok(#(empty, same_identity)) =
+    diagnostics.await(capacity, fn(sample) { sample.0.active == 0 }, 5000)
+  empty |> should.equal(initial)
+  same_identity |> should.equal(identity)
   let third_reply = process.new_subject()
   let _ =
     process.spawn_unlinked(fn() {
@@ -111,6 +130,7 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
   process.receive(third_reply, within: 5000) |> should.equal(Ok(Ok(True)))
   postgres.state(database, third_handle) |> should.equal(Ok(job.Succeeded))
   mark_database_test_executed("consumer-capacity-two-enforced")
+  mark_database_test_executed("diagnostic-local-capacity-transitions")
 }
 
 fn run_automatic_consumer_capacity_test(database_url: String) -> Nil {

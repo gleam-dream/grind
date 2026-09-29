@@ -3,9 +3,12 @@
 -export([
     call_safely/2,
     execute_safely/2,
+    call_measured/2,
+    execute_measured/2,
     stop_consumer_supervisor/1,
     stop_supervisor/1,
     transaction_safely/2,
+    transaction_measured/2,
     transaction_or_checkout_failure/2,
     migration_transaction_safely/3
 ]).
@@ -57,10 +60,14 @@
 %% caller's own "checkout itself failed" value — the callers below need
 %% different shapes here (a bare `pog.QueryError` vs. a
 %% `pog.TransactionError`), so it is not baked in here.
-with_deadline({pool, PoolName}, Fun, OnCheckoutFailure) ->
-    with_deadline_ms(PoolName, configured, Fun, OnCheckoutFailure);
-with_deadline(SingleConnection = {single_connection, Conn}, Fun, _OnCheckoutFailure) ->
-    Fun(SingleConnection, Conn).
+with_deadline(Connection, Fun, OnCheckoutFailure) ->
+    {Value, _Timing} = with_deadline_timing(Connection, Fun, OnCheckoutFailure),
+    Value.
+
+with_deadline_timing({pool, PoolName}, Fun, OnCheckoutFailure) ->
+    with_deadline_ms_timing(PoolName, configured, Fun, OnCheckoutFailure);
+with_deadline_timing(SingleConnection = {single_connection, Conn}, Fun, _OnCheckoutFailure) ->
+    {Fun(SingleConnection, Conn), no_checkout}.
 
 %% pgo writes its query cache in the application caller, even after the pool
 %% and socket owner have stopped. Register before checkout and release only
@@ -68,6 +75,10 @@ with_deadline(SingleConnection = {single_connection, Conn}, Fun, _OnCheckoutFail
 %% a managed caller can still write old cache entries. A missing or closing
 %% owner rejects the call before any database work is sent.
 with_deadline_ms(PoolName, Deadline, Fun, OnCheckoutFailure) ->
+    {Value, _Timing} = with_deadline_ms_timing(PoolName, Deadline, Fun, OnCheckoutFailure),
+    Value.
+
+with_deadline_ms_timing(PoolName, Deadline, Fun, OnCheckoutFailure) ->
     case grind_pool_ffi:acquire(PoolName) of
         {ok, Owner, Token, ConfiguredDeadlineMs} ->
             DeadlineMs = case Deadline of
@@ -75,37 +86,45 @@ with_deadline_ms(PoolName, Deadline, Fun, OnCheckoutFailure) ->
                 ExplicitDeadlineMs -> ExplicitDeadlineMs
             end,
             ExpiresAt = erlang:monotonic_time(millisecond) + DeadlineMs,
-            try checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure)
+            try checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure, 0, 0)
             after grind_pool_ffi:release(Owner, Token)
             end;
-        {error, closed} -> OnCheckoutFailure()
+        {error, closed} -> checkout_unavailable(OnCheckoutFailure, 0, 0)
     end.
 
 %% A crashed or reconnected pgo connection can leave its old holder queued.
 %% Checking it back in recycles that dead socket forever. Retire unusable
 %% candidates before sending any SQL, sharing one absolute deadline across
 %% all candidates. This retries admission only: Fun is never retried here.
-checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure) ->
+checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
     case erlang:monotonic_time(millisecond) < ExpiresAt of
-        false -> OnCheckoutFailure();
-        true -> checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure)
+        false -> checkout_unavailable(OnCheckoutFailure, WaitUs, Candidates);
+        true -> checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates)
     end.
 
-checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure) ->
+checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
+    %% Time only the real checkout call. Probes, stale-holder retirement,
+    %% callback execution and cleanup do not masquerade as pool waiting.
+    %% Pinned pgo has no receive timeout while queued: this interval may exceed
+    %% D, and measuring it must neither clamp nor replace the absolute deadline.
+    StartedUs = erlang:monotonic_time(microsecond),
     try pgo:checkout(PoolName, [{timeout, infinity}, {deadline, ExpiresAt}]) of
         {ok, Ref, Conn} ->
+            CheckedOutWaitUs = WaitUs + erlang:monotonic_time(microsecond) - StartedUs,
             case connection_usable(Conn, ExpiresAt) andalso
                  erlang:monotonic_time(millisecond) < ExpiresAt of
                 true ->
-                    try Fun({single_connection, Conn}, Conn)
+                    Value = try Fun({single_connection, Conn}, Conn)
                     after
                         %% Cleanup cannot change a result or prove whether an
                         %% earlier command committed. Ambiguity stays ambiguous.
                         catch return_connection(Ref, Conn, ExpiresAt)
-                    end;
+                    end,
+                    {Value, {checkout_timing, CheckedOutWaitUs, Candidates + 1, checked_out}};
                 false ->
                     retire_connection(Ref, Conn),
-                    checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure)
+                    checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure,
+                                    CheckedOutWaitUs, Candidates + 1)
             end;
         {error, _Reason} ->
             %% Covers every checkout-time rejection pgo can return here,
@@ -120,11 +139,27 @@ checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure) ->
             %% checkout itself failed, so nothing was ever sent — this is
             %% the "knowably never ran" case, unlike the post-checkout crash
             %% `guarded_query`/`guarded_transaction` handle below.
-            OnCheckoutFailure()
+            checkout_unavailable(OnCheckoutFailure,
+                                 WaitUs + erlang:monotonic_time(microsecond) - StartedUs,
+                                 Candidates + 1)
     catch
         exit:{_Reason, {pgo_pool, checkout, _Details}} ->
-            OnCheckoutFailure()
+            checkout_unavailable(OnCheckoutFailure,
+                                 WaitUs + erlang:monotonic_time(microsecond) - StartedUs,
+                                 Candidates + 1)
     end.
+
+checkout_unavailable(OnCheckoutFailure, WaitUs, Candidates) ->
+    {OnCheckoutFailure(), {checkout_timing, WaitUs, Candidates, checkout_unavailable}}.
+
+%% A completed report is built only after the enclosing helper's after clauses
+%% have returned the connection and released its lifecycle token. Unexpected
+%% exceptions propagate with their original class/reason/stack; no report is
+%% returned for them. This boundary invokes no diagnostic callback or subscriber.
+measured(Run) ->
+    StartedUs = erlang:monotonic_time(microsecond),
+    {Value, Timing} = Run(),
+    {measured, Value, erlang:monotonic_time(microsecond) - StartedUs, Timing}.
 
 return_connection(Ref, Conn, ExpiresAt) ->
     case connection_usable(Conn, ExpiresAt) of
@@ -247,6 +282,9 @@ is_convert_error_crash(_Stacktrace) ->
 execute_safely(Query, Connection) ->
     call_safely(Connection, fun(Conn) -> pog:execute(Query, Conn) end).
 
+execute_measured(Query, Connection) ->
+    call_measured(Connection, fun(Conn) -> pog:execute(Query, Conn) end).
+
 %% Generic form of `execute_safely/2`, for a Squirrel-generated query
 %% function (`grind/internal/sql`) that calls `pog.execute` itself rather
 %% than going through `execute_safely/2` — and for any other one-off call
@@ -261,6 +299,15 @@ call_safely(Connection, Fun) ->
         fun() -> {error, connection_unavailable} end
     ).
 
+call_measured(Connection, Fun) ->
+    measured(fun() ->
+        with_deadline_timing(
+            Connection,
+            fun(WrappedConn, RawConn) -> guarded_query(RawConn, fun() -> Fun(WrappedConn) end) end,
+            fun() -> {error, connection_unavailable} end
+        )
+    end).
+
 %% Runs `pog.transaction` under the deadline: `BEGIN`, the callback's own
 %% statements, and `COMMIT`/`ROLLBACK` all run against the one connection
 %% this module itself checked out, bounded by the same deadline throughout —
@@ -274,6 +321,17 @@ transaction_safely(Connection, Callback) ->
         end,
         fun() -> {error, {transaction_query_error, connection_unavailable}} end
     ).
+
+transaction_measured(Connection, Callback) ->
+    measured(fun() ->
+        with_deadline_timing(
+            Connection,
+            fun(WrappedConn, RawConn) ->
+                guarded_transaction(RawConn, fun() -> pog:transaction(WrappedConn, Callback) end)
+            end,
+            fun() -> {error, {transaction_query_error, connection_unavailable}} end
+        )
+    end).
 
 %% Unlike `transaction_safely/2`, this does not disguise a checkout failure
 %% (the pool could not hand out a connection at all, before `BEGIN` ever

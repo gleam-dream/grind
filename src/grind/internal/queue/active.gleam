@@ -3,6 +3,7 @@
 
 import gleam/erlang/process
 import gleam/list
+import grind/diagnostic
 import grind/internal/attempt
 import grind/internal/queue/worker as queue_worker
 
@@ -16,6 +17,7 @@ pub type ActiveAttempt(completion, status) {
     monitor: process.Monitor,
     completion: completion,
     renewal_status: status,
+    phase: diagnostic.AttemptPhase,
   )
 }
 

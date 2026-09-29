@@ -6,13 +6,16 @@ import gleam/json
 import gleam/list
 import gleam/string
 import gleeunit/should
+import grind/diagnostic
 import grind/job
 import grind/postgres
 import grind/queue
 import grind/registry
+import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/job_state.{wait_for_succeeded}
 import grind/support/lease_queries.{lease_expiration}
+import grind/support/observers.{detach}
 import grind/worker
 import pog
 
@@ -45,6 +48,27 @@ fn first_ack_rollback(url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, definition)
   let assert Ok(handle) =
     postgres.submit(database, "first-rollback", definition, 41)
+  let #(acks, ack_attachment) =
+    diagnostics.capture(
+      "first-rollback-ack",
+      diagnostic.acknowledgement(),
+      fn(meta) { meta.context.ref.job_id == job.id_value(handle) },
+    )
+  use <- exception.defer(fn() { detach(ack_attachment) })
+  let #(retries, retry_attachment) =
+    diagnostics.capture(
+      "first-rollback-retry",
+      diagnostic.acknowledgement_retry(),
+      fn(meta) { meta.context.ref.job_id == job.id_value(handle) },
+    )
+  use <- exception.defer(fn() { detach(retry_attachment) })
+  let #(capacity, capacity_attachment) =
+    diagnostics.capture(
+      "first-rollback-capacity",
+      diagnostic.capacity(),
+      fn(meta) { meta.queue.queue == "first-rollback" },
+    )
+  use <- exception.defer(fn() { detach(capacity_attachment) })
   // Sequence advancement survives rollback. A single real acknowledgement
   // fails before COMMIT; its retry must preserve the completed proposal.
   execute(connection, "CREATE SEQUENCE first_ack_failure_count")
@@ -77,6 +101,39 @@ fn first_ack_rollback(url: String) -> Nil {
   queue.stop(consumer) |> should.equal(Ok(queue.StoppedCleanly))
   postgres.outcome(database, handle) |> should.equal(Ok(job.SucceededWith(42)))
   process.receive(invoked, 0) |> should.equal(Error(Nil))
+  let assert Ok(#(failed_measurements, failed)) = process.receive(acks, 5000)
+  failed.outcome |> should.equal(diagnostic.AckRolledBack)
+  failed_measurements.count |> should.equal(1)
+  { failed_measurements.duration_us > 0 } |> should.be_true()
+  let assert Ok(#(retry_measurements, retry)) = process.receive(retries, 5000)
+  retry.reason |> should.equal(diagnostic.RetryAfterFailure)
+  retry_measurements.retry_number |> should.equal(1)
+  retry_measurements.delay_ms |> should.equal(2000)
+  { retry_measurements.pending_duration_us >= 0 } |> should.be_true()
+  retry.context |> should.equal(failed.context)
+  retry.command_id |> should.equal(failed.command_id)
+  let assert Ok(#(_, completed)) = process.receive(acks, 5000)
+  completed.outcome |> should.equal(diagnostic.AckReplied)
+  completed.context |> should.equal(failed.context)
+  completed.context.attempt.attempt |> should.equal(1)
+  completed.context.consumer.node |> should.not_equal("")
+  completed.context.consumer.consumer |> should.not_equal("")
+  completed.command_id |> should.equal(failed.command_id)
+  let assert Ok(#(pending, _)) =
+    diagnostics.await(capacity, fn(sample) { sample.0.ack_pending == 1 }, 5000)
+  pending.active |> should.equal(1)
+  pending.running |> should.equal(0)
+  pending.available |> should.equal(pending.maximum - 1)
+  let assert Ok(#(empty, drained)) =
+    diagnostics.await(
+      capacity,
+      fn(sample) { sample.0.active == 0 && sample.1.draining },
+      5000,
+    )
+  empty.ack_pending |> should.equal(0)
+  empty.available |> should.equal(empty.maximum)
+  drained.queue.consumer |> should.equal(completed.context.consumer)
+  mark_database_test_executed("diagnostic-ack-rollback-retry-capacity")
   mark_database_test_executed("first-ack-rollback-retried-without-rerun")
 }
 
@@ -185,7 +242,7 @@ fn slow_acks(url: String) -> Nil {
   handles
   |> list.drop(8)
   |> list.each(fn(handle) {
-    wait_for_succeeded(database, handle, 120) |> should.be_true()
+    { wait_for_succeeded(database, handle, 120) } |> should.be_true()
   })
   process.receive(started, 0) |> should.equal(Error(Nil))
   mark_database_test_executed("slow-acks-independent-healthy-renewal")
@@ -249,7 +306,7 @@ fn saturated_pool(url: String) -> Nil {
         |> pog.execute(on: postgres.connection(database))
       process.send(occupied, outcome)
     })
-  wait_for_saturated_pool(observer_connection, 200) |> should.be_true()
+  { wait_for_saturated_pool(observer_connection, 200) } |> should.be_true()
   process.sleep(6500)
   let assert Ok(renewed_expiry) =
     lease_expiration(observer_connection, job.id_value(handle))
@@ -257,7 +314,7 @@ fn saturated_pool(url: String) -> Nil {
   postgres.state(observer, handle) |> should.equal(Ok(job.Executing))
   process.send(release, Nil)
   let assert Ok(Ok(_)) = process.receive(occupied, 5000)
-  wait_for_succeeded(observer, handle, 240) |> should.be_true()
+  { wait_for_succeeded(observer, handle, 240) } |> should.be_true()
   postgres.outcome(observer, handle) |> should.equal(Ok(job.SucceededWith(7)))
   process.receive(started, 0) |> should.equal(Error(Nil))
   mark_database_test_executed("saturated-pool-independent-renewal")

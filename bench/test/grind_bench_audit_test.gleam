@@ -748,7 +748,7 @@ pub fn quarantine_and_forwarder_drop_counters_bumped_by_real_events_test() {
   let assert Ok(Nil) =
     sinal.emit(
       forwarder.dropped_event(),
-      forwarder.Dropped(rejected: 1, lost: 0),
+      forwarder.Dropped(rejected: 1, lost: 0, unavailable: 0),
       forwarder.DroppedMetadata(forwarder: "bench-audit-wiring"),
     )
   load.counter_value(load.forwarder_drop_counter)

@@ -5,6 +5,7 @@ import gleam/int
 import gleam/json
 import gleam/option.{None}
 import gleeunit/should
+import grind/diagnostic
 import grind/internal/attempt
 import grind/job
 import grind/observation
@@ -16,6 +17,7 @@ import grind/support/ack_queries.{
 }
 import grind/support/concurrency.{LongHandlerStarted, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
+import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/lease_queries.{await_renewal_status}
 import grind/support/observation_fixtures.{
@@ -528,6 +530,17 @@ fn run_acknowledged_observation_reconciled_after_lost_reply_test(
     register_sentinel_worker(workers, "reply-lost")
   let assert Ok(handle) =
     postgres.submit(database, "observation-reply-lost", definition, 33)
+  let #(ack_diagnostics, diagnostic_attachment) =
+    diagnostics.capture("lost-reply", diagnostic.acknowledgement(), fn(meta) {
+      meta.context.ref.job_id == job.id_value(handle)
+    })
+  use <- exception.defer(fn() { detach(diagnostic_attachment) })
+  let #(checkouts, checkout_attachment) =
+    diagnostics.capture("lost-reply-checkout", diagnostic.checkout(), fn(meta) {
+      meta.queue.queue == "observation-reply-lost"
+      && meta.operation == diagnostic.ReconcileAcknowledgement
+    })
+  use <- exception.defer(fn() { detach(checkout_attachment) })
   let signal = process.new_subject()
   let attachment =
     attach_acknowledged_observer("reply-lost", fn(measurements, metadata) {
@@ -574,6 +587,22 @@ fn run_acknowledged_observation_reconciled_after_lost_reply_test(
   metadata.committed_state |> should.equal(job.Succeeded)
   metadata.confirmation |> should.equal(observation.Reconciled)
   metadata.command_id |> should.equal(expected_command_id)
+
+  let assert Ok(#(ack_timing, ack_diagnostic)) =
+    process.receive(ack_diagnostics, 5000)
+  ack_diagnostic.outcome |> should.equal(diagnostic.AckReconciled)
+  ack_diagnostic.context.ref |> should.equal(metadata.ref)
+  ack_diagnostic.context.attempt |> should.equal(metadata.attempt)
+  ack_diagnostic.command_id |> should.equal(expected_command_id)
+  { ack_timing.duration_us > 0 } |> should.be_true()
+  let assert Ok(#(checkout_timing, checkout)) = process.receive(checkouts, 5000)
+  checkout.pool |> should.equal(diagnostic.MainPool)
+  checkout.checkout |> should.equal(diagnostic.CheckoutAcquired)
+  checkout.returned |> should.equal(diagnostic.CallSucceeded)
+  { checkout_timing.candidates >= 1 } |> should.be_true()
+  { checkout_timing.call_duration_us >= checkout_timing.wait_us }
+  |> should.be_true()
+  mark_database_test_executed("diagnostic-ack-reconciled-after-lost-reply")
 
   // Exactly one observation for this command — no duplicate `Replied` also
   // arrived from the same lost-reply commit. Checked deterministically: a

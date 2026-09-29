@@ -16,7 +16,9 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import grind/diagnostic
 import grind/internal/attempt/acknowledgement.{type Claim, AckProposal, Claim} as attempt_acknowledgement
+import grind/internal/diagnostics
 import grind/internal/lease
 import grind/internal/sql
 import grind/internal/store
@@ -43,14 +45,33 @@ pub fn claim_one(
   attempt_owner: String,
   lease_duration_ms: Int,
 ) -> Result(Option(ClaimedJob), postgres.QueueRunError) {
-  case
-    lease.quarantine_expired_in_queue(
+  let fwd = postgres.forwarder(database)
+  let reference = diagnostics.queue_ref(queue, attempt_owner)
+  let measured =
+    lease.quarantine_expired_in_queue_measured(
       postgres.connection(database),
-      postgres.forwarder(database),
+      fwd,
       queue,
     )
+  case
+    diagnostics.checkout(
+      fwd,
+      reference,
+      diagnostic.QuarantineScan,
+      diagnostic.MainPool,
+      measured,
+    )
   {
-    Error(error) -> Error(postgres.QueueClaimFailed(error))
+    Error(error) -> {
+      diagnostics.claim_failed(
+        fwd,
+        reference,
+        diagnostic.QuarantineScan,
+        error,
+        measured.call_duration_us,
+      )
+      Error(postgres.QueueClaimFailed(error))
+    }
     Ok(Nil) ->
       claim_registered_job(
         database,
@@ -74,6 +95,40 @@ pub fn claim_identity(claimed: ClaimedJob) -> #(Int, Int, Int) {
   let ClaimedJob(claim: claim, ..) = claimed
   let Claim(id:, attempt_id:, epoch:, ..) = claim
   #(id, attempt_id, epoch)
+}
+
+pub fn diagnostic_context(
+  claimed: ClaimedJob,
+  queue: String,
+  owner: String,
+) -> diagnostic.AttemptContext {
+  let ClaimedJob(claim:, ..) = claimed
+  diagnostic_context_from_claim(claim, queue, owner)
+}
+
+fn diagnostic_context_from_claim(
+  claim: Claim,
+  queue: String,
+  owner: String,
+) -> diagnostic.AttemptContext {
+  let Claim(
+    id:,
+    attempt_id:,
+    epoch:,
+    current_attempt:,
+    worker_id:,
+    worker_version:,
+    ..,
+  ) = claim
+  diagnostic.AttemptContext(
+    ref: observation.JobRef(job_id: id, queue:, worker_id:, worker_version:),
+    attempt: observation.AttemptRef(
+      attempt_id:,
+      epoch:,
+      attempt: current_attempt,
+    ),
+    consumer: diagnostics.consumer_ref(owner),
+  )
 }
 
 fn claim_previous_state(claim: Claim) -> String {
@@ -109,6 +164,31 @@ pub fn renew_many(
   claims: List(ClaimedJob),
   lease_duration_ms: Int,
 ) -> Result(List(#(Int, Int, BatchRenewal)), pog.QueryError) {
+  case
+    renew_many_observed(connection, queue, owner, claims, lease_duration_ms).value
+  {
+    Error(error) -> Error(error)
+    Ok(rows) ->
+      Ok(list.map(rows, fn(row) { #(row.attempt_id, row.epoch, row.status) }))
+  }
+}
+
+pub type ObservedRenewal {
+  ObservedRenewal(
+    attempt_id: Int,
+    epoch: Int,
+    status: BatchRenewal,
+    remaining_lease_ms: Option(Int),
+  )
+}
+
+pub fn renew_many_observed(
+  connection: pog.Connection,
+  queue: String,
+  owner: String,
+  claims: List(ClaimedJob),
+  lease_duration_ms: Int,
+) -> store.Measured(Result(List(ObservedRenewal), pog.QueryError)) {
   let identities = list.map(claims, claim_identity)
   let live = lease.live_lease_predicate("clock_timestamp()")
   let query =
@@ -117,9 +197,9 @@ pub fn renew_many(
       <> live
       <> " FOR NO KEY UPDATE OF j SKIP LOCKED), renewed AS (UPDATE grind_jobs j SET lease_expires_at = clock_timestamp() + ($6::double precision * interval '1 millisecond') FROM locked l WHERE j.id = l.id AND "
       <> live
-      <> " RETURNING j.id) SELECT f.attempt_id, f.epoch, CASE WHEN r.id IS NOT NULL THEN 1 WHEN j.state = 'executing' AND j.queue = $4 AND j.attempt_owner = $5 AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch AND "
+      <> " RETURNING j.id, j.lease_expires_at AS new_lease_expires_at) SELECT f.attempt_id, f.epoch, CASE WHEN r.id IS NOT NULL THEN 1 WHEN j.state = 'executing' AND j.queue = $4 AND j.attempt_owner = $5 AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch AND j."
       <> live
-      <> " THEN 2 ELSE 0 END FROM fences f LEFT JOIN renewed r ON r.id = f.id LEFT JOIN grind_jobs j ON j.id = f.id",
+      <> " THEN 2 ELSE 0 END, CASE WHEN r.id IS NOT NULL THEN floor(extract(epoch FROM (r.new_lease_expires_at - clock_timestamp())) * 1000)::bigint WHEN j.queue = $4 AND j.attempt_owner = $5 AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch THEN floor(extract(epoch FROM (j.lease_expires_at - clock_timestamp())) * 1000)::bigint ELSE NULL::bigint END FROM fences f LEFT JOIN renewed r ON r.id = f.id LEFT JOIN grind_jobs j ON j.id = f.id",
     )
     |> pog.parameter(pog.array(pog.int, list.map(identities, fn(x) { x.0 })))
     |> pog.parameter(pog.array(pog.int, list.map(identities, fn(x) { x.1 })))
@@ -136,12 +216,24 @@ pub fn renew_many(
         2 -> BatchLocked
         _ -> BatchLeaseLost
       }
-      decode.success(#(attempt_id, epoch, status))
+      use remaining_lease_ms <- decode.field(3, decode.optional(decode.int))
+      decode.success(ObservedRenewal(
+        attempt_id:,
+        epoch:,
+        status:,
+        remaining_lease_ms:,
+      ))
     })
-  case store.execute_safely(query, on: connection) {
+  let measured = store.execute_measured(query, on: connection)
+  let value = case measured.value {
     Error(error) -> Error(error)
     Ok(returned) -> Ok(returned.rows)
   }
+  store.Measured(
+    value:,
+    call_duration_us: measured.call_duration_us,
+    checkout: measured.checkout,
+  )
 }
 
 /// Extends the current lease using PostgreSQL's clock and current row values.
@@ -450,8 +542,27 @@ fn claim_registered_job(
         previous_state:,
       ))
     })
-  case store.execute_safely(query, on: connection) {
-    Error(error) -> Error(postgres.QueueClaimFailed(error))
+  let reference = diagnostics.queue_ref(queue, attempt_owner)
+  let measured = store.execute_measured(query, on: connection)
+  case
+    diagnostics.checkout(
+      forwarder,
+      reference,
+      diagnostic.ClaimCandidate,
+      diagnostic.MainPool,
+      measured,
+    )
+  {
+    Error(error) -> {
+      diagnostics.claim_failed(
+        forwarder,
+        reference,
+        diagnostic.ClaimCandidate,
+        error,
+        measured.call_duration_us,
+      )
+      Error(postgres.QueueClaimFailed(error))
+    }
     Ok(returned) ->
       case returned.rows {
         [] -> Ok(None)
@@ -841,8 +952,9 @@ fn run_acknowledgement(
   }
   let command_id =
     attempt_acknowledgement.acknowledgement_command_id(id, attempt_id, epoch)
-  let transaction_result =
-    store.transaction_safely(connection, fn(transaction) {
+  let started_at = diagnostics.monotonic_us()
+  let measured =
+    store.transaction_measured(connection, fn(transaction) {
       attempt_acknowledgement.acknowledge_transaction(
         transaction,
         queue,
@@ -854,7 +966,16 @@ fn run_acknowledgement(
         expected_output_version,
       )
     })
-  case
+  let reference = diagnostics.queue_ref(queue, attempt_owner)
+  let transaction_result =
+    diagnostics.checkout(
+      forwarder,
+      reference,
+      diagnostic.Acknowledge,
+      diagnostic.MainPool,
+      measured,
+    )
+  let resolved =
     attempt_acknowledgement.resolve_ack_transaction_result(
       connection,
       queue,
@@ -864,8 +985,10 @@ fn run_acknowledgement(
       proposal,
       execution,
       transaction_result,
+      forwarder,
+      reference,
     )
-  {
+  let acknowledged = case resolved {
     Error(error) -> Error(error)
     Ok(commit) -> {
       case job.state_of_stored(commit.committed_state) {
@@ -896,6 +1019,36 @@ fn run_acknowledgement(
       Ok(True)
     }
   }
+  let outcome = case resolved {
+    Ok(commit) ->
+      case commit.via_receipt_match {
+        True -> diagnostic.AckReconciled
+        False -> diagnostic.AckReplied
+      }
+    Error(postgres.QueueAckUnknown(..)) -> diagnostic.AckUnknown
+    Error(postgres.QueueAckStale(..)) -> diagnostic.AckFenceRejected
+    Error(postgres.QueueAckCommandConflict) -> diagnostic.AckCommandConflict
+    Error(_) ->
+      case transaction_result {
+        Error(pog.TransactionRolledBack(_)) -> diagnostic.AckRolledBack
+        _ -> diagnostic.AckFailed
+      }
+  }
+  let _ =
+    forwarder.emit(
+      forwarder,
+      diagnostic.acknowledgement(),
+      diagnostic.AcknowledgementMeasurements(
+        count: 1,
+        duration_us: diagnostics.monotonic_us() - started_at,
+      ),
+      diagnostic.AcknowledgementMetadata(
+        context: diagnostic_context_from_claim(claim, queue, attempt_owner),
+        command_id:,
+        outcome:,
+      ),
+    )
+  acknowledged
 }
 
 /// Builds and forwards `[grind, job, acknowledged]` from a proven-committed

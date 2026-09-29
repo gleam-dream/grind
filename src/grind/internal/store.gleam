@@ -6,6 +6,45 @@
 
 import pog
 
+/// Whether a managed storage call entered its callback after obtaining a
+/// usable connection. This does not describe whether SQL committed.
+pub type CheckoutOutcome {
+  CheckedOut
+  CheckoutUnavailable
+}
+
+pub type CheckoutTiming {
+  /// This call reused an enclosing call's connection and did not check out.
+  NoCheckout
+  /// Wait covers only pgo checkout calls, summed across stale candidates.
+  /// Owner rejection has zero wait and candidates. Pool waiting can exceed D.
+  CheckoutTiming(wait_us: Int, candidates: Int, outcome: CheckoutOutcome)
+}
+
+pub type Measured(a) {
+  /// The unchanged return value, with time from owner admission through
+  /// connection cleanup and lifecycle-token release. No subscriber runs here.
+  Measured(value: a, call_duration_us: Int, checkout: CheckoutTiming)
+}
+
+@external(erlang, "grind_postgres_ffi", "execute_measured")
+pub fn execute_measured(
+  query: pog.Query(a),
+  on connection: pog.Connection,
+) -> Measured(Result(pog.Returned(a), pog.QueryError))
+
+@external(erlang, "grind_postgres_ffi", "call_measured")
+pub fn call_measured(
+  connection: pog.Connection,
+  run: fn(pog.Connection) -> Result(pog.Returned(a), pog.QueryError),
+) -> Measured(Result(pog.Returned(a), pog.QueryError))
+
+@external(erlang, "grind_postgres_ffi", "transaction_measured")
+pub fn transaction_measured(
+  connection: pog.Connection,
+  callback: fn(pog.Connection) -> Result(a, b),
+) -> Measured(Result(a, pog.TransactionError(b)))
+
 // Every Grind storage call funnels through one of these four wrappers,
 // which check out their own connection under a deadline
 // owned by `grind/internal/pool`, and run against the pog `Connection` shape

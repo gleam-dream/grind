@@ -73,6 +73,7 @@ a future backend does not touch the rest:
 | `grind/submission`  | The admission vocabulary every submit path returns (`SubmissionId`, `Admission`, `Conflict`, `PendingSubmission`, `SubmitError`) — shared by plain, `submit_with_id`, and `submit_unique` admission.                                                                  |
 | `grind/pruner`      | The supervised retention pruner (`start`/`supervised`/`stop`) — see "Retention" below.                                                                                                                                                                                |
 | `grind/observation` | Grind's Sinal event descriptors — see "Observations" below.                                                                                                                                                                                                           |
+| `grind/diagnostic`  | Typed operational events for renewal, ACK recovery, checkout wait and local consumer capacity.                                                                                                                                                                        |
 
 Everything under `grind/internal/*` is implementation detail with no
 stability contract; only the modules above are public API.
@@ -235,7 +236,7 @@ The events currently published, one per durable job-lifecycle transition:
 
 Every Grind observation is emitted through a `Database`'s own
 `sinal/forwarder.Forwarder` (sized by `postgres.with_observation_capacity`, default
-1024, shared across every `[grind, job, *]` event above — one `Forwarder` per
+1024, shared across lifecycle, pruning and diagnostic events — one `Forwarder` per
 `Database`, not one per event kind), never through a plain `sinal.emit`, so a
 slow or raising attached handler stalls only the forwarder process — never
 the coordinator proving a commit or the worker that produced it. The
@@ -253,8 +254,7 @@ simply unavailable: `forwarder.emit` reports `ForwarderUnavailable`, which
 Grind already discards, so jobs keep being admitted, claimed, and
 acknowledged normally with no observations at all.
 
-**Delivery semantics — read before depending on this for anything but
-diagnostics:**
+**Lifecycle delivery semantics:**
 
 - **Best-effort.** An event can be delivered more than once (a `Reconciled`
   observation after an earlier `Replied` one for the exact same dedupe key,
@@ -311,6 +311,46 @@ diagnostics:**
 See [docs/RECOVERY-EVIDENCE.md](docs/RECOVERY-EVIDENCE.md), "Acknowledged
 observation" and "Round 2 observations", for the full mutation-proven
 evidence.
+
+## Operational diagnostics
+
+`grind/diagnostic` provides six typed Sinal descriptors under
+`[grind, diagnostic, …]`. Attach with `sinal.observe`, as above. They share the
+Database's bounded forwarder with lifecycle events, including renewal through
+the reserved pool. Subscriber delay, overflow and unavailability do not control
+job execution. Delivery is best-effort and ordered only within one producer.
+
+| Descriptor              | What it reports                                                                                                                                                  |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `renewal`               | Renewed, skipped lock, unavailable live fence, storage failure, or completion-renewal budget exhaustion. Optional signed lease headroom uses the database clock. |
+| `acknowledgement`       | Returned ACK transaction/reconciliation outcome: replied, reconciled, rolled back, unknown, rejected fence or command conflict.                                  |
+| `acknowledgement_retry` | Scheduled ACK retry number, delay and time pending. The handler is not rerun.                                                                                    |
+| `checkout`              | Actual pool wait, checkout candidates and full storage-call duration, labelled by operation and main/reserved pool.                                              |
+| `claim_failed`          | Quarantine-scan or candidate-claim failure with a sanitized error kind.                                                                                          |
+| `capacity`              | Local maximum, active, handler-running, ACK-pending and available slots, plus draining status.                                                                   |
+
+Timing fields use microseconds; lease headroom and retry delay use milliseconds.
+Renewal duration describes the batch call and is repeated for each attempt it
+observed. Use checkout events to count storage calls. Capacity describes the
+coordinator's local ledger, including pending ACKs, and is not global queue depth.
+Metadata contains node, consumer, queue and attempt identities where applicable;
+it excludes job payloads, error messages, SQL and connection settings.
+
+A missing live fence does not establish expiry. A skipped lock does not identify
+its owner. Completion-renewal budget exhaustion is a local limit, not proof of
+quarantine. An unknown ACK does not prove commit or rollback. The existing
+`observation.acknowledged()` event with `Reconciled` confirmation remains proof
+of a matching durable receipt.
+
+Checkout coverage includes queue quarantine scans, claims, batch renewal, ACK
+transactions and their reconciliation reads. It excludes other public storage
+operations, proposal validation before storage and contract-mismatch parking.
+Nested calls on a checked-out connection do not emit another checkout event.
+Wait measures actual checkout calls, including stale candidates; total duration
+also includes admission, SQL and cleanup. Pool waiting can exceed the configured
+storage deadline. A process killed before return may emit no completed sample.
+
+See [the diagnostics contract and acceptance evidence](docs/OPERATIONAL-DIAGNOSTICS.md).
 
 ## Uniqueness
 

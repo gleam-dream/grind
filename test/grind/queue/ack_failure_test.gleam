@@ -4,6 +4,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleeunit/should
+import grind/diagnostic
 import grind/internal/attempt
 import grind/job
 import grind/postgres
@@ -14,10 +15,12 @@ import grind/support/ack_queries.{
 }
 import grind/support/concurrency.{ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
+import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/job_state.{
   retry_transient_query, wait_for_job_state_tolerating_errors,
 }
+import grind/support/observers.{detach}
 import grind/support/queue_signals.{FirstAttemptStarted, WorkerInvoked}
 import grind/support/syncrep.{
   backend_pid_is_alive, install_syncrep_reply_trigger,
@@ -179,6 +182,18 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   let assert Ok(workers) = registry.register(workers, definition)
   let assert Ok(handle) =
     postgres.submit(database, "auto-ack-commit-loss", definition, 41)
+  let #(acks, ack_attachment) =
+    diagnostics.capture("ack-unknown", diagnostic.acknowledgement(), fn(meta) {
+      meta.context.ref.job_id == job.id_value(handle)
+    })
+  use <- exception.defer(fn() { detach(ack_attachment) })
+  let #(retries, retry_attachment) =
+    diagnostics.capture(
+      "retry-unknown",
+      diagnostic.acknowledgement_retry(),
+      fn(meta) { meta.context.ref.job_id == job.id_value(handle) },
+    )
+  use <- exception.defer(fn() { detach(retry_attachment) })
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_lease_duration(4008)
@@ -256,6 +271,23 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   |> should.equal(Ok(41))
   retry_transient_query(fn() { postgres.outcome(database, handle) }, 20)
   |> should.equal(Ok(job.SucceededWith("auto-terminated-41")))
+  let assert Ok(#(_, unknown)) = process.receive(acks, 5000)
+  unknown.outcome |> should.equal(diagnostic.AckUnknown)
+  let assert Ok(#(retried, retry)) = process.receive(retries, 5000)
+  retry.reason |> should.equal(diagnostic.RetryAfterUnknown)
+  retried.retry_number |> should.equal(1)
+  retried.delay_ms |> should.equal(1336)
+  retry.context |> should.equal(unknown.context)
+  retry.command_id |> should.equal(unknown.command_id)
+  let assert Ok(#(_, completed)) =
+    diagnostics.await(
+      acks,
+      fn(sample) { sample.1.outcome == diagnostic.AckReplied },
+      5000,
+    )
+  completed.context |> should.equal(unknown.context)
+  completed.command_id |> should.equal(unknown.command_id)
+  mark_database_test_executed("diagnostic-ack-unknown-retry")
   mark_database_test_executed(
     "automatic-ack-commit-connection-loss-recovers-passed",
   )

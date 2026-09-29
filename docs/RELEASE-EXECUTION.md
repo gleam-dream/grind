@@ -52,7 +52,7 @@ and the evidence listed for each item.
 | 5    | B1–B10 harness repairs, durable completion and provenance                                               | Repaired composite v4 accepted locally; dirty, uncommitted evidence                   |
 | 6    | Independent-node M1–M7, process/node death, DB loss, slow commit, delay/partition, soak, audited replay | 14 standalone cases and 266 mixed rounds pass; final audit and cleanup verified       |
 | 7    | Shared paired oracle, cross-result comparator, ledger/source checks and explicit divergences            | Twelve core pairs and fresh-soak M2/M6 fault comparisons pass                         |
-| 8    | Operational Sinal diagnostics explaining uncertainty and pressure                                       | Implementation plan prepared; before 1.0                                              |
+| 8    | Operational Sinal diagnostics explaining uncertainty and pressure                                       | Implemented locally; PostgreSQL/oracle/consumer, bench and formatting gates pass      |
 | 9    | Transaction-scoped enqueue and stronger public testing helpers                                          | API constraints and acceptance cases prepared; before 1.0                             |
 | 10   | Rebenchmark after correctness; do not implement batch claims or broader throughput optimization         | Repeated baseline, delayed subsets and matched L7 pair accepted; T3 remains triggered |
 
@@ -431,13 +431,12 @@ not unconditionally bounded by D. Fencing and quarantine remain the outage path.
 
 ## Before 1.0 follow-ups
 
-Operational diagnostics should be separate from commit-proven lifecycle events.
-Use typed, payload-free Sinal descriptors for renewal observations, ACK retries,
-claim failures and local capacity transitions. A skipped row proves contention,
-not the identity of its locker; a missing live fence does not by itself prove
-lease expiry; renewal-budget exhaustion does not prove quarantine. Measure
-checkout wait separately from total storage-call duration. Preserve the existing
-bounded forwarder and durable `acknowledged(Reconciled)` contract.
+Operational diagnostics are implemented after `1e87d2c`.
+`grind/diagnostic` separates typed runtime observations from commit-proven
+lifecycle events. It covers renewal, ACK outcomes/retries, selected checkout
+waits, claim failures and local capacity. The bounded Database forwarder and
+`acknowledged(Reconciled)` receipt proof remain unchanged. Scope, limitations
+and validation are recorded in [OPERATIONAL-DIAGNOSTICS.md](OPERATIONAL-DIAGNOSTICS.md).
 
 Transaction-scoped enqueue must separate admission statements from transaction
 ownership: calling the existing submission transaction inside a caller transaction
