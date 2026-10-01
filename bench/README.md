@@ -1,160 +1,179 @@
-# Benchmark harness
+# Benchmarks
 
-Run the disposable-database harness gate with:
+This unpublished Gleam project measures Grind against disposable PostgreSQL
+clusters. Use it to check workload correctness, renewal safety, latency and
+throughput on the machine where you intend to run Grind. Historical results
+below describe specific development snapshots; they do not qualify today's code
+for release. See [release readiness](../docs/RELEASE-READINESS.md) for that decision.
+
+## Run
+
+Run from the repository root with Nix installed and the Sinal path dependency at
+`../sinal`. The development shell supplies Gleam, Erlang, PostgreSQL and Python.
+Run database gates and benchmarks serially in a checkout, with the host awake
+and no competing workload.
 
 ```sh
+# Harness tests, activation checks and an audited 1,000-job drain.
 nix develop --command bash scripts/bench-smoke.sh
+
+# Full representative matrix, including four optional resource-stress points.
+GRIND_BENCH_T2_STRESS=1 GRIND_BENCH_DRAIN_TIMEOUT_MS=600000 \
+  nix develop --command bash scripts/bench-matrix.sh all
+
+# Matched coordinator comparison: identical drain budgets, separate runs.
+GRIND_BENCH_DRAIN_TIMEOUT_MS=600000 \
+  nix develop --command bash scripts/bench-matrix.sh l7
+GRIND_BENCH_DRAIN_TIMEOUT_MS=600000 GRIND_BENCH_NETWORK_DELAY_MS=5 \
+  nix develop --command bash scripts/bench-matrix.sh l7
 ```
 
-The gate runs the bench tests, requires every database-test marker, then drains
-1,000 jobs and audits effects, rows, receipts and observations. Compilation or
-plain `gleam test` without the database variables does not prove the DB cases.
+The matrix also accepts `l1`, `l2`, `l3`, `l4`, `l5`, `l6`, `l6t1` and `l6t2`.
+Each main point discards one warm-up and measures at least three repeats;
+`GRIND_BENCH_REPEATS` can increase that count. L7 also runs two diagnostic
+coordinator profiles. The full matrix takes hours. A subset establishes only
+its selected coverage. Plain `gleam test` without database configuration skips
+DB cases and does not replace the harness gate.
 
-For a matrix, select `l1`, `l2`, `l3`, `l4`, `l5`, `l6`, `l7`, or `all`:
+## Scenarios
 
-```sh
-nix develop --command bash scripts/bench-matrix.sh l3
-GRIND_BENCH_NETWORK_DELAY_MS=5 nix develop --command bash scripts/bench-matrix.sh l3
-```
+`C` is concurrency per consumer, `D` is the storage-call deadline, `L` is the
+lease duration, and `K` is the number of deliberately slow ACK targets.
 
-Each point discards a warm-up and keeps at least three repeats. L6 uses jobs
-lasting multiple leases at the real D=4-second ACK deadline. The 26 T2 profiles
-cover L=16/24/30 seconds, 0.8D/1.2D ACK delay, K=0 and K=3..8 at L=16 seconds,
-and K=0/5/8 at L=24/30 seconds. These and the healthy profiles take hours to run.
-A reduced selection is partial evidence, never a full-matrix verdict.
+| Suite   | Question and representative workload                                                                                                                      |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| L1      | Drain throughput across consumer, concurrency, queue-count and handler-cost shapes.                                                                       |
+| L2      | Empty polling cost with 1/8 consumers, 50/250ms polling and 0/100k/1M retained rows. Reports call counts, time per call and untimed production SQL plans. |
+| L3      | Open-loop latency at 50/200/1000 arrivals per second, with four C10 consumers.                                                                            |
+| L4      | Unique admission under hot/cold keys and 4/16/64 submitters, with a live C10 consumer and a separate lock sampler.                                        |
+| L5      | Pruning on/off during traffic, with 10,000 pre-aged terminal rows in each arm.                                                                            |
+| L6 / T1 | Healthy renewal lag at C4/C10/C50; staggered handlers run for at least three leases.                                                                      |
+| L6 / T2 | Healthy siblings during slow ACKs: D=4s, L=16/24/30s, ACK delay=0.8D/1.2D. The default 26 profiles cover K=0/3–8 at L=16s and K=0/5/8 at L=24/30s.        |
+| L7 / T3 | Coordinator throughput at 1×C50, 5×C10 and 10×C5, with 1ms handlers; mailbox and function sampling explain the shape.                                     |
 
-`GRIND_BENCH_T2_STRESS=1` adds four selected C50 profiles with main pools of 50
-and 10. To run an explicit subset, set `GRIND_BENCH_T2_PROFILES` to a text file
-with one `K D L ACK_delay concurrency main_pool` row per point (milliseconds;
-blank lines and `#` comments allowed). The file is copied into the results.
-The direct CLI accepts `l6t2 K D L ACK_delay concurrency main_pool repeat`;
-older forms remain supported. Every consumer reserves one additional renewal
-connection. CSVs name main, reserved-renewal and total Grind connection counts;
-the ledger pool is separately `max(total_concurrency, 4)` (L4 uses 8), and the
-observer pool has one connection. Keep these resource budgets equal in paired
-comparisons; equal main-pool sizes alone do not imply equal connection budgets.
+`GRIND_BENCH_T2_STRESS=1` adds four C50 profiles with main pools of 50 and 10.
+For a deliberate subset, set `GRIND_BENCH_T2_PROFILES` to a text file containing
+`K D L ACK_delay concurrency main_pool` per row, in milliseconds where applicable.
+Blank lines and `#` comments are allowed. The matrix copies the profile file into
+its output. Point definitions live in [bench-matrix.sh](../scripts/bench-matrix.sh);
+the individual-run CLI is documented in [load.gleam](src/grind_bench/load.gleam).
 
-`GRIND_BENCH_NETWORK_DELAY_MS` delays each TCP chunk in each direction between
-Grind and PostgreSQL. The ledger and observers connect directly. This is a real
-socket-path delay, separate from handler cost. It does not simulate bandwidth,
-packet loss, or an Internet topology. A configured 5 ms is per direction, not
-a claim that every SQL call takes exactly 10 ms. Include the delay in every
-comparison's configuration.
+## Comparability and validity
 
-L7 and diagnostic `profile` runs accept `GRIND_BENCH_DRAIN_TIMEOUT_MS`, a
-positive decimal integer defaulting to `60000`. For matched zero-delay and
-5-ms-delay L7 comparisons, set the same explicit budget (for example `600000`)
-on both arms. This changes only how long those runs may wait for completion;
-it does not change counts, job costs, pools, leases, statement deadlines, or the
-throughput denominator. The budget is checked between drain polls; an in-flight
-query can outlast it, so diagnostics report the actual interval. It does not
-alter L3's drain or generator-validity rules.
+- Match job count, handler cost, arrival pattern, concurrency, queue count,
+  storage deadlines, leases, database settings and transport delay. Record the
+  machine, operating system, storage and toolchain; results are not portable
+  capacity guarantees. Keep observer overhead equal when comparing Grind with Oban.
+- Count every connection. Each consumer reserves one renewal connection in
+  addition to the main pool; the ledger uses `max(total_concurrency, 4)`
+  connections (L4 uses 8), and the observer uses one. Equal worker concurrency
+  or equal main pools alone do not establish equal resource budgets.
+- `GRIND_BENCH_NETWORK_DELAY_MS` delays each received TCP chunk in each direction
+  on Grind's database path; ledger and observer connections remain direct.
+  Handler cost is separate. A 5ms setting is neither 5ms round-trip latency nor
+  a bandwidth, loss or partition simulation.
+- Throughput spans the first handler start to the last independently observed
+  durable receipt. The observer polls nominally every 10ms, so completion time
+  includes observation delay and contention. Handler completion and SQL
+  `finished_at`/receipt timestamps are separate metrics, not exact commit times.
+- L3 keeps absolute arrival slots and defaults to 256 outstanding admissions
+  (`GRIND_BENCH_MAX_INFLIGHT`). Any capacity-exhausted slot or maximum dispatch
+  lag above `max(20ms, 2% of the arrival window)` invalidates the generator.
+  Failed, unfinished and undispatched work stays in the accounting denominator.
+- Healthy runs must reconcile submissions, effects, final states, outputs,
+  receipts and observations. Missing measurements, observer failure, an
+  unacknowledged observer stop, or unexplained database errors invalidate evidence.
+  The scripts configure PostgreSQL logging and `auto_explain` for these checks.
+- L2 verifies actual row counts and captures `ANALYZE/BUFFERS/TIMING` plans outside
+  the timed interval. L4 requires at least 30 lock samples from its separate pool.
+  L5 must observe pruning inside the traffic window and account for every fresh
+  handler and durable completion; idle pruner polls do not prove pruning cost.
+- T1's lag threshold is `L/6`. Require `t1_triggered=false`, strictly positive
+  all-attempt minimum headroom and no negative samples; the runner records the
+  lag trigger without failing on it. T2 requires every slow target to activate
+  and a slow ACK to overlap a running sibling. Check the recorded renewals during
+  those stalls before claiming renewal-overlap coverage.
+- T2 requires every healthy sibling to succeed with one matching receipt, no
+  quarantine, and sampled headroom at least `L/10`. Each fault target must succeed
+  consistently or finish uncertain without an ACK receipt; incomplete jobs fail.
+  The legacy `t2_triggered` flag includes fault-target quarantine and is not the
+  healthy-sibling verdict. Never use `GRIND_BENCH_ALLOW_T2_FAILURE=1` for acceptance.
+- T3 is triggered when 1×C50 throughput is below 70% of 5×C10 while PostgreSQL
+  uses less than 50% of the whole machine's CPU capacity. Report both the ratio
+  and CPU denominator; the CSV's per-core percentage needs that normalization.
 
-Each L7/profile raw file has a sibling `.jsonl.drain.json` diagnostic, including
-successes. It records the resolved budget, time from consumer-startup entry to
-drain entry, the actual drain interval, the outcome, sampler first/last times,
-tick count, largest observed gap, and a completion snapshot after the observer
-has stopped. The sampler takes its first sample before drain entry and its final
-sample after drain exit, then acknowledges stop; it has no fixed tick limit.
-Coverage is of the drain interval only, not the earlier consumer-startup period.
-Cadence remains nominal, and the largest observed gap must be considered when
-interpreting samples. These monotonic times are separate from throughput's
-handler-start / durable-observation timestamp denominator.
+L7 and diagnostic profiles accept positive `GRIND_BENCH_DRAIN_TIMEOUT_MS`
+(default 60000). Use the same explicit value for matched arms; 600000 accommodates
+the recorded 5ms-delay shapes. This is a soft polling budget, not SQL cancellation
+or the throughput denominator. It does not change L3's drain or validity rules.
+Each `.jsonl.drain.json` records the actual interval, final completion counts and
+sampler coverage, including first/last samples, count and maximum gap. Timeout
+still fails; final diagnostics do not start another drain or turn failure into success.
 
-A timeout or instrumentation failure still fails the run. Diagnostic counts are
-observed after the drain decision, before consumer shutdown; they do not trigger
-another drain or convert partial work to success. On any matrix failure, the
-warm-up artifacts are retained under `warmup-results-on-failure/`. They may
-include earlier successful warm-ups; logs and diagnostic outcomes identify the
-actual failed phase. Warm-up artifacts are discarded when the matrix succeeds.
+## Historical results: 2026-09-28
 
-## Measurements and validity
+These are laptop measurements from dirty exploratory trees based on `8431b61`,
+with Sinal `c8868251a69ecf4fafdba7a7a8f1b419c71c1dfe`. The source SHA-256 values identify
+historical inputs; the removed generated snapshots cannot be reconstructed from
+these hashes alone:
 
-| Concern              | Current measurement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Handler work         | `bench_effects.started_at` is recorded before simulated work; `finished_at` is recorded after it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Durable completion   | An independent observer records the first time the succeeded receipt is visible. Aggregate throughput ends at this observation. It is an upper bound on commit time, including the 10 ms polling interval, observer query time and contention.                                                                                                                                                                                                                                                                                                                                                              |
-| SQL timestamps       | Existing `finished_at`/receipt timestamp latency columns remain available; they are written within the transaction and are not exact commit timestamps.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| Open-loop arrival    | A monotonic-clock scheduler uses absolute arrival slots and at most 256 outstanding admissions by default (`GRIND_BENCH_MAX_INFLIGHT`). Admission latency cannot move later slots. A slot without capacity is counted as capacity-limited, never queued for later dispatch.                                                                                                                                                                                                                                                                                                                                 |
-| Generator overload   | `arrivals.csv` preserves scheduled, dispatched, admitted, failed/unrecorded, unfinished and capacity-limited counts, the cap, peak outstanding, dispatch duration and p99/max lag. Any exhausted slot or lag over 2% of the window (20 ms floor) marks the run `generator_limited` and fails after writing the row. Failures remain in the denominator.                                                                                                                                                                                                                                                     |
-| Renewal headroom     | A separate pool samples every tracked attempt, including expired executing leases. T2 requires coverage of every non-stalled attempt. Successful renewal timing is a separate metric, not the denominator.                                                                                                                                                                                                                                                                                                                                                                                                  |
-| Slow ACK activation  | A PostgreSQL sequence increments inside the actual ACK trigger and survives rollback. T2 requires activation of each target and samples proving a slow ACK overlapped a running sibling handler.                                                                                                                                                                                                                                                                                                                                                                                                            |
-| T2 result            | Every admitted job has a final row in `l6_t2_outcomes.csv`. Healthy siblings must succeed with exactly one matching receipt and expected output. Fault targets may succeed under the same rule or be uncertain without an ACK receipt. Missing, queued, executing and inconsistent outcomes fail. Summary CSVs retain classification and uncertainty counts. Default validation also rejects non-stalled headroom below L/10 or quarantine. `GRIND_BENCH_ALLOW_T2_FAILURE=1` relaxes the headroom verdict for a historical baseline; it cannot bypass final classification or justify a release pass.       |
-| Pruning              | Both L5 arms start with 10,000 pre-aged terminal rows. A durable-prune telemetry observation must arrive within the fixed traffic interval. A later row-count read is reported separately, so admission drain time cannot expand that interval. Fresh workload rows remain in retention so no fast job disappears from the latency sample. The observed durable-completion and handler-completion counts must equal admitted jobs. L5 reports durable p50/p95/p99 separately from the explicitly labelled SQL timestamp columns. Both arms receive a full workload audit after synthetic filler is removed. |
-| Polling cost         | L2 compares 0/100k/1M rows, asserts actual table/retained-row counts, and reports time per call separately from calls per second. After timing, a fresh one-connection pool runs three actual empty-queue polls with session-local `auto_explain` ANALYZE/BUFFERS/TIMING JSON logging. Raw plans for the production claim/quarantine SQL and measured counts are retained under `raw/l2-plans-*.log`; missing plans fail. This requires PostgreSQL's `auto_explain` module and the disposable server log.                                                                                                   |
-| Admission contention | L4 holds the Grind pool at 80 and runs a C10 consumer. Its separate observer samples lock waits and requires at least 30 samples. CPU and latency are reported independently; rising latency alone is not evidence of advisory-lock contention.                                                                                                                                                                                                                                                                                                                                                             |
+- Baseline and delayed L3/T2: `4b0c3e229246b329a45ab4b52353954d25d577e72833b3f0fdef8013c0df4cf9`.
+- Fresh matched L7 pair: `c48eda5d5034c5d62979463f3f030316b9f7af146650db0823c116831139dddc`.
 
-Observer traffic is part of harness overhead, and must be held equal between
-implementations and measured in overhead controls before publishing comparative
-numbers. The idle L2 and admission-only L4 contexts disable the completion
-observer. DB samplers never borrow Grind's processing pool. The run owns the completion observer and waits for its stop acknowledgement
-before teardown; a query failure or stop timeout invalidates evidence. The
-activation gate requires an observer to survive multiple queries and acknowledge
-stop. The completion observer and lease sampler share the separate observer pool, so their sample
-cadence is nominal rather than a guaranteed deadline.
+Environment: Darwin 25.5.0 arm64, 12 logical CPUs, Gleam 1.18.1,
+OTP 28.5.0.6 / ERTS 16.4.0.6, PostgreSQL 16.15 on the same host, with
+`synchronous_commit=local`. Each main point had three measured repeats after
+warm-up. Operating-system and storage differences limit cross-host comparisons.
 
-## Provenance
+L7 medians used one queue, 50 total worker slots, main pool 50, 1ms handlers and
+a 600-second drain budget. The job counts were 9,000 / 33,000 / 46,000 respectively.
+Harness connections are additional to the Grind totals below.
 
-Every matrix run receives a new timestamped directory and `provenance.json`.
-The resolved L7/profile drain budget is recorded even when its environment
-variable is unset. CSV rows include commit, dirty flag, source SHA-256 and TCP delay. The digest
-covers current repository inputs (including untracked code, excluding results)
-and the sibling Sinal source. The matrix refuses to finish successfully if the
-source digest changes during the run. `GRIND_BENCH_RELEASE_EVIDENCE=1` rejects a
-dirty checkout before collecting evidence. A dirty exploratory run remains
-useful for development, but must not be relabelled as clean release evidence.
+| Shape | Total Grind connections | Jobs/s, no injected delay | Jobs/s, 5ms per direction/chunk |
+| ----- | ----------------------: | ------------------------: | ------------------------------: |
+| 1×C50 |                      51 |                  1,651.07 |                           41.74 |
+| 5×C10 |                      55 |                  3,872.33 |                          207.81 |
+| 10×C5 |                      60 |                  4,329.82 |                          414.29 |
 
-Old committed CSV files are historical evidence. The repaired composite is now
-accepted as exploratory evidence; it does not retroactively validate the
-provisional L2–L6 results or change their provenance.
+The 1×C50 / 5×C10 ratios were 42.64% and 20.09%; median PostgreSQL CPU at 1×C50
+was 14.78% and 3.44% of the machine respectively. T3 remained triggered. These
+are topology comparisons with different total connection budgets, not a
+controlled speedup over an older runtime. Batch claiming remains deferred.
 
-## B1–B10 repair status
+| Other accepted scope  | Recorded result                                                                                                                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| L3 at 1000 arrivals/s | Median observed durable-ACK p99: 253.647ms without injected delay; 25,644.262ms with 5ms delay. Both generators passed validity checks.                                                                |
+| T1, 9 measured rows   | 192 attempts; worst renewal lag 15.371ms against a 5,000ms threshold; minimum sampled headroom 19,984.037ms. No T1 trigger.                                                                            |
+| T2, 111 measured rows | 1,830 classified jobs; all 1,254 healthy siblings succeeded, with minimum headroom 10,638.835ms and no quarantine. All 576 targets activated: 288 succeeded and 288 became uncertain without receipts. |
 
-The repeated repaired composite passed its full numeric, raw-artifact and
-provenance audit. The accepted report is
-`bench/results/l7-drain-pair-20260928T091612Z/composite-audit-v4.json`; its retained
-parent terminal witness records exit 0. The detailed repair ledger and source
-references are in [RELEASE-READINESS.md](../docs/RELEASE-READINESS.md), with current
-measurements in [PERFORMANCE-EVIDENCE.md](../docs/PERFORMANCE-EVIDENCE.md).
+The accepted composite contained 240 main rows: the original baseline, delayed
+L3/T2 subsets and the fresh L7 pair. Its numeric, raw and provenance audit passed
+at the time. Three exact L2 autovacuum-related waits were adjudicated as setup or
+cleanup outside measurement; this did not create a general log-error exception.
+The original delayed L7 run failed its 60-second drain budget and remains a failed
+historical attempt; the fresh pair supplied the matched comparison. Earlier
+L2–L6 measurements had harness defects and are not release evidence. The repaired
+harness gate passed 38 tests and its audited smoke; a deliberate 1ms drain timeout
+also verified failure diagnostics. None of these historical passes qualifies
+subsequent source changes.
 
-The final PostgreSQL gate passed 38 tests, its 1,000-job audited smoke and
-L2/L3/L5/L7/profile activation checks in `bench/results/repaired-gate-garghm/`.
-A separate deliberate 1ms drain timeout retained failure diagnostics, completion
-counts and sampler coverage in `bench/results/drain-timeout-negative-2w6b1o/`.
-Its corrected checker validates expected failure retention, not performance;
-the original stale-literal checker failure remains recorded.
+## Outputs and release use
 
-A later formatting incident affected 17 retained JSON files. All formatted
-variants are preserved; nine preexisting pinned byte sequences were restored,
-and eight unpinned files remain formatted. The unchanged composite v4 re-audit
-accepted the evidence with no issues (actual session 66728, exit 0); its report,
-empty stderr and terminal result are retained beside the incident record.
-Permanent result-folder formatter exclusions are implemented; all 11,177 retained
-evidence files remained byte-identical after targeted documentation/configuration formatting. See the incident record in
-[PERFORMANCE-EVIDENCE.md](../docs/PERFORMANCE-EVIDENCE.md).
+Each matrix reserves a fresh output directory under `bench/results/`; an existing
+`GRIND_BENCH_RESULTS_DIR` is rejected. CSVs, raw samples, plans, logs and provenance
+are generated working files. Failed runs preserve warm-up context, which can
+include earlier successful warm-ups. Review failures before recording a summary.
 
-These are dirty, content-pinned exploratory snapshots. Earlier provisional
-measurements, the 34-test gate and seven-profile smoke retain their original
-scope. The original matrix wrapper failed delayed L7’s 60-second drain bound;
-that failure remains retained. A fresh zero/5ms L7 pair uses the same repaired
-harness and explicit 600-second soft drain budget. The composite accepts the
-unaffected original-source arms and the fresh pair, with three exact L2
-setup/cleanup log incidents adjudicated separately.
+Record results with the exact source/dependency versions, environment, shapes,
+repeat counts, validity checks and limitations. Routine generated output is
+ignored and disposable after that review; keep concise summaries in this file,
+not source archives or run-directory histories in Git. The historical raw files
+summarized above were removed during repository cleanup and are no longer
+available here for re-audit.
 
-Every measured T2 fault target activated. All healthy siblings succeeded with
-valid receipts and headroom above L/10. The aggregate `t2_triggered` flag can
-still be true when selected fault targets become uncertain; it is distinct
-from healthy-sibling acceptance. T3 remains triggered.
-
-The owner-approved fresh two-hour resilience run passed all 14 standalone cases
-and 266 mixed rounds over 7,202.060719 seconds after warm-up, retaining all
-healthy-job, fencing and resource assertions. Actual run session 7230 and audit
-session 97027 exited 0. The [final audit](../resilience/results/repaired-7200s-8YvcJq/soak-audit-v5.json)
-and [paired M2/M6 comparison](../resilience/results/repaired-7200s-8YvcJq/paired-comparison.json)
-are accepted local exploratory evidence; they do not establish a clean release
-baseline or remove the documented resource and coverage limits.
-The owner approved the prospective duration change on 2026-09-28. The earlier
-86,400-second attempt in
-`resilience/results/repaired-86400s-o23a23/` remains failed after a 275-second
-host software sleep crossed a healthy job's lease expiry. Its elapsed time does
-not count toward the fresh run. Day-long endurance remains unverified.
+Release qualification needs fresh gates and relevant benchmark runs on fixed
+source and dependencies. Set `GRIND_BENCH_RELEASE_EVIDENCE=1` to reject a dirty
+Grind checkout; separately verify the Sinal revision and cleanliness. The matrix
+records both inputs and rejects source-digest changes during a run. A clean run
+is a prerequisite, not an automatic release verdict or a replacement for the
+behavioural, fault and resilience checks in the release checklist.

@@ -1,3 +1,2 @@
 build/
-results/adhoc/
-results/**/raw/
+/results/

@@ -1,528 +1,113 @@
 # Release readiness
 
-Current work (2026-09-28): executor-owned ACKs, independent reserved renewal,
-first-ACK rollback recovery, startup cleanup and B1–B10 harness repairs are
-implemented in uncommitted exploratory snapshots. The repeated benchmark
-composite is accepted; [RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) records the
-runtime gates and remaining validation. The owner-approved two-hour resilience
-run and its independent audit passed.
-Historical descriptions below of coordinator-owned ACKs, an undecided T2
-remedy or the old concurrency-dependent lease minimum describe the prior
-implementation. No clean release baseline, commit or publication is claimed.
+Status checked on 2026-10-01 against Grind `75e50ae`. No release candidate is
+qualified yet. This checklist concerns the first experimental release; the
+before-1.0 API work below is separate.
 
-On 2026-09-28, the owner approved a fresh 7,200-second mixed-fault soak as the
-acceptance target. The run in `resilience/results/repaired-7200s-8YvcJq/` passed:
-actual session 7230 exited 0, followed by independent audit session 97027 exiting 0. The [final audit](../resilience/results/repaired-7200s-8YvcJq/soak-audit-v5.json)
-records 7,202.060719 mixed-fault seconds after warm-up; its independent lower
-bound is 7,202.058878 seconds. All 14 standalone cases and 266 mixed rounds
-passed, with 30 node-kill, worker-kill, request-partition, reply-partition and
-full-partition rounds each, and 29 lost-commit-reply, slow-ACK-delay,
-connection-loss and database-restart rounds each. Existing healthy-job, receipt,
-effect, fencing, audited replay and resource assertions were preserved.
-The [paired M2/M6 comparison](../resilience/results/repaired-7200s-8YvcJq/paired-comparison.json)
-also passed and records Grind's deliberate replay and pruning differences from
-Oban. These remain local exploratory results from dirty, content-pinned inputs.
+## What remains
 
-The earlier 86,400-second attempt in
-`resilience/results/repaired-86400s-o23a23/` remains failed. A retained power log
-confirms a 275-second host software sleep spanning a healthy job's lease expiry;
-the job became `uncertain` with one effect, no receipt and no replay. This is
-consistent with fencing after suspension, not a passed soak. No time from that
-attempt counts toward the fresh run. Day-long endurance remains unverified.
+| Requirement                        | Current state                                                                                                                                 | Acceptance                                                                                                                                                                                             |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Reproducible dependencies          | Grind uses `sinal = { path = "../sinal" }`. Local Sinal is `8acec45`; the last Grind gate used `858dfa3`; CI pins `f4622b6`.                  | Choose the Sinal release, use its published version range, refresh root/consumer/benchmark manifests and make local/CI resolution agree. Run Sinal's own suite on that version.                        |
+| Qualification of the final source  | `75e50ae` has passing root, consumer, oracle and benchmark gates with the older Sinal revision. The full matrix and soak predate diagnostics. | Run the commands below on a clean candidate with fixed dependencies. Source or dependency changes invalidate the affected evidence.                                                                    |
+| Independent result review          | The runners enforce fault, accounting and resource checks. Historical aggregate auditors were scripts specific to old runs.                   | Review the fresh raw results and provenance independently, or add a reusable post-run auditor. A zero exit status alone is not the complete review.                                                    |
+| Package contents and documentation | License/repository metadata exists; publication review remains open.                                                                          | Review Oban-derived notices, version/changelog, generated API docs and the getting-started example. Export the Hex package and build an external consumer from its contents without sibling checkouts. |
+| CI and release identity            | CI runs the PostgreSQL gate and Sinal tests, but uses an older Sinal pin. Push CI targets `main`; the local branch is `master`.               | Align dependency resolution and the intended release branch, obtain green CI, and record the qualified commit and environment.                                                                         |
 
-Tracks the work between the current experimental slice and a first release of
-Grind, published together with its sibling libraries. Tick an item only when
-its evidence is committed (tests, gate markers, and an entry in
-`docs/RECOVERY-EVIDENCE.md` where behavior changes). See
-[docs/RISKS.md](RISKS.md) for the standing risk register this checklist
-feeds into: several open items below (renewal starvation, storage-owner
-scoping, network-fault coverage, load/multi-node/soak evidence) are also
-risk-register entries with their own likelihood/impact judgment and
-mitigation status.
+Publishing dependencies or Grind, pushing and tagging require separate owner
+instructions. Changing the release dependency is implementation work; this
+cleanup does not select or publish a Sinal version. The benchmark, oracle and resilience
+provenance readers currently hash `../sinal`; update them to identify the actual
+resolved dependency when switching to Hex. A clean Grind tree alone does not
+prove that Sinal is clean or that the recorded source was the one built.
 
-Status legend: `[ ]` open, `[~]` in progress, `[x]` done (commit hash).
+## Qualification commands
 
-## 1. Contract decisions (decided 2026-09-25)
+Run serially in a fresh checkout. The PostgreSQL gate cleans build artifacts.
+Prevent host sleep for long runs; on macOS, prefix them with `caffeinate -i`.
+The commands create disposable databases and local, ignored result directories.
 
-- [x] **Old-version executing rows** (a86e439). A consumer's scan
-      quarantines expired executing rows for every worker and version in the
-      queues it polls; public `postgres.quarantine_expired(database, limit:)`
-      sweeps queues no consumer polls. Evidence: `docs/RECOVERY-EVIDENCE.md`,
-      Increment 14.
-- [x] **Retry-safe plain submit** (a86e439). `postgres.submit_with_id` shares
-      the unique-admission receipt, fingerprint and reconciliation through one
-      request with an optional uniqueness policy; ID-less `submit`/`submit_at`
-      document that a failed call may have committed. Evidence:
-      `docs/RECOVERY-EVIDENCE.md`, Increment 14; `docs/UNIQUENESS-CONTRACT.md`,
-      "Admission receipts".
-- [x] **Acknowledgement deadline** (a8feb68). A real TCP fault proxy
-      (`test/grind_fault_proxy.erl`) proves the code as found _was_ bounded
-      (~5000ms, pog's own hardcoded checkout deadline) for a dropped `COMMIT`
-      reply, a dropped request, a dropped `BEGIN` reply, and a stalled
-      lease-renewal `UPDATE` (T1–T5) — but only as a side effect of a
-      dependency's internals, never configurable or validated against the
-      lease. Replaced with a Grind-owned, validated `postgres.with_statement_deadline`
-      (default 4000ms) every storage call now goes through
-      (`src/grind_postgres_ffi.erl`), plus `queue.LeaseTooShortForDeadline`
-      validating the lease against it. Mutation-proven (checkout timeout
-      forced to `infinity`: T1/T4 genuinely unbounded; T2/T3/T5 still bounded
-      via the independent DEFECT-3 fix below, not the checkout deadline).
-      Evidence: `docs/RECOVERY-EVIDENCE.md`, Increment 15.
-- [x] **Migration mechanism** (1fb3c5d). Versioned, advisory-locked,
-      per-step migrations with exact declared shapes; cigogne-format files in
-      `priv/migrations`; upgrade harness from a frozen v11 fixture. Evidence:
-      `docs/RECOVERY-EVIDENCE.md`, Increment 16.
-- [x] **Migration step lock waits are bounded**. Each step's own transaction
-      sets a constant, transaction-local `lock_timeout` (2000ms) right after
-      its advisory lock; a step statement hitting PostgreSQL's own `55P03`
-      is now the typed, retry-safe `postgres.MigrationLockUnavailable(version)`
-      instead of blocking for up to the full `migration_deadline_ms`. Not
-      applied to `priv/migrations/*.sql` run directly through cigogne — see
-      README, "Migrations". Mutation-proven (removing the `SET` makes the
-      same scenario instead block until `migration_deadline_ms` and report
-      `MigrationCommitUnknown`). Evidence: `docs/RECOVERY-EVIDENCE.md`,
-      Increment 20.
-- [x] **Migration gaps** (72fe573). `cigogne_applies_grind_files_then_migrate_is_noop_test`:
-      cigogne itself applies `priv/migrations/*.sql` to a fresh schema
-      (sharing the `Database`'s own pool via `config.ConnectionDbConfig`),
-      `postgres.migrate` against the result is a genuine no-op, the
-      cigogne-applied schema submits/claims/acks a real job, and cigogne's
-      own down-then-up of `grind_v12` round-trips.
-      `cigogne_apply_serializes_with_concurrent_migrate_test`:
-      `postgres.migrate`, started only once `pg_locks` confirms cigogne's
-      own session already holds the shared advisory lock, genuinely queues
-      behind it and then no-ops once cigogne commits — both calls succeed.
-      `postgres_migrate_upgrade_reconcile_unique_lost_reply_test`: a
-      `submit_unique` against the frozen v11 fixture whose outcome is
-      genuinely uncertain (one committed via the SyncRep-trigger technique,
-      one never-committed via the real TCP fault proxy's own
-      `OnCommit`/`DropRequest`) survives `migrate_with` to v12, and
-      `reconcile_unique` against the upgraded schema resolves each
-      correctly. Mutation-proven (dropping `grind_v12`'s own advisory-lock
-      line, and breaking the generated receipt-lookup SQL, each turn the
-      relevant test red). A genuine empirical finding surfaced while
-      building this, documented rather than glossed over: the TCP fault
-      proxy's `OnCommit`/`DropReply` does not produce a genuine commit for
-      `submit_unique` specifically (its admission transaction reliably
-      parks on `wait_event = Client/ClientRead` and rolls back instead),
-      unlike the shorter acknowledgement transaction T1-T5
-      (`test/grind_fault_proxy_test.gleam`) exercise — see that test's own
-      doc comment and `docs/RECOVERY-EVIDENCE.md`, Increment 34.
+```sh
+nix flake check
+nix develop --command bash scripts/test-postgres.sh
+nix develop --command bash scripts/bench-postgres.sh
 
-### Defects found while designing the deadline (fix with it)
+nix develop --command env GRIND_BENCH_RELEASE_EVIDENCE=1 GRIND_BENCH_T2_STRESS=1 GRIND_BENCH_DRAIN_TIMEOUT_MS=600000 bash scripts/bench-matrix.sh all
 
-- [x] (a8feb68) Default `unique_lock_wait` (5000 ms) equalled pgo's fixed 5000 ms
-      transaction checkout deadline, so contention could surface as
-      `CommitUnknown`/`AdmissionFailed(QueryTimeout)` instead of
-      `AdmissionContended`. `postgres.validate` now rejects
-      `unique_lock_wait_ms + 1000 >= statement_deadline_ms`
-      (`UniqueLockWaitTooCloseToDeadline`); default lowered to 2000 ms.
-      Red-then-green mutation evidence: `docs/RECOVERY-EVIDENCE.md`,
-      Increment 15 (DEFECT 1).
-- [x] (a8feb68) pog's `convert_error` raises `function_clause` on some pgo error shapes
-      (e.g. "deadline reached while in queue", `econnreset`, `etimedout`).
-      Fixed structurally for the checkout-time shape (Grind's own wrapper
-      never lets pog run its own checkout any more) and defensively for the
-      post-checkout query shape (`guarded_query`/`guarded_transaction` catch
-      `error:function_clause`). Attempted but did not reproduce the exact
-      crash empirically (pgo's own overload shedding returns an
-      already-handled error first under ordinary contention) — fixed on
-      source-level confirmation of the missing clause, not a red test.
-      Evidence and the reproduction attempt: `docs/RECOVERY-EVIDENCE.md`,
-      Increment 15 (DEFECT 2 probe).
-- [x] (a8feb68) A lost `COMMIT` request leaves a server session idle in transaction
-      holding row locks. `postgres.validate` now sets
-      `idle_in_transaction_session_timeout` to `2 × statement_deadline_ms`
-      (8000 ms by default) as a connection startup parameter. Mutation-proven
-      as an independent backstop from the checkout deadline (T2/T3/T5 in
-      Increment 15 still converge with the checkout deadline disabled).
-      TCP keepalive is a real, complementary defense for a genuine network
-      partition, not exercised (loopback only) — documented, not fixed here.
-- [x] (a8feb68) Migrations share the 5000 ms deadline; a longer DDL step would fail.
-      Fixed as a side effect of the Grind-owned deadline: `migrate` now uses
-      its own `postgres.migration_deadline_ms` (default 30000 ms) instead of
-      the shared per-pool deadline. The migration _mechanism_ itself
-      (Grind-owned versioned `.sql` files) is still the separate, tracked
-      item above — out of scope for this run.
-- [x] Flaky under load: `postgres_submit_unique_aborted_commit_is_commit_unknown_test`
-      (`QueryTimeout` from the same 5000 ms deadline). Root cause was never
-      the deadline directly — a transient pool-recovery window right after
-      the test's own deliberate `pg_terminate_backend`, already tolerated
-      elsewhere in the suite via `retry_transient_query` but missing here;
-      wrapped the two exposed calls in it. The same gap, independently
-      found, was also fixed in
-      `postgres_resolved_observation_absent_on_commit_unknown_test`.
-      Confirmed deterministic across multiple fresh-cluster reruns. Evidence:
-      `docs/RECOVERY-EVIDENCE.md`, Increment 15.
-- [x] (a8feb68) Known limit, documented: several pending acknowledgements can still
-      starve sibling renewals even once `queue.LeaseTooShortForDeadline`
-      passes; the real fix is renewals off the coordinator loop (not
-      attempted here). Documented in README ("Guarantees") and
-      `docs/RECOVERY-EVIDENCE.md`, Increment 15.
+nix develop --command env GRIND_BENCH_RELEASE_EVIDENCE=1 GRIND_BENCH_NETWORK_DELAY_MS=5 GRIND_BENCH_T2_PROFILES=bench/profiles/t2-smoke.txt GRIND_BENCH_DRAIN_TIMEOUT_MS=600000 bash scripts/bench-matrix.sh l6t2
+nix develop --command env GRIND_BENCH_RELEASE_EVIDENCE=1 GRIND_BENCH_NETWORK_DELAY_MS=5 GRIND_BENCH_DRAIN_TIMEOUT_MS=600000 bash scripts/bench-matrix.sh l3
+nix develop --command env GRIND_BENCH_RELEASE_EVIDENCE=1 GRIND_BENCH_NETWORK_DELAY_MS=5 GRIND_BENCH_DRAIN_TIMEOUT_MS=600000 bash scripts/bench-matrix.sh l7
 
-## 2. Sinal release readiness
+nix develop --command bash scripts/test-resilience.sh --release-evidence --deadline-ms 4000 --lease-ms 30000 --soak-seconds 7200
+nix develop --command bash oracle/run-faults.sh
+```
 
-- [x] Bounded emitter-side forwarder merged to Sinal `master` (355617c).
-- [x] Sinal version, CHANGELOG, and publish metadata (f4622b6). `CHANGELOG.md`
-      documents the full unreleased feature set; `gleam.toml` carries license,
-      description, and repository metadata. The package version stays `0.1.0`
-      by deliberate decision (recorded in the changelog itself) until a
-      release is actually cut — not an open gap.
-- [x] Close the forwarder test gaps (f4622b6): the sender-side duplicate-drop
-      guard is now independently observable
-      (`concurrent_drops_queue_single_report_message_test`, which reads the
-      forwarder's own mailbox length before any message is processed). The
-      restart race stays a best-effort stress test by deliberate decision — a
-      deterministic reproduction would need a permanent test-only delay
-      inside the production initialiser for a concurrent `emit` to race
-      against, which Sinal's `forwarder_test.gleam` documents and rejects as
-      a seam not worth shipping.
-- [ ] Grind depends on a published Sinal version range instead of `../sinal`.
+After dependency alignment, check packaging with `nix develop --command gleam
+export hex-tarball` and `nix develop --command gleam docs build`. These commands
+build local artifacts; they do not publish. Inspect the export and exercise an
+external consumer before accepting it.
 
-## 2b. pog dependency (fork dropped; Grind-owned checkout restored)
+Then run `python3 oracle/fault_compare.py --grind <grind-run> --oban <oban-run>
+--output <new-comparison.json>` against those fresh M2/M6 runs. The ordinary
+PostgreSQL gate already includes the twelve core Oban pairs, ledger validation,
+Squirrel generation checks and the external consumer tests. Plain `gleam test`
+can skip PostgreSQL cases and does not replace that gate.
 
-- [x] **Decision (user, superseding the 5701ede/Increment 17 fork migration):**
-      drop the `lostbean/pog` git dependency entirely. Grind depends on
-      vanilla `pog` from Hex (`>= 4.1.0 and < 4.2.0`), with `pgo` also
-      declared directly and pinned just as tightly (`>= 0.20.0 and < 0.21.0`)
-      since `grind_postgres_ffi.erl` calls straight into it. No PRs upstream
-      are needed for Grind's own release; #85/#86/#87 against lpil/pog are no
-      longer blocking anything here (left open only if the pog maintainer
-      still wants the upstream discussion).
-- [x] **Release blocker resolved:** nothing but Hex dependencies remains in
-      `gleam.toml`/`consumer/gleam.toml` — the git dependency that previously
-      blocked Hex publication is gone.
-- [x] Restored: Grind's own bounded checkout in `grind_postgres_ffi.erl`
-      (`with_deadline`/`with_deadline_ms`, a `pgo:checkout/2` with one absolute
-      deadline shared across candidate checkouts), `Settings.statement_deadline_ms`/`migration_deadline_ms`
-      with their own setters and validation, and the per-pool
-      `persistent_term` deadline set in `postgres.start` and cleared in
-      `postgres.close`. `docs/RECOVERY-EVIDENCE.md` has the before/after
-      fault-proxy numbers for this reversal.
-- [ ] **Remaining risk, accepted:** this couples Grind directly to pog's
-      private `Connection` shape (`{pool, Name} | {single_connection, Conn}`)
-      and to pgo's private connection record, checkout/return APIs, pool
-      topology and cache layouts. The version ranges above limit upgrade scope
-      but do not guarantee these private contracts remain stable.
-      `pog_connection_pool_shape_test` (`test/grind_test.gleam`) checks the pog
-      pool tuple; startup/cache and reconnect regressions cover the additional
-      private contracts. Dependency upgrades require review of all of them.
-- [x] Pool name lifetime (plan commit 15, see below): `postgres.validate`
-      creates the pool's name once, and every `start` of that same
-      `ValidatedSettings` value reuses it — not fresh per `start` — so a
-      close/reopen cycle against the same validated settings reopens under
-      the same name a still-running `Consumer` is already addressing. The
-      `persistent_term` deadline entry `set_deadline` attaches to that name
-      is erased by a matching `postgres.close`; a process that starts a
-      `Database` and never closes it (or crashes before closing) still
-      leaks one small entry per distinct `ValidatedSettings` value that was
-      ever started — down from one per `start` call before this commit, and
-      down from one per `start` call under the pre-fork design too, since a
-      caller reusing the same `ValidatedSettings` for repeated
-      close/reopen cycles now shares one name across all of them.
-- [ ] Known, pre-existing behaviors unrelated to the above: (a) pog's
-      transaction crash cleanup uses `let assert` on its rollback, so a
-      crash during `COMMIT` followed by a failed rollback crashes the
-      caller instead of returning an error. (b) a checkout that has to
-      queue behind other contended callers is bounded by `pgo_pool`'s own
-      CoDel-style overload shedding, not by `D` alone.
+The benchmark matrix requires at least three measured repeats after warm-up.
+Use the same source, pool/concurrency shapes, job costs and drain budget for
+the zero-delay and delayed comparisons. The stress and delayed subsets are
+specified in [the benchmark guide](../bench/README.md).
 
-## 3. Public API tidy-up (breaking after release)
+The soak requirement is **two hours of mixed faults after warm-up**, plus all
+fourteen standalone cases. A shorter rehearsal validates the harness; it does
+not qualify a release. A 24-hour run is not required. See the
+[resilience guide](../resilience/README.md) for scenario and resource assertions.
 
-- [x] Collapse the four `queue.start*` variants (294e67b). One
-      `queue.start(database, workers, policy: ValidatedPolicy)`, keyed on a
-      `Polling` type (`PollEvery(interval_ms:) | Manual`) instead of a
-      separate boolean argument.
-- [x] `resolve_uncertain` takes a record instead of positional strings
-      (47396c9).
-      `ResolutionRequest(resolution_id:, resolved_by:, details:, decision:)`.
-- [x] Replace stringly typed public fields (`AckRejection.state`,
-      `QueueAckProposalCodecMismatch.kind`, `AcknowledgementReceipt.committed_at`)
-      (5f95e08, a9a1c7a). `AckOwnershipChanged`/`AckRecordChanged` dropped
-      their redundant `state` field entirely; `AckStateChanged.state` is
-      `job.State`; `QueueAckProposalCodecMismatch`/`QueueCodecMismatch.kind`
-      is the new `worker.CodecKind` (moved from `observation.CodecKind`,
-      which described a worker concept, not an observation one);
-      `AcknowledgementReceipt.committed_at: String` (an ISO-8601 `to_char`
-      rendering) is now `committed_at_unix_ms: Int`.
-- [x] One `SubmitError` shape across `postgres` and `unique` (a6b2f3e).
-      `postgres.SubmitError` is gone; plain `submit`/`submit_at` return
-      `unique.SubmitError` too, with their own uncertain-outcome case
-      renamed `CommitUnknownWithoutId`.
-- [x] Move the internal claim/ack/renew protocol out of `postgres.gleam`
-      into `grind/internal/` (33ce119). `grind/internal/attempt`
-      (claim/renew/acknowledge) and `grind/internal/lease` (lease-fencing
-      predicates, quarantine scan).
-- [x] Move test-only fault hooks out of the production coordinator
-      (8efa554). `grind/internal/consumer_hooks.Hooks`, supplied once at
-      start time (`@internal queue.start_with_hooks`), replaces the two
-      mid-flight `InjectWorkerStartFailure`/`KillNextWorkerBeforeMonitor`
-      messages.
-- [x] Test hygiene: `postgres_resolved_observation_absent_on_commit_unknown_test`
-      uses fixed queue/worker names, so it fails on a reused database (the
-      gate always uses a fresh cluster) (ceeaa03). Suffixed the queue name
-      and worker id with the test's own already-computed per-run suffix.
-- [x] Trim doc-comment density in `grind/internal/unique_admission.gleam`
-      (comments doubled in a86e439) to match the rest of the codebase
-      (08ed52c).
-- [x] Review naming (`ConsumerDrainTimedOut` after a successful stop,
-      `attempt.renew` error names) (81f8fb3, 4d37cfe). `ConsumerDrainTimedOut`
-      is `StopOutcome.StoppedDrainUnconfirmed`; `attempt.renew` returns
-      `Renewal { Renewed LeaseLost }` instead of a bare `Bool`.
-- [x] `grind/submission` module (user-approved optional item O1, plan commit
-      13). `SubmissionId`/`submission_id`/`submission_id_value`,
-      `Availability`, `Admission`/`Conflict` (+accessors), `PendingSubmission`
-      (+accessors), and `SubmitError` move out of `grind/unique` into a new
-      `grind/submission` module; `EmptySubmissionId` becomes its own
-      `SubmissionIdError` there. `grind/unique` keeps only the uniqueness
-      policy vocabulary (`Key`, `Policy`, `States`, `Period`, `QueueScope`,
-      `ConflictAction`) — these types apply to plain `submit`/`submit_at`
-      too, which never touch a uniqueness policy at all.
-- [x] One `JobReadError` (user-approved optional item O4, plan commit 14)
-      for `bind_handle`/`arguments`/`state`/`outcome`/
-      `reconcile_acknowledgement`, replacing five separate, inconsistently
-      shaped error types (`HandleBindError`, `ArgumentError`, `StateError`,
-      `OutcomeError`, `AckReconciliationError`). Every queue/worker-contract
-      mismatch across all five now carries the same `expected`/`actual`
-      payload (several were previously bare); each function's own doc
-      comment says exactly which variants it can and cannot return.
-      `ExecutedBusinessFailure.cause` is now typed as
-      `worker.BusinessFailureCause` instead of a raw `String` (O5); the
-      identical `worker.FailureCause` merges into it — moved to
-      `grind/worker` rather than `grind/job` as O5 originally named it,
-      since `grind/job` already depends on `grind/worker` for `Codec`/
-      `Worker` and the reverse would cycle. One canonical
-      `worker.business_failure_cause_to_string`/`_from_string` pair replaces
-      three separate ad hoc strings-to-enum mappings that had accumulated in
-      `grind/postgres`, `grind/observation`, and `grind/internal/attempt`.
-- [x] Observation names (user-approved optional item O6, plan commit 16). `[grind, job, cancellation]` → `[grind, job, cancellation_decided]`, `[grind, job, contract_mismatch]` → `[grind, job, contract_mismatch_recorded]` — both the telemetry event name and the `grind/observation` descriptor function (`cancellation`/`contract_mismatch` → `cancellation_decided`/`contract_mismatch_recorded`), matching the past-participle naming
-      every other event already uses (`acknowledged`, `admitted`, `claimed`,
-      `quarantined`, `resolved`, `released`). `CancellationOutcome`'s
-      constructors drop their redundant `Outcome` suffix
-      (`CancelledBeforeRunOutcome`/`CancellationRequestedOutcome` →
-      `CancelledBeforeRun`/`CancellationRequested` — the type name already
-      says "outcome"). The `Measurements`/`Metadata` type names themselves
-      are unchanged, matching the plan's scope of "event names and
-      descriptor functions" only.
-- [x] Settings cleanup (user-approved optional items O2+O3, plan commit 15).
-      `postgres`'s setters are renamed `with_*` to match `queue`'s own
-      (`pool_size`/`unique_lock_wait`/`statement_deadline`/
-      `migration_deadline`/`observation_capacity` →
-      `with_pool_size`/`with_unique_lock_wait`/`with_statement_deadline`/
-      `with_migration_deadline`/`with_observation_capacity`). `Settings` no
-      longer carries `process.Name(pog.Message)` at all — `postgres.settings`
-      takes only a database URL now; the pool's own name is created once
-      inside `validate` (not accepted from the caller, and not fresh on
-      every `start` — see "2b" above for why that distinction matters).
-      Every test that reconstructed a raw connection via
-      `pog.named_connection(pool_name)` now uses the existing `@internal`
-      `postgres.connection(database)` instead, since the caller no longer
-      holds a name to reconstruct one from.
+## What passing means
 
-## 4. Evidence still missing
+- Every required test marker and paired scenario ran; no skipped database suite
+  is counted as a pass. Claims, receipts, effects and explicit replay agree.
+- Healthy jobs survive the tested slow-ACK and pool-pressure configurations.
+  Fault targets may become uncertain only where the scenario expects it.
+  T1 must report `t1_triggered=false` and strictly positive minimum headroom
+  across all attempts; the runner's exit alone does not enforce the lag verdict.
+  T2 thresholds, arrival validity and resource bounds remain unchanged.
+- The benchmark has no unexplained accounting, generator, SQL or resource
+  failure. Report throughput and latency with hardware and configuration.
+  T3's coordinator bottleneck remains a documented, deferred optimization;
+  crossing its 70% trigger is not itself a release blocker.
+- Fresh M2/M6 comparisons classify Grind's audited replay and leaderless pruning
+  as deliberate differences from Oban. They do not prove every fault equivalent.
+- Review records actual duration, fault coverage, provenance, final outcomes and
+  cleanup. Close any new correctness finding before accepting the candidate.
 
-- [x] Half-open socket through a real TCP fault proxy, beyond backend
-      termination (Increment 15): a dropped `COMMIT` reply, a dropped
-      `BEGIN` reply, a dropped request, and a stalled lease-renewal `UPDATE`
-      all resolve within the checkout deadline. **Remaining gap, not this
-      item:** the proxy is loopback-only (no genuine network partition,
-      packet loss, or asymmetric latency), every test database connects
-      with `sslmode=disable` (TLS untested), and a connect-time hang against
-      an unresponsive host is not covered (every injected fault assumes an
-      already-established connection) — see `docs/RECOVERY-EVIDENCE.md`,
-      Increment 15, "Limits", and `docs/RISKS.md`.
-- [x] Load (L1/L7, throughput and coordinator bottleneck): drain throughput
-      at `maximum_concurrency` 1-50, 1-10 consumers, 1-2 queues, and the
-      `1×C50` vs `5×C10` vs `10×C5` coordinator-bottleneck matrix. See
-      `docs/PERFORMANCE-EVIDENCE.md` ("L1: drain throughput matrix", "L7:
-      coordinator bottleneck", "T3 verdict") and
-      `bench/results/2026-09-26-25894a6/`. **T3 triggered** (`1×C50` reached
-      about 32% of `5×C10`'s throughput at equal total concurrency, under the
-      70% threshold, with PostgreSQL itself at under 8% of the whole
-      benchmark machine's CPU — see `docs/RISKS.md` risk 19): the single
-      coordinator process, not the database, is the throughput ceiling at
-      high per-consumer concurrency. **Remedy deferred by user decision
-      (2026-09-27)**, tracked as post-release performance optimizations, not
-      a release blocker; see the current follow-ups below. The mitigation is
-      topology (more consumers/queues, `maximum_concurrency` around 10 per
-      consumer). This paragraph records the historical `25894a6` result.
-      The repaired L1–L7 evidence is recorded below; T3 remains triggered.
-- [~] **L2–L6 and B1–B10:** repaired and remeasured locally. Composite v4
-  accepts the complete repeated baseline, delayed L3/T2 subsets and fresh
-  matched L7 pair. Its source snapshots are dirty and content-pinned; evidence
-  remains uncommitted. The `548c31e` measurements retain their provisional
-  status. See “Repaired benchmark composite — 2026-09-28” in
-  [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md).
-- [~] **T2 healthy-sibling starvation:** the owner selected executor-owned
-  ACKs and independent reserved renewal. All 1,254 healthy siblings in the
-  repeated zero/5ms-delay profiles succeeded with one valid receipt. Minimum
-  observed healthy headroom was 10,638.835ms; every row exceeded its own L/10
-  threshold, with no healthy quarantine or negative headroom sample. Each
-  of the 576 fault targets activated; 288 succeeded and 288 became uncertain
-  without receipts. These results support the repaired mechanism in the
-  tested configurations, alongside the accepted two-hour mixed-fault soak. The
-  historical reproduction and rejected “not triggered” verdict remain recorded in
-  [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md).
+## Release record and output retention
 
-- [~] **Independent-node and fault coverage:** implemented and locally verified.
-  The accepted two-hour run passed all 14 standalone cases and 266 mixed rounds,
-  including process/node death, backend/server loss, slow ACKs and
-  directional/full transport partitions. The earlier 300-second rehearsal
-  remains retained. The two primary VMs are independent OS processes. The
-  [paired M2/M6 comparison](../resilience/results/repaired-7200s-8YvcJq/paired-comparison.json)
-  also passed; see [RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) for scope and limits.
-- [~] **Soak:** the owner-approved fresh two-hour run and independent audit passed
-  in `resilience/results/repaired-7200s-8YvcJq/`: 7,202.060719 mixed-fault seconds,
-  266 rounds and 6,993 primary effects. The earlier 86,400-second attempt remains
-  failed after host software sleep. None of its elapsed time was carried forward;
-  day-long endurance remains unverified.
-- [~] **Fault-proxy delay/partition modes and benchmark smoke:** implemented.
-  The independent-node rehearsal exercised request, reply and full partitions;
-  the accepted benchmark composite includes matching 5ms transport-delay
-  subsets. `scripts/bench-smoke.sh` delegates to the PostgreSQL benchmark gate;
-  that gate's latest 38-test run and 1,000-job audit passed in
-  `bench/results/repaired-gate-garghm/`.
-- [~] **Per-attempt storage decision:** executor-owned ACKs and independent
-  reserved renewal are implemented under the approved correctness work.
-  The repeated T1/T2 results and accepted two-hour soak support liveness in the
-  tested configurations. T3 still triggers, and batch claiming remains deferred.
+Commit one concise release record: Grind and dependency revisions, toolchain and
+machine, configuration, command exits, test counts, benchmark medians/ranges,
+soak duration and fault counts, resource peaks, and remaining limits. Record a
+failed run as failed; an unchanged retry does not erase it.
 
-### Bench harness fixes — locally verified, uncommitted
+Raw logs, traces, CSVs, runtime copies and source archives are temporary outputs.
+Keep them through review, then delete them after recording the checked summary.
+They are ignored by Git. A summary preserves the finding, not the ability to
+re-audit deleted bytes. Historical results below cannot qualify a newer build.
 
-The repaired composite is accepted. These entries remain `[~]` under this
-checklist’s committed-evidence rule. The old B1–B10 descriptions and provisional
-results remain in [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md); they are not
-retroactively accepted. The new results are laptop evidence from dirty,
-content-pinned snapshots. The final PostgreSQL gate passed 38 tests and its
-activation checks in `bench/results/repaired-gate-garghm/`. The separate
-`drain-timeout-negative-2w6b1o/` evidence verifies completion diagnostics and
-sampler coverage are retained when a deliberate 1ms drain budget fails.
+## Historical baseline and remaining scope
 
-| Defect | Repair and retained evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| B1     | `[~]` Staggered slow ACKs overlap long healthy handlers. Rollback-proof counters prove activation of every target. All 90 measured fault rows also observed renewal during slow ACKs. A zero renewal-overlap count would limit that stress evidence. Source: `bench/src/grind_bench/instrumentation.gleam:220`, `bench/src/grind_bench/load/maintenance.gleam:407`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| B2     | `[~]` Independent samples cover all healthy attempts, including expired leases; every admitted job has a final state/receipt classification. The 1,830 retained T2 outcomes contain no missing or unfinished job. Source: `bench/src/grind_bench/load/maintenance.gleam:445`, `:465`, `:561`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| B3     | `[~]` All three enabled L5 repeats pruned 10,000 old rows within their traffic windows; disabled repeats pruned none. All 12,000 measured jobs have handler and independently observed durable completions. Source: `bench/src/grind_bench/load/maintenance.gleam:95`, `:109`, `:191`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| B4     | `[~]` All 36 L2 rows verify actual 0/100k/1M table sizes and retain call totals, mean costs and untimed production plans. Three exact setup/cleanup log incidents were adjudicated separately; no claim of flat per-call cost follows from call counts. Source: `bench/src/grind_bench/load/open_loop.gleam:187`, `bench/src/grind_bench/load/plan_evidence.gleam:38`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| B5     | `[~]` Absolute arrival slots use a bounded generator with explicit lag, admission and capacity denominators. All 18 measured L3 rows were valid at 50/200/1000 arrivals/s; each delay arm completed 18,750 jobs. Source: `bench/src/grind_bench/load/arrivals.gleam:86`, `bench/src/grind_bench/load/open_loop.gleam:69`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| B6     | `[~]` L4 keeps a fixed main pool, live consumer and separate sampler connection. All 18 repeats retain distinct raw files: 3,717 lock samples, at least 130 per repeat. Latency alone is not evidence of lock contention. Source: `bench/src/grind_bench/load/admission.gleam:156`, `:199`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| B7     | `[~]` Fractional milliseconds are padded correctly. Database tests cover a real consumer ACK and rollback-proof per-target activation; repeated activation of one target cannot satisfy another. Source: `bench/test/grind_bench_instrumentation_test.gleam:211`, `:221`, `:287`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| B8     | `[~]` T1 uses staggered work of at least 3L, warm-up and three repeats at C4/C10/C50. All 192 attempts were observed, with 1,911 renewal samples; worst lag 15.371ms was below L/6 = 5,000ms. Source: `bench/src/grind_bench/load/maintenance.gleam:247`, `scripts/bench-matrix.sh:179`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| B9     | `[~]` Dirty state, source/Sinal inputs, toolchain, machine, arguments and external drivers are retained and checked before/after execution. Output directories and repeat labels prevent evidence reuse/overwriting. The pre-incident audit accepted exploratory evidence, not a clean release claim. A later formatter changed 17 retained JSON files; nine pinned originals were restored and eight unpinned files remain formatted. The unchanged v4 post-incident re-audit accepted the evidence with no issues (actual session 66728, exit 0). Permanent result-folder formatter exclusions are implemented; all 11,177 retained evidence files remained byte-identical after targeted documentation/configuration formatting. Source: `scripts/bench-provenance.py:8`, `:87`, `:108`; the incident record in the performance appendix. |
-| B10    | `[~]` The baseline covers 26 default-scale T2 profiles plus four selected C50 resource-stress profiles, each with three repeats. D=4s, L=16/24/30s, K 0/3–8 and 0.8D/1.2D ACK delays are represented; seven selected profiles also run with 5ms transport delay. This is a targeted matrix, not every Cartesian combination. Source: `scripts/bench-matrix.sh:188`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-
-L7 and its diagnostic profiles now share a validated, recorded drain budget and
-retain sampler coverage plus completion diagnostics on failure. The fresh pair
-used 600,000ms in both arms. This soft polling budget does not cancel SQL or
-change the durable-completion throughput denominator. Source:
-`bench/src/grind_bench/load/runtime.gleam:70`,
-`bench/src/grind_bench/load/drain.gleam:68`,
-`bench/src/grind_bench/load/report.gleam:18`.
-
-### Performance follow-ups (T3, not bench harness fixes)
-
-- [ ] **Batch claim** (post-release performance optimization, deferred by
-      user decision 2026-09-27, not a release blocker): one claim statement
-      claims up to the number of free slots at once, Oban's `fetch_jobs`
-      shape (`UPDATE` with a `SELECT ... FOR UPDATE SKIP LOCKED LIMIT`
-      subquery bounded by the free-slot count), plus one expired-lease
-      quarantine sweep per poll instead of one per claim. See
-      `docs/RISKS.md` risk 19.
-- [~] **Ack from the attempt process:** implemented under the owner-approved
-  correctness work, with independent reserved renewal. Its repeated
-  benchmark evidence and the owner-approved two-hour soak are accepted locally.
-  T3 still triggers in the repaired L7 comparison. Batch claiming remains
-  deferred; executor-owned ACKs did not remove the throughput limitation.
-  See [RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) and the repaired benchmark
-  appendix in [PERFORMANCE-EVIDENCE.md](PERFORMANCE-EVIDENCE.md).
-
-## 5. Packaging and documentation
-
-- [ ] Hex metadata; license and Apache-notice review for Oban-derived material.
-- [ ] Getting-started guide built on the consumer package; generated API docs.
-- [x] CI workflow running `scripts/test-postgres.sh`, `nix flake check`, and
-      Sinal's tests (`.github/workflows/ci.yml`, `postgres-gate` job).
-  - Uses the same `nix develop` shell (`flake.nix`) a contributor's own
-    environment would, not a hand-rolled toolchain. CI exercises the same
-    PostgreSQL 16, Erlang, Gleam, and Elixir versions already proven green
-    locally.
-  - A separate, fast `quick-check` job (format, build, plain `gleam test`,
-    no database) gives quicker feedback on a compile or format error. Its
-    own `gleam test` step is not meaningful PostgreSQL coverage by itself:
-    every DB-backed test short-circuits to a no-op with no
-    `GRIND_TEST_*_URL` set. That gap is exactly why `postgres-gate` exists.
-  - `postgres-gate` is what actually proves the system works. Its own
-    `scripts/test-postgres.sh` already fails closed if any named
-    integration contract's marker was never written, so a DB test silently
-    skipping there fails the job outright.
-  - Sinal is checked out as a sibling directory at a pinned commit for both
-    jobs. `gleam.toml` depends on it as a local path (`../sinal`), not a
-    Hex package, so `gleam build` cannot resolve at all without that
-    checkout, true even before considering Postgres coverage. Bump
-    `SINAL_REF` in `.github/workflows/ci.yml` deliberately when Sinal
-    changes; never point it at a floating branch.
-  - `nix run nixpkgs#actionlint` validated the workflow YAML itself.
-    GitHub Actions cannot be run from this environment to confirm the
-    workflow end to end.
-  - `scripts/test-postgres.sh` must fetch dependencies fresh. A cached
-    `build/` directory carried over from before the pog fork was dropped
-    once silently kept the old fork's compiled artifacts in play even
-    after the manifest moved to vanilla Hex `pog`.
-  - `scripts/test-postgres.sh` guards this directly: it refuses to run if
-    either manifest resolves `pog` from anything but Hex, and
-    unconditionally runs `gleam clean` in both the root and consumer
-    projects before compiling. Plain `gleam deps download` does not help
-    here, since it trusts the packages record of what is already
-    downloaded, not the package directories on disk. This costs a full
-    rebuild on every gate run, accepted as the simplest guard that cannot
-    itself drift from how Gleam tracks its own cache. Because of this,
-    `postgres-gate`'s own `actions/cache` step does not cache `grind/build`
-    or `grind/consumer/build` at all — either tree is unconditionally
-    discarded before it could ever be reused, so caching it only cost
-    restore time for no benefit. It caches only what `gleam clean` does not
-    touch: the Elixir oracle's `deps`/`_build` and `sinal/build`, keyed
-    solely on the manifests those two actually depend on
-    (`oracle/mix.lock`, `sinal/manifest.toml`), with no `restore-keys`
-    fallback prefix — a same-OS, different-hash restore would risk reusing
-    a tree built against a different dependency version than the run
-    actually resolves. A separate `DeterminateSystems/magic-nix-cache-action`
-    step caches the Nix store itself (every `nix develop`/`nix flake check`
-    derivation), independent of this Gleam/Mix artifact cache.
-  - `oracle`'s own `mix deps.get --check-locked` needs Hex installed, which
-    `flake.nix`'s dev shell does not provide. `scripts/test-postgres.sh`
-    installs it (`mix local.hex --force --if-missing`) into a script-local
-    `MIX_HOME`/`HEX_HOME` under its own disposable run directory — never the
-    invoking user's real `~/.mix`/`~/.hex` — and points `MIX_REBAR3` at the
-    dev shell's own `rebar3` so no rebar3 build is fetched over the network
-    either.
-- [x] Update Oversight design docs (owner go-ahead given; Oversight is a
-      separate repository). `sinal-design.md` now records the bounded
-      emitter-side forwarder as delivered in Sinal core (not adapter-owned);
-      `grind-design.md` §5 (uniqueness), §9 (storage/migrations/retention),
-      and §15 (observations, delivered via the forwarder, post-commit only)
-      now match what was built; `API-COVERAGE.md`'s Grind and Sinal rows are
-      marked Delivered/Partial/Open accurately. See Oversight commit history
-      for the corresponding change.
-- [ ] Organise branch history for merge into `main`.
-
-## After package readiness
-
-Scheduled to start **after** section 5 above (Hex metadata, license review,
-getting-started guide, API docs) is done — a new, separate session, not part
-of this documentation pass:
-
-- [ ] **Comparative benchmark and design-strategy review.** Compare Grind's
-      own benchmarks and design strategy against other job-queue systems.
-      At minimum Oban (the oracle this codebase already tracks); others as
-      the session sees fit — candidates include Sidekiq, good_job, River,
-      pg-boss, graphile-worker, Solid Queue, and Temporal. Cover: what each
-      system measures and publishes, and its own methodology for doing so;
-      architectural strategies (batch fetch, per-job ack, leases/heartbeats,
-      uniqueness, pruning); and first-year roadmap ideas — looking
-      specifically for new ideas Grind could adopt, or new ground Grind
-      could pioneer, not merely parity-checking against Oban.
-
-## Follow-ups outside Grind
-
-- Saga, Relay and LLM Wire: switch `sinal.emit` to `sinal/forwarder`; correct
-  Saga's coordinator comment that overclaims handler isolation.
+- Runtime isolation, first-ACK recovery, startup cleanup, B1–B10 repairs and the
+  independent-node harness landed in `1e87d2c`. Historical matrix results and
+  their configuration are summarized in [bench/README.md](../bench/README.md).
+- Diagnostics landed in `75e50ae`: 261 root tests, 12 consumer tests, twelve
+  core pairs, 38 benchmark tests and the 1,000-job smoke audit passed with
+  Sinal `858dfa3`. See [OPERATIONAL-DIAGNOSTICS.md](OPERATIONAL-DIAGNOSTICS.md).
+- The earlier dirty-source two-hour run passed 14 standalone cases and 266
+  mixed rounds. Its summary is in [resilience/README.md](../resilience/README.md).
+  It predates diagnostics and today's Sinal changes.
+- Before 1.0: transaction-scoped enqueue and stronger public testing helpers.
+  Their remaining design constraints are in [RELEASE-EXECUTION.md](RELEASE-EXECUTION.md).
+- Deferred: batch claims and broader throughput optimization. Cron, Reindexer,
+  automatic Lifeline replay and Peer election are outside the initial scope.
+- Documented deployment limits remain: pooler support, encrypted fault paths,
+  indefinite consumer-churn atom growth and liveness during arbitrary outages
+  are not established by the laptop results. See [RISKS.md](RISKS.md).

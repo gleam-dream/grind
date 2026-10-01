@@ -113,19 +113,17 @@ the exact missed renewal was not retained. The isolated long-handler rerun
 passed without code or expectation changes. Final gates use `caffeinate -i`
 only for the command lifetime to prevent idle sleep during lease tests.
 
-## Final validation
+## Validation at commit `75e50ae`
 
 - PostgreSQL gate: **261 root tests and 12 external-consumer tests pass**.
   All diagnostic execution markers are required by the gate. The pinned Oban
   harness, 55-row ledger check, 12 core pairs and 14 oracle evidence checks pass.
 - Benchmark gate: **38 Gleam tests, 5 Python tests and the 1000-job smoke audit
   pass**, followed by query-plan, open-loop, pruning and full-drain sampling
-  activation checks. The passing run is
-  `bench/results/diagnostics-gate-retry-20260928/`.
+  activation checks.
 - Formatting: `nix flake check` passes on `aarch64-darwin`. An uncached
   filesystem formatting check also passes for the new, untracked files.
-- The first benchmark execution is retained at
-  `bench/results/diagnostics-gate-20260928/`. It rejected an open-loop generator
+- The first benchmark execution rejected an open-loop generator
   maximum lag of 31 ms against its unchanged 20 ms limit; all 50 jobs were
   admitted. The unchanged rerun recorded 6 ms maximum lag for that scenario.
   The failed run is not accepted performance evidence.
@@ -135,7 +133,9 @@ only for the command lifetime to prevent idle sleep during lease tests.
   `858dfa360e260a3e12cf27c71f9adc40d4f0c3c8`. Its added `Dropped.unavailable`
   field required one benchmark fixture to supply zero; no Sinal source changed.
 
-These results were collected from the local, uncommitted implementation. Raw
-benchmark outputs remain local and untracked. They establish the selected
-diagnostic contracts and gates; they do not repeat the full throughput matrix
-or two-hour soak, or qualify a published release.
+These results were collected before the implementation was committed as
+`75e50ae`. The generated benchmark outputs were removed during the 2026-10-01
+cleanup after preserving this summary. The historical findings cannot be
+re-audited from raw files here. They establish the selected diagnostic contracts
+at the recorded inputs; they do not repeat the full matrix or two-hour soak, or
+qualify today's changed dependency set. See [release readiness](RELEASE-READINESS.md).

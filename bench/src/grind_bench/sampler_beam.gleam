@@ -1,7 +1,7 @@
 //// A 1-second BEAM introspection sampler: appends one JSON line per tick to
 //// a caller-chosen path (raw evidence -- gitignored under
-//// `bench/results/*/raw/`, never committed; see `grind_bench/summarize` for
-//// the committed percentile/CSV rollup this feeds).
+//// `bench/results/`, never committed; see `grind_bench/summarize` for
+//// the generated percentile/CSV rollup this feeds).
 ////
 //// Runs synchronously on whatever process calls `run` -- a load scenario
 //// spawns it on its own unlinked process (`process.spawn_unlinked`) and

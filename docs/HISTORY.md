@@ -6,6 +6,10 @@ The full original 89-commit history is preserved, unaltered, at the annotated ta
 
 ## Evidence documents cite the archived history
 
+The benchmark CSVs described in this historical note were removed from the
+working tree during the 2026-10-01 cleanup; their committed versions remain in
+Git history. Current results are summarized in [the benchmark guide](../bench/README.md).
+
 Commit hashes cited in `docs/RECOVERY-EVIDENCE.md`, `docs/PERFORMANCE-EVIDENCE.md`, `docs/RELEASE-READINESS.md`, `oracle/ORACLE-LEDGER.md`, and the bench/results CSV `commit` columns and directory names all refer to commits in that archived history — resolve them against the `archive/grind-simplify` tag, not against `grind-milestones` or `master`. Those documents and CSVs record what was actually measured at the time, against the commit that was actually checked out; that is only reproducible from the archive, so none of their hashes were rewritten as part of this squash.
 
 ## Mapping: original commit to milestone

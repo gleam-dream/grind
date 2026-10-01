@@ -860,4 +860,7 @@ of paired Grind/Oban scenarios. It retains results and source/catalog hashes und
 `oracle/results/`. Independent-node fault scenarios and the long mixed soak live
 in the [resilience harness](resilience/README.md); load and durable-completion
 measurements live in the [benchmark harness](bench/README.md). Current acceptance
-status is recorded in [the release execution ledger](docs/RELEASE-EXECUTION.md).
+status is recorded in [release readiness](docs/RELEASE-READINESS.md).
+Generated results are ignored working files: review them, record the checked
+summary, then remove them. Benchmark methods and historical measurements live
+in the benchmark README; raw run archives are not part of the repository.

@@ -56,8 +56,8 @@ for query generation and migration changes.
   destructive faults and mixed-workload soak assertions. The approved two-hour
   run passed fourteen standalone cases and 266 mixed fault rounds; its reviewed
   causal audit and final paired M2/M6 comparison pass. The failed first
-  86,400-second attempt remains retained separately, and day-long endurance
-  is unverified. [Recovery evidence](RECOVERY-EVIDENCE.md#topic-index) records
+  86,400-second attempt is summarized as failed; raw artifacts were removed
+  during cleanup. Day-long endurance remains unverified. [Recovery evidence](RECOVERY-EVIDENCE.md#topic-index) records
   exact counts, resource limits, cleanup and the auditor correction.
 - Run the database gate with `nix develop --command bash scripts/test-postgres.sh`,
   the benchmark gate with `nix develop --command bash scripts/bench-postgres.sh`,

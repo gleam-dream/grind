@@ -58,15 +58,13 @@ five minutes.
 | F5   | Ten consumer start/stop cycles while a sibling VM remains live.                                                                       | Exact deadline/type/query cache counts return to baseline, the owner mailbox stays empty, and sibling jobs continue completing.                                                                                                |
 | Soak | Repeated normal/retry/snooze batches, queued and running cancellation, lifecycle churn, pruning and all nine destructive fault types. | Exact attempt/effect/receipt accounting; every fault runs at least twice; a long primary job survives each fault without duplicate effects; every round passes the resource bounds below.                                      |
 
-M1–M7 are the concrete scenario slots proposed in the review, not names borrowed
-from the unrelated archived-history milestones. M6 covers Grind's concurrent
-maintenance design; Grind has no leader election. The retained
-[M2/M6 comparison](results/repaired-7200s-8YvcJq/paired-comparison.json) passed
-against the pinned independent Oban run in
-`../oracle/results/20260928T015525Z-23535`. It checks Grind's audited replay
-against Oban Lifeline rescue, and Grind's locked-row concurrent pruning against
-Oban Peer failover followed by maintenance. These are classified intentional
-differences. No Cron or automatic Lifeline behavior is introduced in Grind.
+M1–M7 are the concrete scenario slots proposed in the review. M6 covers
+Grind's concurrent maintenance design; Grind has no leader election. Compare
+fresh M2/M6 results with the pinned Oban run using
+[oracle/fault_compare.py](../oracle/fault_compare.py), as described in the
+[oracle guide](../oracle/README.md). These scenarios classify audited replay
+versus Lifeline rescue and leaderless pruning versus Peer failover as intentional
+differences; they do not establish equivalence for every fault.
 
 ## Evidence and limits
 
@@ -83,13 +81,6 @@ Each run retains:
   scenario, including failed scenarios when the database remains reachable.
 - Runtime processes, atoms, total memory, mailbox messages and deadline entries;
   soak relation sizes and database session counts; final scenario pass/fail results.
-
-The initial thirteen-case short run passed in
-`results/20260928T012210Z-98201` (about 155 seconds). The stronger M3 drain assertion,
-post-fsync acknowledgements, F5 mailbox assertion and mixed soak were added after
-that run and require their own execution evidence. Earlier F5 runs reproduced
-unbounded dependency type-cache retention and one trapped normal EXIT per stopped
-consumer; those findings drove the scoped cache and confirmed-stop cleanup fixes.
 
 The soak keeps its primary admin and consumer VMs alive throughout. Each round
 runs eight normal, eight retry-once and eight snooze-once jobs, plus one queued
@@ -122,37 +113,44 @@ long-lived VMs; a failed bound fails the soak:
   schema's retained table/index/TOAST storage after prune and vacuum: at most
   16 MiB. Job and receipt counts must be zero after each prune.
 
-`--release-evidence` requires clean pinned source, every short scenario and a
-requested soak of at least 7,200 seconds. Dirty runs remain useful exploratory
-evidence. A short rehearsal cannot establish the two-hour requirement. The retained
-M2/M6 comparison covers only those two intentional differences; broader
-cross-engine fault pairing, TLS and pooler coverage remain separate. The harness
-never claims exactly-once effects after an operator has explicitly authorized
-replay.
+`--release-evidence` requires a clean Grind checkout, every short scenario and
+a requested soak of at least 7,200 seconds. Separately verify the exact resolved
+Sinal dependency: this flag does not establish its cleanliness or identity.
+A short rehearsal cannot qualify the two-hour requirement. TLS and pooler
+coverage remain separate. The harness never claims exactly-once effects after
+an operator explicitly authorizes replay.
 
-The owner changed the prospective duration requirement from 24 hours to two hours
-on 2026-09-28. All scenario assertions, fault counts, fencing checks and resource
-bounds remain unchanged. The failed 86,400-second attempt in
-`results/repaired-86400s-o23a23/` remains failed and retained; its elapsed time does
-not count toward the required fresh run.
+## Historical result: 2026-09-28
 
-The fresh [two-hour audit](results/repaired-7200s-8YvcJq/soak-audit-v5.json)
-passed: 7,202.060719 mixed seconds after warm-up, 14 standalone cases and 266
-mixed rounds, with each fault repeated 29–30 times. Its source/runtime provenance,
-7,182 primary jobs, 11,172 receipts, 6,993 effects including warm-up, resource
-bounds and final cleanup were independently checked. The results remain
-exploratory because the source tree was dirty. Day-long endurance is unverified.
+The two-hour run passed 7,202.060719 mixed-fault seconds after warm-up, fourteen
+standalone cases and 266 mixed rounds. Each of nine fault types ran 29–30 times.
+Independent review checked source/runtime identity, 7,182 primary jobs, 11,172
+receipts, 6,993 effects including warm-up, resource bounds and final cleanup.
+Peak sampled database sessions were eight; retained primary storage peaked at
+245,760 bytes. Worker atoms grew by 1,596 across 532 consumer starts, within the
+explicit allowance but not a claim of bounded atoms under indefinite churn.
 
-The first auditor rejected a cross-runtime wall-clock comparison. The retained
-v5 correction proves primary overlap through the exact file barrier, matching
-callback identity and controller-monotonic order; replay uses explicit
-authorization and fence lineage. It does not assume that independent BEAM and
-controller wall clocks agree. Both audit versions and the failed first result
-remain available under the run's `orchestration/` directory.
+These results came from dirty development snapshots before `1e87d2c`; diagnostics
+and later Sinal changes were not covered. The final audit used causal barriers
+and controller monotonic order rather than comparing independent VM wall clocks.
+The paired M2/M6 comparison passed within its deliberate semantic differences.
+The earlier 24-hour attempt failed after a 275-second host sleep; none of its
+elapsed time counted toward this run. Day-long endurance remains unverified.
+
+The historical raw directories and one-off auditors were removed during the
+2026-10-01 cleanup after recording these findings. They cannot be re-audited here.
+The old independent auditor was tied to snapshot hashes and temporary driver
+paths; it is not a portable qualification command. Review fresh source, duration,
+fault/accounting/resource results and process cleanup independently before
+recording a new release summary. The maintained harness assertions remain.
+
+Future run artifacts are ignored working files. Keep them through investigation
+and review, record a concise result with exact source/dependencies and environment,
+then delete them. See [release readiness](../docs/RELEASE-READINESS.md).
 
 Partition modes preserve the reliable byte stream: each direction retains at most
 one 64 KiB read and stops reading until recovery, allowing socket backpressure.
 Healing forwards those bytes before any later bytes. Only the explicit M4 COMMIT
 reply-loss fault blackholes bytes. The earlier byte-discard partition model left
 pgo waiting forever for a discarded ReadyForQuery and was rejected after the
-stronger M3 drain assertion exposed it; diagnostic artifacts retain that failure.
+stronger M3 drain assertion exposed it; the historical failure is recorded in [recovery evidence](../docs/RECOVERY-EVIDENCE.md).

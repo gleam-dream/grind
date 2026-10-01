@@ -1,10 +1,6 @@
-//// Percentile summarizer: turns a raw per-line-JSON evidence file (a load
-//// scenario's own latency samples, or one of `grind_bench/sampler_beam`'s /
-//// `grind_bench/sampler_db`'s JSONL files) into one committed CSV summary
-//// row per numeric field -- the raw JSONL itself is gitignored
-//// (`bench/results/*/raw/`); only this rollup is committed
-//// (`bench/results/<date>-<commit>/*.csv`), per the plan's own "commit only
-//// CSV summaries" rule.
+//// Percentile summarizer: turns raw latency or sampler JSONL into one CSV
+//// row per numeric field. CSVs and raw samples are ignored working outputs.
+//// Record checked results in bench/README.md before removing a run's files.
 
 import gleam/dynamic/decode
 import gleam/float

@@ -1,13 +1,16 @@
 # Risk register
 
-Current work (2026-09-28): automatic acknowledgements and reconciliation now
-run in the attempt process. A separate renewer uses a reserved connection per
-consumer. The complete root/consumer/paired gate, retained benchmark composite
-and approved two-hour soak pass within their recorded evidence scope. See
-[RELEASE-EXECUTION.md](RELEASE-EXECUTION.md) for source snapshots, validation
-and the owner-approved scope. Historical subsections below preserve the old
-coordinator measurements and decisions; they do not describe current topology.
-Dirty source runs remain exploratory evidence.
+Runtime isolation landed in `1e87d2c`; diagnostics landed in `75e50ae`.
+Historical matrix and two-hour results apply only to their recorded inputs.
+Today's Sinal dependency has changed; current qualification is tracked in
+[RELEASE-READINESS.md](RELEASE-READINESS.md).
+
+Generated run directories were removed on 2026-10-01 after summarization.
+Concrete run paths and retention statements in historical sections identify
+past observations; those files are no longer available for re-audit. Current
+summaries live in [bench/README.md](../bench/README.md) and
+[resilience/README.md](../resilience/README.md). This cleanup does not close risks
+or change accepted runtime guarantees.
 
 A standing inventory of Grind's known correctness, durability, and operational
 risks. Each entry is a real, currently-accepted trade-off or an open gap — not
@@ -191,9 +194,8 @@ reconciled. Quarantine and audited replay remain the recovery boundary.
 
 **Current evidence.** The executor regressions cover first-ACK rollback,
 slow ACKs alongside live siblings, and saturation of the ordinary pool.
-The accepted benchmark composite at
-`bench/results/l7-drain-pair-20260928T091612Z/composite-audit-v4.json`
-includes 1,254 healthy sibling jobs, all succeeded with one receipt.
+The historical benchmark composite summarized in
+[the benchmark guide](../bench/README.md) included 1,254 healthy sibling jobs, all succeeded with one receipt.
 Its 576 selected slow-ACK targets split into 288 successes and 288 quarantines
 under the defined below/above-deadline profiles. These are finite tested
 configurations, not an unconditional liveness guarantee. See the latest
@@ -1025,9 +1027,8 @@ write their own ACKs and reconciliation calls; a reserved renewer performs
 batch renewals independently. The old description of every ACK and renewal
 passing through the coordinator is superseded.
 
-The fresh matched L7 pair in
-`bench/results/l7-drain-pair-20260928T091612Z/composite-audit-v4.json`
-reports median one-C50/five-C10 throughput ratios of approximately 0.426
+The historical matched L7 pair summarized in
+[the benchmark guide](../bench/README.md) reported median one-C50/five-C10 throughput ratios of approximately 0.426
 without added delay and 0.201 with the configured delay. Both remain below
 the existing 0.70 T3 threshold. These results establish a remaining
 single-consumer throughput limitation in those configurations. They are

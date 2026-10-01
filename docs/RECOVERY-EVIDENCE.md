@@ -1,5 +1,14 @@
 # Recovery evidence
 
+**Historical record.** Generated benchmark, oracle and resilience run directories
+were removed on 2026-10-01 after their findings were summarized in the
+[benchmark guide](../bench/README.md), [resilience guide](../resilience/README.md)
+and [diagnostics record](OPERATIONAL-DIAGNOSTICS.md). Paths, session identifiers
+and statements about retained artifacts below describe the original runs; they
+are not links to available evidence today. Tests and harness source remain.
+Use [release readiness](RELEASE-READINESS.md) for current qualification, not the
+historical pass counts or superseded duration requirements below.
+
 This document tracks, per recovery claim, how it was proven: the fault
 injection mechanism, how the test synchronizes with the fault instead of
 sleeping past it, and either genuine red-before-green evidence or a named
