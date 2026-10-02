@@ -1,20 +1,16 @@
 # History
 
-On 2026-09-27, the 89-commit development history of `codex/grind-simplify` was milestone-squashed into 12 milestone commits (plus this docs commit) on top of `master`, producing the `grind-milestones` branch. Each milestone commit's tree is byte-identical to the tree of a real, previously gated commit from the original history — the squash groups commits together, it does not rewrite or reorder any tree.
+On 2026-09-27, an 89-commit development history was squashed into the 12 milestone commits M1–M12 on `master`. Each milestone commit's tree is byte-identical to the tree of a gated commit from the original history: the squash grouped commits together but did not rewrite or reorder any tree.
 
-The full original 89-commit history is preserved, unaltered, at the annotated tag `archive/grind-simplify` (published alongside this branch). Nothing under `codex/grind-simplify` was deleted or moved.
+The original history was removed on 2026-10-02 and is no longer available in this repository.
 
-## Evidence documents cite the archived history
+## Commit hashes in evidence documents
 
-The benchmark CSVs described in this historical note were removed from the
-working tree during the 2026-10-01 cleanup; their committed versions remain in
-Git history. Current results are summarized in [the benchmark guide](../bench/README.md).
-
-Commit hashes cited in `docs/RECOVERY-EVIDENCE.md`, `docs/PERFORMANCE-EVIDENCE.md`, `docs/RELEASE-READINESS.md`, `oracle/ORACLE-LEDGER.md`, and the bench/results CSV `commit` columns and directory names all refer to commits in that archived history — resolve them against the `archive/grind-simplify` tag, not against `grind-milestones` or `master`. Those documents and CSVs record what was actually measured at the time, against the commit that was actually checked out; that is only reproducible from the archive, so none of their hashes were rewritten as part of this squash.
+`docs/RECOVERY-EVIDENCE.md`, `docs/PERFORMANCE-EVIDENCE.md`, `docs/RELEASE-READINESS.md`, `oracle/ORACLE-LEDGER.md` and the benchmark results in Git history cite commits from the original history. Those hashes record what was measured at the time and were not rewritten. They no longer resolve in this repository; use the mapping below to find the milestone commit on `master` that contains each one.
 
 ## Mapping: original commit to milestone
 
-Every one of the original 89 commits, in order, and the milestone commit on `grind-milestones` it was squashed into. "Boundary" means that original commit was the last constituent of its milestone, so the milestone commit's tree is byte-identical to that original commit's tree (`git diff <original> <milestone>` is empty); every other row's tree differs from its own original commit's tree because later constituents in the same milestone changed it further.
+The table lists all 89 original commits in order, with the milestone commit that contains each one. "Boundary" means the original commit was the last one in its milestone, so the milestone commit's tree is byte-identical to the original commit's tree. For every other row, later commits in the same milestone changed the tree further.
 
 | Original  | Original subject                                                                                                               | Milestone | Milestone commit | Milestone subject                                                                                      | Boundary |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------ | --------- | ---------------- | ------------------------------------------------------------------------------------------------------ | -------- |
@@ -110,19 +106,9 @@ Every one of the original 89 commits, in order, and the milestone commit on `gri
 
 ## Known blemishes carried through
 
-The squash groups commits; it does not clean up defects already present in the original history. Three are worth calling out explicitly so they are not mistaken for something the squash introduced:
+The squash groups commits; it does not clean up defects already present in the original history. Four are worth calling out explicitly so they are not mistaken for something the squash introduced:
 
 - **`bce4cc4`'s mislabelled CI changes.** `bce4cc4` (`chore(bench): grind_a/grind_ctl roles, log/data-dir env, bench-matrix.sh (items 8, 10, 13)`, squashed into M10) actually carried CI, `scripts/test-postgres.sh`, and `RELEASE-READINESS.md` changes that came from a concurrent agent, on top of its own stated bench-role and bench-matrix work. M10's message notes this; the content itself is unchanged.
 - **`c950fcf`, wip commit.** The very first commit of the original history, `wip(grind): preserve unaccepted cancellation slice`, was a work-in-progress checkpoint rather than a finished unit. It is folded into M1 rather than dropped, since M1's tree (byte-identical to `1a96627`) already reflects whatever of that slice survived review.
 - **`5701ede`, pog fork commit.** `refactor(postgres): use pog's public timeout API from the fork` depended on an interim `lostbean/pog` git fork whose branches no longer exist. It is squashed into M6, which ends (at `7529d45`) with that fork already dropped in favor of a Grind-owned checkout deadline on vanilla, Hex-sourced `pog`; M6's message notes this explicitly.
 - **`fc9454e`, storage-owner commit.** `feat(postgres)!: storage owner identifies the database, not the URL` introduced a `storage_owner` concept that was itself removed two commits later in the same range (`5c88aa5`, `refactor!: remove storage_owner; one Grind installation per schema`). Both are squashed into M8, whose tree (at `6842d39`) reflects only the surviving one-installation-per-schema design.
-
-## Fast-forwarding master
-
-`grind-milestones` was built without moving `master` or deleting any existing branch; that is left to whoever integrates it. `master` can be fast-forwarded once `grind-milestones` is accepted:
-
-```sh
-git switch master
-git merge --ff-only grind-milestones
-git branch -d codex/grind-cancel-checkpoint  # tip c950fcf, contained in archive/grind-simplify
-```
