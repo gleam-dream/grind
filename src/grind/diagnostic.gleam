@@ -297,72 +297,55 @@ fn attempt_ref_fields() -> fields.Fields(observation.AttemptRef) {
 }
 
 fn consumer_ref_fields() -> fields.Fields(ConsumerRef) {
-  fields.record({
-    use node <- fields.parameter
-    use consumer <- fields.parameter
-    ConsumerRef(node:, consumer:)
+  use node <- fields.include(fields.string("node"), get: fn(m) { m.node })
+  use consumer <- fields.include(fields.string("consumer"), get: fn(m) {
+    m.consumer
   })
-  |> fields.and(fields.string("node"), fn(m: ConsumerRef) { m.node })
-  |> fields.and(fields.string("consumer"), fn(m) { m.consumer })
-  |> fields.build
+  fields.success(ConsumerRef(node:, consumer:))
 }
 
 fn queue_ref_fields() -> fields.Fields(QueueRef) {
-  fields.record({
-    use queue <- fields.parameter
-    use consumer <- fields.parameter
-    QueueRef(queue:, consumer:)
+  use queue <- fields.include(fields.string("queue"), get: fn(m) { m.queue })
+  use consumer <- fields.include(consumer_ref_fields(), get: fn(m) {
+    m.consumer
   })
-  |> fields.and(fields.string("queue"), fn(m: QueueRef) { m.queue })
-  |> fields.and(consumer_ref_fields(), fn(m) { m.consumer })
-  |> fields.build
+  fields.success(QueueRef(queue:, consumer:))
 }
 
 fn attempt_context_fields() -> fields.Fields(AttemptContext) {
-  fields.record({
-    use ref <- fields.parameter
-    use attempt <- fields.parameter
-    use consumer <- fields.parameter
-    AttemptContext(ref:, attempt:, consumer:)
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use attempt <- fields.include(attempt_ref_fields(), get: fn(m) { m.attempt })
+  use consumer <- fields.include(consumer_ref_fields(), get: fn(m) {
+    m.consumer
   })
-  |> fields.and(job_ref_fields(), fn(m: AttemptContext) { m.ref })
-  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
-  |> fields.and(consumer_ref_fields(), fn(m) { m.consumer })
-  |> fields.build
+  fields.success(AttemptContext(ref:, attempt:, consumer:))
 }
 
 fn renewal_measurements_fields() -> fields.Fields(RenewalMeasurements) {
-  fields.record({
-    use count <- fields.parameter
-    use duration_us <- fields.parameter
-    use remaining_lease_ms <- fields.parameter
-    RenewalMeasurements(count:, duration_us:, remaining_lease_ms:)
+  use count <- fields.include(fields.int("count"), get: fn(m) { m.count })
+  use duration_us <- fields.include(fields.int("duration_us"), get: fn(m) {
+    m.duration_us
   })
-  |> fields.and(fields.int("count"), fn(m: RenewalMeasurements) { m.count })
-  |> fields.and(fields.int("duration_us"), fn(m) { m.duration_us })
-  |> fields.and(fields.optional(fields.int("remaining_lease_ms")), fn(m) {
-    m.remaining_lease_ms
-  })
-  |> fields.build
+  use remaining_lease_ms <- fields.include(
+    fields.optional(fields.int("remaining_lease_ms")),
+    get: fn(m) { m.remaining_lease_ms },
+  )
+  fields.success(RenewalMeasurements(count:, duration_us:, remaining_lease_ms:))
 }
 
 fn renewal_metadata_fields() -> fields.Fields(RenewalMetadata) {
-  fields.record({
-    use context <- fields.parameter
-    use phase <- fields.parameter
-    use outcome <- fields.parameter
-    RenewalMetadata(context:, phase:, outcome:)
+  use context <- fields.include(attempt_context_fields(), get: fn(m) {
+    m.context
   })
-  |> fields.and(attempt_context_fields(), fn(m: RenewalMetadata) { m.context })
-  |> fields.and(
+  use phase <- fields.include(
     fields.enum(
       "phase",
       [HandlerRunning, AcknowledgementPending],
       attempt_phase_to_string,
     ),
-    fn(m) { m.phase },
+    get: fn(m) { m.phase },
   )
-  |> fields.and(
+  use outcome <- fields.include(
     fields.enum(
       "outcome",
       [
@@ -374,38 +357,29 @@ fn renewal_metadata_fields() -> fields.Fields(RenewalMetadata) {
       ],
       renewal_outcome_to_string,
     ),
-    fn(m) { m.outcome },
+    get: fn(m) { m.outcome },
   )
-  |> fields.build
+  fields.success(RenewalMetadata(context:, phase:, outcome:))
 }
 
 fn acknowledgement_measurements_fields() -> fields.Fields(
   AcknowledgementMeasurements,
 ) {
-  fields.record({
-    use count <- fields.parameter
-    use duration_us <- fields.parameter
-    AcknowledgementMeasurements(count:, duration_us:)
+  use count <- fields.include(fields.int("count"), get: fn(m) { m.count })
+  use duration_us <- fields.include(fields.int("duration_us"), get: fn(m) {
+    m.duration_us
   })
-  |> fields.and(fields.int("count"), fn(m: AcknowledgementMeasurements) {
-    m.count
-  })
-  |> fields.and(fields.int("duration_us"), fn(m) { m.duration_us })
-  |> fields.build
+  fields.success(AcknowledgementMeasurements(count:, duration_us:))
 }
 
 fn acknowledgement_metadata_fields() -> fields.Fields(AcknowledgementMetadata) {
-  fields.record({
-    use context <- fields.parameter
-    use command_id <- fields.parameter
-    use outcome <- fields.parameter
-    AcknowledgementMetadata(context:, command_id:, outcome:)
-  })
-  |> fields.and(attempt_context_fields(), fn(m: AcknowledgementMetadata) {
+  use context <- fields.include(attempt_context_fields(), get: fn(m) {
     m.context
   })
-  |> fields.and(fields.string("command_id"), fn(m) { m.command_id })
-  |> fields.and(
+  use command_id <- fields.include(fields.string("command_id"), get: fn(m) {
+    m.command_id
+  })
+  use outcome <- fields.include(
     fields.enum(
       "outcome",
       [
@@ -419,150 +393,146 @@ fn acknowledgement_metadata_fields() -> fields.Fields(AcknowledgementMetadata) {
       ],
       ack_outcome_to_string,
     ),
-    fn(m) { m.outcome },
+    get: fn(m) { m.outcome },
   )
-  |> fields.build
+  fields.success(AcknowledgementMetadata(context:, command_id:, outcome:))
 }
 
 fn retry_measurements_fields() -> fields.Fields(RetryMeasurements) {
-  fields.record({
-    use count <- fields.parameter
-    use retry_number <- fields.parameter
-    use delay_ms <- fields.parameter
-    use pending_duration_us <- fields.parameter
-    RetryMeasurements(count:, retry_number:, delay_ms:, pending_duration_us:)
+  use count <- fields.include(fields.int("count"), get: fn(m) { m.count })
+  use retry_number <- fields.include(fields.int("retry_number"), get: fn(m) {
+    m.retry_number
   })
-  |> fields.and(fields.int("count"), fn(m: RetryMeasurements) { m.count })
-  |> fields.and(fields.int("retry_number"), fn(m) { m.retry_number })
-  |> fields.and(fields.int("delay_ms"), fn(m) { m.delay_ms })
-  |> fields.and(fields.int("pending_duration_us"), fn(m) {
-    m.pending_duration_us
+  use delay_ms <- fields.include(fields.int("delay_ms"), get: fn(m) {
+    m.delay_ms
   })
-  |> fields.build
+  use pending_duration_us <- fields.include(
+    fields.int("pending_duration_us"),
+    get: fn(m) { m.pending_duration_us },
+  )
+  fields.success(RetryMeasurements(
+    count:,
+    retry_number:,
+    delay_ms:,
+    pending_duration_us:,
+  ))
 }
 
 fn retry_metadata_fields() -> fields.Fields(RetryMetadata) {
-  fields.record({
-    use context <- fields.parameter
-    use command_id <- fields.parameter
-    use reason <- fields.parameter
-    RetryMetadata(context:, command_id:, reason:)
+  use context <- fields.include(attempt_context_fields(), get: fn(m) {
+    m.context
   })
-  |> fields.and(attempt_context_fields(), fn(m: RetryMetadata) { m.context })
-  |> fields.and(fields.string("command_id"), fn(m) { m.command_id })
-  |> fields.and(
+  use command_id <- fields.include(fields.string("command_id"), get: fn(m) {
+    m.command_id
+  })
+  use reason <- fields.include(
     fields.enum(
       "reason",
       [RetryAfterFailure, RetryAfterUnknown],
       retry_reason_to_string,
     ),
-    fn(m) { m.reason },
+    get: fn(m) { m.reason },
   )
-  |> fields.build
+  fields.success(RetryMetadata(context:, command_id:, reason:))
 }
 
 fn checkout_measurements_fields() -> fields.Fields(CheckoutMeasurements) {
-  fields.record({
-    use count <- fields.parameter
-    use wait_us <- fields.parameter
-    use call_duration_us <- fields.parameter
-    use candidates <- fields.parameter
-    CheckoutMeasurements(count:, wait_us:, call_duration_us:, candidates:)
+  use count <- fields.include(fields.int("count"), get: fn(m) { m.count })
+  use wait_us <- fields.include(fields.int("checkout_wait_us"), get: fn(m) {
+    m.wait_us
   })
-  |> fields.and(fields.int("count"), fn(m: CheckoutMeasurements) { m.count })
-  |> fields.and(fields.int("checkout_wait_us"), fn(m) { m.wait_us })
-  |> fields.and(fields.int("call_duration_us"), fn(m) { m.call_duration_us })
-  |> fields.and(fields.int("candidates"), fn(m) { m.candidates })
-  |> fields.build
+  use call_duration_us <- fields.include(
+    fields.int("call_duration_us"),
+    get: fn(m) { m.call_duration_us },
+  )
+  use candidates <- fields.include(fields.int("candidates"), get: fn(m) {
+    m.candidates
+  })
+  fields.success(CheckoutMeasurements(
+    count:,
+    wait_us:,
+    call_duration_us:,
+    candidates:,
+  ))
 }
 
 fn checkout_metadata_fields() -> fields.Fields(CheckoutMetadata) {
-  fields.record({
-    use queue <- fields.parameter
-    use operation <- fields.parameter
-    use pool <- fields.parameter
-    use checkout <- fields.parameter
-    use returned <- fields.parameter
-    CheckoutMetadata(queue:, operation:, pool:, checkout:, returned:)
+  use queue <- fields.include(queue_ref_fields(), get: fn(m) { m.queue })
+  use operation <- fields.include(operation_field("operation"), get: fn(m) {
+    m.operation
   })
-  |> fields.and(queue_ref_fields(), fn(m: CheckoutMetadata) { m.queue })
-  |> fields.and(operation_field("operation"), fn(m) { m.operation })
-  |> fields.and(
+  use pool <- fields.include(
     fields.enum("pool", [MainPool, ReservedPool], pool_role_to_string),
-    fn(m) { m.pool },
+    get: fn(m) { m.pool },
   )
-  |> fields.and(
+  use checkout <- fields.include(
     fields.enum(
       "checkout",
       [CheckoutAcquired, CheckoutUnavailable],
       checkout_outcome_to_string,
     ),
-    fn(m) { m.checkout },
+    get: fn(m) { m.checkout },
   )
-  |> fields.and(
+  use returned <- fields.include(
     fields.enum("returned", [CallSucceeded, CallFailed], call_outcome_to_string),
-    fn(m) { m.returned },
+    get: fn(m) { m.returned },
   )
-  |> fields.build
+  fields.success(CheckoutMetadata(
+    queue:,
+    operation:,
+    pool:,
+    checkout:,
+    returned:,
+  ))
 }
 
 fn claim_failed_measurements_fields() -> fields.Fields(ClaimFailedMeasurements) {
-  fields.record({
-    use count <- fields.parameter
-    use duration_us <- fields.parameter
-    ClaimFailedMeasurements(count:, duration_us:)
+  use count <- fields.include(fields.int("count"), get: fn(m) { m.count })
+  use duration_us <- fields.include(fields.int("duration_us"), get: fn(m) {
+    m.duration_us
   })
-  |> fields.and(fields.int("count"), fn(m: ClaimFailedMeasurements) { m.count })
-  |> fields.and(fields.int("duration_us"), fn(m) { m.duration_us })
-  |> fields.build
+  fields.success(ClaimFailedMeasurements(count:, duration_us:))
 }
 
 fn claim_failed_metadata_fields() -> fields.Fields(ClaimFailedMetadata) {
-  fields.record({
-    use queue <- fields.parameter
-    use stage <- fields.parameter
-    use failure <- fields.parameter
-    ClaimFailedMetadata(queue:, stage:, failure:)
-  })
-  |> fields.and(queue_ref_fields(), fn(m: ClaimFailedMetadata) { m.queue })
-  |> fields.and(operation_field("stage"), fn(m) { m.stage })
-  |> fields.and(
+  use queue <- fields.include(queue_ref_fields(), get: fn(m) { m.queue })
+  use stage <- fields.include(operation_field("stage"), get: fn(m) { m.stage })
+  use failure <- fields.include(
     fields.enum(
       "failure",
       [TimedOut, ConnectionUnavailable, Rejected, UnexpectedResult],
       failure_kind_to_string,
     ),
-    fn(m) { m.failure },
+    get: fn(m) { m.failure },
   )
-  |> fields.build
+  fields.success(ClaimFailedMetadata(queue:, stage:, failure:))
 }
 
 fn capacity_measurements_fields() -> fields.Fields(CapacityMeasurements) {
-  fields.record({
-    use maximum <- fields.parameter
-    use active <- fields.parameter
-    use running <- fields.parameter
-    use ack_pending <- fields.parameter
-    use available <- fields.parameter
-    CapacityMeasurements(maximum:, active:, running:, ack_pending:, available:)
+  use maximum <- fields.include(fields.int("maximum"), get: fn(m) { m.maximum })
+  use active <- fields.include(fields.int("active"), get: fn(m) { m.active })
+  use running <- fields.include(fields.int("running"), get: fn(m) { m.running })
+  use ack_pending <- fields.include(fields.int("ack_pending"), get: fn(m) {
+    m.ack_pending
   })
-  |> fields.and(fields.int("maximum"), fn(m: CapacityMeasurements) { m.maximum })
-  |> fields.and(fields.int("active"), fn(m) { m.active })
-  |> fields.and(fields.int("running"), fn(m) { m.running })
-  |> fields.and(fields.int("ack_pending"), fn(m) { m.ack_pending })
-  |> fields.and(fields.int("available"), fn(m) { m.available })
-  |> fields.build
+  use available <- fields.include(fields.int("available"), get: fn(m) {
+    m.available
+  })
+  fields.success(CapacityMeasurements(
+    maximum:,
+    active:,
+    running:,
+    ack_pending:,
+    available:,
+  ))
 }
 
 fn capacity_metadata_fields() -> fields.Fields(CapacityMetadata) {
-  fields.record({
-    use queue <- fields.parameter
-    use draining <- fields.parameter
-    CapacityMetadata(queue:, draining:)
+  use queue <- fields.include(queue_ref_fields(), get: fn(m) { m.queue })
+  use draining <- fields.include(fields.bool("draining"), get: fn(m) {
+    m.draining
   })
-  |> fields.and(queue_ref_fields(), fn(m: CapacityMetadata) { m.queue })
-  |> fields.and(fields.bool("draining"), fn(m) { m.draining })
-  |> fields.build
+  fields.success(CapacityMetadata(queue:, draining:))
 }
 
 fn operation_field(key: String) -> fields.Fields(Operation) {

@@ -40,18 +40,14 @@ pub fn job_ref_fields(
   worker_id: fn(reference) -> String,
   worker_version: fn(reference) -> String,
 ) -> fields.Fields(reference) {
-  fields.record({
-    use job_id <- fields.parameter
-    use queue <- fields.parameter
-    use worker_id <- fields.parameter
-    use worker_version <- fields.parameter
-    make(job_id, queue, worker_id, worker_version)
-  })
-  |> fields.and(fields.int("job_id"), job_id)
-  |> fields.and(fields.string("queue"), queue)
-  |> fields.and(fields.string("worker_id"), worker_id)
-  |> fields.and(fields.string("worker_version"), worker_version)
-  |> fields.build
+  use job_id <- fields.include(fields.int("job_id"), get: job_id)
+  use queue <- fields.include(fields.string("queue"), get: queue)
+  use worker_id <- fields.include(fields.string("worker_id"), get: worker_id)
+  use worker_version <- fields.include(
+    fields.string("worker_version"),
+    get: worker_version,
+  )
+  fields.success(make(job_id, queue, worker_id, worker_version))
 }
 
 /// The shared `AttemptRef` codec: `attempt_id`, `epoch`, and the attempt
@@ -62,16 +58,10 @@ pub fn attempt_ref_fields(
   epoch: fn(reference) -> Int,
   attempt: fn(reference) -> Int,
 ) -> fields.Fields(reference) {
-  fields.record({
-    use attempt_id <- fields.parameter
-    use epoch <- fields.parameter
-    use attempt <- fields.parameter
-    make(attempt_id, epoch, attempt)
-  })
-  |> fields.and(fields.int("attempt_id"), attempt_id)
-  |> fields.and(fields.int("epoch"), epoch)
-  |> fields.and(fields.int("attempt"), attempt)
-  |> fields.build
+  use attempt_id <- fields.include(fields.int("attempt_id"), get: attempt_id)
+  use epoch <- fields.include(fields.int("epoch"), get: epoch)
+  use attempt <- fields.include(fields.int("attempt"), get: attempt)
+  fields.success(make(attempt_id, epoch, attempt))
 }
 
 /// Builds a `[grind, job, <part>]` name from its final component (the shared

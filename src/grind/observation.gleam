@@ -503,231 +503,190 @@ fn attempt_ref_fields() -> fields.Fields(AttemptRef) {
 /// A one-key `count` measurement record, shared by every event whose only
 /// measurement is `count`.
 fn count_record(make: fn(Int) -> m, count: fn(m) -> Int) -> fields.Fields(m) {
-  fields.record({
-    use count <- fields.parameter
-    make(count)
-  })
-  |> fields.and(observation_wire.count_fields(), count)
-  |> fields.build
+  use count <- fields.include(observation_wire.count_fields(), get: count)
+  fields.success(make(count))
 }
 
 fn admitted_metadata_fields() -> fields.Fields(AdmittedMetadata) {
-  fields.record({
-    use ref <- fields.parameter
-    use committed_state <- fields.parameter
-    use available_at_unix_ms <- fields.parameter
-    use submission_id <- fields.parameter
-    use confirmation <- fields.parameter
-    AdmittedMetadata(
-      ref:,
-      committed_state:,
-      available_at_unix_ms:,
-      submission_id:,
-      confirmation:,
-    )
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use committed_state <- fields.include(
+    observation_wire.job_state_field("committed_state"),
+    get: fn(m) { m.committed_state },
+  )
+  use available_at_unix_ms <- fields.include(
+    fields.optional(fields.int("available_at_unix_ms")),
+    get: fn(m) { m.available_at_unix_ms },
+  )
+  use submission_id <- fields.include(
+    fields.optional(fields.string("submission_id")),
+    get: fn(m) { m.submission_id },
+  )
+  use confirmation <- fields.include(confirmation_field(), get: fn(m) {
+    m.confirmation
   })
-  |> fields.and(job_ref_fields(), fn(m: AdmittedMetadata) { m.ref })
-  |> fields.and(observation_wire.job_state_field("committed_state"), fn(m) {
-    m.committed_state
-  })
-  |> fields.and(fields.optional(fields.int("available_at_unix_ms")), fn(m) {
-    m.available_at_unix_ms
-  })
-  |> fields.and(fields.optional(fields.string("submission_id")), fn(m) {
-    m.submission_id
-  })
-  |> fields.and(confirmation_field(), fn(m) { m.confirmation })
-  |> fields.build
+  fields.success(AdmittedMetadata(
+    ref:,
+    committed_state:,
+    available_at_unix_ms:,
+    submission_id:,
+    confirmation:,
+  ))
 }
 
 fn claimed_metadata_fields() -> fields.Fields(ClaimedMetadata) {
-  fields.record({
-    use ref <- fields.parameter
-    use attempt <- fields.parameter
-    use previous_state <- fields.parameter
-    ClaimedMetadata(ref:, attempt:, previous_state:)
-  })
-  |> fields.and(job_ref_fields(), fn(m: ClaimedMetadata) { m.ref })
-  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
-  |> fields.and(observation_wire.job_state_field("previous_state"), fn(m) {
-    m.previous_state
-  })
-  |> fields.build
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use attempt <- fields.include(attempt_ref_fields(), get: fn(m) { m.attempt })
+  use previous_state <- fields.include(
+    observation_wire.job_state_field("previous_state"),
+    get: fn(m) { m.previous_state },
+  )
+  fields.success(ClaimedMetadata(ref:, attempt:, previous_state:))
 }
 
 fn quarantined_metadata_fields() -> fields.Fields(QuarantinedMetadata) {
-  fields.record({
-    use ref <- fields.parameter
-    use attempt <- fields.parameter
-    use cancellation_was_requested <- fields.parameter
-    QuarantinedMetadata(ref:, attempt:, cancellation_was_requested:)
-  })
-  |> fields.and(job_ref_fields(), fn(m: QuarantinedMetadata) { m.ref })
-  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
-  |> fields.and(fields.bool("cancellation_was_requested"), fn(m) {
-    m.cancellation_was_requested
-  })
-  |> fields.build
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use attempt <- fields.include(attempt_ref_fields(), get: fn(m) { m.attempt })
+  use cancellation_was_requested <- fields.include(
+    fields.bool("cancellation_was_requested"),
+    get: fn(m) { m.cancellation_was_requested },
+  )
+  fields.success(QuarantinedMetadata(
+    ref:,
+    attempt:,
+    cancellation_was_requested:,
+  ))
 }
 
 fn resolved_metadata_fields() -> fields.Fields(ResolvedMetadata) {
-  fields.record({
-    use ref <- fields.parameter
-    use decision <- fields.parameter
-    use committed_state <- fields.parameter
-    use resolution_id <- fields.parameter
-    use resolved_by <- fields.parameter
-    use confirmation <- fields.parameter
-    ResolvedMetadata(
-      ref:,
-      decision:,
-      committed_state:,
-      resolution_id:,
-      resolved_by:,
-      confirmation:,
-    )
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use decision <- fields.include(resolution_decision_field(), get: fn(m) {
+    m.decision
   })
-  |> fields.and(job_ref_fields(), fn(m: ResolvedMetadata) { m.ref })
-  |> fields.and(resolution_decision_field(), fn(m) { m.decision })
-  |> fields.and(observation_wire.job_state_field("committed_state"), fn(m) {
-    m.committed_state
+  use committed_state <- fields.include(
+    observation_wire.job_state_field("committed_state"),
+    get: fn(m) { m.committed_state },
+  )
+  use resolution_id <- fields.include(
+    fields.string("resolution_id"),
+    get: fn(m) { m.resolution_id },
+  )
+  use resolved_by <- fields.include(fields.string("resolved_by"), get: fn(m) {
+    m.resolved_by
   })
-  |> fields.and(fields.string("resolution_id"), fn(m) { m.resolution_id })
-  |> fields.and(fields.string("resolved_by"), fn(m) { m.resolved_by })
-  |> fields.and(confirmation_field(), fn(m) { m.confirmation })
-  |> fields.build
+  use confirmation <- fields.include(confirmation_field(), get: fn(m) {
+    m.confirmation
+  })
+  fields.success(ResolvedMetadata(
+    ref:,
+    decision:,
+    committed_state:,
+    resolution_id:,
+    resolved_by:,
+    confirmation:,
+  ))
 }
 
 fn cancellation_metadata_fields() -> fields.Fields(CancellationMetadata) {
-  fields.record({
-    use ref <- fields.parameter
-    use previous_state <- fields.parameter
-    use outcome <- fields.parameter
-    CancellationMetadata(ref:, previous_state:, outcome:)
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use previous_state <- fields.include(
+    observation_wire.job_state_field("previous_state"),
+    get: fn(m) { m.previous_state },
+  )
+  use outcome <- fields.include(cancellation_outcome_field(), get: fn(m) {
+    m.outcome
   })
-  |> fields.and(job_ref_fields(), fn(m: CancellationMetadata) { m.ref })
-  |> fields.and(observation_wire.job_state_field("previous_state"), fn(m) {
-    m.previous_state
-  })
-  |> fields.and(cancellation_outcome_field(), fn(m) { m.outcome })
-  |> fields.build
+  fields.success(CancellationMetadata(ref:, previous_state:, outcome:))
 }
 
 fn released_metadata_fields() -> fields.Fields(ReleasedMetadata) {
-  fields.record({
-    use ref <- fields.parameter
-    use attempt <- fields.parameter
-    use restored_state <- fields.parameter
-    ReleasedMetadata(ref:, attempt:, restored_state:)
-  })
-  |> fields.and(job_ref_fields(), fn(m: ReleasedMetadata) { m.ref })
-  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
-  |> fields.and(observation_wire.job_state_field("restored_state"), fn(m) {
-    m.restored_state
-  })
-  |> fields.build
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use attempt <- fields.include(attempt_ref_fields(), get: fn(m) { m.attempt })
+  use restored_state <- fields.include(
+    observation_wire.job_state_field("restored_state"),
+    get: fn(m) { m.restored_state },
+  )
+  fields.success(ReleasedMetadata(ref:, attempt:, restored_state:))
 }
 
 fn contract_mismatch_metadata_fields() -> fields.Fields(
   ContractMismatchMetadata,
 ) {
-  fields.record({
-    use ref <- fields.parameter
-    use attempt <- fields.parameter
-    use kind <- fields.parameter
-    use expected_version <- fields.parameter
-    use actual_version <- fields.parameter
-    ContractMismatchMetadata(
-      ref:,
-      attempt:,
-      kind:,
-      expected_version:,
-      actual_version:,
-    )
-  })
-  |> fields.and(job_ref_fields(), fn(m: ContractMismatchMetadata) { m.ref })
-  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
-  |> fields.and(codec_kind_field(), fn(m) { m.kind })
-  |> fields.and(fields.string("expected_version"), fn(m) { m.expected_version })
-  |> fields.and(fields.string("actual_version"), fn(m) { m.actual_version })
-  |> fields.build
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use attempt <- fields.include(attempt_ref_fields(), get: fn(m) { m.attempt })
+  use kind <- fields.include(codec_kind_field(), get: fn(m) { m.kind })
+  use expected_version <- fields.include(
+    fields.string("expected_version"),
+    get: fn(m) { m.expected_version },
+  )
+  use actual_version <- fields.include(
+    fields.string("actual_version"),
+    get: fn(m) { m.actual_version },
+  )
+  fields.success(ContractMismatchMetadata(
+    ref:,
+    attempt:,
+    kind:,
+    expected_version:,
+    actual_version:,
+  ))
 }
 
 fn prune_completed_measurements_fields() -> fields.Fields(
   PruneCompletedMeasurements,
 ) {
-  fields.record({
-    use jobs <- fields.parameter
-    PruneCompletedMeasurements(jobs:)
-  })
-  |> fields.and(fields.int("jobs"), fn(m: PruneCompletedMeasurements) { m.jobs })
-  |> fields.build
+  use jobs <- fields.include(fields.int("jobs"), get: fn(m) { m.jobs })
+  fields.success(PruneCompletedMeasurements(jobs:))
 }
 
 fn prune_completed_metadata_fields() -> fields.Fields(PruneCompletedMetadata) {
-  fields.record({
-    use older_than_ms <- fields.parameter
-    use limit <- fields.parameter
-    PruneCompletedMetadata(older_than_ms:, limit:)
-  })
-  |> fields.and(fields.int("older_than_ms"), fn(m: PruneCompletedMetadata) {
+  use older_than_ms <- fields.include(fields.int("older_than_ms"), get: fn(m) {
     m.older_than_ms
   })
-  |> fields.and(fields.int("limit"), fn(m) { m.limit })
-  |> fields.build
+  use limit <- fields.include(fields.int("limit"), get: fn(m) { m.limit })
+  fields.success(PruneCompletedMetadata(older_than_ms:, limit:))
 }
 
 fn prune_failed_metadata_fields() -> fields.Fields(PruneFailedMetadata) {
-  fields.record({
-    use older_than_ms <- fields.parameter
-    use limit <- fields.parameter
-    use kind <- fields.parameter
-    PruneFailedMetadata(older_than_ms:, limit:, kind:)
-  })
-  |> fields.and(fields.int("older_than_ms"), fn(m: PruneFailedMetadata) {
+  use older_than_ms <- fields.include(fields.int("older_than_ms"), get: fn(m) {
     m.older_than_ms
   })
-  |> fields.and(fields.int("limit"), fn(m) { m.limit })
-  |> fields.and(prune_failure_kind_field(), fn(m) { m.kind })
-  |> fields.build
+  use limit <- fields.include(fields.int("limit"), get: fn(m) { m.limit })
+  use kind <- fields.include(prune_failure_kind_field(), get: fn(m) { m.kind })
+  fields.success(PruneFailedMetadata(older_than_ms:, limit:, kind:))
 }
 
 fn metadata_fields() -> fields.Fields(AcknowledgedMetadata) {
-  fields.record({
-    use ref <- fields.parameter
-    use attempt <- fields.parameter
-    use proposed <- fields.parameter
-    use committed_state <- fields.parameter
-    use failure_cause <- fields.parameter
-    use available_at_unix_ms <- fields.parameter
-    use confirmation <- fields.parameter
-    use command_id <- fields.parameter
-    AcknowledgedMetadata(
-      ref:,
-      attempt:,
-      proposed:,
-      committed_state:,
-      failure_cause:,
-      available_at_unix_ms:,
-      confirmation:,
-      command_id:,
-    )
+  use ref <- fields.include(job_ref_fields(), get: fn(m) { m.ref })
+  use attempt <- fields.include(attempt_ref_fields(), get: fn(m) { m.attempt })
+  use proposed <- fields.include(proposed_field(), get: fn(m) { m.proposed })
+  use committed_state <- fields.include(
+    observation_wire.job_state_field("committed_state"),
+    get: fn(m) { m.committed_state },
+  )
+  use failure_cause <- fields.include(
+    fields.optional(failure_cause_field()),
+    get: fn(m) { m.failure_cause },
+  )
+  use available_at_unix_ms <- fields.include(
+    fields.optional(fields.int("available_at_unix_ms")),
+    get: fn(m) { m.available_at_unix_ms },
+  )
+  use confirmation <- fields.include(confirmation_field(), get: fn(m) {
+    m.confirmation
   })
-  |> fields.and(job_ref_fields(), fn(m: AcknowledgedMetadata) { m.ref })
-  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
-  |> fields.and(proposed_field(), fn(m) { m.proposed })
-  |> fields.and(observation_wire.job_state_field("committed_state"), fn(m) {
-    m.committed_state
+  use command_id <- fields.include(fields.string("command_id"), get: fn(m) {
+    m.command_id
   })
-  |> fields.and(fields.optional(failure_cause_field()), fn(m) {
-    m.failure_cause
-  })
-  |> fields.and(fields.optional(fields.int("available_at_unix_ms")), fn(m) {
-    m.available_at_unix_ms
-  })
-  |> fields.and(confirmation_field(), fn(m) { m.confirmation })
-  |> fields.and(fields.string("command_id"), fn(m) { m.command_id })
-  |> fields.build
+  fields.success(AcknowledgedMetadata(
+    ref:,
+    attempt:,
+    proposed:,
+    committed_state:,
+    failure_cause:,
+    available_at_unix_ms:,
+    confirmation:,
+    command_id:,
+  ))
 }
 
 /// The `[grind, job, acknowledged]` event descriptor: one committed
