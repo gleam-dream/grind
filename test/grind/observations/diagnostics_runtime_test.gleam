@@ -64,7 +64,7 @@ fn locked_renewal(url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "diagnostic-lock", definition, 9)
   let #(renewals, attachment) =
-    diagnostics.capture("locked-renewal", diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(diagnostic.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -160,12 +160,12 @@ fn claim_failures(url: String) -> Nil {
     postgres.submit(database, "diagnostic-claim", definition, 7)
   let id = job.id_value(handle)
   let #(failed, failed_attachment) =
-    diagnostics.capture("claim-stage", diagnostic.claim_failed(), fn(meta) {
+    diagnostics.capture(diagnostic.claim_failed(), fn(meta) {
       meta.queue.queue == "diagnostic-claim"
     })
   use <- exception.defer(fn() { detach(failed_attachment) })
   let #(checkouts, checkout_attachment) =
-    diagnostics.capture("claim-stage-checkout", diagnostic.checkout(), fn(meta) {
+    diagnostics.capture(diagnostic.checkout(), fn(meta) {
       meta.queue.queue == "diagnostic-claim"
     })
   use <- exception.defer(fn() { detach(checkout_attachment) })
@@ -354,18 +354,14 @@ fn completion_budget(url: String) -> Nil {
   // One subject preserves the single renewer's producer order across the
   // exhausted attempt and the sibling that remains eligible for renewal.
   let #(renewals, renewal_attachment) =
-    diagnostics.capture(
-      "completion-budget-renewals",
-      diagnostic.renewal(),
-      fn(meta) { meta.context.ref.queue == "diagnostic-budget" },
-    )
+    diagnostics.capture(diagnostic.renewal(), fn(meta) {
+      meta.context.ref.queue == "diagnostic-budget"
+    })
   use <- exception.defer(fn() { detach(renewal_attachment) })
   let #(quarantines, quarantine_attachment) =
-    diagnostics.capture(
-      "completion-budget-quarantine",
-      observation.quarantined(),
-      fn(meta) { meta.ref.job_id == first_id },
-    )
+    diagnostics.capture(observation.quarantined(), fn(meta) {
+      meta.ref.job_id == first_id
+    })
   use <- exception.defer(fn() { detach(quarantine_attachment) })
   let assert Ok(policy) =
     queue.default_policy()

@@ -41,6 +41,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   signature; code that builds `Settings` directly or reads the field must
   wrap or call it (`settings.database_url()`). `ValidatedSettings` and
   `Database` also keep the pool configuration behind a closure.
+- Grind builds on the Sinal wave 2 API. Applications attach to
+  `grind/observation` and `grind/diagnostic` descriptors with
+  `sinal.observe(event, run)`; handler ids are automatic. A closed-enum
+  metadata field now also decodes an atom with the same text.
 
 ### Fixed
 

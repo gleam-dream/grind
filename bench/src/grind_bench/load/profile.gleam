@@ -60,7 +60,7 @@ pub fn run_profile(job_count: Int, consumers: Int, concurrency: Int) -> Nil {
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.profile.echo")
   let assert Ok(r) = registry.new(queue_name)
   let assert Ok(r) = registry.register(r, worker_def)
-  observers.attach_audit_observers("profile")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
   workload.preload_and_track(
     database,

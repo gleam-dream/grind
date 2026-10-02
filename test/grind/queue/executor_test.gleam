@@ -49,25 +49,19 @@ fn first_ack_rollback(url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "first-rollback", definition, 41)
   let #(acks, ack_attachment) =
-    diagnostics.capture(
-      "first-rollback-ack",
-      diagnostic.acknowledgement(),
-      fn(meta) { meta.context.ref.job_id == job.id_value(handle) },
-    )
+    diagnostics.capture(diagnostic.acknowledgement(), fn(meta) {
+      meta.context.ref.job_id == job.id_value(handle)
+    })
   use <- exception.defer(fn() { detach(ack_attachment) })
   let #(retries, retry_attachment) =
-    diagnostics.capture(
-      "first-rollback-retry",
-      diagnostic.acknowledgement_retry(),
-      fn(meta) { meta.context.ref.job_id == job.id_value(handle) },
-    )
+    diagnostics.capture(diagnostic.acknowledgement_retry(), fn(meta) {
+      meta.context.ref.job_id == job.id_value(handle)
+    })
   use <- exception.defer(fn() { detach(retry_attachment) })
   let #(capacity, capacity_attachment) =
-    diagnostics.capture(
-      "first-rollback-capacity",
-      diagnostic.capacity(),
-      fn(meta) { meta.queue.queue == "first-rollback" },
-    )
+    diagnostics.capture(diagnostic.capacity(), fn(meta) {
+      meta.queue.queue == "first-rollback"
+    })
   use <- exception.defer(fn() { detach(capacity_attachment) })
   // Sequence advancement survives rollback. A single real acknowledgement
   // fails before COMMIT; its retry must preserve the completed proposal.

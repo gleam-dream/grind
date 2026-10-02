@@ -58,9 +58,8 @@ fn run_claimed_observation_emission_test(database_url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, definition)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-claimed-emission")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.claimed(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.claimed(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -123,9 +122,8 @@ fn run_claimed_observation_absent_when_nothing_due_test(
   let assert Ok(workers) = registry.register(workers, definition)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-claimed-absent")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.claimed(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.claimed(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -209,9 +207,8 @@ fn run_quarantined_observation_emission_test(database_url: String) -> Nil {
     |> pog.execute(on: connection)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-quarantined-emission")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.quarantined(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.quarantined(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -284,9 +281,8 @@ fn run_quarantined_observation_absent_test(database_url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, definition)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-quarantined-absent")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.quarantined(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.quarantined(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -366,29 +362,18 @@ fn run_claimed_precedes_acknowledged_test(database_url: String) -> Nil {
     postgres.submit(database, "ordering-claimed-acknowledged", definition, 7)
 
   let signal = process.new_subject()
-  let assert Ok(claimed_id) = sinal.handler_id("grind-test-ordering-claimed")
-  let assert Ok(claimed_attachment) =
-    sinal.observe(
-      claimed_id,
-      observation.claimed(),
-      fn(_measurements, metadata) {
-        process.send(signal, ClaimedOrderingEvent(metadata.attempt.attempt_id))
-      },
-    )
+  let claimed_attachment =
+    sinal.observe(observation.claimed(), fn(_measurements, metadata) {
+      process.send(signal, ClaimedOrderingEvent(metadata.attempt.attempt_id))
+    })
   use <- exception.defer(fn() { detach(claimed_attachment) })
-  let assert Ok(acknowledged_id) =
-    sinal.handler_id("grind-test-ordering-acknowledged")
-  let assert Ok(acknowledged_attachment) =
-    sinal.observe(
-      acknowledged_id,
-      observation.acknowledged(),
-      fn(_measurements, metadata) {
-        process.send(
-          signal,
-          AcknowledgedOrderingEvent(metadata.attempt.attempt_id),
-        )
-      },
-    )
+  let acknowledged_attachment =
+    sinal.observe(observation.acknowledged(), fn(_measurements, metadata) {
+      process.send(
+        signal,
+        AcknowledgedOrderingEvent(metadata.attempt.attempt_id),
+      )
+    })
   use <- exception.defer(fn() { detach(acknowledged_attachment) })
 
   let assert Ok(consumer) = queue.start(database, workers, manual_policy())
@@ -530,16 +515,10 @@ fn run_quarantine_expired_global_test(database_url: String) -> Nil {
     |> pog.execute(on: connection)
 
   let signal = process.new_subject()
-  let assert Ok(handler_id) =
-    sinal.handler_id("grind-test-quarantine-global-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(
-      handler_id,
-      observation.quarantined(),
-      fn(measurements, metadata) {
-        process.send(signal, #(measurements, metadata))
-      },
-    )
+  let attachment =
+    sinal.observe(observation.quarantined(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   postgres.quarantine_expired(database, limit: 0)

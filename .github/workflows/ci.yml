@@ -29,7 +29,7 @@ permissions:
 # explicitly (`actions/checkout`'s own `token:` input), not just this
 # workflow's ambient permissions.
 env:
-  SINAL_REF: f4622b67394965c18091ef95390cfd55ad6502db
+  SINAL_REF: a0c05ef8169149d12cffddf059593ae17d42af3a
 
 jobs:
   # Fast feedback: format, compile (both the root package and the external

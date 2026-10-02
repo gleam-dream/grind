@@ -76,22 +76,20 @@ fn round_trip(
   expected_measurements: Dynamic,
   expected_metadata: Dynamic,
 ) -> Nil {
-  sinal.event_name(event) |> should.equal(["grind", "diagnostic", part])
+  sinal.name(event) |> should.equal(["grind", "diagnostic", part])
   let raw = process.new_subject()
   let typed = process.new_subject()
   let assert Ok(Nil) =
-    native_attach(part, sinal.event_native_name(event), fn(m, d) {
+    native_attach(part, list.map(sinal.name(event), atom.create), fn(m, d) {
       process.send(raw, #(m, d))
     })
   use <- exception.defer(fn() { native_detach(part) })
-  let assert Ok(id) = sinal.handler_id("diagnostics-wire-" <> part)
-  let assert Ok(attached) =
-    sinal.observe(id, event, fn(m, d) { process.send(typed, #(m, d)) })
+  let attached = sinal.observe(event, fn(m, d) { process.send(typed, #(m, d)) })
   use <- exception.defer(fn() {
     let assert Ok(Nil) = sinal.detach(attached)
     Nil
   })
-  sinal.emit(event, measurements, metadata) |> should.equal(Ok(Nil))
+  sinal.emit(event, measurements, metadata)
   process.receive(raw, 1000)
   |> should.equal(Ok(#(expected_measurements, expected_metadata)))
   process.receive(typed, 1000) |> should.equal(Ok(#(measurements, metadata)))
@@ -105,25 +103,25 @@ fn rejects(
 ) -> Nil {
   let delivered = process.new_subject()
   let failed = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("diagnostics-wire-rejected")
   let assert Ok(attachment) =
     sinal.attach(
-      id,
-      event,
-      fn(_, _, _) {
-        process.send(delivered, Nil)
-        Ok(Nil)
-      },
-      fn(_, failure: sinal.HandlerFailure(Nil)) {
-        process.send(failed, failure)
-      },
+      sinal.handler(
+        [event],
+        fn(_, _, _) {
+          process.send(delivered, Nil)
+          Ok(Nil)
+        },
+        fn(_, failure: sinal.HandlerFailure(Nil)) {
+          process.send(failed, failure)
+        },
+      ),
     )
   use <- exception.defer(fn() {
     // Malformed native delivery auto-detaches its handler.
     let _ = sinal.detach(attachment)
     Nil
   })
-  native_emit(sinal.event_native_name(event), measurements, metadata)
+  native_emit(list.map(sinal.name(event), atom.create), measurements, metadata)
   let assert Ok(failure) = process.receive(failed, 1000)
   case failure {
     sinal.MalformedMeasurements(_) -> measurements_are_bad |> should.be_true()

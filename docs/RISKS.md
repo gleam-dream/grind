@@ -767,8 +767,9 @@ rate for that run, not a fixed lifetime bound.
 
 The allocations are in `postgres.validate`, `queue.start`,
 `grind_pool_ffi:start_deadline_owner/2`, and the pruner constructors.
-`grind/observation` constructs descriptors from fixed names; `atom.create`
-only inserts a new atom when that string does not already exist.
+`grind/observation` constructs descriptors from fixed names, which Sinal
+turns into atoms; an atom is new only when that string does not already
+exist.
 
 **Status.** Open — measured lifecycle allocation, documented and monitored.
 

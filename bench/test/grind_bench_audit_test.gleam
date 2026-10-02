@@ -723,34 +723,32 @@ fn run_i5_state_mismatch(url: String) -> Nil {
 /// would then bump the counter twice, not once. Both counters are proven
 /// through the one attachment instead.
 pub fn quarantine_and_forwarder_drop_counters_bumped_by_real_events_test() {
-  load.attach_audit_observers("mutation-wiring")
+  load.attach_audit_observers()
   let quarantine_before = load.counter_value(load.quarantine_counter)
   let dropped_before = load.counter_value(load.forwarder_drop_counter)
 
-  let assert Ok(Nil) =
-    sinal.emit(
-      observation.quarantined(),
-      observation.QuarantinedMeasurements(count: 1),
-      observation.QuarantinedMetadata(
-        ref: observation.JobRef(
-          job_id: 1,
-          queue: "bench-audit-guard",
-          worker_id: "bench-audit-wiring",
-          worker_version: "v1",
-        ),
-        attempt: observation.AttemptRef(attempt_id: 1, epoch: 0, attempt: 1),
-        cancellation_was_requested: False,
+  sinal.emit(
+    observation.quarantined(),
+    observation.QuarantinedMeasurements(count: 1),
+    observation.QuarantinedMetadata(
+      ref: observation.JobRef(
+        job_id: 1,
+        queue: "bench-audit-guard",
+        worker_id: "bench-audit-wiring",
+        worker_version: "v1",
       ),
-    )
+      attempt: observation.AttemptRef(attempt_id: 1, epoch: 0, attempt: 1),
+      cancellation_was_requested: False,
+    ),
+  )
   load.counter_value(load.quarantine_counter)
   |> should.equal(quarantine_before + 1)
 
-  let assert Ok(Nil) =
-    sinal.emit(
-      forwarder.dropped_event(),
-      forwarder.Dropped(rejected: 1, lost: 0, unavailable: 0),
-      forwarder.DroppedMetadata(forwarder: "bench-audit-wiring"),
-    )
+  sinal.emit(
+    forwarder.dropped_event(),
+    forwarder.Dropped(rejected: 1, lost: 0, unavailable: 0),
+    forwarder.DroppedMetadata(forwarder: "bench-audit-wiring"),
+  )
   load.counter_value(load.forwarder_drop_counter)
   |> should.equal(dropped_before + 1)
 

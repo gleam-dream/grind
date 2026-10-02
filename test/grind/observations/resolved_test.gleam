@@ -71,9 +71,8 @@ fn run_resolved_observation_replied_reconciled_test(
   postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-resolved-emission")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.resolved(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.resolved(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -165,9 +164,8 @@ fn run_resolved_observation_absent_test(database_url: String) -> Nil {
   postgres.state(database, uncertain_handle) |> should.equal(Ok(job.Uncertain))
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-resolved-absent")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.resolved(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.resolved(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -311,10 +309,8 @@ fn run_resolved_observation_commit_unknown_test(database_url: String) -> Nil {
   use <- exception.defer(drop_trigger)
 
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-resolved-commit-unknown-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.resolved(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.resolved(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })

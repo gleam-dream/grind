@@ -183,16 +183,14 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   let assert Ok(handle) =
     postgres.submit(database, "auto-ack-commit-loss", definition, 41)
   let #(acks, ack_attachment) =
-    diagnostics.capture("ack-unknown", diagnostic.acknowledgement(), fn(meta) {
+    diagnostics.capture(diagnostic.acknowledgement(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(ack_attachment) })
   let #(retries, retry_attachment) =
-    diagnostics.capture(
-      "retry-unknown",
-      diagnostic.acknowledgement_retry(),
-      fn(meta) { meta.context.ref.job_id == job.id_value(handle) },
-    )
+    diagnostics.capture(diagnostic.acknowledgement_retry(), fn(meta) {
+      meta.context.ref.job_id == job.id_value(handle)
+    })
   use <- exception.defer(fn() { detach(retry_attachment) })
   let assert Ok(policy) =
     queue.default_policy()

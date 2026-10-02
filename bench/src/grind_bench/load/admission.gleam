@@ -167,7 +167,7 @@ pub fn run_l4(
   let context.Harness(database:, ledger: _ledger, drain:, ..) = harness
   let queue_name = "l4-" <> mode
   let worker_def = l4_worker("bench.l4." <> mode)
-  observers.attach_audit_observers("l4-" <> mode)
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
   let assert Ok(workers) = registry.new(queue_name)
   let assert Ok(workers) = registry.register(workers, worker_def)

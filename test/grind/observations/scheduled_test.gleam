@@ -65,12 +65,9 @@ fn run_acknowledged_observation_available_at_retry_test(
     postgres.submit(database, "observation-available-at-retry", definition, 1)
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer(
-      "available-at-retry",
-      fn(measurements, metadata) {
-        process.send(signal, AcknowledgedSignal(measurements, metadata))
-      },
-    )
+    attach_acknowledged_observer(fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
   let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
@@ -142,12 +139,9 @@ fn run_acknowledged_observation_available_at_snooze_test(
     postgres.submit(database, "observation-available-at-snooze", snoozing, 1)
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer(
-      "available-at-snooze",
-      fn(measurements, metadata) {
-        process.send(signal, AcknowledgedSignal(measurements, metadata))
-      },
-    )
+    attach_acknowledged_observer(fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
   let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })
@@ -235,12 +229,9 @@ fn run_acknowledged_observation_available_at_cancel_overrides_retry_test(
     )
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer(
-      "available-at-cancel-retry",
-      fn(measurements, metadata) {
-        process.send(signal, AcknowledgedSignal(measurements, metadata))
-      },
-    )
+    attach_acknowledged_observer(fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
   let assert Ok(consumer) = queue.start(database, workers, manual_policy())
   use <- exception.defer(fn() { queue.stop(consumer) })

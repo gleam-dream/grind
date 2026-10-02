@@ -212,15 +212,10 @@ fn run_prune_finished_test(database_url: String, owner_b_url: String) -> Nil {
     )
 
   let signal = process.new_subject()
-  let assert Ok(handler_id) = sinal.handler_id("grind-test-prune-completed")
-  let assert Ok(attachment) =
-    sinal.observe(
-      handler_id,
-      observation.prune_completed(),
-      fn(measurements, metadata) {
-        process.send(signal, #(measurements, metadata))
-      },
-    )
+  let attachment =
+    sinal.observe(observation.prune_completed(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   let assert Ok(report) =

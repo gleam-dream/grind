@@ -79,7 +79,7 @@ fn run_lease_renewal_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "lease-renewal", slow_worker, 7)
   let #(renewals, attachment) =
-    diagnostics.capture("renewal-success", diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(diagnostic.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -157,7 +157,7 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "lease-renewal-loss", slow_worker, 7)
   let #(renewals, attachment) =
-    diagnostics.capture("renewal-loss", diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(diagnostic.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -238,7 +238,7 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "renewal-storage-error", slow_worker, 18)
   let #(renewals, attachment) =
-    diagnostics.capture("renewal-error", diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(diagnostic.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })

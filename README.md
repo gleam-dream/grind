@@ -197,9 +197,8 @@ you would to any other Sinal event:
 import grind/observation
 import sinal
 
-let assert Ok(id) = sinal.handler_id("my-app-acknowledged-log")
-let assert Ok(_attachment) =
-  sinal.observe(id, observation.acknowledged(), fn(measurements, metadata) {
+let _attachment =
+  sinal.observe(observation.acknowledged(), fn(measurements, metadata) {
     // metadata.committed_state, metadata.proposed, metadata.confirmation, ...
     io.println("job " <> int.to_string(metadata.ref.job_id) <> " acknowledged")
   })

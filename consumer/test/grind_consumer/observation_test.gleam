@@ -53,9 +53,8 @@ fn run_public_consumer_observation_test(url: String) -> Nil {
     postgres.submit(database, "external-consumer-observation", echo_worker, 41)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("consumer-observation-acknowledged")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.acknowledged(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.acknowledged(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() {
@@ -112,9 +111,8 @@ fn run_public_consumer_claimed_observation_test(url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, echo_worker)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("consumer-observation-claimed")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.claimed(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.claimed(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() {
@@ -123,21 +121,16 @@ fn run_public_consumer_claimed_observation_test(url: String) -> Nil {
   })
 
   let capacity = process.new_subject()
-  let assert Ok(capacity_id) = sinal.handler_id("consumer-diagnostic-capacity")
-  let assert Ok(capacity_attachment) =
-    sinal.observe(
-      capacity_id,
-      diagnostic.capacity(),
-      fn(measurements, metadata) {
-        case
-          metadata.queue.queue == "external-consumer-claimed"
-          && measurements.running == 1
-        {
-          True -> process.send(capacity, #(measurements, metadata))
-          False -> Nil
-        }
-      },
-    )
+  let capacity_attachment =
+    sinal.observe(diagnostic.capacity(), fn(measurements, metadata) {
+      case
+        metadata.queue.queue == "external-consumer-claimed"
+        && measurements.running == 1
+      {
+        True -> process.send(capacity, #(measurements, metadata))
+        False -> Nil
+      }
+    })
   use <- exception.defer(fn() {
     let assert Ok(Nil) = sinal.detach(capacity_attachment)
     Nil
@@ -244,15 +237,14 @@ fn public_diagnostic(
   measurements: m,
   metadata: d,
 ) -> Nil {
-  sinal.event_name(event) |> should.equal(["grind", "diagnostic", part])
+  sinal.name(event) |> should.equal(["grind", "diagnostic", part])
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("consumer-public-diagnostic-" <> part)
-  let assert Ok(attachment) =
-    sinal.observe(id, event, fn(m, d) { process.send(signal, #(m, d)) })
+  let attachment =
+    sinal.observe(event, fn(m, d) { process.send(signal, #(m, d)) })
   use <- exception.defer(fn() {
     let assert Ok(Nil) = sinal.detach(attachment)
     Nil
   })
-  sinal.emit(event, measurements, metadata) |> should.equal(Ok(Nil))
+  sinal.emit(event, measurements, metadata)
   process.receive(signal, 1000) |> should.equal(Ok(#(measurements, metadata)))
 }

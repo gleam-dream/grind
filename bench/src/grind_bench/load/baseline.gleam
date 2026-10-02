@@ -30,7 +30,7 @@ pub fn run_smoke(job_count: Int) -> Nil {
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.smoke.echo")
   let assert Ok(workers) = registry.new("bench-smoke")
   let assert Ok(workers) = registry.register(workers, worker_def)
-  observers.attach_audit_observers("smoke")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
 
   workload.preload_and_track(
@@ -110,7 +110,7 @@ pub fn run_l1(
       let assert Ok(r) = registry.register(r, worker_def)
       r
     })
-  observers.attach_audit_observers("l1")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
   workload.preload_and_track(
     database,
@@ -273,7 +273,7 @@ pub fn run_l7(
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l7.echo")
   let assert Ok(r) = registry.new(queue_name)
   let assert Ok(r) = registry.register(r, worker_def)
-  observers.attach_audit_observers("l7")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
   workload.preload_and_track(
     database,

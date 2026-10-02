@@ -37,26 +37,18 @@ pub type OverflowGateEntered {
 }
 
 pub fn attach_acknowledged_observer(
-  id_suffix: String,
   run: fn(
     observation.AcknowledgedMeasurements,
     observation.AcknowledgedMetadata,
   ) -> Nil,
 ) -> sinal.Attachment {
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-observation-acknowledged-" <> id_suffix)
-  let assert Ok(attachment) = sinal.observe(id, observation.acknowledged(), run)
-  attachment
+  sinal.observe(observation.acknowledged(), run)
 }
 
 pub fn attach_dropped_observer(
-  id_suffix: String,
   run: fn(forwarder.Dropped, forwarder.DroppedMetadata) -> Nil,
 ) -> sinal.Attachment {
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-observation-dropped-" <> id_suffix)
-  let assert Ok(attachment) = sinal.observe(id, forwarder.dropped_event(), run)
-  attachment
+  sinal.observe(forwarder.dropped_event(), run)
 }
 
 /// Counts how many pending messages are already waiting on `subject`,

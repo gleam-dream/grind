@@ -92,7 +92,7 @@ fn run_acknowledged_commit_ordering_test(database_url: String) -> Nil {
   let job_id = job.id_value(handle)
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer("commit-ordering", fn(measurements, metadata) {
+    attach_acknowledged_observer(fn(measurements, metadata) {
       let observed_state = postgres.state(database, handle)
       process.send(signal, #(
         observed_state,
@@ -190,7 +190,7 @@ fn run_acknowledged_observation_isolation_test(database_url: String) -> Nil {
   // process cannot be received on from a different process.
   let gate_entered = process.new_subject()
   let attachment =
-    attach_acknowledged_observer("isolation", fn(_measurements, metadata) {
+    attach_acknowledged_observer(fn(_measurements, metadata) {
       case metadata.ref.job_id == job_a_id {
         True -> {
           let gate = process.new_subject()
@@ -306,7 +306,7 @@ fn run_acknowledged_observation_absent_on_commit_unknown_test(
     postgres.submit(database, "observation-commit-unknown", definition, 21)
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer("commit-unknown", fn(measurements, metadata) {
+    attach_acknowledged_observer(fn(measurements, metadata) {
       process.send(signal, AcknowledgedSignal(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -428,7 +428,7 @@ fn run_acknowledged_observation_absent_on_stale_ack_test(
   let job_id = job.id_value(handle)
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer("stale-ack", fn(measurements, metadata) {
+    attach_acknowledged_observer(fn(measurements, metadata) {
       process.send(signal, AcknowledgedSignal(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -531,19 +531,19 @@ fn run_acknowledged_observation_reconciled_after_lost_reply_test(
   let assert Ok(handle) =
     postgres.submit(database, "observation-reply-lost", definition, 33)
   let #(ack_diagnostics, diagnostic_attachment) =
-    diagnostics.capture("lost-reply", diagnostic.acknowledgement(), fn(meta) {
+    diagnostics.capture(diagnostic.acknowledgement(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(diagnostic_attachment) })
   let #(checkouts, checkout_attachment) =
-    diagnostics.capture("lost-reply-checkout", diagnostic.checkout(), fn(meta) {
+    diagnostics.capture(diagnostic.checkout(), fn(meta) {
       meta.queue.queue == "observation-reply-lost"
       && meta.operation == diagnostic.ReconcileAcknowledgement
     })
   use <- exception.defer(fn() { detach(checkout_attachment) })
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer("reply-lost", fn(measurements, metadata) {
+    attach_acknowledged_observer(fn(measurements, metadata) {
       process.send(signal, AcknowledgedSignal(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -677,7 +677,7 @@ fn run_acknowledged_observation_committed_state_overrides_proposal_test(
     postgres.submit(database, "observation-cancel-running", definition, 9)
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer("cancel-running", fn(measurements, metadata) {
+    attach_acknowledged_observer(fn(measurements, metadata) {
       process.send(signal, AcknowledgedSignal(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })

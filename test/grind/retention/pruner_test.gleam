@@ -110,14 +110,10 @@ fn run_supervised_pruner_test(database_url: String) -> Nil {
     )
 
   let signal = process.new_subject()
-  let assert Ok(handler_id) =
-    sinal.handler_id("grind-test-supervised-pruner-completed")
-  let assert Ok(attachment) =
-    sinal.observe(
-      handler_id,
-      observation.prune_completed(),
-      fn(measurements, _metadata) { process.send(signal, measurements) },
-    )
+  let attachment =
+    sinal.observe(observation.prune_completed(), fn(measurements, _metadata) {
+      process.send(signal, measurements)
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   let assert Ok(policy) =
@@ -205,14 +201,10 @@ fn run_supervised_pruner_restart_test(database_url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
 
   let signal = process.new_subject()
-  let assert Ok(handler_id) =
-    sinal.handler_id("grind-test-supervised-pruner-restart")
-  let assert Ok(attachment) =
-    sinal.observe(
-      handler_id,
-      observation.prune_completed(),
-      fn(_measurements, _metadata) { process.send(signal, Nil) },
-    )
+  let attachment =
+    sinal.observe(observation.prune_completed(), fn(_measurements, _metadata) {
+      process.send(signal, Nil)
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   let interval_ms = 200

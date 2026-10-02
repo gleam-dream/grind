@@ -64,7 +64,7 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
   let assert Ok(third_handle) =
     postgres.submit(database, "consumer-capacity", definition, 3)
   let #(capacity, attachment) =
-    diagnostics.capture("capacity", diagnostic.capacity(), fn(meta) {
+    diagnostics.capture(diagnostic.capacity(), fn(meta) {
       meta.queue.queue == "consumer-capacity"
     })
   use <- exception.defer(fn() { detach(attachment) })

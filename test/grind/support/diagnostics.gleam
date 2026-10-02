@@ -6,14 +6,12 @@ import grind/support/env
 import sinal
 
 pub fn capture(
-  name: String,
   event: sinal.Event(measurements, metadata),
   accepts: fn(metadata) -> Bool,
 ) -> #(process.Subject(#(measurements, metadata)), sinal.Attachment) {
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-diagnostics-test-" <> name)
-  let assert Ok(attachment) =
-    sinal.observe(id, event, fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(event, fn(measurements, metadata) {
       case accepts(metadata) {
         True -> process.send(signal, #(measurements, metadata))
         False -> Nil

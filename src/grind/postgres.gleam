@@ -402,8 +402,7 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
 
 fn validated_forwarder(capacity: Int) -> Forwarder {
   let name = process.new_name("grind_postgres_observation_forwarder")
-  let assert Ok(fwd) = forwarder.new(name, capacity)
-  fwd
+  forwarder.new(name) |> forwarder.with_capacity(capacity)
 }
 
 /// `config` holds the database password behind a closure, so

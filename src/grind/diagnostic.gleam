@@ -18,7 +18,6 @@
 //// fields use their record's snake_case name except `wait_us`, whose native key
 //// is `checkout_wait_us`. Closed enum wire strings are listed on each type.
 
-import gleam/erlang/atom
 import gleam/option.{type Option}
 import grind/internal/observation/wire
 import grind/observation
@@ -223,8 +222,8 @@ pub type CapacityMetadata {
 
 /// `[grind, diagnostic, renewal]`.
 pub fn renewal() -> Event(RenewalMeasurements, RenewalMetadata) {
-  wire.event(
-    [atom.create("grind"), atom.create("diagnostic"), atom.create("renewal")],
+  sinal.event(
+    ["grind", "diagnostic", "renewal"],
     renewal_measurements_fields(),
     renewal_metadata_fields(),
   )
@@ -235,12 +234,8 @@ pub fn acknowledgement() -> Event(
   AcknowledgementMeasurements,
   AcknowledgementMetadata,
 ) {
-  wire.event(
-    [
-      atom.create("grind"),
-      atom.create("diagnostic"),
-      atom.create("acknowledgement"),
-    ],
+  sinal.event(
+    ["grind", "diagnostic", "acknowledgement"],
     acknowledgement_measurements_fields(),
     acknowledgement_metadata_fields(),
   )
@@ -248,12 +243,8 @@ pub fn acknowledgement() -> Event(
 
 /// `[grind, diagnostic, acknowledgement_retry]`.
 pub fn acknowledgement_retry() -> Event(RetryMeasurements, RetryMetadata) {
-  wire.event(
-    [
-      atom.create("grind"),
-      atom.create("diagnostic"),
-      atom.create("acknowledgement_retry"),
-    ],
+  sinal.event(
+    ["grind", "diagnostic", "acknowledgement_retry"],
     retry_measurements_fields(),
     retry_metadata_fields(),
   )
@@ -261,8 +252,8 @@ pub fn acknowledgement_retry() -> Event(RetryMeasurements, RetryMetadata) {
 
 /// `[grind, diagnostic, checkout]`.
 pub fn checkout() -> Event(CheckoutMeasurements, CheckoutMetadata) {
-  wire.event(
-    [atom.create("grind"), atom.create("diagnostic"), atom.create("checkout")],
+  sinal.event(
+    ["grind", "diagnostic", "checkout"],
     checkout_measurements_fields(),
     checkout_metadata_fields(),
   )
@@ -270,12 +261,8 @@ pub fn checkout() -> Event(CheckoutMeasurements, CheckoutMetadata) {
 
 /// `[grind, diagnostic, claim_failed]`.
 pub fn claim_failed() -> Event(ClaimFailedMeasurements, ClaimFailedMetadata) {
-  wire.event(
-    [
-      atom.create("grind"),
-      atom.create("diagnostic"),
-      atom.create("claim_failed"),
-    ],
+  sinal.event(
+    ["grind", "diagnostic", "claim_failed"],
     claim_failed_measurements_fields(),
     claim_failed_metadata_fields(),
   )
@@ -283,315 +270,312 @@ pub fn claim_failed() -> Event(ClaimFailedMeasurements, ClaimFailedMetadata) {
 
 /// `[grind, diagnostic, capacity]`.
 pub fn capacity() -> Event(CapacityMeasurements, CapacityMetadata) {
-  wire.event(
-    [atom.create("grind"), atom.create("diagnostic"), atom.create("capacity")],
+  sinal.event(
+    ["grind", "diagnostic", "capacity"],
     capacity_measurements_fields(),
     capacity_metadata_fields(),
   )
 }
 
-fn pair(a: fields.Fields(a), b: fields.Fields(b)) -> fields.Fields(#(a, b)) {
-  let assert Ok(paired) = fields.pair(a, b)
-  paired
-}
-
-fn triple(
-  a: fields.Fields(a),
-  b: fields.Fields(b),
-  c: fields.Fields(c),
-) -> fields.Fields(#(a, b, c)) {
-  fields.imap(pair(pair(a, b), c), fn(t) { #(t.0.0, t.0.1, t.1) }, fn(t) {
-    #(#(t.0, t.1), t.2)
-  })
-}
-
-fn quadruple(
-  a: fields.Fields(a),
-  b: fields.Fields(b),
-  c: fields.Fields(c),
-  d: fields.Fields(d),
-) -> fields.Fields(#(a, b, c, d)) {
-  fields.imap(
-    pair(triple(a, b, c), d),
-    fn(t) { #(t.0.0, t.0.1, t.0.2, t.1) },
-    fn(t) { #(#(t.0, t.1, t.2), t.3) },
-  )
-}
-
-fn quintuple(
-  a: fields.Fields(a),
-  b: fields.Fields(b),
-  c: fields.Fields(c),
-  d: fields.Fields(d),
-  e: fields.Fields(e),
-) -> fields.Fields(#(a, b, c, d, e)) {
-  fields.imap(
-    pair(quadruple(a, b, c, d), e),
-    fn(t) { #(t.0.0, t.0.1, t.0.2, t.0.3, t.1) },
-    fn(t) { #(#(t.0, t.1, t.2, t.3), t.4) },
-  )
-}
-
 fn job_ref_fields() -> fields.Fields(observation.JobRef) {
   wire.job_ref_fields(
-    fn(t) { observation.JobRef(t.0.0.0, t.0.0.1, t.0.1, t.1) },
-    fn(r) { #(#(#(r.job_id, r.queue), r.worker_id), r.worker_version) },
+    observation.JobRef,
+    fn(ref: observation.JobRef) { ref.job_id },
+    fn(ref) { ref.queue },
+    fn(ref) { ref.worker_id },
+    fn(ref) { ref.worker_version },
   )
 }
 
 fn attempt_ref_fields() -> fields.Fields(observation.AttemptRef) {
   wire.attempt_ref_fields(
-    fn(t) { observation.AttemptRef(t.0.0, t.0.1, t.1) },
-    fn(r) { #(#(r.attempt_id, r.epoch), r.attempt) },
+    observation.AttemptRef,
+    fn(ref: observation.AttemptRef) { ref.attempt_id },
+    fn(ref) { ref.epoch },
+    fn(ref) { ref.attempt },
   )
 }
 
 fn consumer_ref_fields() -> fields.Fields(ConsumerRef) {
-  fields.imap(
-    pair(
-      fields.string(atom.create("node")),
-      fields.string(atom.create("consumer")),
-    ),
-    fn(t) { ConsumerRef(node: t.0, consumer: t.1) },
-    fn(m) { #(m.node, m.consumer) },
-  )
+  fields.record({
+    use node <- fields.parameter
+    use consumer <- fields.parameter
+    ConsumerRef(node:, consumer:)
+  })
+  |> fields.and(fields.string("node"), fn(m: ConsumerRef) { m.node })
+  |> fields.and(fields.string("consumer"), fn(m) { m.consumer })
+  |> fields.build
 }
 
 fn queue_ref_fields() -> fields.Fields(QueueRef) {
-  fields.imap(
-    pair(fields.string(atom.create("queue")), consumer_ref_fields()),
-    fn(t) { QueueRef(queue: t.0, consumer: t.1) },
-    fn(m) { #(m.queue, m.consumer) },
-  )
+  fields.record({
+    use queue <- fields.parameter
+    use consumer <- fields.parameter
+    QueueRef(queue:, consumer:)
+  })
+  |> fields.and(fields.string("queue"), fn(m: QueueRef) { m.queue })
+  |> fields.and(consumer_ref_fields(), fn(m) { m.consumer })
+  |> fields.build
 }
 
 fn attempt_context_fields() -> fields.Fields(AttemptContext) {
-  fields.imap(
-    triple(job_ref_fields(), attempt_ref_fields(), consumer_ref_fields()),
-    fn(t) { AttemptContext(ref: t.0, attempt: t.1, consumer: t.2) },
-    fn(m) { #(m.ref, m.attempt, m.consumer) },
-  )
+  fields.record({
+    use ref <- fields.parameter
+    use attempt <- fields.parameter
+    use consumer <- fields.parameter
+    AttemptContext(ref:, attempt:, consumer:)
+  })
+  |> fields.and(job_ref_fields(), fn(m: AttemptContext) { m.ref })
+  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
+  |> fields.and(consumer_ref_fields(), fn(m) { m.consumer })
+  |> fields.build
 }
 
 fn renewal_measurements_fields() -> fields.Fields(RenewalMeasurements) {
-  let assert Ok(optional_remaining_lease_ms) =
-    fields.optional(fields.int(atom.create("remaining_lease_ms")))
-  fields.imap(
-    triple(
-      fields.int(atom.create("count")),
-      fields.int(atom.create("duration_us")),
-      optional_remaining_lease_ms,
-    ),
-    fn(t) {
-      RenewalMeasurements(count: t.0, duration_us: t.1, remaining_lease_ms: t.2)
-    },
-    fn(m) { #(m.count, m.duration_us, m.remaining_lease_ms) },
-  )
+  fields.record({
+    use count <- fields.parameter
+    use duration_us <- fields.parameter
+    use remaining_lease_ms <- fields.parameter
+    RenewalMeasurements(count:, duration_us:, remaining_lease_ms:)
+  })
+  |> fields.and(fields.int("count"), fn(m: RenewalMeasurements) { m.count })
+  |> fields.and(fields.int("duration_us"), fn(m) { m.duration_us })
+  |> fields.and(fields.optional(fields.int("remaining_lease_ms")), fn(m) {
+    m.remaining_lease_ms
+  })
+  |> fields.build
 }
 
 fn renewal_metadata_fields() -> fields.Fields(RenewalMetadata) {
-  fields.imap(
-    triple(
-      attempt_context_fields(),
-      wire.closed_string_field(
-        "phase",
-        attempt_phase_to_string,
-        attempt_phase_from_string,
-      ),
-      wire.closed_string_field(
-        "outcome",
-        renewal_outcome_to_string,
-        renewal_outcome_from_string,
-      ),
+  fields.record({
+    use context <- fields.parameter
+    use phase <- fields.parameter
+    use outcome <- fields.parameter
+    RenewalMetadata(context:, phase:, outcome:)
+  })
+  |> fields.and(attempt_context_fields(), fn(m: RenewalMetadata) { m.context })
+  |> fields.and(
+    fields.enum(
+      "phase",
+      [HandlerRunning, AcknowledgementPending],
+      attempt_phase_to_string,
     ),
-    fn(t) { RenewalMetadata(context: t.0, phase: t.1, outcome: t.2) },
-    fn(m) { #(m.context, m.phase, m.outcome) },
+    fn(m) { m.phase },
   )
+  |> fields.and(
+    fields.enum(
+      "outcome",
+      [
+        Renewed,
+        SkippedLocked,
+        LiveFenceUnavailable,
+        StorageFailed,
+        CompletionBudgetExhausted,
+      ],
+      renewal_outcome_to_string,
+    ),
+    fn(m) { m.outcome },
+  )
+  |> fields.build
 }
 
 fn acknowledgement_measurements_fields() -> fields.Fields(
   AcknowledgementMeasurements,
 ) {
-  fields.imap(
-    pair(
-      fields.int(atom.create("count")),
-      fields.int(atom.create("duration_us")),
-    ),
-    fn(t) { AcknowledgementMeasurements(count: t.0, duration_us: t.1) },
-    fn(m) { #(m.count, m.duration_us) },
-  )
+  fields.record({
+    use count <- fields.parameter
+    use duration_us <- fields.parameter
+    AcknowledgementMeasurements(count:, duration_us:)
+  })
+  |> fields.and(fields.int("count"), fn(m: AcknowledgementMeasurements) {
+    m.count
+  })
+  |> fields.and(fields.int("duration_us"), fn(m) { m.duration_us })
+  |> fields.build
 }
 
 fn acknowledgement_metadata_fields() -> fields.Fields(AcknowledgementMetadata) {
-  fields.imap(
-    triple(
-      attempt_context_fields(),
-      fields.string(atom.create("command_id")),
-      wire.closed_string_field(
-        "outcome",
-        ack_outcome_to_string,
-        ack_outcome_from_string,
-      ),
+  fields.record({
+    use context <- fields.parameter
+    use command_id <- fields.parameter
+    use outcome <- fields.parameter
+    AcknowledgementMetadata(context:, command_id:, outcome:)
+  })
+  |> fields.and(attempt_context_fields(), fn(m: AcknowledgementMetadata) {
+    m.context
+  })
+  |> fields.and(fields.string("command_id"), fn(m) { m.command_id })
+  |> fields.and(
+    fields.enum(
+      "outcome",
+      [
+        AckReplied,
+        AckReconciled,
+        AckRolledBack,
+        AckUnknown,
+        AckFenceRejected,
+        AckCommandConflict,
+        AckFailed,
+      ],
+      ack_outcome_to_string,
     ),
-    fn(t) {
-      AcknowledgementMetadata(context: t.0, command_id: t.1, outcome: t.2)
-    },
-    fn(m) { #(m.context, m.command_id, m.outcome) },
+    fn(m) { m.outcome },
   )
+  |> fields.build
 }
 
 fn retry_measurements_fields() -> fields.Fields(RetryMeasurements) {
-  fields.imap(
-    quadruple(
-      fields.int(atom.create("count")),
-      fields.int(atom.create("retry_number")),
-      fields.int(atom.create("delay_ms")),
-      fields.int(atom.create("pending_duration_us")),
-    ),
-    fn(t) {
-      RetryMeasurements(
-        count: t.0,
-        retry_number: t.1,
-        delay_ms: t.2,
-        pending_duration_us: t.3,
-      )
-    },
-    fn(m) { #(m.count, m.retry_number, m.delay_ms, m.pending_duration_us) },
-  )
+  fields.record({
+    use count <- fields.parameter
+    use retry_number <- fields.parameter
+    use delay_ms <- fields.parameter
+    use pending_duration_us <- fields.parameter
+    RetryMeasurements(count:, retry_number:, delay_ms:, pending_duration_us:)
+  })
+  |> fields.and(fields.int("count"), fn(m: RetryMeasurements) { m.count })
+  |> fields.and(fields.int("retry_number"), fn(m) { m.retry_number })
+  |> fields.and(fields.int("delay_ms"), fn(m) { m.delay_ms })
+  |> fields.and(fields.int("pending_duration_us"), fn(m) {
+    m.pending_duration_us
+  })
+  |> fields.build
 }
 
 fn retry_metadata_fields() -> fields.Fields(RetryMetadata) {
-  fields.imap(
-    triple(
-      attempt_context_fields(),
-      fields.string(atom.create("command_id")),
-      wire.closed_string_field(
-        "reason",
-        retry_reason_to_string,
-        retry_reason_from_string,
-      ),
+  fields.record({
+    use context <- fields.parameter
+    use command_id <- fields.parameter
+    use reason <- fields.parameter
+    RetryMetadata(context:, command_id:, reason:)
+  })
+  |> fields.and(attempt_context_fields(), fn(m: RetryMetadata) { m.context })
+  |> fields.and(fields.string("command_id"), fn(m) { m.command_id })
+  |> fields.and(
+    fields.enum(
+      "reason",
+      [RetryAfterFailure, RetryAfterUnknown],
+      retry_reason_to_string,
     ),
-    fn(t) { RetryMetadata(context: t.0, command_id: t.1, reason: t.2) },
-    fn(m) { #(m.context, m.command_id, m.reason) },
+    fn(m) { m.reason },
   )
+  |> fields.build
 }
 
 fn checkout_measurements_fields() -> fields.Fields(CheckoutMeasurements) {
-  fields.imap(
-    quadruple(
-      fields.int(atom.create("count")),
-      fields.int(atom.create("checkout_wait_us")),
-      fields.int(atom.create("call_duration_us")),
-      fields.int(atom.create("candidates")),
-    ),
-    fn(t) {
-      CheckoutMeasurements(
-        count: t.0,
-        wait_us: t.1,
-        call_duration_us: t.2,
-        candidates: t.3,
-      )
-    },
-    fn(m) { #(m.count, m.wait_us, m.call_duration_us, m.candidates) },
-  )
+  fields.record({
+    use count <- fields.parameter
+    use wait_us <- fields.parameter
+    use call_duration_us <- fields.parameter
+    use candidates <- fields.parameter
+    CheckoutMeasurements(count:, wait_us:, call_duration_us:, candidates:)
+  })
+  |> fields.and(fields.int("count"), fn(m: CheckoutMeasurements) { m.count })
+  |> fields.and(fields.int("checkout_wait_us"), fn(m) { m.wait_us })
+  |> fields.and(fields.int("call_duration_us"), fn(m) { m.call_duration_us })
+  |> fields.and(fields.int("candidates"), fn(m) { m.candidates })
+  |> fields.build
 }
 
 fn checkout_metadata_fields() -> fields.Fields(CheckoutMetadata) {
-  fields.imap(
-    quintuple(
-      queue_ref_fields(),
-      wire.closed_string_field(
-        "operation",
-        operation_to_string,
-        operation_from_string,
-      ),
-      wire.closed_string_field(
-        "pool",
-        pool_role_to_string,
-        pool_role_from_string,
-      ),
-      wire.closed_string_field(
-        "checkout",
-        checkout_outcome_to_string,
-        checkout_outcome_from_string,
-      ),
-      wire.closed_string_field(
-        "returned",
-        call_outcome_to_string,
-        call_outcome_from_string,
-      ),
-    ),
-    fn(t) {
-      CheckoutMetadata(
-        queue: t.0,
-        operation: t.1,
-        pool: t.2,
-        checkout: t.3,
-        returned: t.4,
-      )
-    },
-    fn(m) { #(m.queue, m.operation, m.pool, m.checkout, m.returned) },
+  fields.record({
+    use queue <- fields.parameter
+    use operation <- fields.parameter
+    use pool <- fields.parameter
+    use checkout <- fields.parameter
+    use returned <- fields.parameter
+    CheckoutMetadata(queue:, operation:, pool:, checkout:, returned:)
+  })
+  |> fields.and(queue_ref_fields(), fn(m: CheckoutMetadata) { m.queue })
+  |> fields.and(operation_field("operation"), fn(m) { m.operation })
+  |> fields.and(
+    fields.enum("pool", [MainPool, ReservedPool], pool_role_to_string),
+    fn(m) { m.pool },
   )
+  |> fields.and(
+    fields.enum(
+      "checkout",
+      [CheckoutAcquired, CheckoutUnavailable],
+      checkout_outcome_to_string,
+    ),
+    fn(m) { m.checkout },
+  )
+  |> fields.and(
+    fields.enum("returned", [CallSucceeded, CallFailed], call_outcome_to_string),
+    fn(m) { m.returned },
+  )
+  |> fields.build
 }
 
 fn claim_failed_measurements_fields() -> fields.Fields(ClaimFailedMeasurements) {
-  fields.imap(
-    pair(
-      fields.int(atom.create("count")),
-      fields.int(atom.create("duration_us")),
-    ),
-    fn(t) { ClaimFailedMeasurements(count: t.0, duration_us: t.1) },
-    fn(m) { #(m.count, m.duration_us) },
-  )
+  fields.record({
+    use count <- fields.parameter
+    use duration_us <- fields.parameter
+    ClaimFailedMeasurements(count:, duration_us:)
+  })
+  |> fields.and(fields.int("count"), fn(m: ClaimFailedMeasurements) { m.count })
+  |> fields.and(fields.int("duration_us"), fn(m) { m.duration_us })
+  |> fields.build
 }
 
 fn claim_failed_metadata_fields() -> fields.Fields(ClaimFailedMetadata) {
-  fields.imap(
-    triple(
-      queue_ref_fields(),
-      wire.closed_string_field(
-        "stage",
-        operation_to_string,
-        operation_from_string,
-      ),
-      wire.closed_string_field(
-        "failure",
-        failure_kind_to_string,
-        failure_kind_from_string,
-      ),
+  fields.record({
+    use queue <- fields.parameter
+    use stage <- fields.parameter
+    use failure <- fields.parameter
+    ClaimFailedMetadata(queue:, stage:, failure:)
+  })
+  |> fields.and(queue_ref_fields(), fn(m: ClaimFailedMetadata) { m.queue })
+  |> fields.and(operation_field("stage"), fn(m) { m.stage })
+  |> fields.and(
+    fields.enum(
+      "failure",
+      [TimedOut, ConnectionUnavailable, Rejected, UnexpectedResult],
+      failure_kind_to_string,
     ),
-    fn(t) { ClaimFailedMetadata(queue: t.0, stage: t.1, failure: t.2) },
-    fn(m) { #(m.queue, m.stage, m.failure) },
+    fn(m) { m.failure },
   )
+  |> fields.build
 }
 
 fn capacity_measurements_fields() -> fields.Fields(CapacityMeasurements) {
-  fields.imap(
-    quintuple(
-      fields.int(atom.create("maximum")),
-      fields.int(atom.create("active")),
-      fields.int(atom.create("running")),
-      fields.int(atom.create("ack_pending")),
-      fields.int(atom.create("available")),
-    ),
-    fn(t) {
-      CapacityMeasurements(
-        maximum: t.0,
-        active: t.1,
-        running: t.2,
-        ack_pending: t.3,
-        available: t.4,
-      )
-    },
-    fn(m) { #(m.maximum, m.active, m.running, m.ack_pending, m.available) },
-  )
+  fields.record({
+    use maximum <- fields.parameter
+    use active <- fields.parameter
+    use running <- fields.parameter
+    use ack_pending <- fields.parameter
+    use available <- fields.parameter
+    CapacityMeasurements(maximum:, active:, running:, ack_pending:, available:)
+  })
+  |> fields.and(fields.int("maximum"), fn(m: CapacityMeasurements) { m.maximum })
+  |> fields.and(fields.int("active"), fn(m) { m.active })
+  |> fields.and(fields.int("running"), fn(m) { m.running })
+  |> fields.and(fields.int("ack_pending"), fn(m) { m.ack_pending })
+  |> fields.and(fields.int("available"), fn(m) { m.available })
+  |> fields.build
 }
 
 fn capacity_metadata_fields() -> fields.Fields(CapacityMetadata) {
-  fields.imap(
-    pair(queue_ref_fields(), fields.bool(atom.create("draining"))),
-    fn(t) { CapacityMetadata(queue: t.0, draining: t.1) },
-    fn(m) { #(m.queue, m.draining) },
+  fields.record({
+    use queue <- fields.parameter
+    use draining <- fields.parameter
+    CapacityMetadata(queue:, draining:)
+  })
+  |> fields.and(queue_ref_fields(), fn(m: CapacityMetadata) { m.queue })
+  |> fields.and(fields.bool("draining"), fn(m) { m.draining })
+  |> fields.build
+}
+
+fn operation_field(key: String) -> fields.Fields(Operation) {
+  fields.enum(
+    key,
+    [
+      QuarantineScan,
+      ClaimCandidate,
+      LeaseRenewal,
+      Acknowledge,
+      ReconcileAcknowledgement,
+    ],
+    operation_to_string,
   )
 }
 
@@ -602,14 +586,6 @@ fn attempt_phase_to_string(value: AttemptPhase) -> String {
   }
 }
 
-fn attempt_phase_from_string(value: String) -> Result(AttemptPhase, Nil) {
-  case value {
-    "handler_running" -> Ok(HandlerRunning)
-    "acknowledgement_pending" -> Ok(AcknowledgementPending)
-    _ -> Error(Nil)
-  }
-}
-
 fn renewal_outcome_to_string(value: RenewalOutcome) -> String {
   case value {
     Renewed -> "renewed"
@@ -617,17 +593,6 @@ fn renewal_outcome_to_string(value: RenewalOutcome) -> String {
     LiveFenceUnavailable -> "live_fence_unavailable"
     StorageFailed -> "storage_failed"
     CompletionBudgetExhausted -> "completion_budget_exhausted"
-  }
-}
-
-fn renewal_outcome_from_string(value: String) -> Result(RenewalOutcome, Nil) {
-  case value {
-    "renewed" -> Ok(Renewed)
-    "skipped_locked" -> Ok(SkippedLocked)
-    "live_fence_unavailable" -> Ok(LiveFenceUnavailable)
-    "storage_failed" -> Ok(StorageFailed)
-    "completion_budget_exhausted" -> Ok(CompletionBudgetExhausted)
-    _ -> Error(Nil)
   }
 }
 
@@ -643,31 +608,10 @@ fn ack_outcome_to_string(value: AckOutcome) -> String {
   }
 }
 
-fn ack_outcome_from_string(value: String) -> Result(AckOutcome, Nil) {
-  case value {
-    "replied" -> Ok(AckReplied)
-    "reconciled" -> Ok(AckReconciled)
-    "rolled_back" -> Ok(AckRolledBack)
-    "unknown" -> Ok(AckUnknown)
-    "fence_rejected" -> Ok(AckFenceRejected)
-    "command_conflict" -> Ok(AckCommandConflict)
-    "failed" -> Ok(AckFailed)
-    _ -> Error(Nil)
-  }
-}
-
 fn retry_reason_to_string(value: RetryReason) -> String {
   case value {
     RetryAfterFailure -> "after_failure"
     RetryAfterUnknown -> "after_unknown"
-  }
-}
-
-fn retry_reason_from_string(value: String) -> Result(RetryReason, Nil) {
-  case value {
-    "after_failure" -> Ok(RetryAfterFailure)
-    "after_unknown" -> Ok(RetryAfterUnknown)
-    _ -> Error(Nil)
   }
 }
 
@@ -681,29 +625,10 @@ fn operation_to_string(value: Operation) -> String {
   }
 }
 
-fn operation_from_string(value: String) -> Result(Operation, Nil) {
-  case value {
-    "quarantine_scan" -> Ok(QuarantineScan)
-    "claim_candidate" -> Ok(ClaimCandidate)
-    "lease_renewal" -> Ok(LeaseRenewal)
-    "acknowledge" -> Ok(Acknowledge)
-    "reconcile_acknowledgement" -> Ok(ReconcileAcknowledgement)
-    _ -> Error(Nil)
-  }
-}
-
 fn pool_role_to_string(value: PoolRole) -> String {
   case value {
     MainPool -> "main"
     ReservedPool -> "reserved"
-  }
-}
-
-fn pool_role_from_string(value: String) -> Result(PoolRole, Nil) {
-  case value {
-    "main" -> Ok(MainPool)
-    "reserved" -> Ok(ReservedPool)
-    _ -> Error(Nil)
   }
 }
 
@@ -714,26 +639,10 @@ fn checkout_outcome_to_string(value: CheckoutOutcome) -> String {
   }
 }
 
-fn checkout_outcome_from_string(value: String) -> Result(CheckoutOutcome, Nil) {
-  case value {
-    "acquired" -> Ok(CheckoutAcquired)
-    "unavailable" -> Ok(CheckoutUnavailable)
-    _ -> Error(Nil)
-  }
-}
-
 fn call_outcome_to_string(value: CallOutcome) -> String {
   case value {
     CallSucceeded -> "succeeded"
     CallFailed -> "failed"
-  }
-}
-
-fn call_outcome_from_string(value: String) -> Result(CallOutcome, Nil) {
-  case value {
-    "succeeded" -> Ok(CallSucceeded)
-    "failed" -> Ok(CallFailed)
-    _ -> Error(Nil)
   }
 }
 
@@ -743,15 +652,5 @@ fn failure_kind_to_string(value: FailureKind) -> String {
     ConnectionUnavailable -> "connection_unavailable"
     Rejected -> "rejected"
     UnexpectedResult -> "unexpected_result"
-  }
-}
-
-fn failure_kind_from_string(value: String) -> Result(FailureKind, Nil) {
-  case value {
-    "timed_out" -> Ok(TimedOut)
-    "connection_unavailable" -> Ok(ConnectionUnavailable)
-    "rejected" -> Ok(Rejected)
-    "unexpected_result" -> Ok(UnexpectedResult)
-    _ -> Error(Nil)
   }
 }

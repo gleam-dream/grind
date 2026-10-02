@@ -71,9 +71,8 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
   let assert Ok(workers) = registry.new("observation-overflow")
   let assert Ok(workers) = registry.register(workers, definition)
   let gate_entered = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("diagnostic-overflow-gate")
-  let assert Ok(attachment) =
-    sinal.observe(id, diagnostic.checkout(), fn(_, metadata) {
+  let attachment =
+    sinal.observe(diagnostic.checkout(), fn(_, metadata) {
       case metadata.queue.queue == "observation-overflow" {
         False -> Nil
         True -> {
@@ -87,7 +86,7 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
   use <- exception.defer(fn() { detach(attachment) })
   let dropped_signal = process.new_subject()
   let dropped_attachment =
-    attach_dropped_observer("overflow", fn(measurements, metadata) {
+    attach_dropped_observer(fn(measurements, metadata) {
       process.send(dropped_signal, DroppedSignal(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(dropped_attachment) })
@@ -180,7 +179,7 @@ fn run_acknowledged_observation_raising_handler_test(
   let assert Ok(handle) =
     postgres.submit(database, "observation-raising", definition, 7)
   let attachment =
-    attach_acknowledged_observer("raising", fn(_measurements, _metadata) {
+    attach_acknowledged_observer(fn(_measurements, _metadata) {
       panic as "deliberately raising acknowledged observer"
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -237,9 +236,8 @@ fn run_forwarder_crash_loop_test(database_url: String) -> Nil {
   let assert Ok(workers) = registry.new("forwarder-crash")
   let assert Ok(workers) = registry.register(workers, definition)
 
-  let assert Ok(id) = sinal.handler_id("grind-test-forwarder-crash-loop")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.acknowledged(), fn(_measurements, _metadata) {
+  let attachment =
+    sinal.observe(observation.acknowledged(), fn(_measurements, _metadata) {
       process.kill(process.self())
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -251,10 +249,8 @@ fn run_forwarder_crash_loop_test(database_url: String) -> Nil {
   // forwarder actually managed to deliver, instead of only inferring
   // "the restart budget must be exhausted by now" from elapsed sleep time.
   let observed = process.new_subject()
-  let assert Ok(counter_id) =
-    sinal.handler_id("grind-test-forwarder-crash-loop-counter")
-  let assert Ok(counter_attachment) =
-    sinal.observe(counter_id, observation.acknowledged(), fn(_, _) {
+  let counter_attachment =
+    sinal.observe(observation.acknowledged(), fn(_, _) {
       process.send(observed, Nil)
     })
   use <- exception.defer(fn() { detach(counter_attachment) })
@@ -361,7 +357,7 @@ fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
 
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer("dup-sequential", fn(measurements, metadata) {
+    attach_acknowledged_observer(fn(measurements, metadata) {
       process.send(signal, AcknowledgedSignal(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -491,12 +487,9 @@ fn run_acknowledged_observation_reconciled_concurrent_duplicate_test(
 
   let signal = process.new_subject()
   let attachment =
-    attach_acknowledged_observer(
-      "dup-concurrent-" <> suffix,
-      fn(measurements, metadata) {
-        process.send(signal, AcknowledgedSignal(measurements, metadata))
-      },
-    )
+    attach_acknowledged_observer(fn(measurements, metadata) {
+      process.send(signal, AcknowledgedSignal(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   let lock_key = unique_test_lock_key(5)

@@ -54,7 +54,7 @@ pub fn run_l5(pruner_on: Int, duration_ms: Int, repeat: Int) -> Nil {
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l5.echo")
   let assert Ok(registry_) = registry.new(queue_name)
   let assert Ok(registry_) = registry.register(registry_, worker_def)
-  observers.attach_audit_observers("l5")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
 
   let assert Ok(policy) =
@@ -69,15 +69,10 @@ pub fn run_l5(pruner_on: Int, duration_ms: Int, repeat: Int) -> Nil {
     })
 
   let prune_events = process.new_subject()
-  let assert Ok(prune_observer_id) = sinal.handler_id("bench-l5-prune-window")
-  let assert Ok(prune_observer) =
-    sinal.observe(
-      prune_observer_id,
-      observation.prune_completed(),
-      fn(measurements, _) {
-        process.send(prune_events, #(runtime.monotonic_ms(), measurements.jobs))
-      },
-    )
+  let prune_observer =
+    sinal.observe(observation.prune_completed(), fn(measurements, _) {
+      process.send(prune_events, #(runtime.monotonic_ms(), measurements.jobs))
+    })
   let maybe_pruner = case pruner_on == 1 {
     True -> {
       let assert Ok(pruner_policy) =
@@ -258,7 +253,7 @@ pub fn run_l6t1(
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l6t1.echo")
   let assert Ok(registry_) = registry.new("l6t1-q0")
   let assert Ok(registry_) = registry.register(registry_, worker_def)
-  observers.attach_audit_observers("l6t1")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
 
   workload.preload_varying_cost(
@@ -398,7 +393,7 @@ pub fn run_l6t2_resources(
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l6t2.echo")
   let assert Ok(registry_) = registry.new("l6t2-q0")
   let assert Ok(registry_) = registry.register(registry_, worker_def)
-  observers.attach_audit_observers("l6t2")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
 
   workload.preload_varying_cost(

@@ -482,7 +482,7 @@ fn run_temporary_worker_death_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "worker-death", definition, 31)
   let #(capacity, attachment) =
-    diagnostics.capture("worker-death", diagnostic.capacity(), fn(meta) {
+    diagnostics.capture(diagnostic.capacity(), fn(meta) {
       meta.queue.queue == "worker-death"
     })
   use <- exception.defer(fn() { detach(attachment) })

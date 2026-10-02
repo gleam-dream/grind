@@ -71,10 +71,8 @@ fn run_cancellation_observation_emission_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { queue.stop(consumer) })
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-cancellation-emission")
-  let assert Ok(attachment) =
+  let attachment =
     sinal.observe(
-      id,
       observation.cancellation_decided(),
       fn(measurements, metadata) {
         process.send(signal, #(measurements, metadata))
@@ -170,10 +168,8 @@ fn run_cancellation_observation_absent_test(database_url: String) -> Nil {
   // ourselves — rather than starting from a subject that might already
   // have it queued — removes that race entirely.
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-cancellation-absent")
-  let assert Ok(attachment) =
+  let attachment =
     sinal.observe(
-      id,
       observation.cancellation_decided(),
       fn(measurements, metadata) {
         process.send(signal, #(measurements, metadata))
@@ -279,11 +275,8 @@ fn run_cancellation_observation_commit_unknown_test(
   use <- exception.defer(drop_trigger)
 
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-cancellation-commit-unknown-" <> suffix)
-  let assert Ok(attachment) =
+  let attachment =
     sinal.observe(
-      id,
       observation.cancellation_decided(),
       fn(measurements, metadata) {
         process.send(signal, #(measurements, metadata))

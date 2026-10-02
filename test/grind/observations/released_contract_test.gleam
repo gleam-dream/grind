@@ -52,9 +52,8 @@ fn run_released_observation_emission_test(database_url: String) -> Nil {
     postgres.submit(database, "released-emission", definition, 1)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-released-emission")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.released(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.released(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -119,9 +118,8 @@ fn run_released_observation_absent_test(database_url: String) -> Nil {
   let assert Ok(_) = postgres.submit(database, "released-absent", definition, 1)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-released-absent")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.released(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.released(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -220,10 +218,8 @@ fn run_contract_mismatch_observation_emission_test(
     |> pog.execute(on: connection)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-contract-mismatch-emission")
-  let assert Ok(attachment) =
+  let attachment =
     sinal.observe(
-      id,
       observation.contract_mismatch_recorded(),
       fn(measurements, metadata) {
         process.send(signal, #(measurements, metadata))
@@ -303,10 +299,8 @@ fn run_contract_mismatch_observation_absent_test(database_url: String) -> Nil {
     |> pog.execute(on: connection)
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-contract-mismatch-absent")
-  let assert Ok(attachment) =
+  let attachment =
     sinal.observe(
-      id,
       observation.contract_mismatch_recorded(),
       fn(measurements, metadata) {
         process.send(signal, #(measurements, metadata))

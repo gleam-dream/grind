@@ -65,9 +65,8 @@ fn run_admitted_plain_submit_test(database_url: String) -> Nil {
       Ok(int.to_string(value))
     })
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-admitted-plain")
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -149,9 +148,8 @@ fn run_admitted_unique_inserted_reconciled_test(database_url: String) -> Nil {
   let submission_text = "admitted-unique-1-" <> suffix
 
   let signal = process.new_subject()
-  let assert Ok(id) = sinal.handler_id("grind-test-admitted-unique-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -226,10 +224,8 @@ fn run_admitted_unique_existing_test(database_url: String) -> Nil {
   // actually run the attached handler — so a handler attached only *after* a
   // call returns can still race that call's own not-yet-processed emission.
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-admitted-unique-existing-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -317,10 +313,8 @@ fn run_admitted_existing_over_executing_test(database_url: String) -> Nil {
     |> pog.execute(on: connection)
 
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-admitted-existing-executing-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -376,10 +370,8 @@ fn run_admitted_absent_on_conflict_test(database_url: String) -> Nil {
   let submission_text = "admitted-conflict-1-" <> suffix
 
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-admitted-conflict-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -443,10 +435,8 @@ pub fn postgres_admitted_observation_absent_from_reconcile_unique_test() {
 fn run_admitted_absent_from_reconcile_unique_test(database_url: String) -> Nil {
   let suffix = unique_test_suffix()
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-admitted-reconcile-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -564,10 +554,8 @@ pub fn postgres_admitted_observation_in_call_post_commit_unknown_reconciled_test
 fn run_admitted_in_call_reconciled_test(database_url: String) -> Nil {
   let suffix = unique_test_suffix()
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-admitted-in-call-reconciled-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -668,10 +656,8 @@ fn run_admitted_observation_submit_with_id_test(database_url: String) -> Nil {
   let submission_text = "admitted-submit-with-id-" <> suffix
 
   let signal = process.new_subject()
-  let assert Ok(id) =
-    sinal.handler_id("grind-test-admitted-submit-with-id-" <> suffix)
-  let assert Ok(attachment) =
-    sinal.observe(id, observation.admitted(), fn(measurements, metadata) {
+  let attachment =
+    sinal.observe(observation.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })

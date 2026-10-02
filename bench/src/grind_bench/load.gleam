@@ -228,6 +228,6 @@ pub fn counter_value(key: Int) -> Int {
   runtime.counter_value(key)
 }
 
-pub fn attach_audit_observers(id_suffix: String) -> Nil {
-  observers.attach_audit_observers(id_suffix)
+pub fn attach_audit_observers() -> Nil {
+  observers.attach_audit_observers()
 }

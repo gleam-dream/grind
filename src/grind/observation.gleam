@@ -48,11 +48,10 @@
 //// `JobRef`/`AttemptRef` are the shared
 //// identity/attempt-fencing shapes every event's metadata embeds rather
 //// than redeclaring per event; embedding them in `acknowledged`'s own
-//// metadata does not change its wire keys (`sinal/fields.pair` flattens
-//// into the same top-level fields either way), so this is unreleased-only
+//// metadata does not change its wire keys (a nested `sinal/fields` record
+//// flattens into the same top-level fields either way), so this is unreleased-only
 //// housekeeping, not a compatibility break.
 
-import gleam/erlang/atom
 import gleam/option.{type Option}
 import grind/internal/observation/wire as observation_wire
 import grind/job
@@ -388,622 +387,347 @@ fn proposed_to_string(proposed: Proposed) -> String {
   }
 }
 
-fn proposed_from_string(raw: String) -> Result(Proposed, Nil) {
-  case raw {
-    "succeeded" -> Ok(ProposedSuccess)
-    "business_failed" -> Ok(ProposedBusinessFailure)
-    "retryable" -> Ok(ProposedRetryable)
-    "runtime_failed" -> Ok(ProposedRuntimeFailed)
-    "snoozed" -> Ok(ProposedSnoozed)
-    "discarded" -> Ok(ProposedDiscarded)
-    "cancelled" -> Ok(ProposedCancelled)
-    "uncertain" -> Ok(ProposedUncertain)
-    _ -> Error(Nil)
-  }
+fn proposed_field() -> fields.Fields(Proposed) {
+  fields.enum(
+    "proposed",
+    [
+      ProposedSuccess,
+      ProposedBusinessFailure,
+      ProposedRetryable,
+      ProposedRuntimeFailed,
+      ProposedSnoozed,
+      ProposedDiscarded,
+      ProposedCancelled,
+      ProposedUncertain,
+    ],
+    proposed_to_string,
+  )
 }
 
-fn confirmation_to_string(confirmation: Confirmation) -> String {
-  case confirmation {
-    Replied -> "replied"
-    Reconciled -> "reconciled"
-  }
-}
-
-fn confirmation_from_string(raw: String) -> Result(Confirmation, Nil) {
-  case raw {
-    "replied" -> Ok(Replied)
-    "reconciled" -> Ok(Reconciled)
-    _ -> Error(Nil)
-  }
-}
-
-fn resolution_decision_to_string(decision: ResolutionDecision) -> String {
-  case decision {
-    DecisionConfirmSuccess -> "confirm_success"
-    DecisionConfirmBusinessFailure -> "confirm_business_failure"
-    DecisionAuthorizeReplay -> "authorize_replay"
-  }
-}
-
-fn resolution_decision_from_string(
-  raw: String,
-) -> Result(ResolutionDecision, Nil) {
-  case raw {
-    "confirm_success" -> Ok(DecisionConfirmSuccess)
-    "confirm_business_failure" -> Ok(DecisionConfirmBusinessFailure)
-    "authorize_replay" -> Ok(DecisionAuthorizeReplay)
-    _ -> Error(Nil)
-  }
-}
-
-fn cancellation_outcome_to_string(outcome: CancellationOutcome) -> String {
-  case outcome {
-    CancellationDecidedBeforeRun -> "cancelled_before_run"
-    CancellationDecidedWhileRunning -> "cancellation_requested"
-  }
-}
-
-fn cancellation_outcome_from_string(
-  raw: String,
-) -> Result(CancellationOutcome, Nil) {
-  case raw {
-    "cancelled_before_run" -> Ok(CancellationDecidedBeforeRun)
-    "cancellation_requested" -> Ok(CancellationDecidedWhileRunning)
-    _ -> Error(Nil)
-  }
-}
-
-fn codec_kind_to_string(kind: worker.CodecKind) -> String {
-  case kind {
-    worker.InputCodec -> "input"
-    worker.OutputCodec -> "output"
-    worker.ErrorCodec -> "error"
-  }
-}
-
-fn codec_kind_from_string(raw: String) -> Result(worker.CodecKind, Nil) {
-  case raw {
-    "input" -> Ok(worker.InputCodec)
-    "output" -> Ok(worker.OutputCodec)
-    "error" -> Ok(worker.ErrorCodec)
-    _ -> Error(Nil)
-  }
-}
-
-fn job_ref_from_tuple(t: #(#(#(Int, String), String), String)) -> JobRef {
-  let #(p2, worker_version) = t
-  let #(p1, worker_id) = p2
-  let #(job_id, queue) = p1
-  JobRef(job_id:, queue:, worker_id:, worker_version:)
-}
-
-fn job_ref_to_tuple(ref: JobRef) -> #(#(#(Int, String), String), String) {
-  let JobRef(job_id:, queue:, worker_id:, worker_version:) = ref
-  #(#(#(job_id, queue), worker_id), worker_version)
-}
-
-fn attempt_ref_from_tuple(t: #(#(Int, Int), Int)) -> AttemptRef {
-  let #(p1, attempt) = t
-  let #(attempt_id, epoch) = p1
-  AttemptRef(attempt_id:, epoch:, attempt:)
-}
-
-fn attempt_ref_to_tuple(ref: AttemptRef) -> #(#(Int, Int), Int) {
-  let AttemptRef(attempt_id:, epoch:, attempt:) = ref
-  #(#(attempt_id, epoch), attempt)
-}
-
-fn admitted_measurements_fields() -> fields.Fields(AdmittedMeasurements) {
-  fields.imap(observation_wire.count_fields(), AdmittedMeasurements, fn(m) {
-    m.count
+fn confirmation_field() -> fields.Fields(Confirmation) {
+  fields.enum("confirmation", [Replied, Reconciled], fn(confirmation) {
+    case confirmation {
+      Replied -> "replied"
+      Reconciled -> "reconciled"
+    }
   })
+}
+
+fn resolution_decision_field() -> fields.Fields(ResolutionDecision) {
+  fields.enum(
+    "decision",
+    [
+      DecisionConfirmSuccess,
+      DecisionConfirmBusinessFailure,
+      DecisionAuthorizeReplay,
+    ],
+    fn(decision) {
+      case decision {
+        DecisionConfirmSuccess -> "confirm_success"
+        DecisionConfirmBusinessFailure -> "confirm_business_failure"
+        DecisionAuthorizeReplay -> "authorize_replay"
+      }
+    },
+  )
+}
+
+fn cancellation_outcome_field() -> fields.Fields(CancellationOutcome) {
+  fields.enum(
+    "outcome",
+    [CancellationDecidedBeforeRun, CancellationDecidedWhileRunning],
+    fn(outcome) {
+      case outcome {
+        CancellationDecidedBeforeRun -> "cancelled_before_run"
+        CancellationDecidedWhileRunning -> "cancellation_requested"
+      }
+    },
+  )
+}
+
+fn codec_kind_field() -> fields.Fields(worker.CodecKind) {
+  fields.enum(
+    "kind",
+    [worker.InputCodec, worker.OutputCodec, worker.ErrorCodec],
+    fn(kind) {
+      case kind {
+        worker.InputCodec -> "input"
+        worker.OutputCodec -> "output"
+        worker.ErrorCodec -> "error"
+      }
+    },
+  )
+}
+
+fn failure_cause_field() -> fields.Fields(worker.BusinessFailureCause) {
+  fields.enum(
+    "failure_cause",
+    [worker.BudgetExhausted, worker.RetryDeclined],
+    worker.business_failure_cause_to_string,
+  )
+}
+
+fn prune_failure_kind_field() -> fields.Fields(PruneFailureKind) {
+  fields.enum(
+    "kind",
+    [PruneReplyLost, PruneResultUndecodable, PruneRejected, PruneNotAttempted],
+    fn(kind) {
+      case kind {
+        PruneReplyLost -> "reply_lost"
+        PruneResultUndecodable -> "result_undecodable"
+        PruneRejected -> "rejected"
+        PruneNotAttempted -> "not_attempted"
+      }
+    },
+  )
+}
+
+fn job_ref_fields() -> fields.Fields(JobRef) {
+  observation_wire.job_ref_fields(
+    JobRef,
+    fn(ref: JobRef) { ref.job_id },
+    fn(ref) { ref.queue },
+    fn(ref) { ref.worker_id },
+    fn(ref) { ref.worker_version },
+  )
+}
+
+fn attempt_ref_fields() -> fields.Fields(AttemptRef) {
+  observation_wire.attempt_ref_fields(
+    AttemptRef,
+    fn(ref: AttemptRef) { ref.attempt_id },
+    fn(ref) { ref.epoch },
+    fn(ref) { ref.attempt },
+  )
+}
+
+/// A one-key `count` measurement record, shared by every event whose only
+/// measurement is `count`.
+fn count_record(make: fn(Int) -> m, count: fn(m) -> Int) -> fields.Fields(m) {
+  fields.record({
+    use count <- fields.parameter
+    make(count)
+  })
+  |> fields.and(observation_wire.count_fields(), count)
+  |> fields.build
 }
 
 fn admitted_metadata_fields() -> fields.Fields(AdmittedMetadata) {
-  let ref =
-    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
-  let state =
-    observation_wire.closed_string_field(
-      "committed_state",
-      job.state_to_stored,
-      job.state_of_stored,
+  fields.record({
+    use ref <- fields.parameter
+    use committed_state <- fields.parameter
+    use available_at_unix_ms <- fields.parameter
+    use submission_id <- fields.parameter
+    use confirmation <- fields.parameter
+    AdmittedMetadata(
+      ref:,
+      committed_state:,
+      available_at_unix_ms:,
+      submission_id:,
+      confirmation:,
     )
-  let confirmation =
-    observation_wire.closed_string_field(
-      "confirmation",
-      confirmation_to_string,
-      confirmation_from_string,
-    )
-  let assert Ok(available_at_field) =
-    fields.optional(fields.int(atom.create("available_at_unix_ms")))
-  let assert Ok(submission_id_field) =
-    fields.optional(fields.string(atom.create("submission_id")))
-  let assert Ok(p1) = fields.pair(ref, state)
-  let assert Ok(p2) = fields.pair(p1, available_at_field)
-  let assert Ok(p3) = fields.pair(p2, submission_id_field)
-  let assert Ok(p4) = fields.pair(p3, confirmation)
-  fields.imap(
-    p4,
-    fn(t) {
-      let #(p3, confirmation) = t
-      let #(p2, submission_id) = p3
-      let #(p1, available_at_unix_ms) = p2
-      let #(ref, committed_state) = p1
-      AdmittedMetadata(
-        ref:,
-        committed_state:,
-        available_at_unix_ms:,
-        submission_id:,
-        confirmation:,
-      )
-    },
-    fn(m: AdmittedMetadata) {
-      let AdmittedMetadata(
-        ref:,
-        committed_state:,
-        available_at_unix_ms:,
-        submission_id:,
-        confirmation:,
-      ) = m
-      let p1 = #(ref, committed_state)
-      let p2 = #(p1, available_at_unix_ms)
-      let p3 = #(p2, submission_id)
-      #(p3, confirmation)
-    },
-  )
-}
-
-fn claimed_measurements_fields() -> fields.Fields(ClaimedMeasurements) {
-  fields.imap(observation_wire.count_fields(), ClaimedMeasurements, fn(m) {
-    m.count
   })
+  |> fields.and(job_ref_fields(), fn(m: AdmittedMetadata) { m.ref })
+  |> fields.and(observation_wire.job_state_field("committed_state"), fn(m) {
+    m.committed_state
+  })
+  |> fields.and(fields.optional(fields.int("available_at_unix_ms")), fn(m) {
+    m.available_at_unix_ms
+  })
+  |> fields.and(fields.optional(fields.string("submission_id")), fn(m) {
+    m.submission_id
+  })
+  |> fields.and(confirmation_field(), fn(m) { m.confirmation })
+  |> fields.build
 }
 
 fn claimed_metadata_fields() -> fields.Fields(ClaimedMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
-      observation_wire.attempt_ref_fields(
-        attempt_ref_from_tuple,
-        attempt_ref_to_tuple,
-      ),
-    )
-  let assert Ok(p2) =
-    fields.pair(
-      p1,
-      observation_wire.closed_string_field(
-        "previous_state",
-        job.state_to_stored,
-        job.state_of_stored,
-      ),
-    )
-  fields.imap(
-    p2,
-    fn(t) {
-      let #(p1, previous_state) = t
-      let #(ref, attempt) = p1
-      ClaimedMetadata(ref:, attempt:, previous_state:)
-    },
-    fn(m: ClaimedMetadata) {
-      let ClaimedMetadata(ref:, attempt:, previous_state:) = m
-      #(#(ref, attempt), previous_state)
-    },
-  )
-}
-
-fn quarantined_measurements_fields() -> fields.Fields(QuarantinedMeasurements) {
-  fields.imap(observation_wire.count_fields(), QuarantinedMeasurements, fn(m) {
-    m.count
+  fields.record({
+    use ref <- fields.parameter
+    use attempt <- fields.parameter
+    use previous_state <- fields.parameter
+    ClaimedMetadata(ref:, attempt:, previous_state:)
   })
+  |> fields.and(job_ref_fields(), fn(m: ClaimedMetadata) { m.ref })
+  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
+  |> fields.and(observation_wire.job_state_field("previous_state"), fn(m) {
+    m.previous_state
+  })
+  |> fields.build
 }
 
 fn quarantined_metadata_fields() -> fields.Fields(QuarantinedMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
-      observation_wire.attempt_ref_fields(
-        attempt_ref_from_tuple,
-        attempt_ref_to_tuple,
-      ),
-    )
-  let assert Ok(p2) =
-    fields.pair(p1, fields.bool(atom.create("cancellation_was_requested")))
-  fields.imap(
-    p2,
-    fn(t) {
-      let #(p1, cancellation_was_requested) = t
-      let #(ref, attempt) = p1
-      QuarantinedMetadata(ref:, attempt:, cancellation_was_requested:)
-    },
-    fn(m: QuarantinedMetadata) {
-      let QuarantinedMetadata(ref:, attempt:, cancellation_was_requested:) = m
-      #(#(ref, attempt), cancellation_was_requested)
-    },
-  )
-}
-
-fn resolved_measurements_fields() -> fields.Fields(ResolvedMeasurements) {
-  fields.imap(observation_wire.count_fields(), ResolvedMeasurements, fn(m) {
-    m.count
+  fields.record({
+    use ref <- fields.parameter
+    use attempt <- fields.parameter
+    use cancellation_was_requested <- fields.parameter
+    QuarantinedMetadata(ref:, attempt:, cancellation_was_requested:)
   })
+  |> fields.and(job_ref_fields(), fn(m: QuarantinedMetadata) { m.ref })
+  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
+  |> fields.and(fields.bool("cancellation_was_requested"), fn(m) {
+    m.cancellation_was_requested
+  })
+  |> fields.build
 }
 
 fn resolved_metadata_fields() -> fields.Fields(ResolvedMetadata) {
-  let ref =
-    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
-  let decision =
-    observation_wire.closed_string_field(
-      "decision",
-      resolution_decision_to_string,
-      resolution_decision_from_string,
+  fields.record({
+    use ref <- fields.parameter
+    use decision <- fields.parameter
+    use committed_state <- fields.parameter
+    use resolution_id <- fields.parameter
+    use resolved_by <- fields.parameter
+    use confirmation <- fields.parameter
+    ResolvedMetadata(
+      ref:,
+      decision:,
+      committed_state:,
+      resolution_id:,
+      resolved_by:,
+      confirmation:,
     )
-  let state =
-    observation_wire.closed_string_field(
-      "committed_state",
-      job.state_to_stored,
-      job.state_of_stored,
-    )
-  let confirmation =
-    observation_wire.closed_string_field(
-      "confirmation",
-      confirmation_to_string,
-      confirmation_from_string,
-    )
-  let assert Ok(p1) = fields.pair(ref, decision)
-  let assert Ok(p2) = fields.pair(p1, state)
-  let assert Ok(p3) =
-    fields.pair(p2, fields.string(atom.create("resolution_id")))
-  let assert Ok(p4) = fields.pair(p3, fields.string(atom.create("resolved_by")))
-  let assert Ok(p5) = fields.pair(p4, confirmation)
-  fields.imap(
-    p5,
-    fn(t) {
-      let #(p4, confirmation) = t
-      let #(p3, resolved_by) = p4
-      let #(p2, resolution_id) = p3
-      let #(p1, committed_state) = p2
-      let #(ref, decision) = p1
-      ResolvedMetadata(
-        ref:,
-        decision:,
-        committed_state:,
-        resolution_id:,
-        resolved_by:,
-        confirmation:,
-      )
-    },
-    fn(m: ResolvedMetadata) {
-      let ResolvedMetadata(
-        ref:,
-        decision:,
-        committed_state:,
-        resolution_id:,
-        resolved_by:,
-        confirmation:,
-      ) = m
-      let p1 = #(ref, decision)
-      let p2 = #(p1, committed_state)
-      let p3 = #(p2, resolution_id)
-      let p4 = #(p3, resolved_by)
-      #(p4, confirmation)
-    },
-  )
-}
-
-fn cancellation_measurements_fields() -> fields.Fields(CancellationMeasurements) {
-  fields.imap(observation_wire.count_fields(), CancellationMeasurements, fn(m) {
-    m.count
   })
+  |> fields.and(job_ref_fields(), fn(m: ResolvedMetadata) { m.ref })
+  |> fields.and(resolution_decision_field(), fn(m) { m.decision })
+  |> fields.and(observation_wire.job_state_field("committed_state"), fn(m) {
+    m.committed_state
+  })
+  |> fields.and(fields.string("resolution_id"), fn(m) { m.resolution_id })
+  |> fields.and(fields.string("resolved_by"), fn(m) { m.resolved_by })
+  |> fields.and(confirmation_field(), fn(m) { m.confirmation })
+  |> fields.build
 }
 
 fn cancellation_metadata_fields() -> fields.Fields(CancellationMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
-      observation_wire.closed_string_field(
-        "previous_state",
-        job.state_to_stored,
-        job.state_of_stored,
-      ),
-    )
-  let assert Ok(p2) =
-    fields.pair(
-      p1,
-      observation_wire.closed_string_field(
-        "outcome",
-        cancellation_outcome_to_string,
-        cancellation_outcome_from_string,
-      ),
-    )
-  fields.imap(
-    p2,
-    fn(t) {
-      let #(p1, outcome) = t
-      let #(ref, previous_state) = p1
-      CancellationMetadata(ref:, previous_state:, outcome:)
-    },
-    fn(m: CancellationMetadata) {
-      let CancellationMetadata(ref:, previous_state:, outcome:) = m
-      #(#(ref, previous_state), outcome)
-    },
-  )
-}
-
-fn released_measurements_fields() -> fields.Fields(ReleasedMeasurements) {
-  fields.imap(observation_wire.count_fields(), ReleasedMeasurements, fn(m) {
-    m.count
+  fields.record({
+    use ref <- fields.parameter
+    use previous_state <- fields.parameter
+    use outcome <- fields.parameter
+    CancellationMetadata(ref:, previous_state:, outcome:)
   })
+  |> fields.and(job_ref_fields(), fn(m: CancellationMetadata) { m.ref })
+  |> fields.and(observation_wire.job_state_field("previous_state"), fn(m) {
+    m.previous_state
+  })
+  |> fields.and(cancellation_outcome_field(), fn(m) { m.outcome })
+  |> fields.build
 }
 
 fn released_metadata_fields() -> fields.Fields(ReleasedMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple),
-      observation_wire.attempt_ref_fields(
-        attempt_ref_from_tuple,
-        attempt_ref_to_tuple,
-      ),
-    )
-  let assert Ok(p2) =
-    fields.pair(
-      p1,
-      observation_wire.closed_string_field(
-        "restored_state",
-        job.state_to_stored,
-        job.state_of_stored,
-      ),
-    )
-  fields.imap(
-    p2,
-    fn(t) {
-      let #(p1, restored_state) = t
-      let #(ref, attempt) = p1
-      ReleasedMetadata(ref:, attempt:, restored_state:)
-    },
-    fn(m: ReleasedMetadata) {
-      let ReleasedMetadata(ref:, attempt:, restored_state:) = m
-      #(#(ref, attempt), restored_state)
-    },
-  )
-}
-
-fn contract_mismatch_measurements_fields() -> fields.Fields(
-  ContractMismatchMeasurements,
-) {
-  fields.imap(
-    observation_wire.count_fields(),
-    ContractMismatchMeasurements,
-    fn(m) { m.count },
-  )
+  fields.record({
+    use ref <- fields.parameter
+    use attempt <- fields.parameter
+    use restored_state <- fields.parameter
+    ReleasedMetadata(ref:, attempt:, restored_state:)
+  })
+  |> fields.and(job_ref_fields(), fn(m: ReleasedMetadata) { m.ref })
+  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
+  |> fields.and(observation_wire.job_state_field("restored_state"), fn(m) {
+    m.restored_state
+  })
+  |> fields.build
 }
 
 fn contract_mismatch_metadata_fields() -> fields.Fields(
   ContractMismatchMetadata,
 ) {
-  let ref =
-    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
-  let attempt =
-    observation_wire.attempt_ref_fields(
-      attempt_ref_from_tuple,
-      attempt_ref_to_tuple,
+  fields.record({
+    use ref <- fields.parameter
+    use attempt <- fields.parameter
+    use kind <- fields.parameter
+    use expected_version <- fields.parameter
+    use actual_version <- fields.parameter
+    ContractMismatchMetadata(
+      ref:,
+      attempt:,
+      kind:,
+      expected_version:,
+      actual_version:,
     )
-  let kind =
-    observation_wire.closed_string_field(
-      "kind",
-      codec_kind_to_string,
-      codec_kind_from_string,
-    )
-  let assert Ok(p1) = fields.pair(ref, attempt)
-  let assert Ok(p2) = fields.pair(p1, kind)
-  let assert Ok(p3) =
-    fields.pair(p2, fields.string(atom.create("expected_version")))
-  let assert Ok(p4) =
-    fields.pair(p3, fields.string(atom.create("actual_version")))
-  fields.imap(
-    p4,
-    fn(t) {
-      let #(p3, actual_version) = t
-      let #(p2, expected_version) = p3
-      let #(p1, kind) = p2
-      let #(ref, attempt) = p1
-      ContractMismatchMetadata(
-        ref:,
-        attempt:,
-        kind:,
-        expected_version:,
-        actual_version:,
-      )
-    },
-    fn(m: ContractMismatchMetadata) {
-      let ContractMismatchMetadata(
-        ref:,
-        attempt:,
-        kind:,
-        expected_version:,
-        actual_version:,
-      ) = m
-      let p1 = #(ref, attempt)
-      let p2 = #(p1, kind)
-      let p3 = #(p2, expected_version)
-      #(p3, actual_version)
-    },
-  )
+  })
+  |> fields.and(job_ref_fields(), fn(m: ContractMismatchMetadata) { m.ref })
+  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
+  |> fields.and(codec_kind_field(), fn(m) { m.kind })
+  |> fields.and(fields.string("expected_version"), fn(m) { m.expected_version })
+  |> fields.and(fields.string("actual_version"), fn(m) { m.actual_version })
+  |> fields.build
 }
 
 fn prune_completed_measurements_fields() -> fields.Fields(
   PruneCompletedMeasurements,
 ) {
-  fields.imap(
-    fields.int(atom.create("jobs")),
-    PruneCompletedMeasurements,
-    fn(m) { m.jobs },
-  )
+  fields.record({
+    use jobs <- fields.parameter
+    PruneCompletedMeasurements(jobs:)
+  })
+  |> fields.and(fields.int("jobs"), fn(m: PruneCompletedMeasurements) { m.jobs })
+  |> fields.build
 }
 
 fn prune_completed_metadata_fields() -> fields.Fields(PruneCompletedMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      fields.int(atom.create("older_than_ms")),
-      fields.int(atom.create("limit")),
-    )
-  fields.imap(
-    p1,
-    fn(t) {
-      let #(older_than_ms, limit) = t
-      PruneCompletedMetadata(older_than_ms:, limit:)
-    },
-    fn(m: PruneCompletedMetadata) {
-      let PruneCompletedMetadata(older_than_ms:, limit:) = m
-      #(older_than_ms, limit)
-    },
-  )
-}
-
-fn prune_failed_measurements_fields() -> fields.Fields(PruneFailedMeasurements) {
-  fields.imap(observation_wire.count_fields(), PruneFailedMeasurements, fn(m) {
-    m.count
+  fields.record({
+    use older_than_ms <- fields.parameter
+    use limit <- fields.parameter
+    PruneCompletedMetadata(older_than_ms:, limit:)
   })
-}
-
-fn prune_failure_kind_to_string(kind: PruneFailureKind) -> String {
-  case kind {
-    PruneReplyLost -> "reply_lost"
-    PruneResultUndecodable -> "result_undecodable"
-    PruneRejected -> "rejected"
-    PruneNotAttempted -> "not_attempted"
-  }
-}
-
-fn prune_failure_kind_from_string(
-  raw: String,
-) -> Result(PruneFailureKind, Nil) {
-  case raw {
-    "reply_lost" -> Ok(PruneReplyLost)
-    "result_undecodable" -> Ok(PruneResultUndecodable)
-    "rejected" -> Ok(PruneRejected)
-    "not_attempted" -> Ok(PruneNotAttempted)
-    _ -> Error(Nil)
-  }
+  |> fields.and(fields.int("older_than_ms"), fn(m: PruneCompletedMetadata) {
+    m.older_than_ms
+  })
+  |> fields.and(fields.int("limit"), fn(m) { m.limit })
+  |> fields.build
 }
 
 fn prune_failed_metadata_fields() -> fields.Fields(PruneFailedMetadata) {
-  let assert Ok(p1) =
-    fields.pair(
-      fields.int(atom.create("older_than_ms")),
-      fields.int(atom.create("limit")),
-    )
-  let assert Ok(p2) =
-    fields.pair(
-      p1,
-      observation_wire.closed_string_field(
-        "kind",
-        prune_failure_kind_to_string,
-        prune_failure_kind_from_string,
-      ),
-    )
-  fields.imap(
-    p2,
-    fn(t) {
-      let #(p1, kind) = t
-      let #(older_than_ms, limit) = p1
-      PruneFailedMetadata(older_than_ms:, limit:, kind:)
-    },
-    fn(m: PruneFailedMetadata) {
-      let PruneFailedMetadata(older_than_ms:, limit:, kind:) = m
-      #(#(older_than_ms, limit), kind)
-    },
-  )
-}
-
-fn measurements_fields() -> fields.Fields(AcknowledgedMeasurements) {
-  fields.imap(fields.int(atom.create("count")), AcknowledgedMeasurements, fn(m) {
-    m.count
+  fields.record({
+    use older_than_ms <- fields.parameter
+    use limit <- fields.parameter
+    use kind <- fields.parameter
+    PruneFailedMetadata(older_than_ms:, limit:, kind:)
   })
+  |> fields.and(fields.int("older_than_ms"), fn(m: PruneFailedMetadata) {
+    m.older_than_ms
+  })
+  |> fields.and(fields.int("limit"), fn(m) { m.limit })
+  |> fields.and(prune_failure_kind_field(), fn(m) { m.kind })
+  |> fields.build
 }
 
 fn metadata_fields() -> fields.Fields(AcknowledgedMetadata) {
-  let ref =
-    observation_wire.job_ref_fields(job_ref_from_tuple, job_ref_to_tuple)
-  let attempt =
-    observation_wire.attempt_ref_fields(
-      attempt_ref_from_tuple,
-      attempt_ref_to_tuple,
+  fields.record({
+    use ref <- fields.parameter
+    use attempt <- fields.parameter
+    use proposed <- fields.parameter
+    use committed_state <- fields.parameter
+    use failure_cause <- fields.parameter
+    use available_at_unix_ms <- fields.parameter
+    use confirmation <- fields.parameter
+    use command_id <- fields.parameter
+    AcknowledgedMetadata(
+      ref:,
+      attempt:,
+      proposed:,
+      committed_state:,
+      failure_cause:,
+      available_at_unix_ms:,
+      confirmation:,
+      command_id:,
     )
-  let proposed =
-    observation_wire.closed_string_field(
-      "proposed",
-      proposed_to_string,
-      proposed_from_string,
-    )
-  let state =
-    observation_wire.closed_string_field(
-      "committed_state",
-      job.state_to_stored,
-      job.state_of_stored,
-    )
-  let failure_cause =
-    observation_wire.closed_string_field(
-      "failure_cause",
-      worker.business_failure_cause_to_string,
-      worker.business_failure_cause_from_string,
-    )
-  let confirmation =
-    observation_wire.closed_string_field(
-      "confirmation",
-      confirmation_to_string,
-      confirmation_from_string,
-    )
-  let assert Ok(failure_cause_field) = fields.optional(failure_cause)
-  let assert Ok(available_at_field) =
-    fields.optional(fields.int(atom.create("available_at_unix_ms")))
-  let assert Ok(p1) = fields.pair(ref, attempt)
-  let assert Ok(p2) = fields.pair(p1, proposed)
-  let assert Ok(p3) = fields.pair(p2, state)
-  let assert Ok(p4) = fields.pair(p3, failure_cause_field)
-  let assert Ok(p5) = fields.pair(p4, available_at_field)
-  let assert Ok(p6) = fields.pair(p5, confirmation)
-  let assert Ok(p7) = fields.pair(p6, fields.string(atom.create("command_id")))
-  fields.imap(
-    p7,
-    fn(t) {
-      let #(p6, command_id) = t
-      let #(p5, confirmation) = p6
-      let #(p4, available_at_unix_ms) = p5
-      let #(p3, failure_cause) = p4
-      let #(p2, committed_state) = p3
-      let #(p1, proposed) = p2
-      let #(ref, attempt) = p1
-      AcknowledgedMetadata(
-        ref:,
-        attempt:,
-        proposed:,
-        committed_state:,
-        failure_cause:,
-        available_at_unix_ms:,
-        confirmation:,
-        command_id:,
-      )
-    },
-    fn(m: AcknowledgedMetadata) {
-      let AcknowledgedMetadata(
-        ref:,
-        attempt:,
-        proposed:,
-        committed_state:,
-        failure_cause:,
-        available_at_unix_ms:,
-        confirmation:,
-        command_id:,
-      ) = m
-      let p1 = #(ref, attempt)
-      let p2 = #(p1, proposed)
-      let p3 = #(p2, committed_state)
-      let p4 = #(p3, failure_cause)
-      let p5 = #(p4, available_at_unix_ms)
-      let p6 = #(p5, confirmation)
-      #(p6, command_id)
-    },
-  )
+  })
+  |> fields.and(job_ref_fields(), fn(m: AcknowledgedMetadata) { m.ref })
+  |> fields.and(attempt_ref_fields(), fn(m) { m.attempt })
+  |> fields.and(proposed_field(), fn(m) { m.proposed })
+  |> fields.and(observation_wire.job_state_field("committed_state"), fn(m) {
+    m.committed_state
+  })
+  |> fields.and(fields.optional(failure_cause_field()), fn(m) {
+    m.failure_cause
+  })
+  |> fields.and(fields.optional(fields.int("available_at_unix_ms")), fn(m) {
+    m.available_at_unix_ms
+  })
+  |> fields.and(confirmation_field(), fn(m) { m.confirmation })
+  |> fields.and(fields.string("command_id"), fn(m) { m.command_id })
+  |> fields.build
 }
 
 /// The `[grind, job, acknowledged]` event descriptor: one committed
@@ -1011,12 +735,11 @@ fn metadata_fields() -> fields.Fields(AcknowledgedMetadata) {
 /// own `sinal/forwarder.Forwarder`, strictly after that disposition is
 /// proven committed (see the module documentation above).
 pub fn acknowledged() -> Event(AcknowledgedMeasurements, AcknowledgedMetadata) {
-  let name = [
-    atom.create("grind"),
-    atom.create("job"),
-    atom.create("acknowledged"),
-  ]
-  observation_wire.event(name, measurements_fields(), metadata_fields())
+  sinal.event(
+    observation_wire.job_event_name("acknowledged"),
+    count_record(AcknowledgedMeasurements, fn(m) { m.count }),
+    metadata_fields(),
+  )
 }
 
 /// The `[grind, job, admitted]` event descriptor: one committed admission
@@ -1024,9 +747,9 @@ pub fn acknowledged() -> Event(AcknowledgedMeasurements, AcknowledgedMetadata) {
 /// (`Inserted`, `Existing`, or `Rescheduled`). Emitted by `grind/postgres`
 /// strictly after that decision is proven committed — see `AdmittedMetadata`.
 pub fn admitted() -> Event(AdmittedMeasurements, AdmittedMetadata) {
-  observation_wire.event(
+  sinal.event(
     observation_wire.job_event_name("admitted"),
-    admitted_measurements_fields(),
+    count_record(AdmittedMeasurements, fn(m) { m.count }),
     admitted_metadata_fields(),
   )
 }
@@ -1035,9 +758,9 @@ pub fn admitted() -> Event(AdmittedMeasurements, AdmittedMetadata) {
 /// for execution. Emitted strictly after the claim's own fenced `UPDATE ...
 /// RETURNING` returns a row — see `ClaimedMetadata`.
 pub fn claimed() -> Event(ClaimedMeasurements, ClaimedMetadata) {
-  observation_wire.event(
+  sinal.event(
     observation_wire.job_event_name("claimed"),
-    claimed_measurements_fields(),
+    count_record(ClaimedMeasurements, fn(m) { m.count }),
     claimed_metadata_fields(),
   )
 }
@@ -1046,9 +769,9 @@ pub fn claimed() -> Event(ClaimedMeasurements, ClaimedMetadata) {
 /// (an expired lease) moved to `uncertain` by the claim-time quarantine scan.
 /// Emitted once per row the scan's `RETURNING` reports as quarantined.
 pub fn quarantined() -> Event(QuarantinedMeasurements, QuarantinedMetadata) {
-  observation_wire.event(
+  sinal.event(
     observation_wire.job_event_name("quarantined"),
-    quarantined_measurements_fields(),
+    count_record(QuarantinedMeasurements, fn(m) { m.count }),
     quarantined_metadata_fields(),
   )
 }
@@ -1057,9 +780,9 @@ pub fn quarantined() -> Event(QuarantinedMeasurements, QuarantinedMetadata) {
 /// decision committed against an `uncertain` job. Emitted strictly after that
 /// decision is proven committed — see `ResolvedMetadata`.
 pub fn resolved() -> Event(ResolvedMeasurements, ResolvedMetadata) {
-  observation_wire.event(
+  sinal.event(
     observation_wire.job_event_name("resolved"),
-    resolved_measurements_fields(),
+    count_record(ResolvedMeasurements, fn(m) { m.count }),
     resolved_metadata_fields(),
   )
 }
@@ -1073,9 +796,9 @@ pub fn cancellation_decided() -> Event(
   CancellationMeasurements,
   CancellationMetadata,
 ) {
-  observation_wire.event(
+  sinal.event(
     observation_wire.job_event_name("cancellation_decided"),
-    cancellation_measurements_fields(),
+    count_record(CancellationMeasurements, fn(m) { m.count }),
     cancellation_metadata_fields(),
   )
 }
@@ -1084,9 +807,9 @@ pub fn cancellation_decided() -> Event(
 /// before its worker ever ran. Emitted strictly after the release's own
 /// fenced `UPDATE ... RETURNING` returns a row.
 pub fn released() -> Event(ReleasedMeasurements, ReleasedMetadata) {
-  observation_wire.event(
+  sinal.event(
     observation_wire.job_event_name("released"),
-    released_measurements_fields(),
+    count_record(ReleasedMeasurements, fn(m) { m.count }),
     released_metadata_fields(),
   )
 }
@@ -1100,9 +823,9 @@ pub fn contract_mismatch_recorded() -> Event(
   ContractMismatchMeasurements,
   ContractMismatchMetadata,
 ) {
-  observation_wire.event(
+  sinal.event(
     observation_wire.job_event_name("contract_mismatch_recorded"),
-    contract_mismatch_measurements_fields(),
+    count_record(ContractMismatchMeasurements, fn(m) { m.count }),
     contract_mismatch_metadata_fields(),
   )
 }
@@ -1117,8 +840,8 @@ pub fn prune_completed() -> Event(
   PruneCompletedMeasurements,
   PruneCompletedMetadata,
 ) {
-  observation_wire.event(
-    [atom.create("grind"), atom.create("prune"), atom.create("completed")],
+  sinal.event(
+    ["grind", "prune", "completed"],
     prune_completed_measurements_fields(),
     prune_completed_metadata_fields(),
   )
@@ -1130,9 +853,9 @@ pub fn prune_completed() -> Event(
 /// `PruneError` to directly. `postgres.prune_finished` itself never emits
 /// this — see its own doc comment.
 pub fn prune_failed() -> Event(PruneFailedMeasurements, PruneFailedMetadata) {
-  observation_wire.event(
-    [atom.create("grind"), atom.create("prune"), atom.create("failed")],
-    prune_failed_measurements_fields(),
+  sinal.event(
+    ["grind", "prune", "failed"],
+    count_record(PruneFailedMeasurements, fn(m) { m.count }),
     prune_failed_metadata_fields(),
   )
 }

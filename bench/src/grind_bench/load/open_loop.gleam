@@ -151,7 +151,7 @@ pub fn run_l2(
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l2.echo")
   let assert Ok(registry_) = registry.new("l2-probe")
   let assert Ok(registry_) = registry.register(registry_, worker_def)
-  observers.attach_audit_observers("l2")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
 
   let assert Ok(policy) =
@@ -266,7 +266,7 @@ pub fn run_l3(arrival_per_sec: Int, duration_ms: Int, repeat: Int) -> Nil {
   let assert Ok(worker_def) = bench_worker.build(ledger, "bench.l3.echo")
   let assert Ok(registry_) = registry.new(queue_name)
   let assert Ok(registry_) = registry.register(registry_, worker_def)
-  observers.attach_audit_observers("l3")
+  observers.attach_audit_observers()
   let log_lines_before = report.postgres_log_lines_before()
 
   let assert Ok(policy) =
