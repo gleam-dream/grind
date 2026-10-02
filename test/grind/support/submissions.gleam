@@ -22,9 +22,17 @@ pub fn unique_test_worker_versioned(
   version: String,
 ) -> worker.Worker(Int, String, e) {
   let assert Ok(input_codec) =
-    worker.codec(id <> "-input-" <> version, json.int, decode.int)
+    worker.codec(
+      id <> "-input-" <> version,
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec(id <> "-output-" <> version, json.string, decode.string)
+    worker.codec(
+      id <> "-output-" <> version,
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker_def) =
     worker.define(id, version, input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))

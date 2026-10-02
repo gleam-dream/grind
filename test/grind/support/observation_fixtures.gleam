@@ -93,13 +93,13 @@ pub fn register_sentinel_worker(
   let assert Ok(input_codec) =
     worker.codec(
       "observation-sentinel-" <> id_suffix <> "-input-v1",
-      json.int,
+      worker.infallible(json.int),
       decode.int,
     )
   let assert Ok(output_codec) =
     worker.codec(
       "observation-sentinel-" <> id_suffix <> "-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(definition) =

@@ -26,7 +26,8 @@
 //// import grind/worker
 ////
 //// pub fn main() {
-////   let assert Ok(text) = worker.codec("1", json.string, decode.string)
+////   let assert Ok(text) =
+////     worker.codec("1", worker.infallible(json.string), decode.string)
 ////   let assert Ok(greet) =
 ////     worker.define("greet", "1", text, text, fn(name) { Ok("Hello, " <> name) })
 ////

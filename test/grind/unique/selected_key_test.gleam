@@ -57,11 +57,15 @@ fn selected_input_worker(
   let assert Ok(input_codec) =
     worker.codec(
       id <> "-input-v1",
-      encode_selected_input,
+      worker.infallible(encode_selected_input),
       selected_input_decoder(),
     )
   let assert Ok(output_codec) =
-    worker.codec(id <> "-output-v1", json.string, decode.string)
+    worker.codec(
+      id <> "-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker_def) =
     worker.define(id, "v1", input_codec, output_codec, fn(input) {
       let SelectedInput(other:, ..) = input
@@ -88,13 +92,13 @@ fn run_submit_unique_selected_key_scoping_test(database_url: String) -> Nil {
   let assert Ok(account_codec) =
     worker.codec(
       "unique-selected-account-" <> suffix <> "-v1",
-      encode_raw_input,
+      worker.infallible(encode_raw_input),
       raw_input_decoder(),
     )
   let assert Ok(other_version_codec) =
     worker.codec(
       "unique-selected-account-" <> suffix <> "-v2",
-      encode_raw_input,
+      worker.infallible(encode_raw_input),
       raw_input_decoder(),
     )
   let assert Ok(account_key) =
@@ -214,7 +218,7 @@ fn run_submit_unique_selected_key_containment_test(
   let assert Ok(account_codec) =
     worker.codec(
       "unique-selected-containment-account-" <> suffix <> "-v1",
-      encode_raw_input,
+      worker.infallible(encode_raw_input),
       raw_input_decoder(),
     )
   let assert Ok(account_key) =

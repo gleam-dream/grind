@@ -97,7 +97,10 @@ pub type ConflictAction {
 /// carries a second type parameter for it.
 pub opaque type Key(input) {
   FullInput
-  Selected(name: String, project: fn(input) -> #(String, String))
+  Selected(
+    name: String,
+    project: fn(input) -> Result(#(String, String), String),
+  )
 }
 
 /// The whole encoded input already admitted forms the key.
@@ -108,7 +111,9 @@ pub fn full_input() -> Key(input) {
 /// A typed projection of the input forms the key, encoded with its own
 /// codec. `name` and the codec's version together identify this key's
 /// contract, so a changed projection or codec never collides with a
-/// differently-meant key that happens to encode to the same JSON.
+/// differently-meant key that happens to encode to the same JSON. If the
+/// codec rejects the projected key, `submit_unique` returns
+/// `submission.InvalidInput("unique key <name>: <reason>")`.
 pub fn selected(
   name: String,
   select: fn(input) -> key,
@@ -142,20 +147,24 @@ pub fn policy(
 
 /// The key's contract string and its encoded JSON text, given the input
 /// already admitted and the submitting worker's own input codec version and
-/// encoded text (reused for `FullInput` rather than re-encoding).
+/// encoded text (reused for `FullInput` rather than re-encoding). `Error`
+/// carries a `selected` key codec's rejection reason, prefixed with the key
+/// name.
 @internal
 pub fn key_material(
   key: Key(input),
   input: input,
   input_codec_version: String,
   encoded_input_json: String,
-) -> #(String, String) {
+) -> Result(#(String, String), String) {
   case key {
-    FullInput -> #("full-input:" <> input_codec_version, encoded_input_json)
-    Selected(name:, project:) -> {
-      let #(codec_version, encoded_json) = project(input)
-      #("selected:" <> name <> ":" <> codec_version, encoded_json)
-    }
+    FullInput -> Ok(#("full-input:" <> input_codec_version, encoded_input_json))
+    Selected(name:, project:) ->
+      case project(input) {
+        Ok(#(codec_version, encoded_json)) ->
+          Ok(#("selected:" <> name <> ":" <> codec_version, encoded_json))
+        Error(reason) -> Error("unique key " <> name <> ": " <> reason)
+      }
   }
 }
 

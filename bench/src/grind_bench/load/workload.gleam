@@ -43,10 +43,16 @@ pub fn preload_varying_cost(
 ) -> Nil {
   let meta = worker_versions(worker_def)
   let encode_input = fn(job: preload.PreloadJob) -> String {
-    worker.encode_input(
-      worker_def,
-      bench_worker.BenchJob(bench_index: job.bench_index, cost_ms: job.cost_ms),
-    )
+    let assert Ok(encoded) =
+      worker.encode_input(
+        worker_def,
+        bench_worker.BenchJob(
+          bench_index: job.bench_index,
+          cost_ms: job.cost_ms,
+        ),
+      )
+      as "the bench input codec is total"
+    encoded
   }
   let queues_count = list.length(queues)
   runtime.int_range(queues_count)

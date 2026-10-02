@@ -146,13 +146,16 @@ fn preload_encode_input(
   worker_def: worker.Worker(bench_worker.BenchJob, Int, Nil),
 ) -> fn(preload.PreloadJob) -> String {
   fn(preload_job: preload.PreloadJob) -> String {
-    worker.encode_input(
-      worker_def,
-      bench_worker.BenchJob(
-        bench_index: preload_job.bench_index,
-        cost_ms: preload_job.cost_ms,
-      ),
-    )
+    let assert Ok(encoded) =
+      worker.encode_input(
+        worker_def,
+        bench_worker.BenchJob(
+          bench_index: preload_job.bench_index,
+          cost_ms: preload_job.cost_ms,
+        ),
+      )
+      as "the bench input codec is total"
+    encoded
   }
 }
 

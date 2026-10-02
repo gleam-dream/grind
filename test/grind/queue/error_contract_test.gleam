@@ -67,11 +67,23 @@ fn typed_worker(
   handler: fn(Int) -> worker.WorkerResponse(String, LookupFailure),
 ) -> worker.Worker(Int, String, LookupFailure) {
   let assert Ok(input_codec) =
-    worker.codec("error-contract-input-v1", json.int, decode.int)
+    worker.codec(
+      "error-contract-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("error-contract-output-v1", json.string, decode.string)
+    worker.codec(
+      "error-contract-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(error_codec) =
-    worker.codec(error_contract, encode_lookup_failure, decode_lookup_failure())
+    worker.codec(
+      error_contract,
+      worker.infallible(encode_lookup_failure),
+      decode_lookup_failure(),
+    )
   let assert Ok(definition) =
     worker.define_with_error_codec(
       id,

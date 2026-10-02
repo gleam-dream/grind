@@ -29,14 +29,15 @@ pub fn payment_worker(
   let assert Ok(input) =
     worker.codec(
       "payment-request-v1",
-      encode_payment_request,
+      worker.infallible(encode_payment_request),
       decode_payment_request(),
     )
-  let assert Ok(output) = worker.codec("receipt-v1", json.string, decode.string)
+  let assert Ok(output) =
+    worker.codec("receipt-v1", worker.infallible(json.string), decode.string)
   let assert Ok(error) =
     worker.codec(
       "payment-error-v1",
-      encode_payment_error,
+      worker.infallible(encode_payment_error),
       decode_payment_error(),
     )
   let assert Ok(definition) =
@@ -81,8 +82,10 @@ pub fn decode_payment_request() -> decode.Decoder(PaymentRequest) {
 pub fn report_worker(
   probe: process.Subject(Probe),
 ) -> worker.Worker(Int, Int, Nil) {
-  let assert Ok(input) = worker.codec("report-count-v1", json.int, decode.int)
-  let assert Ok(output) = worker.codec("report-total-v1", json.int, decode.int)
+  let assert Ok(input) =
+    worker.codec("report-count-v1", worker.infallible(json.int), decode.int)
+  let assert Ok(output) =
+    worker.codec("report-total-v1", worker.infallible(json.int), decode.int)
   let assert Ok(definition) =
     worker.define("reports.total", "v3", input, output, fn(count) {
       process.send(probe, ReportInvoked)
@@ -122,9 +125,14 @@ pub fn retry_then_succeed_worker(
   attempt_probe: process.Subject(Int),
   retry_context_probe: process.Subject(Int),
 ) -> worker.Worker(Int, String, Nil) {
-  let assert Ok(input) = worker.codec("retry-input-v1", json.int, decode.int)
+  let assert Ok(input) =
+    worker.codec("retry-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output) =
-    worker.codec("retry-output-v1", json.string, decode.string)
+    worker.codec(
+      "retry-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("consumer.retry_then_succeed", "v1", input, output, fn(value) {
       let attempt = env.next_counter("consumer-retry-attempt")
@@ -152,11 +160,15 @@ pub fn cancel_while_running_worker(
   let assert Ok(input) =
     worker.codec(
       "cancel-running-request-v1",
-      encode_payment_request,
+      worker.infallible(encode_payment_request),
       decode_payment_request(),
     )
   let assert Ok(output) =
-    worker.codec("cancel-running-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancel-running-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "consumer.cancel_while_running",
@@ -191,11 +203,15 @@ pub fn fault_prone_payment_worker() -> worker.Worker(
   let assert Ok(input) =
     worker.codec(
       "fault-prone-request-v1",
-      encode_payment_request,
+      worker.infallible(encode_payment_request),
       decode_payment_request(),
     )
   let assert Ok(output) =
-    worker.codec("fault-prone-output-v1", json.string, decode.string)
+    worker.codec(
+      "fault-prone-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "consumer.fault_prone_payment",
@@ -215,9 +231,14 @@ pub fn fault_prone_payment_worker() -> worker.Worker(
 /// The `Int` input / `String` output worker used by admission and
 /// retention tests.
 pub fn unique_echo_worker(id: String) -> worker.Worker(Int, String, Nil) {
-  let assert Ok(input) = worker.codec(id <> "-input-v1", json.int, decode.int)
+  let assert Ok(input) =
+    worker.codec(id <> "-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output) =
-    worker.codec(id <> "-output-v1", json.string, decode.string)
+    worker.codec(
+      id <> "-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(id, "v1", input, output, fn(value) {
       Ok(int.to_string(value))

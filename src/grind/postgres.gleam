@@ -771,6 +771,10 @@ pub type ResolutionError {
   ResolutionWorkerContractMismatch
   ResolutionCodecMismatch
   ResolutionRequiresErrorCodec
+  /// The admitted job's output codec (for `ConfirmSuccess`) or error codec
+  /// (for `ConfirmBusinessFailure`) rejected the confirmed value. `reason`
+  /// is the codec's own text. Checked before any storage call.
+  ResolutionInvalidValue(reason: String)
   ResolutionCancellationPending
   ResolutionAttemptMetadataMissing
   ResolutionWriteRejected
@@ -860,6 +864,8 @@ fn resolve_uncertain_checked(
       postgres_resolution.ResolutionCodecMismatch -> ResolutionCodecMismatch
       postgres_resolution.ResolutionRequiresErrorCodec ->
         ResolutionRequiresErrorCodec
+      postgres_resolution.ResolutionInvalidValue(reason) ->
+        ResolutionInvalidValue(reason)
       postgres_resolution.ResolutionCancellationPending ->
         ResolutionCancellationPending
       postgres_resolution.ResolutionAttemptMetadataMissing ->
@@ -961,8 +967,9 @@ fn migration_error(error: postgres_migration.RunnerError) -> StorageError {
 }
 
 /// Persists an immediate job without invoking its worker. May return
-/// `submission.EmptyQueueName` (an empty `queue`) or
-/// `submission.CommitUnknownWithoutId` (the insert's own query failed, its
+/// `submission.EmptyQueueName` (an empty `queue`),
+/// `submission.InvalidInput` (the input codec rejected `input`; nothing is
+/// written), or `submission.CommitUnknownWithoutId` (the insert's own query failed, its
 /// reply was lost, or its checkout failed outright — see that variant's doc
 /// comment); never `submission.AdmissionContended`, `submission.SubmissionConflict`,
 /// `submission.NotCommitted`, or `submission.CommitUnknown`, which only ever come
@@ -980,7 +987,8 @@ pub fn submit(
 }
 
 /// Persists a job at an absolute Unix-millisecond availability time. May
-/// return `submission.EmptyQueueName` or `submission.CommitUnknownWithoutId`; never
+/// return `submission.EmptyQueueName`, `submission.InvalidInput` or
+/// `submission.CommitUnknownWithoutId`; never
 /// `submission.AdmissionContended`, `submission.SubmissionConflict`,
 /// `submission.NotCommitted`, or `submission.CommitUnknown` — the same possible and
 /// impossible variants as `submit`.
@@ -1013,9 +1021,10 @@ fn submit_with_availability(
   JobHandle(input, output, error),
   submission.SubmitError(input, output, error),
 ) {
-  case queue {
-    "" -> Error(submission.EmptyQueueName)
-    _ -> {
+  case queue, worker.encode_input(worker, input) {
+    "", _ -> Error(submission.EmptyQueueName)
+    _, Error(reason) -> Error(submission.InvalidInput(reason))
+    _, Ok(encoded_input) -> {
       let Database(connection:, forwarder:, installation:, ..) = database
       let worker.Metadata(
         id: worker_id,
@@ -1044,7 +1053,7 @@ fn submit_with_availability(
         |> pog.parameter(pog.text(worker_id))
         |> pog.parameter(pog.text(worker_version))
         |> pog.parameter(pog.text(input_version))
-        |> pog.parameter(pog.text(worker.encode_input(worker, input)))
+        |> pog.parameter(pog.text(encoded_input))
         |> pog.parameter(pog.text(output_version))
         |> pog.parameter(error_parameter)
         |> pog.parameter(pog.int(max_attempts))
@@ -1885,6 +1894,8 @@ pub fn reconcile_acknowledgement(
 /// Admits one job under a uniqueness policy. Rejects an empty queue name
 /// before acquiring any resource. See `docs/UNIQUENESS-CONTRACT.md` for the
 /// full admission transaction. May return `submission.EmptyQueueName`,
+/// `submission.InvalidInput` (the input codec or a `unique.selected` key
+/// codec rejected the value, before any storage call),
 /// `submission.AdmissionContended`, `submission.SubmissionConflict`,
 /// `submission.NotCommitted`, or `submission.CommitUnknown`; never
 /// `submission.CommitUnknownWithoutId`, which is reserved for `submit`/
@@ -1962,6 +1973,7 @@ pub fn submit_unique(
 /// `submit_unique`'s `Existing`/`Rescheduled` variants never occur here —
 /// there is no policy to conflict against, so every resolved call is
 /// `Inserted`. May return `submission.EmptyQueueName`,
+/// `submission.InvalidInput` (before any storage call),
 /// `submission.AdmissionContended`, `submission.SubmissionConflict`,
 /// `submission.NotCommitted`, or `submission.CommitUnknown` (recoverable with
 /// `reconcile_unique`, or a plain retry of the same `SubmissionId`); never

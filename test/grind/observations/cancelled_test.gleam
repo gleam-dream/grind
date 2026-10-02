@@ -42,9 +42,17 @@ fn run_cancellation_observation_emission_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancellation-emission-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancellation-emission-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cancellation-emission-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancellation-emission-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -143,9 +151,17 @@ fn run_cancellation_observation_absent_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancellation-absent-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancellation-absent-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cancellation-absent-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancellation-absent-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "cancellation.absent",
@@ -222,11 +238,15 @@ fn run_cancellation_observation_commit_unknown_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancellation-commit-unknown-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancellation-commit-unknown-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
     worker.codec(
       "cancellation-commit-unknown-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(definition) =

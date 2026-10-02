@@ -53,8 +53,10 @@ fn collect_l4(subject: process.Subject(L4Acc), n: Int, acc: L4Acc) -> L4Acc {
 }
 
 fn l4_worker(id: String) -> worker.Worker(Int, Int, Nil) {
-  let assert Ok(input) = worker.codec(id <> "-input-v1", json.int, decode.int)
-  let assert Ok(output) = worker.codec(id <> "-output-v1", json.int, decode.int)
+  let assert Ok(input) =
+    worker.codec(id <> "-input-v1", worker.infallible(json.int), decode.int)
+  let assert Ok(output) =
+    worker.codec(id <> "-output-v1", worker.infallible(json.int), decode.int)
   let assert Ok(definition) =
     worker.define(id, "v1", input, output, fn(value) { Ok(value) })
   definition
@@ -179,7 +181,8 @@ pub fn run_l4(
 
   let assert Ok(key) =
     unique.selected("l4-key", fn(x) { x }, {
-      let assert Ok(codec) = worker.codec("l4-key-v1", json.int, decode.int)
+      let assert Ok(codec) =
+        worker.codec("l4-key-v1", worker.infallible(json.int), decode.int)
       codec
     })
   let policy =

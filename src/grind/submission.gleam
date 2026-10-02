@@ -169,6 +169,11 @@ pub fn pending_submission_request_sha256(
 
 pub type SubmitError(input, output, error) {
   EmptyQueueName
+  /// The worker's input codec, or a `unique.selected` key's codec, rejected
+  /// the value. `reason` is the codec's own text. Checked before any
+  /// connection is checked out, so nothing was written and no
+  /// `PendingSubmission` exists. Retrying the same value fails the same way.
+  InvalidInput(reason: String)
   /// The bounded wait for the admission lock (`postgres.with_unique_lock_wait`,
   /// default 2000ms) elapsed (PostgreSQL `55P03`). No conflicting job is
   /// implied. For `submit_unique` this is the domain-wide advisory lock;

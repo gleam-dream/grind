@@ -48,7 +48,7 @@ fn locked_renewal(url: String) -> Nil {
   let assert Ok(lock_database) = postgres.start(lock_settings)
   use <- exception.defer(fn() { postgres.close(lock_database) })
   let assert Ok(codec) =
-    worker.codec("diagnostic-lock-int", json.int, decode.int)
+    worker.codec("diagnostic-lock-int", worker.infallible(json.int), decode.int)
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =
@@ -147,7 +147,11 @@ fn claim_failures(url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
   let connection = postgres.connection(database)
   let assert Ok(codec) =
-    worker.codec("diagnostic-claim-int", json.int, decode.int)
+    worker.codec(
+      "diagnostic-claim-int",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define("diagnostic.claim", "v1", codec, codec, fn(value) {
@@ -306,7 +310,11 @@ fn completion_budget(url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
   let connection = postgres.connection(database)
   let assert Ok(codec) =
-    worker.codec("diagnostic-budget-int", json.int, decode.int)
+    worker.codec(
+      "diagnostic-budget-int",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let invoked = process.new_subject()
   let held = process.new_subject()
   let assert Ok(definition) =

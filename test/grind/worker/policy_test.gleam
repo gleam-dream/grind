@@ -13,9 +13,13 @@ import grind/worker
 
 pub fn invocation_preserves_the_application_error_test() {
   let assert Ok(input_codec) =
-    worker.codec("account-input-v1", json.int, decode.int)
+    worker.codec("account-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("account-output-v1", json.string, decode.string)
+    worker.codec(
+      "account-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(account_lookup) =
     worker.define(
       "accounts.lookup",
@@ -31,9 +35,17 @@ pub fn invocation_preserves_the_application_error_test() {
 
 pub fn queue_response_adapter_keeps_the_ordinary_worker_result_test() {
   let assert Ok(input_codec) =
-    worker.codec("queue-adapter-input-v1", json.int, decode.int)
+    worker.codec(
+      "queue-adapter-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("queue-adapter-output-v1", json.string, decode.string)
+    worker.codec(
+      "queue-adapter-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(delay) = worker.retry_delay(0)
   let probe = process.new_subject()
   let assert Ok(lookup) =
@@ -74,9 +86,17 @@ pub fn deterministic_default_retry_backoff_is_bounded_test() {
 
 pub fn retry_settings_reject_invalid_values_before_resources_test() {
   let assert Ok(input_codec) =
-    worker.codec("retry-validation-input-v1", json.int, decode.int)
+    worker.codec(
+      "retry-validation-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("retry-validation-output-v1", json.string, decode.string)
+    worker.codec(
+      "retry-validation-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("retry.validation", "v1", input_codec, output_codec, fn(v) {
       Ok(int.to_string(v))
@@ -202,9 +222,13 @@ fn resolver_test_worker(
   delay: worker.RetryDelay,
 ) -> worker.Worker(Int, String, LookupFailure) {
   let assert Ok(input_codec) =
-    worker.codec("resolver-input-v1", json.int, decode.int)
+    worker.codec("resolver-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("resolver-output-v1", json.string, decode.string)
+    worker.codec(
+      "resolver-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(base) =
     worker.define("worker.resolver", "v1", input_codec, output_codec, fn(_) {
       Error(AccountMissing(0))

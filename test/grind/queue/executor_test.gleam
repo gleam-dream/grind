@@ -37,7 +37,7 @@ fn first_ack_rollback(url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
   let connection = postgres.connection(database)
   let assert Ok(codec) =
-    worker.codec("first-rollback-int", json.int, decode.int)
+    worker.codec("first-rollback-int", worker.infallible(json.int), decode.int)
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define("first.rollback", "v1", codec, codec, fn(value) {
@@ -158,7 +158,8 @@ fn slow_acks(url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let connection = postgres.connection(database)
-  let assert Ok(codec) = worker.codec("slow-acks-int", json.int, decode.int)
+  let assert Ok(codec) =
+    worker.codec("slow-acks-int", worker.infallible(json.int), decode.int)
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("slow.acks", "v1", codec, codec, fn(value) {
@@ -263,7 +264,7 @@ fn saturated_pool(url: String) -> Nil {
   let assert Ok(observer) = postgres.start(observer_settings)
   use <- exception.defer(fn() { postgres.close(observer) })
   let assert Ok(codec) =
-    worker.codec("pool-saturation-int", json.int, decode.int)
+    worker.codec("pool-saturation-int", worker.infallible(json.int), decode.int)
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("pool.saturation", "v1", codec, codec, fn(value) {

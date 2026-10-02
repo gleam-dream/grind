@@ -244,9 +244,17 @@ pub fn fault_proxy_pass_through_test() {
       use <- exception.defer(fn() { postgres.close(database) })
       let assert Ok(Nil) = postgres.migrate(database)
       let assert Ok(input_codec) =
-        worker.codec("fp-pass-through-input-v1", json.int, decode.int)
+        worker.codec(
+          "fp-pass-through-input-v1",
+          worker.infallible(json.int),
+          decode.int,
+        )
       let assert Ok(output_codec) =
-        worker.codec("fp-pass-through-output-v1", json.string, decode.string)
+        worker.codec(
+          "fp-pass-through-output-v1",
+          worker.infallible(json.string),
+          decode.string,
+        )
       let assert Ok(definition) =
         worker.define(
           "fault.proxy.pass.through",
@@ -295,9 +303,13 @@ fn run_t1(base_url: String) -> Nil {
   let deadline_ms = postgres.statement_deadline_ms(database)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fp-t1-input-v1", json.int, decode.int)
+    worker.codec("fp-t1-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("fp-t1-output-v1", json.string, decode.string)
+    worker.codec(
+      "fp-t1-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("fault.proxy.t1", "v1", input_codec, output_codec, fn(value) {
       Ok("t1-" <> int.to_string(value))
@@ -422,9 +434,13 @@ fn run_t2(base_url: String) -> Nil {
   let deadline_ms = postgres.statement_deadline_ms(database)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fp-t2-input-v1", json.int, decode.int)
+    worker.codec("fp-t2-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("fp-t2-output-v1", json.string, decode.string)
+    worker.codec(
+      "fp-t2-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("fault.proxy.t2", "v1", input_codec, output_codec, fn(value) {
       Ok("t2-" <> int.to_string(value))
@@ -538,9 +554,13 @@ fn run_t4(base_url: String) -> Nil {
   let deadline_ms = postgres.statement_deadline_ms(database)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fp-t4-input-v1", json.int, decode.int)
+    worker.codec("fp-t4-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("fp-t4-output-v1", json.string, decode.string)
+    worker.codec(
+      "fp-t4-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("fault.proxy.t4", "v1", input_codec, output_codec, fn(value) {
       Ok("t4-" <> int.to_string(value))
@@ -634,9 +654,13 @@ fn run_t5(base_url: String) -> Nil {
   let deadline_ms = postgres.statement_deadline_ms(database)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fp-t5-input-v1", json.int, decode.int)
+    worker.codec("fp-t5-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("fp-t5-output-v1", json.string, decode.string)
+    worker.codec(
+      "fp-t5-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("fault.proxy.t5", "v1", input_codec, output_codec, fn(value) {
       Ok("t5-" <> int.to_string(value))
@@ -770,9 +794,13 @@ fn run_t3(base_url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
 
   let assert Ok(input_codec) =
-    worker.codec("fp-t3-input-v1", json.int, decode.int)
+    worker.codec("fp-t3-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("fp-t3-output-v1", json.string, decode.string)
+    worker.codec(
+      "fp-t3-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   // Each worker's own release subject is created *inside* the worker
   // closure, in the worker actor's own process — a `Subject` can only be
@@ -946,9 +974,13 @@ fn run_defect2(base_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fp-defect2-input-v1", json.int, decode.int)
+    worker.codec("fp-defect2-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("fp-defect2-output-v1", json.string, decode.string)
+    worker.codec(
+      "fp-defect2-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "fault.proxy.defect2",

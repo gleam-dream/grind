@@ -33,9 +33,13 @@ fn run_worker_snooze_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("snooze-input-v1", json.int, decode.int)
+    worker.codec("snooze-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("snooze-output-v1", json.string, decode.string)
+    worker.codec(
+      "snooze-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(delay) = worker.retry_delay(60_000)
   let ordinary_probe = process.new_subject()
   let assert Ok(ordinary) =
@@ -134,9 +138,17 @@ fn run_snooze_receipt_rollback_test(database_url: String) -> Nil {
   })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("snooze-rollback-input-v1", json.int, decode.int)
+    worker.codec(
+      "snooze-rollback-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("snooze-rollback-output-v1", json.string, decode.string)
+    worker.codec(
+      "snooze-rollback-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(delay) = worker.retry_delay(60_000)
   let assert Ok(ordinary) =
     worker.define(
@@ -225,9 +237,17 @@ fn run_snooze_after_replay_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("snooze-replay-input-v1", json.int, decode.int)
+    worker.codec(
+      "snooze-replay-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("snooze-replay-output-v1", json.string, decode.string)
+    worker.codec(
+      "snooze-replay-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(delay) = worker.retry_delay(0)
   let ordinary_probe = process.new_subject()
   let queue_probe = process.new_subject()
@@ -353,9 +373,17 @@ fn run_snooze_delay_receipt_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("snooze-delay-input-v1", json.int, decode.int)
+    worker.codec(
+      "snooze-delay-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("snooze-delay-output-v1", json.string, decode.string)
+    worker.codec(
+      "snooze-delay-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(delay) = worker.retry_delay(60_000)
   let assert Ok(ordinary) =
     worker.define(

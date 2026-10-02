@@ -43,9 +43,17 @@ fn run_claimed_observation_emission_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("claimed-emission-input-v1", json.int, decode.int)
+    worker.codec(
+      "claimed-emission-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("claimed-emission-output-v1", json.string, decode.string)
+    worker.codec(
+      "claimed-emission-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "claimed.emission",
@@ -111,9 +119,17 @@ fn run_claimed_observation_absent_when_nothing_due_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("claimed-absent-input-v1", json.int, decode.int)
+    worker.codec(
+      "claimed-absent-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("claimed-absent-output-v1", json.string, decode.string)
+    worker.codec(
+      "claimed-absent-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("claimed.absent", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
@@ -175,9 +191,17 @@ fn run_quarantined_observation_emission_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("quarantined-emission-input-v1", json.int, decode.int)
+    worker.codec(
+      "quarantined-emission-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("quarantined-emission-output-v1", json.string, decode.string)
+    worker.codec(
+      "quarantined-emission-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "quarantined.emission",
@@ -266,9 +290,17 @@ fn run_quarantined_observation_absent_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("quarantined-absent-input-v1", json.int, decode.int)
+    worker.codec(
+      "quarantined-absent-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("quarantined-absent-output-v1", json.string, decode.string)
+    worker.codec(
+      "quarantined-absent-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "quarantined.absent",
@@ -345,9 +377,13 @@ fn run_claimed_precedes_acknowledged_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("ordering-input-v1", json.int, decode.int)
+    worker.codec("ordering-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("ordering-output-v1", json.string, decode.string)
+    worker.codec(
+      "ordering-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "ordering.claimed.acknowledged",

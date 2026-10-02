@@ -42,13 +42,13 @@ fn run_acknowledged_observation_available_at_retry_test(
   let assert Ok(input_codec) =
     worker.codec(
       "observation-available-at-retry-input-v1",
-      json.int,
+      worker.infallible(json.int),
       decode.int,
     )
   let assert Ok(output_codec) =
     worker.codec(
       "observation-available-at-retry-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(definition) =
@@ -111,13 +111,13 @@ fn run_acknowledged_observation_available_at_snooze_test(
   let assert Ok(input_codec) =
     worker.codec(
       "observation-available-at-snooze-input-v1",
-      json.int,
+      worker.infallible(json.int),
       decode.int,
     )
   let assert Ok(output_codec) =
     worker.codec(
       "observation-available-at-snooze-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(delay) = worker.retry_delay(60_000)
@@ -193,13 +193,13 @@ fn run_acknowledged_observation_available_at_cancel_overrides_retry_test(
   let assert Ok(input_codec) =
     worker.codec(
       "observation-available-at-cancel-retry-input-v1",
-      json.int,
+      worker.infallible(json.int),
       decode.int,
     )
   let assert Ok(output_codec) =
     worker.codec(
       "observation-available-at-cancel-retry-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let started = process.new_subject()

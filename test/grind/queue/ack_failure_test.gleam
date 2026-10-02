@@ -45,9 +45,17 @@ fn run_ack_commit_connection_loss_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("ack-commit-loss-input-v1", json.int, decode.int)
+    worker.codec(
+      "ack-commit-loss-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("ack-commit-loss-output-v1", json.string, decode.string)
+    worker.codec(
+      "ack-commit-loss-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =
@@ -159,9 +167,17 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-ack-commit-loss-input-v1", json.int, decode.int)
+    worker.codec(
+      "auto-ack-commit-loss-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("auto-ack-commit-loss-output-v1", json.string, decode.string)
+    worker.codec(
+      "auto-ack-commit-loss-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -324,9 +340,17 @@ fn run_automatic_ack_retry_bounded_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-ack-bounded-input-v1", json.int, decode.int)
+    worker.codec(
+      "auto-ack-bounded-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("auto-ack-bounded-output-v1", json.string, decode.string)
+    worker.codec(
+      "auto-ack-bounded-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -483,9 +507,17 @@ fn run_ack_committed_reply_lost_reconciles_test(database_url: String) -> Nil {
   let connection = postgres.connection(database)
   require_syncrep_cluster_configured(connection)
   let assert Ok(input_codec) =
-    worker.codec("ack-reply-lost-input-v1", json.int, decode.int)
+    worker.codec(
+      "ack-reply-lost-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("ack-reply-lost-output-v1", json.string, decode.string)
+    worker.codec(
+      "ack-reply-lost-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =
@@ -564,9 +596,17 @@ fn run_reconcile_acknowledgement_wrong_job_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("receipt-job-mismatch-input-v1", json.int, decode.int)
+    worker.codec(
+      "receipt-job-mismatch-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("receipt-job-mismatch-output-v1", json.string, decode.string)
+    worker.codec(
+      "receipt-job-mismatch-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "receipt.job.mismatch",

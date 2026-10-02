@@ -38,9 +38,13 @@ fn run_takeover_fencing_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("takeover-input-v1", json.int, decode.int)
+    worker.codec("takeover-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("takeover-output-v1", json.string, decode.string)
+    worker.codec(
+      "takeover-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let signals = process.new_subject()
   let assert Ok(first_worker) =
     worker.define("takeover.echo", "v1", input_codec, output_codec, fn(value) {
@@ -252,9 +256,17 @@ fn run_exact_expiry_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("exact-expiry-input-v1", json.int, decode.int)
+    worker.codec(
+      "exact-expiry-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("exact-expiry-output-v1", json.string, decode.string)
+    worker.codec(
+      "exact-expiry-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker) =
     worker.define(
       "exact-expiry.echo",
@@ -316,9 +328,17 @@ fn run_ack_after_database_expiry_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("ack-after-expiry-input-v1", json.int, decode.int)
+    worker.codec(
+      "ack-after-expiry-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("ack-after-expiry-output-v1", json.string, decode.string)
+    worker.codec(
+      "ack-after-expiry-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(slow_worker) =
@@ -430,9 +450,13 @@ fn run_bounded_quarantine_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("bounded-input-v1", json.int, decode.int)
+    worker.codec("bounded-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("bounded-output-v1", json.string, decode.string)
+    worker.codec(
+      "bounded-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker) =
     worker.define("bounded.echo", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
@@ -491,9 +515,13 @@ fn run_expired_attempt_quarantine_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("quarantine-input-v1", json.int, decode.int)
+    worker.codec("quarantine-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("quarantine-output-v1", json.string, decode.string)
+    worker.codec(
+      "quarantine-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let probe = process.new_subject()
   let assert Ok(worker) =
     worker.define("quarantine.echo", "v1", input_codec, output_codec, fn(value) {

@@ -83,9 +83,17 @@ pub fn postgres_migrate_upgrade_from_frozen_v11_fixture_test() {
 
 fn legacy_upgrade_worker() -> worker.Worker(Int, String, LookupFailure) {
   let assert Ok(input_codec) =
-    worker.codec("upgrade-legacy-input-v1", json.int, decode.int)
+    worker.codec(
+      "upgrade-legacy-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("upgrade-legacy-output-v1", json.string, decode.string)
+    worker.codec(
+      "upgrade-legacy-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker_def) =
     worker.define(
       "upgrade.legacy-worker",
@@ -378,9 +386,17 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
   // The upgraded schema is fully functional for ordinary new traffic:
   // submit/claim/ack on a fresh job.
   let assert Ok(input_codec) =
-    worker.codec("upgrade-smoke-input-v1", json.int, decode.int)
+    worker.codec(
+      "upgrade-smoke-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("upgrade-smoke-output-v1", json.string, decode.string)
+    worker.codec(
+      "upgrade-smoke-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(smoke_worker) =
     worker.define(
       "upgrade.smoke-worker",

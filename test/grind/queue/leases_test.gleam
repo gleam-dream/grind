@@ -61,9 +61,13 @@ fn run_lease_renewal_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("renewal-input-v1", json.int, decode.int)
+    worker.codec("renewal-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("renewal-output-v1", json.string, decode.string)
+    worker.codec(
+      "renewal-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(slow_worker) =
     worker.define("lease.renewal", "v1", input_codec, output_codec, fn(value) {
@@ -133,9 +137,17 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("renewal-loss-input-v1", json.int, decode.int)
+    worker.codec(
+      "renewal-loss-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("renewal-loss-output-v1", json.string, decode.string)
+    worker.codec(
+      "renewal-loss-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(slow_worker) =
     worker.define(
@@ -214,9 +226,17 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("renewal-storage-error-input-v1", json.int, decode.int)
+    worker.codec(
+      "renewal-storage-error-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("renewal-storage-error-output-v1", json.string, decode.string)
+    worker.codec(
+      "renewal-storage-error-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(slow_worker) =
     worker.define(
@@ -327,9 +347,17 @@ fn run_closed_pool_renewal_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("closed-pool-renewal-input-v1", json.int, decode.int)
+    worker.codec(
+      "closed-pool-renewal-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("closed-pool-renewal-output-v1", json.string, decode.string)
+    worker.codec(
+      "closed-pool-renewal-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(slow_worker) =
     worker.define(

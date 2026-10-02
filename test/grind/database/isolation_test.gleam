@@ -79,9 +79,17 @@ fn run_two_schemas_isolated_test(base_url: String) -> Nil {
   let connection_b = postgres.connection(database_b)
 
   let assert Ok(input_codec) =
-    worker.codec("schema-isolation-input-v1", json.int, decode.int)
+    worker.codec(
+      "schema-isolation-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("schema-isolation-output-v1", json.string, decode.string)
+    worker.codec(
+      "schema-isolation-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker_def) =
     worker.define(
       "schema.isolation",
@@ -212,9 +220,17 @@ fn run_two_urls_same_schema_test(database_url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database_a)
 
   let assert Ok(input_codec) =
-    worker.codec("cross-endpoint-input-v1", json.int, decode.int)
+    worker.codec(
+      "cross-endpoint-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cross-endpoint-output-v1", json.string, decode.string)
+    worker.codec(
+      "cross-endpoint-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "cross-endpoint.owner",
@@ -297,9 +313,17 @@ fn run_user_schema_fallback_test(base_url: String) -> Nil {
   |> should.equal(postgres.installation(database_y))
 
   let assert Ok(input_codec) =
-    worker.codec("user-schema-fallback-input-v1", json.int, decode.int)
+    worker.codec(
+      "user-schema-fallback-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("user-schema-fallback-output-v1", json.string, decode.string)
+    worker.codec(
+      "user-schema-fallback-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker_def) =
     worker.define(
       "user-schema-fallback.worker",

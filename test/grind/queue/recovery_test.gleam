@@ -61,9 +61,17 @@ fn run_owner_restart_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("owner-restart-input-v1", json.int, decode.int)
+    worker.codec(
+      "owner-restart-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("owner-restart-output-v1", json.string, decode.string)
+    worker.codec(
+      "owner-restart-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("owner.restart", "v1", input_codec, output_codec, fn(value) {
       Ok("restarted-" <> int.to_string(value))
@@ -155,9 +163,17 @@ fn run_coordinator_loss_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("coordinator-loss-input-v1", json.int, decode.int)
+    worker.codec(
+      "coordinator-loss-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("coordinator-loss-output-v1", json.string, decode.string)
+    worker.codec(
+      "coordinator-loss-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =
@@ -293,9 +309,17 @@ fn run_stale_consumer_handle_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("stale-consumer-input-v1", json.int, decode.int)
+    worker.codec(
+      "stale-consumer-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("stale-consumer-output-v1", json.string, decode.string)
+    worker.codec(
+      "stale-consumer-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("stale.consumer", "v1", input_codec, output_codec, fn(value) {
       Ok("generation-" <> int.to_string(value))
@@ -333,9 +357,17 @@ fn run_long_handler_wait_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("long-handler-input-v1", json.int, decode.int)
+    worker.codec(
+      "long-handler-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("long-handler-output-v1", json.string, decode.string)
+    worker.codec(
+      "long-handler-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let finished = process.new_subject()
   let assert Ok(definition) =
@@ -397,9 +429,17 @@ fn run_owner_loss_recovers_after_pool_restart_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("owner-pool-loss-input-v1", json.int, decode.int)
+    worker.codec(
+      "owner-pool-loss-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("owner-pool-loss-output-v1", json.string, decode.string)
+    worker.codec(
+      "owner-pool-loss-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =

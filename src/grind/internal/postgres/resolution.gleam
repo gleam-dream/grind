@@ -40,6 +40,7 @@ pub type ResolutionError {
   ResolutionWorkerContractMismatch
   ResolutionCodecMismatch
   ResolutionRequiresErrorCodec
+  ResolutionInvalidValue(reason: String)
   ResolutionCancellationPending
   ResolutionAttemptMetadataMissing
   ResolutionWriteRejected
@@ -68,8 +69,11 @@ pub fn resolve_uncertain(
       )
     <- result.try(case decision {
       ConfirmSuccess(value) -> {
-        let #(version, encoded) = job.encode_reconciled_success(handle, value)
-        Ok(#(
+        use #(version, encoded) <- result.map(
+          job.encode_reconciled_success(handle, value)
+          |> result.map_error(ResolutionInvalidValue),
+        )
+        #(
           "confirm_success",
           "succeeded",
           version,
@@ -77,12 +81,13 @@ pub fn resolve_uncertain(
           None,
           None,
           None,
-        ))
+        )
       }
       ConfirmBusinessFailure(value) ->
         case job.encode_reconciled_error(handle, value) {
           None -> Error(ResolutionRequiresErrorCodec)
-          Some(#(version, encoded)) ->
+          Some(Error(reason)) -> Error(ResolutionInvalidValue(reason))
+          Some(Ok(#(version, encoded))) ->
             Ok(#(
               "confirm_business_failure",
               "business_failed",

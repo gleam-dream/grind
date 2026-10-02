@@ -71,8 +71,10 @@ pub fn build(
   ledger: pog.Connection,
   id: String,
 ) -> Result(Worker(BenchJob, Int, Nil), worker.DefinitionError) {
-  let assert Ok(input) = worker.codec(id <> "-input-v1", encode, decoder())
-  let assert Ok(output) = worker.codec(id <> "-output-v1", json.int, decode.int)
+  let assert Ok(input) =
+    worker.codec(id <> "-input-v1", worker.infallible(encode), decoder())
+  let assert Ok(output) =
+    worker.codec(id <> "-output-v1", worker.infallible(json.int), decode.int)
   worker.define(id, "v1", input, output, fn(job) {
     let BenchJob(bench_index:, cost_ms:) = job
     let delivery_count = next_delivery_count(bench_index)

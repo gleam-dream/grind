@@ -58,8 +58,7 @@ pub fn submit(
     _ -> {
       let unique.PolicyFields(key:, scope:, period:, states:) =
         unique.policy_fields(policy)
-      run(
-        connection,
+      use request <- result.try(
         unique_admission_request.build_request(
           installation,
           submission_id,
@@ -68,8 +67,12 @@ pub fn submit(
           input,
           availability,
           fn(input_version, encoded_input) {
-            let #(key_contract, encoded_key) =
-              unique.key_material(key, input, input_version, encoded_input)
+            use #(key_contract, encoded_key) <- result.map(unique.key_material(
+              key,
+              input,
+              input_version,
+              encoded_input,
+            ))
             Some(PolicyPart(
               key_contract:,
               encoded_key:,
@@ -80,8 +83,8 @@ pub fn submit(
             ))
           },
         ),
-        lock_wait_ms,
       )
+      run(connection, request, lock_wait_ms)
     }
   }
 }
@@ -108,9 +111,8 @@ pub fn submit_plain(
 ) {
   case queue {
     "" -> Error(submission.EmptyQueueName)
-    _ ->
-      run(
-        connection,
+    _ -> {
+      use request <- result.try(
         unique_admission_request.build_request(
           installation,
           submission_id,
@@ -118,10 +120,11 @@ pub fn submit_plain(
           worker_def,
           input,
           availability,
-          fn(_input_version, _encoded_input) { None },
+          fn(_input_version, _encoded_input) { Ok(None) },
         ),
-        lock_wait_ms,
       )
+      run(connection, request, lock_wait_ms)
+    }
   }
 }
 
@@ -245,6 +248,7 @@ fn reconcile_from_receipt(
     Error(submission.AdmissionContended)
     | Error(submission.NotCommitted(_))
     | Error(submission.EmptyQueueName)
+    | Error(submission.InvalidInput(_))
     | Error(submission.CommitUnknown(_))
     | Error(submission.CommitUnknownWithoutId(_)) ->
       Error(submission.CommitUnknown(pending))

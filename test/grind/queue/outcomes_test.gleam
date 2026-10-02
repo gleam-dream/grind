@@ -67,13 +67,17 @@ fn run_business_failure_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("lookup-input-v1", json.int, decode.int)
+    worker.codec("lookup-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("lookup-output-v1", json.string, decode.string)
+    worker.codec(
+      "lookup-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(error_codec) =
     worker.codec(
       "lookup-error-v1",
-      encode_lookup_failure,
+      worker.infallible(encode_lookup_failure),
       decode_lookup_failure(),
     )
   let assert Ok(lookup) =
@@ -111,9 +115,13 @@ fn run_worker_discard_outcome_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("discard-input-v1", json.int, decode.int)
+    worker.codec("discard-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("discard-output-v1", json.string, decode.string)
+    worker.codec(
+      "discard-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(ordinary) =
     worker.define("worker.discard", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
@@ -167,9 +175,17 @@ fn run_worker_cancel_outcome_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("worker-cancel-input-v1", json.int, decode.int)
+    worker.codec(
+      "worker-cancel-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("worker-cancel-output-v1", json.string, decode.string)
+    worker.codec(
+      "worker-cancel-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(ordinary) =
     worker.define("worker.cancel", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
@@ -224,9 +240,13 @@ fn run_worker_uncertainty_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("uncertain-input-v1", json.int, decode.int)
+    worker.codec("uncertain-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("uncertain-output-v1", json.string, decode.string)
+    worker.codec(
+      "uncertain-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let effect_probe = process.new_subject()
   let policy_probe = process.new_subject()
   let assert Ok(ordinary) =
@@ -353,9 +373,13 @@ fn run_output_codec_mismatch_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("mismatch-input-v1", json.int, decode.int)
+    worker.codec("mismatch-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("mismatch-output-v1", json.string, decode.string)
+    worker.codec(
+      "mismatch-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let probe = process.new_subject()
   let assert Ok(effect) =
     worker.define("codec.drift", "v1", input_codec, output_codec, fn(value) {
@@ -398,9 +422,13 @@ fn run_postgres_queue_success_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("queue-input-v1", json.int, decode.int)
+    worker.codec("queue-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("queue-output-v1", json.string, decode.string)
+    worker.codec(
+      "queue-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(increment) =
     worker.define("queue.increment", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value + 1))

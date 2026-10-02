@@ -35,9 +35,17 @@ fn run_released_observation_emission_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("released-emission-input-v1", json.int, decode.int)
+    worker.codec(
+      "released-emission-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("released-emission-output-v1", json.string, decode.string)
+    worker.codec(
+      "released-emission-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "released.emission",
@@ -106,9 +114,17 @@ fn run_released_observation_absent_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("released-absent-input-v1", json.int, decode.int)
+    worker.codec(
+      "released-absent-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("released-absent-output-v1", json.string, decode.string)
+    worker.codec(
+      "released-absent-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("released.absent", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
@@ -195,9 +211,17 @@ fn run_contract_mismatch_observation_emission_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("contract-mismatch-input-v1", json.int, decode.int)
+    worker.codec(
+      "contract-mismatch-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("contract-mismatch-output-v1", json.int, decode.int)
+    worker.codec(
+      "contract-mismatch-output-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(definition) =
     worker.define(
       "contract.mismatch.emission",
@@ -274,9 +298,17 @@ fn run_contract_mismatch_observation_absent_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("contract-mismatch-absent-input-v1", json.int, decode.int)
+    worker.codec(
+      "contract-mismatch-absent-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("contract-mismatch-absent-output-v1", json.int, decode.int)
+    worker.codec(
+      "contract-mismatch-absent-output-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(definition) =
     worker.define(
       "contract.mismatch.absent",

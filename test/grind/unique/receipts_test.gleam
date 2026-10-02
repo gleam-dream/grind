@@ -298,13 +298,13 @@ fn run_receipt_output_codec_change_conflict_test(database_url: String) -> Nil {
   let assert Ok(input_codec) =
     worker.codec(
       "unique-receipt-codec-input-" <> suffix <> "-v1",
-      json.int,
+      worker.infallible(json.int),
       decode.int,
     )
   let assert Ok(output_codec_v1) =
     worker.codec(
       "unique-receipt-codec-output-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let worker_id = "unique.receipt-codec-change-" <> suffix
@@ -315,7 +315,7 @@ fn run_receipt_output_codec_change_conflict_test(database_url: String) -> Nil {
   let assert Ok(output_codec_v2) =
     worker.codec(
       "unique-receipt-codec-output-" <> suffix <> "-v2",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(worker_v1_recoded) =

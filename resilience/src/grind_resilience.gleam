@@ -116,9 +116,17 @@ fn encode_input(input: Input) -> json.Json {
 fn definition() -> worker.Worker(Input, String, Nil) {
   let version = env("RESILIENCE_VERSION")
   let assert Ok(input) =
-    worker.codec("resilience-input-" <> version, encode_input, input_decoder())
+    worker.codec(
+      "resilience-input-" <> version,
+      worker.infallible(encode_input),
+      input_decoder(),
+    )
   let assert Ok(output) =
-    worker.codec("resilience-output-" <> version, json.string, decode.string)
+    worker.codec(
+      "resilience-output-" <> version,
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("resilience.effect", version, input, output, perform)
   let assert Ok(delay) = worker.retry_delay(50)

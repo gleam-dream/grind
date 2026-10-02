@@ -4,6 +4,7 @@ import gleam/bit_array
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import grind/job
 import grind/submission
 import grind/unique
@@ -57,7 +58,9 @@ pub type Request(input, output, error) {
 
 /// Gathers every value the admission transaction needs. `build_policy`
 /// receives the submitting worker's input codec version and encoded input
-/// so a policy's key uses the exact same encoding as the request.
+/// so a policy's key uses the exact same encoding as the request. Returns
+/// `submission.InvalidInput` when the input codec or `build_policy` rejects
+/// the value, before any storage call.
 pub fn build_request(
   installation: job.Installation,
   submission_id: submission.SubmissionId,
@@ -65,8 +68,11 @@ pub fn build_request(
   worker_def: Worker(input, output, error),
   input: input,
   availability: submission.Availability,
-  build_policy: fn(String, String) -> Option(PolicyPart),
-) -> Request(input, output, error) {
+  build_policy: fn(String, String) -> Result(Option(PolicyPart), String),
+) -> Result(
+  Request(input, output, error),
+  submission.SubmitError(input, output, error),
+) {
   let worker.Metadata(
     id: worker_id,
     worker_version:,
@@ -75,8 +81,14 @@ pub fn build_request(
     error_version:,
     max_attempts:,
   ) = worker.metadata(worker_def)
-  let encoded_input = worker.encode_input(worker_def, input)
-  let policy = build_policy(input_version, encoded_input)
+  use encoded_input <- result.try(
+    worker.encode_input(worker_def, input)
+    |> result.map_error(submission.InvalidInput),
+  )
+  use policy <- result.try(
+    build_policy(input_version, encoded_input)
+    |> result.map_error(submission.InvalidInput),
+  )
   let request =
     Request(
       installation:,
@@ -94,7 +106,7 @@ pub fn build_request(
       policy:,
       request_sha256: <<>>,
     )
-  Request(..request, request_sha256: fingerprint(request))
+  Ok(Request(..request, request_sha256: fingerprint(request)))
 }
 
 /// The request fingerprint envelope; see `docs/UNIQUENESS-CONTRACT.md`,

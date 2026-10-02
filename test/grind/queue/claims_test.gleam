@@ -71,9 +71,13 @@ fn run_dead_idle_worker_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("dead-idle-input-v1", json.int, decode.int)
+    worker.codec("dead-idle-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("dead-idle-output-v1", json.string, decode.string)
+    worker.codec(
+      "dead-idle-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define("dead.idle", "v1", input_codec, output_codec, fn(value) {
@@ -146,9 +150,17 @@ fn run_automatic_fill_yields_to_shutdown_between_claims_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fill-yield-shutdown-input-v1", json.int, decode.int)
+    worker.codec(
+      "fill-yield-shutdown-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("fill-yield-shutdown-output-v1", json.int, decode.int)
+    worker.codec(
+      "fill-yield-shutdown-output-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(definition) =
     worker.define(
       "fill.yield-shutdown",
@@ -278,9 +290,13 @@ fn run_independent_consumer_claim_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database_b) })
   let assert Ok(Nil) = postgres.migrate(database_a)
   let assert Ok(input_codec) =
-    worker.codec("claim-race-input-v1", json.int, decode.int)
+    worker.codec("claim-race-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("claim-race-output-v1", json.string, decode.string)
+    worker.codec(
+      "claim-race-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let signals = process.new_subject()
   let assert Ok(definition) =
     worker.define("claim.race", "v1", input_codec, output_codec, fn(value) {
@@ -366,9 +382,17 @@ fn run_overlapping_claim_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database_b) })
   let assert Ok(Nil) = postgres.migrate(database_a)
   let assert Ok(input_codec) =
-    worker.codec("claim-overlap-input-v1", json.int, decode.int)
+    worker.codec(
+      "claim-overlap-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("claim-overlap-output-v1", json.string, decode.string)
+    worker.codec(
+      "claim-overlap-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define("claim.overlap", "v1", input_codec, output_codec, fn(value) {
@@ -462,9 +486,17 @@ fn run_temporary_worker_death_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("worker-death-input-v1", json.int, decode.int)
+    worker.codec(
+      "worker-death-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("worker-death-output-v1", json.string, decode.string)
+    worker.codec(
+      "worker-death-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =
@@ -536,9 +568,17 @@ fn run_worker_start_failure_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("start-failure-input-v1", json.int, decode.int)
+    worker.codec(
+      "start-failure-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("start-failure-output-v1", json.string, decode.string)
+    worker.codec(
+      "start-failure-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define("start.failure", "v1", input_codec, output_codec, fn(value) {

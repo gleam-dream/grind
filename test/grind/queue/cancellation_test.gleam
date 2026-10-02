@@ -59,9 +59,17 @@ fn run_cancel_before_execution_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancel-before-run-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancel-before-run-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cancel-before-run-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancel-before-run-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let probe = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -114,9 +122,17 @@ fn run_cancel_after_completion_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancel-complete-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancel-complete-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cancel-complete-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancel-complete-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -153,9 +169,17 @@ fn run_cancel_running_ack_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancel-running-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancel-running-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cancel-running-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancel-running-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -266,9 +290,17 @@ fn run_cancel_running_uncertain_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancel-uncertain-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancel-uncertain-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cancel-uncertain-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancel-uncertain-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(ordinary) =
     worker.define(
@@ -397,9 +429,17 @@ fn run_cancelled_expired_attempt_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("cancel-expired-input-v1", json.int, decode.int)
+    worker.codec(
+      "cancel-expired-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cancel-expired-output-v1", json.string, decode.string)
+    worker.codec(
+      "cancel-expired-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(ordinary) =
     worker.define(

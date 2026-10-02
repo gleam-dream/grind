@@ -42,9 +42,13 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("capacity-input-v1", json.int, decode.int)
+    worker.codec("capacity-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("capacity-output-v1", json.string, decode.string)
+    worker.codec(
+      "capacity-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("capacity.echo", "v1", input_codec, output_codec, fn(value) {
@@ -140,9 +144,17 @@ fn run_automatic_consumer_capacity_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-capacity-input-v1", json.int, decode.int)
+    worker.codec(
+      "auto-capacity-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("auto-capacity-output-v1", json.string, decode.string)
+    worker.codec(
+      "auto-capacity-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("auto.capacity", "v1", input_codec, output_codec, fn(value) {
@@ -224,9 +236,17 @@ fn run_automatic_consumer_polls_while_capacity_free_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-free-capacity-input-v1", json.int, decode.int)
+    worker.codec(
+      "auto-free-capacity-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("auto-free-capacity-output-v1", json.string, decode.string)
+    worker.codec(
+      "auto-free-capacity-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -318,9 +338,17 @@ fn run_automatic_consumer_drains_backlog_without_per_interval_ceiling_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-backlog-drain-input-v1", json.int, decode.int)
+    worker.codec(
+      "auto-backlog-drain-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("auto-backlog-drain-output-v1", json.int, decode.int)
+    worker.codec(
+      "auto-backlog-drain-output-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(definition) =
     worker.define(
       "auto.backlog-drain",
@@ -485,9 +513,17 @@ fn run_automatic_consumer_waits_full_interval_when_idle_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-idle-wait-input-v1", json.int, decode.int)
+    worker.codec(
+      "auto-idle-wait-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("auto-idle-wait-output-v1", json.int, decode.int)
+    worker.codec(
+      "auto-idle-wait-output-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(definition) =
     worker.define("auto.idle-wait", "v1", input_codec, output_codec, fn(value) {
       Ok(value)
@@ -566,9 +602,17 @@ fn run_automatic_fill_does_not_hot_loop_on_claim_error_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fill-hot-loop-input-v1", json.int, decode.int)
+    worker.codec(
+      "fill-hot-loop-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("fill-hot-loop-output-v1", json.int, decode.int)
+    worker.codec(
+      "fill-hot-loop-output-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(definition) =
     worker.define("fill.hot-loop", "v1", input_codec, output_codec, fn(value) {
       Ok(value)

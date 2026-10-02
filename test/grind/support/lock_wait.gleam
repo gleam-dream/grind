@@ -171,8 +171,8 @@ pub fn unique_domain_lock_query(
   input: input,
 ) -> pog.Query(Bool) {
   let worker_meta = worker.metadata(worker_def)
-  let encoded_input = worker.encode_input(worker_def, input)
-  let #(key_contract, encoded_key) =
+  let assert Ok(encoded_input) = worker.encode_input(worker_def, input)
+  let assert Ok(#(key_contract, encoded_key)) =
     unique.key_material(
       unique.full_input(),
       input,

@@ -115,9 +115,17 @@ fn run_handle_cross_installation_test(base_url: String) -> Nil {
   |> should.not_equal(postgres.installation(database_b))
 
   let assert Ok(input_codec) =
-    worker.codec("cross-installation-input-v1", json.int, decode.int)
+    worker.codec(
+      "cross-installation-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cross-installation-output-v1", json.string, decode.string)
+    worker.codec(
+      "cross-installation-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker_def) =
     worker.define(
       "cross-installation.worker",

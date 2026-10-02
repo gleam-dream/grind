@@ -89,9 +89,13 @@ pub fn unique_test_blocking_worker(
   started: process.Subject(LeaseSignal),
 ) -> worker.Worker(Int, String, LookupFailure) {
   let assert Ok(input_codec) =
-    worker.codec(id <> "-input-v1", json.int, decode.int)
+    worker.codec(id <> "-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec(id <> "-output-v1", json.string, decode.string)
+    worker.codec(
+      id <> "-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker_def) =
     worker.define(id, "v1", input_codec, output_codec, fn(value) {
       let release = process.new_subject()

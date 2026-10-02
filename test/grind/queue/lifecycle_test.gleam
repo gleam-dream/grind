@@ -32,7 +32,8 @@ fn stop_cycles(url: String) -> Nil {
   let assert Ok(database) = postgres.start(settings)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
-  let assert Ok(codec) = worker.codec("lifecycle-int", json.int, decode.int)
+  let assert Ok(codec) =
+    worker.codec("lifecycle-int", worker.infallible(json.int), decode.int)
   let assert Ok(definition) =
     worker.define("lifecycle.echo", "v1", codec, codec, Ok)
   let assert Ok(workers) = registry.new("lifecycle")

@@ -36,9 +36,13 @@ fn run_uncertain_resolution_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("resolve-input-v1", json.int, decode.int)
+    worker.codec("resolve-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("resolve-output-v1", json.string, decode.string)
+    worker.codec(
+      "resolve-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let invocations = process.new_subject()
   let assert Ok(worker) =
     worker.define("resolve.echo", "v1", input_codec, output_codec, fn(value) {
@@ -167,9 +171,17 @@ fn run_resolution_payload_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("resolution-payload-input-v1", json.int, decode.int)
+    worker.codec(
+      "resolution-payload-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("resolution-payload-output-v1", json.string, decode.string)
+    worker.codec(
+      "resolution-payload-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(worker) =
     worker.define(
       "resolution.payload",
@@ -255,13 +267,13 @@ fn run_resolution_concurrent_test(database_url: String) -> Nil {
   let assert Ok(input_codec) =
     worker.codec(
       "resolution-concurrent-input-" <> suffix <> "-v1",
-      json.int,
+      worker.infallible(json.int),
       decode.int,
     )
   let assert Ok(output_codec) =
     worker.codec(
       "resolution-concurrent-output-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(definition) =

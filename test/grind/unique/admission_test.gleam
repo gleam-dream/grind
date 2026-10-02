@@ -30,7 +30,8 @@ pub fn unique_period_validation_test() {
 }
 
 pub fn unique_key_and_submission_id_validation_test() {
-  let assert Ok(codec) = worker.codec("unique-key-v1", json.int, decode.int)
+  let assert Ok(codec) =
+    worker.codec("unique-key-v1", worker.infallible(json.int), decode.int)
   unique.selected("", fn(input: Int) { input }, codec)
   |> should.equal(Error(unique.EmptyKeyName))
   let assert Ok(_) = unique.selected("account", fn(input: Int) { input }, codec)
@@ -188,13 +189,13 @@ fn run_submit_unique_json_equality_test(database_url: String) -> Nil {
   let assert Ok(input_codec) =
     worker.codec(
       "unique-json-input-" <> suffix <> "-v1",
-      encode_raw_input,
+      worker.infallible(encode_raw_input),
       raw_input_decoder(),
     )
   let assert Ok(output_codec) =
     worker.codec(
       "unique-json-output-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(worker_def) =
@@ -286,13 +287,13 @@ fn run_submit_unique_worker_identity_test(database_url: String) -> Nil {
   let assert Ok(input_codec) =
     worker.codec(
       "unique-identity-input-" <> suffix <> "-v1",
-      json.int,
+      worker.infallible(json.int),
       decode.int,
     )
   let assert Ok(output_codec) =
     worker.codec(
       "unique-identity-output-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let worker_id = "unique.identity-" <> suffix

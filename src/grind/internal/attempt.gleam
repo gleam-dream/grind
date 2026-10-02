@@ -426,7 +426,7 @@ pub fn acknowledge(
             option_version(actual_version),
           ))
       }
-    worker.ExecutedInvalidInput(_) ->
+    worker.ExecutedInvalidInput(_) | worker.ExecutedUnencodable(_, _) ->
       run_acknowledgement(
         database,
         queue,
@@ -905,6 +905,17 @@ fn run_acknowledgement(
         error: None,
         failure_description: Some(description),
       )
+    worker.ExecutedUnencodable(codec, reason) ->
+      AckProposal(
+        proposed_state: "runtime_failed",
+        failure_cause: None,
+        requested_delay_ms: None,
+        output_version: None,
+        output: None,
+        error_version: None,
+        error: None,
+        failure_description: Some(worker.unencodable_description(codec, reason)),
+      )
     worker.ExecutedSnoozed(delay_ms, reason) ->
       AckProposal(
         proposed_state: "snoozed",
@@ -1100,6 +1111,7 @@ fn proposed_of_execution(execution: worker.Execution) -> observation.Proposed {
       observation.ProposedBusinessFailure
     worker.ExecutedRetryable(_, _, _, _) -> observation.ProposedRetryable
     worker.ExecutedInvalidInput(_) -> observation.ProposedRuntimeFailed
+    worker.ExecutedUnencodable(_, _) -> observation.ProposedRuntimeFailed
     worker.ExecutedSnoozed(_, _) -> observation.ProposedSnoozed
     worker.ExecutedDiscarded(_) -> observation.ProposedDiscarded
     worker.ExecutedCancelled(_) -> observation.ProposedCancelled

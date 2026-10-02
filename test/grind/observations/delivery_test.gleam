@@ -57,9 +57,17 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-overflow-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-overflow-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("observation-overflow-output-v1", json.string, decode.string)
+    worker.codec(
+      "observation-overflow-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "observation.overflow",
@@ -163,9 +171,17 @@ fn run_acknowledged_observation_raising_handler_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-raising-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-raising-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("observation-raising-output-v1", json.string, decode.string)
+    worker.codec(
+      "observation-raising-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "observation.raising",
@@ -226,9 +242,17 @@ fn run_forwarder_crash_loop_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("forwarder-crash-input-v1", json.int, decode.int)
+    worker.codec(
+      "forwarder-crash-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("forwarder-crash-output-v1", json.string, decode.string)
+    worker.codec(
+      "forwarder-crash-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("forwarder.crash", "v1", input_codec, output_codec, fn(value) {
       Ok("crash-" <> int.to_string(value))
@@ -323,11 +347,15 @@ fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-dup-sequential-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-dup-sequential-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
     worker.codec(
       "observation-dup-sequential-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(definition) =
@@ -456,11 +484,15 @@ fn run_acknowledged_observation_reconciled_concurrent_duplicate_test(
   let assert [#(database_a, connection_a), #(database_b, _)] = entries
 
   let assert Ok(input_codec) =
-    worker.codec("ack-obs-rr-input-" <> suffix <> "-v1", json.int, decode.int)
+    worker.codec(
+      "ack-obs-rr-input-" <> suffix <> "-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
     worker.codec(
       "ack-obs-rr-output-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(definition) =

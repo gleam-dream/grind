@@ -5,6 +5,14 @@
 //// `fn(input) -> Result(output, error)` and to a `Codec` for each persisted
 //// value. Build codecs with `codec`, and workers with `define`, or with
 //// `define_with_error_codec` when the error must be stored and read back.
+////
+//// A codec's encoder returns `Result(json.Json, String)`, so a validating
+//// codec (a json_blueprint codec with refinements such as `integer_between`)
+//// can reject a value. Wrap a plain gleam_json encoder with `infallible`.
+//// A rejected input fails `submit` with `submission.InvalidInput` before
+//// anything is written. A rejected output or error, after the handler ran,
+//// ends the job as `job.RuntimeFailed`: it is not retried, and
+//// `postgres.outcome` returns `job.FailedOperationally` with the reason.
 //// `with_queue_handler` lets a handler return a `WorkerResponse` that snoozes,
 //// discards, cancels or reports an uncertain outcome. `with_max_attempts` and
 //// `with_retry_policy` control retries. Register workers in a `grind/registry`,
@@ -20,7 +28,7 @@ import gleam/string
 pub opaque type Codec(value) {
   Codec(
     version: String,
-    encode: fn(value) -> json.Json,
+    encode: fn(value) -> Result(json.Json, String),
     decoder: decode.Decoder(value),
   )
 }
@@ -30,15 +38,46 @@ pub type CodecError {
 }
 
 /// Creates a JSON codec whose version is persisted with each job.
+///
+/// `encode` may reject a value with a reason, which Grind reports without
+/// parsing it: `submit` returns `submission.InvalidInput(reason)` and writes
+/// nothing, and a worker whose output or error is rejected ends the job as
+/// `job.RuntimeFailed`. A plain gleam_json encoder cannot fail; wrap it with
+/// `infallible`:
+///
+/// ```gleam
+/// worker.codec("email-v1", worker.infallible(encode_email), email_decoder())
+/// ```
+///
+/// A json_blueprint codec maps its encode error to the reason:
+///
+/// ```gleam
+/// worker.codec(
+///   "invoice-v1",
+///   fn(value) {
+///     codec.to_json(invoice_codec, value)
+///     |> result.map_error(codec.describe_encode_error)
+///   },
+///   codec.decoder(invoice_codec),
+/// )
+/// ```
 pub fn codec(
   version: String,
-  encode: fn(value) -> json.Json,
+  encode: fn(value) -> Result(json.Json, String),
   decoder: decode.Decoder(value),
 ) -> Result(Codec(value), CodecError) {
   case version {
     "" -> Error(EmptyCodecVersion)
     _ -> Ok(Codec(version:, encode:, decoder:))
   }
+}
+
+/// Adapts an encoder that cannot fail, such as `json.string` or a
+/// hand-written gleam_json encoder, to the encoder shape `codec` takes.
+pub fn infallible(
+  encode: fn(value) -> json.Json,
+) -> fn(value) -> Result(json.Json, String) {
+  fn(value) { Ok(encode(value)) }
 }
 
 pub type DefinitionError {
@@ -394,14 +433,15 @@ pub fn metadata(worker: Worker(input, output, error)) -> Metadata {
   )
 }
 
-/// Internal JSON encoding used at admission.
+/// Internal JSON encoding used at admission. `Error` carries the input
+/// codec's own rejection reason.
 @internal
 pub fn encode_input(
   worker: Worker(input, output, error),
   input: input,
-) -> String {
+) -> Result(String, String) {
   let Worker(input: Codec(encode:, ..), ..) = worker
-  encode(input) |> json.to_string
+  encode(input) |> result.map(json.to_string)
 }
 
 /// Internal codec result used by typed job retrieval.
@@ -425,11 +465,16 @@ pub fn decode_codec(
   }
 }
 
-/// Internal version and JSON encoding view used by audited typed outcomes.
+/// Internal version and JSON encoding view used by audited typed outcomes
+/// and unique keys. `Error` carries the codec's own rejection reason.
 @internal
-pub fn encode_value(codec: Codec(value), value: value) -> #(String, String) {
+pub fn encode_value(
+  codec: Codec(value),
+  value: value,
+) -> Result(#(String, String), String) {
   let Codec(version:, encode:, ..) = codec
-  #(version, json.to_string(encode(value)))
+  encode(value)
+  |> result.map(fn(encoded) { #(version, json.to_string(encoded)) })
 }
 
 @internal
@@ -463,6 +508,11 @@ pub type Execution {
   ExecutedCancelled(String)
   ExecutedUncertain(String)
   ExecutedInvalidInput(String)
+  /// The handler ran, and its output codec (`OutputCodec`) or error codec
+  /// (`ErrorCodec`) rejected the value it returned. Committed as
+  /// `runtime_failed`, which is terminal: the job is not retried, because
+  /// the handler's effects already happened.
+  ExecutedUnencodable(codec: CodecKind, reason: String)
 }
 
 /// Internal erased invocation. The closure remains bound to this worker's types.
@@ -473,38 +523,40 @@ pub fn execute_encoded(
   encoded_input: String,
   context: RetryContext,
 ) -> Execution {
-  let Worker(
-    input: input_codec,
-    output: Codec(version: output_version, encode: encode_output, ..),
-    ..,
-  ) = worker
+  let Worker(input: input_codec, output: output_codec, ..) = worker
   case decode_codec(input_codec, input_version, encoded_input) {
     Error(decode_error) -> ExecutedInvalidInput(string.inspect(decode_error))
     Ok(input) -> {
       let response = respond(worker, input)
       case resolve_response(worker, response, context) {
         ResolvedSucceeded(output) ->
-          ExecutedSuccess(output_version, json.to_string(encode_output(output)))
-        ResolvedRetryable(application_error, delay) -> {
-          let #(error_version, encoded_error) =
-            encode_error(worker, application_error)
-          ExecutedRetryable(
-            error_version,
-            encoded_error,
-            "worker returned an application error",
-            retry_delay_milliseconds(delay),
-          )
-        }
-        ResolvedBusinessFailure(application_error, cause) -> {
-          let #(error_version, encoded_error) =
-            encode_error(worker, application_error)
-          ExecutedBusinessFailure(
-            error_version,
-            encoded_error,
-            "worker returned an application error",
-            cause,
-          )
-        }
+          case encode_value(output_codec, output) {
+            Ok(#(output_version, encoded_output)) ->
+              ExecutedSuccess(output_version, encoded_output)
+            Error(reason) -> ExecutedUnencodable(OutputCodec, reason)
+          }
+        ResolvedRetryable(application_error, delay) ->
+          case encode_error(worker, application_error) {
+            Ok(#(error_version, encoded_error)) ->
+              ExecutedRetryable(
+                error_version,
+                encoded_error,
+                "worker returned an application error",
+                retry_delay_milliseconds(delay),
+              )
+            Error(reason) -> ExecutedUnencodable(ErrorCodec, reason)
+          }
+        ResolvedBusinessFailure(application_error, cause) ->
+          case encode_error(worker, application_error) {
+            Ok(#(error_version, encoded_error)) ->
+              ExecutedBusinessFailure(
+                error_version,
+                encoded_error,
+                "worker returned an application error",
+                cause,
+              )
+            Error(reason) -> ExecutedUnencodable(ErrorCodec, reason)
+          }
         ResolvedSnoozed(delay, reason) ->
           ExecutedSnoozed(retry_delay_milliseconds(delay), reason)
         ResolvedDiscarded(reason) -> ExecutedDiscarded(reason)
@@ -518,14 +570,26 @@ pub fn execute_encoded(
 fn encode_error(
   worker: Worker(input, output, error),
   application_error: error,
-) -> #(Option(String), Option(String)) {
+) -> Result(#(Option(String), Option(String)), String) {
   let Worker(error:, ..) = worker
   case error {
-    Some(Codec(version:, encode:, ..)) -> #(
-      Some(version),
-      Some(json.to_string(encode(application_error))),
-    )
-    None -> #(None, None)
+    Some(codec) ->
+      encode_value(codec, application_error)
+      |> result.map(fn(encoded) {
+        let #(version, encoded_error) = encoded
+        #(Some(version), Some(encoded_error))
+      })
+    None -> Ok(#(None, None))
+  }
+}
+
+/// The stored failure description for an `ExecutedUnencodable` proposal.
+@internal
+pub fn unencodable_description(codec: CodecKind, reason: String) -> String {
+  case codec {
+    OutputCodec -> "output codec rejected the handler's output: " <> reason
+    ErrorCodec -> "error codec rejected the handler's error: " <> reason
+    InputCodec -> "input codec rejected the value: " <> reason
   }
 }
 

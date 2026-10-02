@@ -106,9 +106,17 @@ fn run_consumer_stop_timeout_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("stop-timeout-input-v1", json.int, decode.int)
+    worker.codec(
+      "stop-timeout-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("stop-timeout-output-v1", json.string, decode.string)
+    worker.codec(
+      "stop-timeout-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("stop.timeout", "v1", input_codec, output_codec, fn(value) {
@@ -186,9 +194,13 @@ fn run_consumer_stop_drain_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("stop-drain-input-v1", json.int, decode.int)
+    worker.codec("stop-drain-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("stop-drain-output-v1", json.string, decode.string)
+    worker.codec(
+      "stop-drain-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("stop.drain", "v1", input_codec, output_codec, fn(value) {
@@ -254,9 +266,17 @@ fn run_consumer_forced_stop_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("stop-forced-input-v1", json.int, decode.int)
+    worker.codec(
+      "stop-forced-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("stop-forced-output-v1", json.string, decode.string)
+    worker.codec(
+      "stop-forced-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invocations = process.new_subject()
   let assert Ok(definition) =
@@ -364,9 +384,17 @@ fn run_forced_stop_pool_cleanup_test(database_url: String) -> Nil {
   let observer_connection = postgres.connection(observer)
 
   let assert Ok(input_codec) =
-    worker.codec("forced-stop-cleanup-input-v1", json.int, decode.int)
+    worker.codec(
+      "forced-stop-cleanup-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("forced-stop-cleanup-output-v1", json.string, decode.string)
+    worker.codec(
+      "forced-stop-cleanup-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invocations = process.new_subject()
   let assert Ok(definition) =
@@ -471,9 +499,13 @@ fn run_automatic_drain_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-drain-input-v1", json.int, decode.int)
+    worker.codec("auto-drain-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("auto-drain-output-v1", json.string, decode.string)
+    worker.codec(
+      "auto-drain-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("auto.drain", "v1", input_codec, output_codec, fn(value) {
@@ -561,9 +593,17 @@ fn run_foreign_stop_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("foreign-stop-input-v1", json.int, decode.int)
+    worker.codec(
+      "foreign-stop-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("foreign-stop-output-v1", json.string, decode.string)
+    worker.codec(
+      "foreign-stop-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("foreign.stop", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
@@ -624,9 +664,17 @@ fn run_stop_without_drain_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("stop-without-drain-input-v1", json.int, decode.int)
+    worker.codec(
+      "stop-without-drain-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("stop-without-drain-output-v1", json.string, decode.string)
+    worker.codec(
+      "stop-without-drain-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "stop.without-drain",
@@ -661,9 +709,17 @@ fn run_stale_shutdown_grace_timer_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("stale-grace-input-v1", json.int, decode.int)
+    worker.codec(
+      "stale-grace-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("stale-grace-output-v1", json.string, decode.string)
+    worker.codec(
+      "stale-grace-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define("stale.grace", "v1", input_codec, output_codec, fn(value) {

@@ -321,9 +321,13 @@ fn run_prune_finished_test(database_url: String, owner_b_url: String) -> Nil {
   // -- After a job is pruned: everything about it reports "not found",
   // -- never a different, misleading error -----------------------------------
   let assert Ok(gone_worker) =
-    worker.codec("prune-gone-input-v1", json.int, decode.int)
+    worker.codec("prune-gone-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(gone_output) =
-    worker.codec("prune-gone-output-v1", json.string, decode.string)
+    worker.codec(
+      "prune-gone-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(gone_worker_def) =
     worker.define(
       "prune.gone-worker",
@@ -355,9 +359,17 @@ fn run_prune_finished_test(database_url: String, owner_b_url: String) -> Nil {
   // -- submit_with_id: idempotency only holds within the retention window --
   let assert Ok(replay_submission) = submission.submission_id("prune-replay")
   let assert Ok(replay_worker) =
-    worker.codec("prune-replay-input-v1", json.int, decode.int)
+    worker.codec(
+      "prune-replay-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(replay_output) =
-    worker.codec("prune-replay-output-v1", json.string, decode.string)
+    worker.codec(
+      "prune-replay-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(replay_worker_def) =
     worker.define(
       "prune.replay-worker",

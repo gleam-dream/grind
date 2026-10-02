@@ -173,9 +173,14 @@ fn kind_decoder() -> decode.Decoder(Kind) {
 
 fn run(database: postgres.Database, scenario: Scenario) -> json.Json {
   let calls = process.new_subject()
-  let assert Ok(codec) = worker.codec("paired-int-v1", json.int, decode.int)
+  let assert Ok(codec) =
+    worker.codec("paired-int-v1", worker.infallible(json.int), decode.int)
   let assert Ok(errors) =
-    worker.codec("paired-error-v1", json.string, decode.string)
+    worker.codec(
+      "paired-error-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(delay) = worker.retry_delay(scenario.delay_ms)
   let assert Ok(definition) =
     worker.define_with_error_codec(

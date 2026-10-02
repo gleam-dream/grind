@@ -134,13 +134,13 @@ fn run_state_eligibility_matrix_test(database_url: String) -> Nil {
   let assert Ok(input_codec) =
     worker.codec(
       "unique-states-input-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(output_codec) =
     worker.codec(
       "unique-states-output-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(worker_def) =

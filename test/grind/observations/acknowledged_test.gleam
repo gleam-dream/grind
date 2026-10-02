@@ -74,9 +74,17 @@ fn run_acknowledged_commit_ordering_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-ordering-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-ordering-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("observation-ordering-output-v1", json.string, decode.string)
+    worker.codec(
+      "observation-ordering-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "observation.ordering",
@@ -157,9 +165,17 @@ fn run_acknowledged_observation_isolation_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-isolation-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-isolation-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("observation-isolation-output-v1", json.string, decode.string)
+    worker.codec(
+      "observation-isolation-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
@@ -273,11 +289,15 @@ fn run_acknowledged_observation_absent_on_commit_unknown_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-commit-unknown-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-commit-unknown-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
     worker.codec(
       "observation-commit-unknown-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let started = process.new_subject()
@@ -398,9 +418,17 @@ fn run_acknowledged_observation_absent_on_stale_ack_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-stale-ack-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-stale-ack-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("observation-stale-ack-output-v1", json.string, decode.string)
+    worker.codec(
+      "observation-stale-ack-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(slow_worker) =
@@ -503,9 +531,17 @@ fn run_acknowledged_observation_reconciled_after_lost_reply_test(
   let connection = postgres.connection(database)
   require_syncrep_cluster_configured(connection)
   let assert Ok(input_codec) =
-    worker.codec("observation-reply-lost-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-reply-lost-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("observation-reply-lost-output-v1", json.string, decode.string)
+    worker.codec(
+      "observation-reply-lost-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =
@@ -645,11 +681,15 @@ fn run_acknowledged_observation_committed_state_overrides_proposal_test(
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("observation-cancel-running-input-v1", json.int, decode.int)
+    worker.codec(
+      "observation-cancel-running-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
     worker.codec(
       "observation-cancel-running-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let started = process.new_subject()

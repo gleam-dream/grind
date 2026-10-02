@@ -70,11 +70,15 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
   require_syncrep_cluster_configured(observer_connection)
 
   let assert Ok(input_codec) =
-    worker.codec("ack-reply-lost-unavailable-input-v1", json.int, decode.int)
+    worker.codec(
+      "ack-reply-lost-unavailable-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
     worker.codec(
       "ack-reply-lost-unavailable-output-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let started = process.new_subject()
@@ -208,9 +212,9 @@ fn run_ack_receipt_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("ack-input-v1", json.int, decode.int)
+    worker.codec("ack-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("ack-output-v1", json.string, decode.string)
+    worker.codec("ack-output-v1", worker.infallible(json.string), decode.string)
   let invocation = process.new_subject()
   let assert Ok(definition) =
     worker.define("ack.receipt", "v1", input_codec, output_codec, fn(value) {
@@ -404,9 +408,9 @@ fn run_batch_partial_error_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("partial-input-v1", json.int, decode.int)
+    worker.codec("partial-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("partial-output-v1", json.int, decode.int)
+    worker.codec("partial-output-v1", worker.infallible(json.int), decode.int)
   let assert Ok(first_worker) =
     worker.define(
       "batch.partial.first",
@@ -506,11 +510,15 @@ fn run_ack_duplicate_repeatable_read_test(database_url: String) -> Nil {
   let assert [#(database_a, connection_a), #(database_b, _)] = entries
 
   let assert Ok(input_codec) =
-    worker.codec("ack-rr-input-" <> suffix <> "-v1", json.int, decode.int)
+    worker.codec(
+      "ack-rr-input-" <> suffix <> "-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
     worker.codec(
       "ack-rr-output-" <> suffix <> "-v1",
-      json.string,
+      worker.infallible(json.string),
       decode.string,
     )
   let assert Ok(definition) =

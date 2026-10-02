@@ -242,9 +242,17 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   // 3. Fully functional for ordinary API traffic: submit, claim, and run a
   // job to completion against the cigogne-applied schema.
   let assert Ok(input_codec) =
-    worker.codec("cigogne-e2e-input-v1", json.int, decode.int)
+    worker.codec(
+      "cigogne-e2e-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("cigogne-e2e-output-v1", json.string, decode.string)
+    worker.codec(
+      "cigogne-e2e-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "cigogne.e2e-worker",

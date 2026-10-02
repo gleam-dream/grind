@@ -5,6 +5,11 @@
 - Caller-defined worker inputs, outputs, and errors use ordinary versioned JSON
   codecs. Worker identity and codec metadata come from the definition; registry
   selection binds types before heterogeneous storage.
+- A codec's encoder may reject a value. A rejected input or `selected` key
+  fails every submit path with `submission.InvalidInput` before any storage
+  call. A rejected handler output or error commits the attempt as terminal
+  `runtime_failed`, with no retry; a rejected `resolve_uncertain` value
+  returns `ResolutionInvalidValue` before any write.
 - PostgreSQL settings are validated before the package starts a connection pool,
   including a bounded uniqueness-lock wait (`unique_lock_wait`, default 2000ms,
   must be positive) and a deadline (`statement_deadline`, default 4000ms,

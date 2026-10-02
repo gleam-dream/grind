@@ -50,9 +50,9 @@ fn run_scheduled_due_time_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("scheduled-input-v1", json.int, decode.int)
+    worker.codec("scheduled-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("scheduled-output-v1", json.int, decode.int)
+    worker.codec("scheduled-output-v1", worker.infallible(json.int), decode.int)
   let probe = process.new_subject()
   let assert Ok(scheduled_worker) =
     worker.define("scheduled.echo", "v1", input_codec, output_codec, fn(value) {
@@ -129,9 +129,17 @@ fn run_automatic_wakeup_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("auto-wakeup-input-v1", json.int, decode.int)
+    worker.codec(
+      "auto-wakeup-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("auto-wakeup-output-v1", json.bool, decode.bool)
+    worker.codec(
+      "auto-wakeup-output-v1",
+      worker.infallible(json.bool),
+      decode.bool,
+    )
   let connection = postgres.connection(database)
   let observed = process.new_subject()
   let lease_duration_ms = 5000
@@ -208,9 +216,9 @@ fn run_queue_batch_policy_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("batch-input-v1", json.int, decode.int)
+    worker.codec("batch-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("batch-output-v1", json.int, decode.int)
+    worker.codec("batch-output-v1", worker.infallible(json.int), decode.int)
   let assert Ok(increment) =
     worker.define("batch.increment", "v1", input_codec, output_codec, fn(value) {
       Ok(value + 1)
@@ -247,9 +255,13 @@ fn run_automatic_queue_fairness_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("fairness-input-v1", json.int, decode.int)
+    worker.codec("fairness-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("fairness-output-v1", json.string, decode.string)
+    worker.codec(
+      "fairness-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let probe = process.new_subject()
   let assert Ok(incompatible) =
     worker.define("queue.drift", "v1", input_codec, output_codec, fn(value) {

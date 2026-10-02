@@ -23,9 +23,13 @@ fn run_postgres_admission_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("integer-input-v1", json.int, decode.int)
+    worker.codec("integer-input-v1", worker.infallible(json.int), decode.int)
   let assert Ok(output_codec) =
-    worker.codec("text-output-v1", json.string, decode.string)
+    worker.codec(
+      "text-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(counter) =
     worker.define(
       "counter.increment",

@@ -94,6 +94,48 @@ resolution, uniqueness admission, and `submit_with_id` retries. Read
 working, copy-pasteable shape; the snippet below covers the same steps in
 isolation, the minimum to get a queue polling.
 
+## Codecs
+
+A worker persists its input, output and error through versioned JSON
+codecs. `worker.codec(version, encode, decoder)` takes an encoder that
+returns `Result(json.Json, String)`, so a validating codec can reject a
+value. Wrap a plain gleam_json encoder with `worker.infallible`:
+
+```gleam
+let assert Ok(email) =
+  worker.codec("email-v1", worker.infallible(encode_email), email_decoder())
+```
+
+A json_blueprint codec's `to_json` can fail on a refinement such as
+`integer_between`. Map its encode error to the reason, and the same
+Blueprint codec serves Grind without a panic or a stored `null`:
+
+```gleam
+let assert Ok(invoice) =
+  worker.codec(
+    "invoice-v1",
+    fn(value) {
+      codec.to_json(invoice_codec, value)
+      |> result.map_error(codec.describe_encode_error)
+    },
+    codec.decoder(invoice_codec),
+  )
+```
+
+When an encoder rejects a value:
+
+| Value rejected                                      | Result                                                                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| Input, or a `unique.selected` key, at submit        | Every submit path returns `submission.InvalidInput(reason)` before checking out a connection. No job row and no receipt are written.    |
+| Handler output, after the handler ran               | The job ends `job.RuntimeFailed` on that attempt and is not retried. `postgres.outcome` returns `job.FailedOperationally(description)`. |
+| Handler error, after the handler ran                | The same terminal `job.RuntimeFailed`, even with retries left.                                                                          |
+| A value confirmed with `postgres.resolve_uncertain` | `postgres.ResolutionInvalidValue(reason)`, before any write. The job stays `Uncertain`.                                                 |
+
+The description is `"output codec rejected the handler's output: <reason>"`
+or `"error codec rejected the handler's error: <reason>"`. A rejected output
+or error is not retried: the handler's effects already happened, and the
+codec, not the job, is at fault.
+
 ## Starting a consumer
 
 The ordinary path needs no policy customization —

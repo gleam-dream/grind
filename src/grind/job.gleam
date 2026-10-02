@@ -213,6 +213,9 @@ pub type Outcome(output, error) {
   BusinessFailedWithCause(error, BusinessFailureCause)
   DiscardedWithReason(String)
   CancelledWithReason(String)
+  /// A terminal failure that carries no typed error: invalid stored input, a
+  /// handler output or error that its codec rejected (both `RuntimeFailed`),
+  /// a codec contract mismatch, or a business failure without an error codec.
   FailedOperationally(String)
   FailedOperationallyWithCause(String, BusinessFailureCause)
   /// A worker declared or recovery detected an uncertain outcome needing an
@@ -333,21 +336,23 @@ pub fn reconciliation_fields(
 }
 
 /// Encodes a caller-confirmed output using the admitted job's bound codec.
+/// `Error` carries the codec's rejection reason.
 @internal
 pub fn encode_reconciled_success(
   handle: JobHandle(input, output, error),
   value: output,
-) -> #(String, String) {
+) -> Result(#(String, String), String) {
   let JobHandle(output:, ..) = handle
   worker.encode_value(output, value)
 }
 
-/// Encodes a caller-confirmed business error when the worker retained a codec.
+/// Encodes a caller-confirmed business error when the worker retained a
+/// codec. `Error` carries the codec's rejection reason.
 @internal
 pub fn encode_reconciled_error(
   handle: JobHandle(input, output, error),
   value: error,
-) -> Option(#(String, String)) {
+) -> Option(Result(#(String, String), String)) {
   let JobHandle(error:, ..) = handle
   case error {
     Some(codec) -> Some(worker.encode_value(codec, value))

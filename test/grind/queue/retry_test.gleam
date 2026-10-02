@@ -49,9 +49,17 @@ fn run_default_retry_backoff_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("default-retry-input-v1", json.int, decode.int)
+    worker.codec(
+      "default-retry-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("default-retry-output-v1", json.string, decode.string)
+    worker.codec(
+      "default-retry-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "worker.default.retry",
@@ -116,9 +124,17 @@ fn run_retry_delay_maximum_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("maximum-delay-input-v1", json.int, decode.int)
+    worker.codec(
+      "maximum-delay-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("maximum-delay-output-v1", json.string, decode.string)
+    worker.codec(
+      "maximum-delay-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let maximum_delay_ms = worker.retry_delay_maximum_milliseconds()
   let assert Ok(delay) = worker.retry_delay(maximum_delay_ms)
   let assert Ok(ordinary) =
@@ -200,9 +216,17 @@ fn run_retry_declined_without_error_codec_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("retry-declined-input-v1", json.int, decode.int)
+    worker.codec(
+      "retry-declined-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("retry-declined-output-v1", json.string, decode.string)
+    worker.codec(
+      "retry-declined-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define(
       "worker.retry.declined",
@@ -225,7 +249,7 @@ fn run_retry_declined_without_error_codec_test(database_url: String) -> Nil {
   let assert Ok(error_codec) =
     worker.codec(
       "retry-declined-error-v1",
-      encode_lookup_failure,
+      worker.infallible(encode_lookup_failure),
       decode_lookup_failure(),
     )
   let assert Ok(typed_definition) =
@@ -317,13 +341,21 @@ fn run_business_retry_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("business-retry-input-v1", json.int, decode.int)
+    worker.codec(
+      "business-retry-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("business-retry-output-v1", json.string, decode.string)
+    worker.codec(
+      "business-retry-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(error_codec) =
     worker.codec(
       "business-retry-error-v1",
-      encode_lookup_failure,
+      worker.infallible(encode_lookup_failure),
       decode_lookup_failure(),
     )
   let assert Ok(delay) = worker.retry_delay(60_000)

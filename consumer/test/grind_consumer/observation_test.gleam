@@ -36,9 +36,17 @@ fn run_public_consumer_observation_test(url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
 
   let assert Ok(input_codec) =
-    worker.codec("consumer-observation-input-v1", json.int, decode.int)
+    worker.codec(
+      "consumer-observation-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("consumer-observation-output-v1", json.string, decode.string)
+    worker.codec(
+      "consumer-observation-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(echo_worker) =
     worker.define(
       "consumer.observation.echo",
@@ -96,9 +104,17 @@ fn run_public_consumer_claimed_observation_test(url: String) -> Nil {
   let assert Ok(Nil) = postgres.migrate(database)
 
   let assert Ok(input_codec) =
-    worker.codec("consumer-claimed-input-v1", json.int, decode.int)
+    worker.codec(
+      "consumer-claimed-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("consumer-claimed-output-v1", json.string, decode.string)
+    worker.codec(
+      "consumer-claimed-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(echo_worker) =
     worker.define(
       "consumer.claimed.echo",

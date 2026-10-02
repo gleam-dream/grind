@@ -32,8 +32,28 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   consumer slice", and it gives a complete example.
 - A regression test that `string.inspect` of `Settings`,
   `ValidatedSettings` and `Database` does not contain the database password.
+- `worker.infallible(encode)` adapts a total gleam_json encoder to the
+  fallible encoder shape `worker.codec` takes.
+- `submission.InvalidInput(reason)`: every submit path (`submit`,
+  `submit_at`, `submit_with_id`, `submit_unique`) returns it when the input
+  codec or a `unique.selected` key codec rejects the value. It is checked
+  before a connection is checked out, so no job row or receipt is written.
+- `postgres.ResolutionInvalidValue(reason)`: `resolve_uncertain` returns it
+  when the job's output or error codec rejects the confirmed value, before
+  any write.
+- `worker.ExecutedUnencodable(codec, reason)`: the handler's output or error
+  was rejected by its codec after the handler ran. It commits as
+  `runtime_failed`, which is terminal and not retried, with the description
+  `"output codec rejected the handler's output: <reason>"` or
+  `"error codec rejected the handler's error: <reason>"`.
 
 ### Changed
+
+- `worker.codec(version, encode, decoder)` takes
+  `encode: fn(value) -> Result(json.Json, String)` instead of
+  `fn(value) -> json.Json`, so a validating codec (a json_blueprint codec
+  with refinements) can reject a value instead of panicking or storing a
+  value its decoder refuses. Wrap a plain encoder with `worker.infallible`.
 
 - `postgres.Settings.database_url` is now `fn() -> String` instead of
   `String`, so `string.inspect`, crash reports and logger metadata no longer

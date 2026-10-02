@@ -190,9 +190,17 @@ fn run_finished_at_paths_test(database_url: String) -> Nil {
   let run_queue = "finished-at-run"
 
   let assert Ok(plain_input) =
-    worker.codec("finished-at-plain-input-v1", json.int, decode.int)
+    worker.codec(
+      "finished-at-plain-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(plain_output) =
-    worker.codec("finished-at-plain-output-v1", json.string, decode.string)
+    worker.codec(
+      "finished-at-plain-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(succeeded_worker) =
     worker.define(
       "finished-at.succeeded",
@@ -204,7 +212,7 @@ fn run_finished_at_paths_test(database_url: String) -> Nil {
   let assert Ok(error_codec) =
     worker.codec(
       "finished-at-error-v1",
-      encode_lookup_failure,
+      worker.infallible(encode_lookup_failure),
       decode_lookup_failure(),
     )
   let assert Ok(business_failed_worker) =

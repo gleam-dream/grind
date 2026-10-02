@@ -39,8 +39,10 @@ fn database_url() -> Result(String, Nil)
 fn mark(name: String) -> Nil
 
 fn echo_worker(id: String) -> worker.Worker(Int, Int, Nil) {
-  let assert Ok(input) = worker.codec(id <> "-input-v1", json.int, decode.int)
-  let assert Ok(output) = worker.codec(id <> "-output-v1", json.int, decode.int)
+  let assert Ok(input) =
+    worker.codec(id <> "-input-v1", worker.infallible(json.int), decode.int)
+  let assert Ok(output) =
+    worker.codec(id <> "-output-v1", worker.infallible(json.int), decode.int)
   let assert Ok(definition) =
     worker.define(id, "v1", input, output, fn(value) { Ok(value) })
   definition

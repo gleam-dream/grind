@@ -57,9 +57,17 @@ fn run_admitted_plain_submit_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(input_codec) =
-    worker.codec("admitted-plain-input-v1", json.int, decode.int)
+    worker.codec(
+      "admitted-plain-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
   let assert Ok(output_codec) =
-    worker.codec("admitted-plain-output-v1", json.string, decode.string)
+    worker.codec(
+      "admitted-plain-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
   let assert Ok(definition) =
     worker.define("admitted.plain", "v1", input_codec, output_codec, fn(value) {
       Ok(int.to_string(value))
