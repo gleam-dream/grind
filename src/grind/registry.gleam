@@ -1,3 +1,11 @@
+//// Collects the workers that one queue's consumer runs.
+////
+//// Create a `Registry` for a queue name with `new`, add each worker with
+//// `register`, and pass it to `queue.start`. A registry may hold workers with
+//// different input, output and error types. Each worker id and version may be
+//// registered once. A consumer runs only jobs whose exact worker id and version
+//// are registered; there is no fallback to another version.
+
 import gleam/list
 import gleam/option.{type Option}
 import grind/worker.{type Worker}

@@ -1,3 +1,15 @@
+//// Defines typed, versioned workers and the JSON codecs that persist their
+//// input, output and error.
+////
+//// A `Worker` binds an id and a version to a handler
+//// `fn(input) -> Result(output, error)` and to a `Codec` for each persisted
+//// value. Build codecs with `codec`, and workers with `define`, or with
+//// `define_with_error_codec` when the error must be stored and read back.
+//// `with_queue_handler` lets a handler return a `WorkerResponse` that snoozes,
+//// discards, cancels or reports an uncertain outcome. `with_max_attempts` and
+//// `with_retry_policy` control retries. Register workers in a `grind/registry`,
+//// submit jobs with `grind/postgres` and run them with `grind/queue`.
+
 import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{type Option, None, Some}

@@ -1,5 +1,15 @@
-//// Public queue policy and coordinator. Internal queue modules own the
-//// active-attempt ledger, temporary worker, startup handoff, and timers.
+//// Starts and stops the supervised consumer that claims and runs one queue's
+//// jobs.
+////
+//// Build a `QueuePolicy` from `default_policy()` with the `with_` setters and
+//// check it with `validate_policy`, or use `default_policy_validated()`. Then
+//// `start` a `Consumer` for a `grind/postgres` `Database` and a
+//// `grind/registry` `Registry`. With automatic polling, the consumer claims due
+//// jobs into every free slot up to `maximum_concurrency`. With manual polling,
+//// the caller drives it with `process_one` or `process_available`. Each
+//// attempt holds a database-time lease that a separate pool renews. `stop`
+//// drains running handlers and pending acknowledgements, up to the shutdown
+//// grace, then stops the consumer's process tree.
 
 import exception
 import gleam/erlang/process
@@ -41,7 +51,7 @@ pub opaque type Consumer {
 
 /// How a consumer discovers newly-due work: `PollEvery` schedules its own
 /// recurring `Poll` message on this timer; `Manual` schedules none, and a
-/// caller drives each attempt through `process_one`/`process_batch` instead.
+/// caller drives each attempt through `process_one`/`process_available` instead.
 pub type Polling {
   PollEvery(interval_ms: Int)
   Manual
@@ -135,7 +145,7 @@ pub fn with_poll_interval(
 
 /// Disables automatic polling: the started consumer schedules no `Poll`
 /// timer of its own, and a caller must drive each attempt through
-/// `process_one`/`process_batch` instead.
+/// `process_one`/`process_available` instead.
 pub fn with_manual_polling(policy: QueuePolicy) -> QueuePolicy {
   QueuePolicy(..policy, polling: Manual)
 }

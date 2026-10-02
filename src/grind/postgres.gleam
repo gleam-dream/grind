@@ -1,6 +1,14 @@
-//// Public PostgreSQL facade: configuration, database ownership, and typed
-//// storage operations. Migration execution, audited resolution, and job
-//// reads live in `grind/internal/postgres`.
+//// Owns Grind's PostgreSQL pool and every storage operation: migrations,
+//// job submission, job reads, cancellation, audited resolution and pruning.
+////
+//// Build `Settings` with `settings(database_url)` and the `with_` setters,
+//// check them with `validate`, and `start` a `Database`. Run `migrate` before
+//// first use of a schema. Submit jobs with `submit`, `submit_at`,
+//// `submit_with_id` or `submit_unique`, and read them with `state` and
+//// `outcome`. Pass the `Database` to `grind/queue` to run jobs and to
+//// `grind/pruner` to delete finished ones. The database URL and the pool
+//// configuration are held behind closures, so `string.inspect` of
+//// `Settings`, `ValidatedSettings` or `Database` prints no password.
 
 import gleam/bit_array
 import gleam/dynamic/decode
@@ -37,9 +45,14 @@ import sinal/forwarder.{type Forwarder}
 /// inside `validate`, and stays stable for that resulting `ValidatedSettings`
 /// value's entire lifetime, across every `start`/`close` cycle; see
 /// `validate` and `start`.
+///
+/// `database_url` is a closure that returns the URL, so `string.inspect`,
+/// crash reports and logger metadata print a function reference instead of
+/// a password the URL may carry. Build it with `settings`; call
+/// `settings.database_url()` to read the URL back.
 pub type Settings {
   Settings(
-    database_url: String,
+    database_url: fn() -> String,
     pool_size: Int,
     unique_lock_wait_ms: Int,
     observation_capacity: Int,
@@ -58,7 +71,7 @@ pub type Settings {
 /// "Acknowledgement deadline".
 pub fn settings(database_url: String) -> Settings {
   Settings(
-    database_url:,
+    database_url: fn() { database_url },
     pool_size: 10,
     unique_lock_wait_ms: 2000,
     observation_capacity: 1024,
@@ -200,9 +213,11 @@ pub type ConfigError {
   MigrationDeadlineTooCloseToLockTimeout
 }
 
+/// The pog configuration holds the database password, so it is kept behind a
+/// closure: `string.inspect` of this value prints no password.
 pub opaque type ValidatedSettings {
   ValidatedSettings(
-    pog.Config,
+    fn() -> pog.Config,
     forwarder: Forwarder,
     unique_lock_wait_ms: Int,
     statement_deadline_ms: Int,
@@ -339,45 +354,48 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
       case
         pog.url_config(
           process.new_name("grind_postgres_pool"),
-          settings.database_url,
+          settings.database_url(),
         )
       {
         Error(_) -> Error(InvalidDatabaseUrl)
-        Ok(config) ->
-          Ok(ValidatedSettings(
+        Ok(config) -> {
+          let config =
             config
-              |> pog.pool_size(settings.pool_size)
-              |> pog.connection_parameter(
-                name: "default_transaction_isolation",
-                value: "read committed",
-              )
-              |> pog.connection_parameter(
-                name: "idle_in_transaction_session_timeout",
-                value: int.to_string(2 * settings.statement_deadline_ms),
-              )
-              // Pins every pooled connection's `search_path` to exactly this
-              // one configured schema — see `with_schema`'s own doc comment
-              // and `docs/RISKS.md` #7. This is what makes the advisory lock
-              // key's bound `schema` parameter (see
-              // `grind/internal/unique_admission/query.lock_key_sql`) and every
-              // `current_schema()`-based query elsewhere in this module
-              // (`read_schema_generation` and friends) agree by
-              // construction: there is exactly one schema in `search_path`,
-              // so `current_schema()` can only ever resolve to it (or to
-              // nothing at all, before `migrate` first creates it) — never
-              // silently fall through to an unrelated schema earlier in a
-              // longer `search_path`, the `$user` hazard this pinning
-              // exists to close.
-              |> pog.connection_parameter(
-                name: "search_path",
-                value: quote_ident(settings.schema),
-              ),
+            |> pog.pool_size(settings.pool_size)
+            |> pog.connection_parameter(
+              name: "default_transaction_isolation",
+              value: "read committed",
+            )
+            |> pog.connection_parameter(
+              name: "idle_in_transaction_session_timeout",
+              value: int.to_string(2 * settings.statement_deadline_ms),
+            )
+            // Pins every pooled connection's `search_path` to exactly this
+            // one configured schema — see `with_schema`'s own doc comment
+            // and `docs/RISKS.md` #7. This is what makes the advisory lock
+            // key's bound `schema` parameter (see
+            // `grind/internal/unique_admission/query.lock_key_sql`) and every
+            // `current_schema()`-based query elsewhere in this module
+            // (`read_schema_generation` and friends) agree by
+            // construction: there is exactly one schema in `search_path`,
+            // so `current_schema()` can only ever resolve to it (or to
+            // nothing at all, before `migrate` first creates it) — never
+            // silently fall through to an unrelated schema earlier in a
+            // longer `search_path`, the `$user` hazard this pinning
+            // exists to close.
+            |> pog.connection_parameter(
+              name: "search_path",
+              value: quote_ident(settings.schema),
+            )
+          Ok(ValidatedSettings(
+            fn() { config },
             forwarder: validated_forwarder(settings.observation_capacity),
             unique_lock_wait_ms: settings.unique_lock_wait_ms,
             statement_deadline_ms: settings.statement_deadline_ms,
             migration_deadline_ms: settings.migration_deadline_ms,
             schema: settings.schema,
           ))
+        }
       }
   }
 }
@@ -388,10 +406,12 @@ fn validated_forwarder(capacity: Int) -> Forwarder {
   fwd
 }
 
+/// `config` holds the database password behind a closure, so
+/// `string.inspect` of a `Database` prints no password.
 pub opaque type Database {
   Database(
     connection: pog.Connection,
-    config: pog.Config,
+    config: fn() -> pog.Config,
     supervisor_pid: process.Pid,
     installation: job.Installation,
     unique_lock_wait_ms: Int,
@@ -487,13 +507,14 @@ pub type StartError {
 /// observation".
 pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
   let ValidatedSettings(
-    config,
+    reveal_config,
     forwarder: fwd,
     unique_lock_wait_ms:,
     statement_deadline_ms:,
     migration_deadline_ms:,
     schema:,
   ) = settings
+  let config = reveal_config()
   let pog.Config(pool_name:, ..) = config
   let forwarder_supervisor =
     static_supervisor.new(static_supervisor.OneForOne)
@@ -515,7 +536,7 @@ pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
         Ok(database_oid) ->
           Ok(Database(
             connection,
-            config,
+            reveal_config,
             started.pid,
             job.new_installation(
               database_oid,
@@ -683,7 +704,7 @@ pub fn renewal_pool_config(
   pool_name: process.Name(pog.Message),
 ) -> pog.Config {
   let Database(config:, ..) = database
-  pog.Config(..config, pool_name:, pool_size: 1)
+  pog.Config(..config(), pool_name:, pool_size: 1)
 }
 
 pub type StorageError {

@@ -1,3 +1,12 @@
+//// Defines the typed handle of a persisted job, its states and its outcomes.
+////
+//// `grind/postgres`'s submit functions return a `JobHandle`, which keeps the
+//// worker's codecs so that `postgres.state` and `postgres.outcome` return typed
+//// values. `State` lists the persisted lifecycle states, and `Outcome` is the
+//// last committed result: pending, succeeded, failed, discarded, cancelled, or
+//// waiting for an audited resolution. `available_at` checks an absolute
+//// Unix-millisecond time for `postgres.submit_at`.
+
 import gleam/option.{type Option, None, Some}
 import grind/worker.{type BusinessFailureCause, type Codec, type Worker}
 
