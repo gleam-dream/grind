@@ -7,7 +7,7 @@ description = "A strongly-typed Oban for Gleam: durable, typed background jobs o
 repository = { type = "github", user = "gleam-dream", repo = "grind" }
 
 [dependencies]
-gleam_stdlib = ">= 0.70.0 and < 1.0.0"
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
 # Pinned tight, not the usual `>= x.y.0 and < (x+1).0.0`:
