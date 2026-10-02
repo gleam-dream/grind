@@ -148,7 +148,7 @@ pub fn cancel_before_run(
     decode.success(CancelBeforeRunRow(id:))
   }
 
-  "UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, error_version = NULL, failure_description = 'cancelled by caller', failure_cause = NULL, uncertain_at = NULL, cancel_requested_at = NULL, finished_at = clock_timestamp() WHERE id = $1 AND state IN ('queued', 'scheduled', 'retryable') RETURNING id
+  "UPDATE grind_jobs SET state = 'cancelled', output = NULL, error = NULL, failure_description = 'cancelled by caller', failure_cause = NULL, uncertain_at = NULL, cancel_requested_at = NULL, finished_at = clock_timestamp() WHERE id = $1 AND state IN ('queued', 'scheduled', 'retryable') RETURNING id
 "
   |> pog.query
   |> pog.parameter(pog.int(id))

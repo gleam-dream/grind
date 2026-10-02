@@ -173,24 +173,25 @@ pub fn update_resolution_query(
     worker_id:,
     worker_version:,
     target_state:,
-    output_version:,
     encoded_output:,
-    error_version:,
     encoded_error:,
     failure_description:,
     ..,
   ) = command
+  // The job's output and error contract versions are fixed at admission and
+  // never written here: an audited resolution only writes the payloads. The
+  // codec check in `reconcile_transaction` already proved a confirmed payload
+  // matches them, and a replayed job must be re-claimed under the same
+  // contract.
   let update =
     pog.query(
-      "UPDATE grind_jobs SET state = $1, output = $2::jsonb, output_version = $3, error = $4::jsonb, error_version = $5, failure_description = $6, attempt_id = CASE WHEN $1 = 'queued' THEN NULL ELSE attempt_id END, attempt_owner = NULL, lease_expires_at = NULL, available_at = CASE WHEN $1 = 'queued' THEN clock_timestamp() ELSE available_at END, finished_at = CASE WHEN $1 IN ("
+      "UPDATE grind_jobs SET state = $1, output = $2::jsonb, error = $3::jsonb, failure_description = $4, attempt_id = CASE WHEN $1 = 'queued' THEN NULL ELSE attempt_id END, attempt_owner = NULL, lease_expires_at = NULL, available_at = CASE WHEN $1 = 'queued' THEN clock_timestamp() ELSE available_at END, finished_at = CASE WHEN $1 IN ("
       <> terminal.states_sql()
-      <> ") THEN clock_timestamp() ELSE NULL END WHERE id = $7 AND queue = $8 AND worker_id = $9 AND worker_version = $10 AND state = 'uncertain' AND attempt_id = $11 AND attempt_epoch = $12 AND attempt_owner = $13 RETURNING state",
+      <> ") THEN clock_timestamp() ELSE NULL END WHERE id = $5 AND queue = $6 AND worker_id = $7 AND worker_version = $8 AND state = 'uncertain' AND attempt_id = $9 AND attempt_epoch = $10 AND attempt_owner = $11 RETURNING state",
     )
     |> pog.parameter(pog.text(target_state))
     |> pog.parameter(pog.nullable(pog.text, encoded_output))
-    |> pog.parameter(pog.text(output_version))
     |> pog.parameter(pog.nullable(pog.text, encoded_error))
-    |> pog.parameter(pog.nullable(pog.text, error_version))
     |> pog.parameter(pog.nullable(pog.text, failure_description))
     |> pog.parameter(pog.int(id))
     |> pog.parameter(pog.text(queue))
