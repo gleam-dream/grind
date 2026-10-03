@@ -1,5 +1,11 @@
 # Risk register
 
+> Names: this document describes the engine and names its modules as they
+> were before wave 3 (`grind/postgres`, `grind/queue`, `grind/submission`,
+> `grind/observation`, ...). Those modules now live under `grind/internal`;
+> [migration-wave-3.md](migration-wave-3.md) maps each name to the public
+> `grind` API.
+
 Runtime isolation landed in `1e87d2c`; diagnostics landed in `75e50ae`.
 Historical matrix and two-hour results apply only to their recorded inputs.
 Today's Sinal dependency has changed; current qualification is tracked in
@@ -751,6 +757,12 @@ Long-lived supervision trees and reused validated database settings avoid
 repeated allocation during ordinary restarts. Fresh consumer start/stop
 churn remains an allocation path.
 
+**Wave 3.** `grind.start` and `grind.supervised` take the runtime's name
+from the caller and keep the application's pool name, and the runtime's
+coordinator, renewal-pool and pruner names are created once per
+`start`/`supervised` call and reused across supervised restarts. Repeated
+`grind.start`/`grind.stop` cycles still allocate those names each time.
+
 **Current mitigation.** Reuse validated settings and existing supervised
 children. There is no bound on cumulative atoms under indefinite creation
 of fresh consumer handles.
@@ -832,9 +844,13 @@ these instead of plain `submit`/`submit_at`.
 **Evidence.** `README.md` ("Guarantees"); `docs/UNIQUENESS-CONTRACT.md`
 ("Admission receipts").
 
-**Status.** Accepted — a deliberate scope boundary (retry safety is
-opt-in via `submit_with_id`/`submit_unique`), not a defect in the ID-less
-path itself.
+**Status.** Closed in wave 3. Every submit now records a receipt, under
+the job's id (`job.with_id`) or a generated one, so a lost reply is
+`CommitUnknown(pending)` and `grind.reconcile_submission` settles it;
+`CommitUnknownWithoutId` no longer exists. The cost is one receipt row and
+index entry per job. Retrying a submit without an id still admits a second
+job, because each retry generates a new id; give the job an id when it may
+be retried.
 
 ---
 

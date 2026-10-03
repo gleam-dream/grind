@@ -1,5 +1,11 @@
 # Recovery evidence
 
+> Names: this document describes the engine and names its modules as they
+> were before wave 3 (`grind/postgres`, `grind/queue`, `grind/submission`,
+> `grind/observation`, ...). Those modules now live under `grind/internal`;
+> [migration-wave-3.md](migration-wave-3.md) maps each name to the public
+> `grind` API.
+
 **Historical record.** Generated benchmark, oracle and resilience run directories
 were removed on 2026-10-01 after their findings were summarized in the
 [benchmark guide](../bench/README.md), [resilience guide](../resilience/README.md)

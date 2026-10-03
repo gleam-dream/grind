@@ -1,5 +1,11 @@
 # Implementation scope
 
+> Names: this document describes the engine and names its modules as they
+> were before wave 3 (`grind/postgres`, `grind/queue`, `grind/submission`,
+> `grind/observation`, ...). Those modules now live under `grind/internal`;
+> [migration-wave-3.md](migration-wave-3.md) maps each name to the public
+> `grind` API.
+
 ## Delivered in the current PostgreSQL slice
 
 - Caller-defined worker inputs, outputs, and errors use ordinary versioned JSON

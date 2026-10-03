@@ -1,174 +1,235 @@
 # Grind
 
-Grind is a typed background-job library for Gleam on PostgreSQL and Erlang/OTP.
-Oban OSS `v2.24.1` is used as a behavioral reference; Grind does not wrap or
-embed Oban. The implementation is experimental and has not been published to
-Hex.
+Grind runs typed background jobs on PostgreSQL and Erlang/OTP: a
+strongly-typed Oban. A worker declares its input, output and error types,
+their JSON codecs and its queue; one supervised child runs the pool,
+consumers and pruner; `grind.submit` admits a job; `grind.await` waits for
+its typed outcome. Oban OSS `v2.24.1` is the behavioral reference; Grind
+does not wrap or embed Oban. The package is not yet published to Hex.
 
-The current runnable slice includes typed, versioned worker definitions,
-heterogeneous registration, PostgreSQL admission and typed result reads,
-absolute one-time scheduling, and a supervised queue consumer with bounded
-per-consumer concurrency. Automatic polling is Oban-like: a poll (or a slot
-freed by a completing job) keeps claiming into every free slot for as long as
-`maximum_concurrency` allows and jobs are available, backing off to the full
-`poll_interval` only once a claim actually finds nothing — so throughput is
-not capped below `maximum_concurrency` regardless of how long `poll_interval`
-is. `maximum_batch_jobs` is unrelated to that: it only bounds how many jobs
-one manual `process_available` call processes before returning. Attempts use
-database-time leases,
-fenced acknowledgement receipts, and conservative uncertainty recovery.
-Business failures support a persisted attempt limit, deterministic default or
-definition-bound retry policy, and typed terminal causes; queue handlers can
-also snooze with a checked delay. Explicit discard, worker uncertainty, and
-cooperative cancellation are implemented. Uniqueness admission
-(`submit_unique`/`reconcile_unique`) checks a typed full-input or selected
-key against a policy's queue scope, occupancy period, and eligible states
-inside one locked transaction, returning a typed handle, an existing
-conflict, or a rescheduled conflict; this milestone is complete, including
-concurrent admission under a forced barrier, lock contention, period-boundary
-timing, live rescheduling, uncertain-commit reconciliation, selected keys, and
-public-API consumer coverage — see
-[docs/UNIQUENESS-CONTRACT.md](docs/UNIQUENESS-CONTRACT.md) for the full
-contract and its remaining, explicitly listed gaps (cross-worker uniqueness,
-general field replacement, unique bulk insertion, and a few other named
-items). `submit_with_id` gives a plain admission the same retry safety
-without a uniqueness policy — a caller-supplied `SubmissionId` reuses the
-identical admission receipt, request fingerprint, and reconciliation
-machinery, converging a same-id retry on the original `Inserted` outcome
-instead of risking a duplicate row; see "Admission receipts" in
-[docs/UNIQUENESS-CONTRACT.md](docs/UNIQUENESS-CONTRACT.md). A consumer's own
-per-poll quarantine scan covers every worker id/version in the queue it
-polls, not only the ones it currently registers, so an executing row a
-retired worker version left behind is still quarantined once its lease
-expires; a separate public `postgres.quarantine_expired(database, limit:)`
-sweeps expired executing rows across every queue in the schema, for a
-queue no consumer polls at all. Grind's schema (baseline v11, current v12
-via `migrate` — see "Migrations" below) installs fresh only into an empty
-schema; a pre-baseline marker (including the prior experimental v10) and a
-partial or tampered Grind schema both fail closed without repair.
-Acknowledgement receipts retain committed attribution and a proposal fingerprint,
-not typed historical proposals. Typed outcome reads return the job's current
-result. `postgres.prune_finished` deletes finished, old-enough jobs and
-their own receipts, scoped to the whole schema and bounded per call;
-`grind/pruner` is a supervised background process that calls it on a timer
-with Oban-shaped defaults — see "Retention" below.
-See [implementation scope](docs/IMPLEMENTATION-SCOPE.md) for the delivered
-boundary and complete retained backlog, and [docs/RISKS.md](docs/RISKS.md)
-for the standing risk register (known gaps, their mitigations, and what
-covers them).
-
-## Public API
-
-One package, `grind`, with the storage backend split into its own module so
-a future backend does not touch the rest:
-
-| Module              | Holds                                                                                                                                                                                                                                                                 |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `grind/worker`      | `Worker(input, output, error)` definitions, codecs, retry policy, business failure causes.                                                                                                                                                                            |
-| `grind/job`         | `JobHandle`, `State`, `AvailableAt`, and the typed outcome vocabulary.                                                                                                                                                                                                |
-| `grind/registry`    | Heterogeneous worker registration for one queue.                                                                                                                                                                                                                      |
-| `grind/queue`       | `QueuePolicy`, the supervised consumer (`start`/`stop`/manual stepping).                                                                                                                                                                                              |
-| `grind/postgres`    | The PostgreSQL storage backend: `settings`/`validate`/`start`/`close`, `migrate`, `submit`/`submit_at`/`submit_with_id`, `submit_unique`/`reconcile_unique`, `bind_handle`, `state`/`outcome`, `cancel`, `resolve_uncertain`, `quarantine_expired`, `prune_finished`. |
-| `grind/unique`      | The pure uniqueness policy vocabulary (`Key`, `Policy`, `States`, `Period`, `QueueScope`, `ConflictAction`) — see "Uniqueness" below.                                                                                                                                 |
-| `grind/submission`  | The admission vocabulary every submit path returns (`SubmissionId`, `Admission`, `Conflict`, `PendingSubmission`, `SubmitError`) — shared by plain, `submit_with_id`, and `submit_unique` admission.                                                                  |
-| `grind/pruner`      | The supervised retention pruner (`start`/`supervised`/`stop`) — see "Retention" below.                                                                                                                                                                                |
-| `grind/observation` | Grind's Sinal event descriptors — see "Observations" below.                                                                                                                                                                                                           |
-| `grind/diagnostic`  | Typed operational events for renewal, ACK recovery, checkout wait and local consumer capacity.                                                                                                                                                                        |
-
-Everything under `grind/internal/*` is implementation detail with no
-stability contract; only the modules above are public API.
-
-## Getting started
-
-The fastest way to see Grind end to end is the separate
-[consumer package](consumer/README.md) (`consumer/`), a complete, runnable
-example built entirely on this public API: it depends on Grind by local path
-and imports only its public modules, registers two differently typed
-workers, admits jobs through their definitions, and runs them from a
-supervised automatic queue — including a definition-bound retry policy
-reaching a second delivery, cooperative cancellation of a genuinely running
-attempt, a worker crash recovering through `Uncertain` and an audited
-resolution, uniqueness admission, and `submit_with_id` retries. Read
-`consumer/src/grind_consumer.gleam` and
-`consumer/test/grind_consumer/` alongside its README for a
-working, copy-pasteable shape; the snippet below covers the same steps in
-isolation, the minimum to get a queue polling.
-
-## Codecs
-
-A worker persists its input, output and error through versioned JSON
-codecs. `worker.codec(version, encode, decoder)` takes an encoder that
-returns `Result(json.Json, String)`, so a validating codec can reject a
-value. Wrap a plain gleam_json encoder with `worker.infallible`:
+## Quick start
 
 ```gleam
-let assert Ok(email) =
-  worker.codec("email-v1", worker.infallible(encode_email), email_decoder())
-```
+import gleam/dynamic/decode
+import gleam/erlang/process
+import gleam/json
+import gleam/otp/static_supervisor as supervisor
+import gleam/time/duration
+import grind
+import grind/job
+import grind/worker
+import pog
 
-A json_blueprint codec's `to_json` can fail on a refinement such as
-`integer_between`. Map its encode error to the reason, and the same
-Blueprint codec serves Grind without a panic or a stored `null`:
+pub type Email {
+  Email(to: String, subject: String)
+}
 
-```gleam
-let assert Ok(invoice) =
-  worker.codec(
-    "invoice-v1",
-    fn(value) {
-      codec.to_json(invoice_codec, value)
-      |> result.map_error(codec.describe_encode_error)
-    },
-    codec.decoder(invoice_codec),
+pub fn mailer() -> worker.Worker(Email, String, Nil) {
+  worker.new(
+    "mailer.send",
+    input: worker.codec(worker.infallible(encode_email), email_decoder()),
+    output: worker.codec(worker.infallible(json.string), decode.string),
+    perform: fn(email) { Ok("msg:" <> email.to) },
   )
+  |> worker.with_queue("mailers")
+}
+
+/// One child in the application's supervision tree runs the pool, one
+/// consumer per queue and the pruner.
+pub fn children(pool: pog.Config, name: process.Name(grind.Message)) {
+  let config = grind.new(pool) |> grind.with_worker(mailer())
+  supervisor.new(supervisor.OneForOne)
+  |> supervisor.add(grind.supervised(config, name))
+}
+
+/// Anywhere in the application: a handle found by name.
+pub fn send(name: process.Name(grind.Message), email: Email) {
+  let jobs = grind.named(name)
+  let assert Ok(grind.Inserted(handle)) =
+    grind.submit(jobs, job.new(mailer(), email))
+  grind.await(jobs, handle, within: duration.seconds(5))
+  // Ok(grind.Succeeded("msg:a@b.c"))
+}
 ```
 
-When an encoder rejects a value:
+Run `grind.migrate(jobs)` once at deploy time, or apply
+[`priv/migrations`](priv/migrations) through cigogne (see "Migrations").
+`test/grind/facade/readme_test.gleam` compiles and runs this program.
 
-| Value rejected                                      | Result                                                                                                                                  |
-| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Input, or a `unique.selected` key, at submit        | Every submit path returns `submission.InvalidInput(reason)` before checking out a connection. No job row and no receipt are written.    |
-| Handler output, after the handler ran               | The job ends `job.RuntimeFailed` on that attempt and is not retried. `postgres.outcome` returns `job.FailedOperationally(description)`. |
-| Handler error, after the handler ran                | The same terminal `job.RuntimeFailed`, even with retries left.                                                                          |
-| A value confirmed with `postgres.resolve_uncertain` | `postgres.ResolutionInvalidValue(reason)`, before any write. The job stays `Uncertain`.                                                 |
+## Defaults
 
-The description is `"output codec rejected the handler's output: <reason>"`
-or `"error codec rejected the handler's error: <reason>"`. A rejected output
-or error is not retried: the handler's effects already happened, and the
-codec, not the job, is at fault.
+Every wait, payload, retry and snooze is bounded by default. An unbounded
+value must be asked for explicitly.
 
-## Starting a consumer
+| Operation                        | Default                                                        | Change it with                                        |
+| -------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------- |
+| Handler execution                | 15 min, then the abandonment policy applies                    | `worker.with_timeout(worker.Infinity)` to lift        |
+| Snoozes per job                  | 100, then `Failed(.., SnoozeLimitReached, ..)`                 | `worker.with_max_snoozes`                             |
+| Business attempts                | 20                                                             | `worker.with_max_attempts`, `job.with_max_attempts`   |
+| Retry delay                      | 15 s doubling to 1 day, plus 0–10% jitter                      | `worker.with_retry_policy`                            |
+| Abandoned attempt                | held `uncertain` (`HoldUncertain`)                             | `worker.with_abandonment(ReplayAfterLeaseExpiry(n))`  |
+| Job retention                    | pruner on: finished jobs deleted after 7 days                  | `grind.with_pruner(max_age:)`, `grind.without_pruner` |
+| Encoded input, output, error     | 1 MiB, then `PayloadTooLarge`                                  | `grind.with_max_payload_bytes`                        |
+| Initial connect at `start`       | 15 s, then `Unavailable`                                       | `grind.with_connect_timeout`                          |
+| Storage call, including checkout | 4 s; a connection obtained later sends nothing                 | `grind.with_statement_deadline`                       |
+| Uniqueness lock wait             | 2 s, then `UniquenessContended`                                | `grind.with_unique_lock_wait`                         |
+| Migration step                   | 30 s                                                           | `grind.with_migration_deadline`                       |
+| Waiting for a result             | `await(within:)` takes the bound                               |                                                       |
+| `testing.drain`                  | `within:` and `limit:` take the bounds                         |                                                       |
+| Queue concurrency, per node      | 10                                                             | `queue.with_concurrency`                              |
+| Poll interval                    | 250 ms                                                         | `queue.with_poll_interval`                            |
+| Attempt lease                    | 30 s, renewed every 10 s (at least 4 × the statement deadline) | `queue.with_lease`                                    |
+| Shutdown grace                   | 15 s                                                           | `queue.with_shutdown_grace`                           |
+| Observation forwarder            | 1,024 events in flight, then dropped and counted               | `grind.with_observation_capacity`                     |
+| Worker and codec versions        | `"1"`                                                          | `worker.with_version`, `worker.with_codec_version`    |
+| Queue                            | `"default"`                                                    | `worker.with_queue`, `job.with_queue`                 |
 
-The ordinary path needs no policy customization —
-`queue.default_policy_validated()` is `queue.default_policy() |> queue
-.validate_policy`, already unwrapped, since the shipped defaults are always
-valid:
+## Modules
+
+| Module            | Holds                                                                                                                                                             |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `grind`           | `Config`, the runtime (`start`, `supervised`, `named`, `stop`, `connection`, `migrate`), `submit`, `submit_in`, reads, `await`, `cancel`, errors and their kinds. |
+| `grind/worker`    | Workers, codecs, `Response`, retry, timeout, snooze and abandonment policies, and the handler `Context`.                                                          |
+| `grind/job`       | The job builder (`new`, `with_id`, `at`, `after`, `unique`, `with_correlation`), `JobHandle`, `State`, `TerminalCause`.                                           |
+| `grind/queue`     | Per-queue tuning: concurrency, polling, lease, shutdown grace.                                                                                                    |
+| `grind/unique`    | Uniqueness policies.                                                                                                                                              |
+| `grind/admin`     | Operator work: `list`, `resolve_uncertain`, `quarantine_expired`, `prune_finished`, `reconcile_acknowledgement`.                                                  |
+| `grind/telemetry` | The Sinal events Grind emits.                                                                                                                                     |
+| `grind/testing`   | `perform` a handler without a database; `drain` a queue on demand.                                                                                                |
+
+Everything under `grind/internal` is machinery with no stability contract.
+The [external consumer package](consumer/README.md) exercises the public API
+from outside the package.
+
+## Workers and codecs
+
+A worker is a definition written in source code, so its constructors and
+setters are total: an empty id, version or queue, or an out-of-range limit,
+panics with the worker's id. `worker.new` takes a handler
+`fn(input) -> Result(output, error)`; `worker.responding` takes
+`fn(Context, input) -> Response(output, error)`, which may also snooze,
+discard, cancel or report an uncertain effect.
+
+A codec's encoder returns `Result(json.Json, String)`, so a validating codec
+can reject a value; wrap a plain encoder with `worker.infallible`. A
+json_blueprint codec maps its encode error to the reason:
 
 ```gleam
-import grind/postgres
-import grind/queue
-import grind/registry
-
-let assert Ok(settings) =
-  postgres.settings(database_url) |> postgres.validate
-let assert Ok(database) = postgres.start(settings)
-let assert Ok(workers) = registry.new("payments")
-let assert Ok(workers) = registry.register(workers, payment_worker)
-let assert Ok(consumer) =
-  queue.start(database, workers, queue.default_policy_validated())
+worker.codec(
+  fn(value) {
+    codec.to_json(invoice_codec, value)
+    |> result.map_error(codec.describe_encode_error)
+  },
+  codec.decoder(invoice_codec),
+)
 ```
 
-Customize polling, concurrency, or lease duration by building a `QueuePolicy`
-instead (`queue.default_policy() |> queue.with_poll_interval(...) |> ... |>
-queue.validate_policy`) and passing its `ValidatedPolicy` to `queue.start`.
+| Value rejected                                   | Result                                                                                               |
+| ------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| Input, or a `unique.selected` key, at submit     | `grind.InvalidInput(reason)` before any connection is used. Nothing is written.                      |
+| Handler output or error, after the handler ran   | `Failed(RuntimeFailure, None, "output codec rejected the handler's output: <reason>")`; not retried. |
+| A value confirmed with `admin.resolve_uncertain` | `admin.ResolutionValueRejected(reason)` before any write.                                            |
+
+The worker id and version and each codec version are stored with every
+job, so a consumer runs a job only with the exact definition it was
+submitted under. Versions default to `"1"`; change one when a stored shape
+changes.
+
+## Jobs, receipts and outcomes
+
+`job.new(worker, input)` runs now, in the worker's queue. `with_id` makes
+the submit idempotent: resubmitting the same job under the same id returns
+the first admission, and a different job under it returns `IdConflict`.
+Every submit records a receipt, under the job's id or one Grind generates,
+so a submit whose reply was lost returns `CommitUnknown(pending)`, which
+`grind.reconcile_submission` settles. `at` and `after` schedule the job;
+`unique` admits it only when no job occupies its key (see "Uniqueness");
+`with_correlation` carries a `sinal/correlation` value into the handler's
+context and every event about the job. Without one, Grind generates one.
+
+`grind.outcome` and `grind.await` return `Pending(state)`, `Succeeded`,
+`Failed(failure, cause, description)`, `Discarded`, `Cancelled` or
+`Uncertain`. The error and outcome types may gain variants: branch on
+`grind.submit_error_kind`, `read_error_kind` and `cancel_error_kind` where
+a new variant should not break your code. `describe_*` functions give a log
+line.
+
+## One pool, and enqueueing inside your transaction
+
+Grind builds its pool from the application's `pog.Config` and keeps its
+pool name. `grind.connection(jobs)` returns that pool, so the application,
+Grind and other libraries (a saga store, for example) share one pool. The
+pool's `search_path` is Grind's schema (`public` by default) and its
+isolation is `READ COMMITTED`; qualify tables in other schemas.
+
+`grind.submit_in(jobs, tx, job)` admits a job inside the application's
+open transaction: the job, its receipt and any uniqueness decision commit or
+roll back with the application's own writes. Grind sends no `BEGIN` or
+`COMMIT` and emits no `admitted` event. The transaction must be
+`READ COMMITTED` on Grind's database; Grind sets `search_path` and
+`lock_timeout` for its own statements and restores yours.
+
+```gleam
+pog.transaction(grind.connection(jobs), fn(tx) {
+  use _ <- result.try(orders.confirm(tx, order))
+  grind.submit_in(jobs, tx, job.new(receipt(), order.id) |> job.with_id(order.id))
+  |> result.map_error(ReceiptNotQueued)
+})
+```
+
+## The runtime
+
+`grind.supervised(config, name)` is one child of the application's tree;
+`grind.named(name)` returns a handle that is valid before the runtime starts
+and across its restarts, so a web handler reaches Grind without threading a
+value. The tree restarts later children when an earlier one restarts, so
+consumers always run against the current pool. On shutdown each queue stops
+claiming and waits up to its grace for running jobs. `grind.start(config,
+name)` starts an unsupervised runtime for scripts and tests, and
+`grind.stop` stops it from any process. `grind.without_consumers` makes a
+submit-only node. `start` and `supervised` validate the configuration;
+`grind.check` returns the same typed `ConfigError` up front.
+
+## Handler context, cancellation and abandoned attempts
+
+A `responding` handler receives a `worker.Context`: `job_id`, `attempt`,
+`max_attempts`, `snooze_count`, `queue`, `correlation`, `deadline` and
+`cancellation`. `grind.cancel` of a running job commits a cancellation
+request; the attempt's next lease renewal (within a third of the lease)
+delivers it to the handler's `cancellation` selector, and a handler that
+stops early returns `Cancelled`.
+
+A handler that exceeds its timeout is stopped. An attempt can also be
+abandoned by a node that died. The worker's abandonment policy decides what
+follows: `HoldUncertain`, the default, holds the job `uncertain` until an
+operator resolves it with `admin.resolve_uncertain`; it never runs twice
+without a decision. `ReplayAfterLeaseExpiry(max_replays:)` requeues it after
+its lease expires, at most that many times; choose it for handlers that are
+idempotent by construction. `admin.list(jobs, admin.query(limit: 100) |>
+admin.in_state(job.Uncertain))` finds the jobs that wait for an operator.
+
+A snooze reschedules the job without using an attempt. After
+`max_snoozes` (100) snoozes, the next one ends the job as
+`Failed(BusinessUnrecorded, Some(SnoozeLimitReached), ..)`, so a receiver
+that always answers 429 cannot keep a job alive forever.
+
+## Testing
+
+`testing.perform(worker, input)` runs a handler in the test's process,
+round-tripping the input, output and error through the worker's codecs.
+`testing.perform_with(worker, testing.context(job_id: 7, attempt: 3), input)`
+chooses the context. `testing.drain(jobs, queue:, limit:, within:)` claims
+and runs a queue's due jobs on demand; configure the runtime
+`without_consumers` so nothing else claims them.
 
 ## Isolation: one installation per schema
 
 Every job, quarantine scan, uniqueness domain, and retention sweep is simply
 whatever `grind_jobs` and its sibling tables hold in one PostgreSQL schema —
 there is no separate owner column scoping rows within one shared schema.
-Which schema is **explicit configuration, not inferred**: `postgres.settings`
-defaults `Settings.schema` to `"public"`; `postgres.with_schema(settings,
-"myschema")` overrides it. `postgres.validate` pins every pooled
+Which schema is **explicit configuration, not inferred**: `grind.new`
+defaults the schema to `"public"`; `grind.with_schema(config,
+"myschema")` overrides it. `grind.start` and `grind.supervised` pin every pooled
 connection's own `search_path` to exactly that one configured schema (a
 `search_path` connection parameter, quoted safely), so it is never left to
 whatever the connecting role or database would otherwise default to. Two
@@ -198,13 +259,13 @@ both operate on the exact same physical table; see
 (`test/grind/database/isolation_test.gleam`) for the concrete duplicate-admission hazard this
 caused and the proof it is now closed.
 
-**Creating the schema.** `postgres.migrate`/`migrate_with` create the
+**Creating the schema.** `grind.migrate` create the
 configured schema (`CREATE SCHEMA IF NOT EXISTS`, safely quoted) if it does
 not already exist — but only after confirming it is genuinely absent, never
 unconditionally: `CREATE SCHEMA IF NOT EXISTS` itself demands database-level
 `CREATE` privilege from the connecting role even when the schema already
 exists, which the recommended least-privilege setup below deliberately does
-not grant. `postgres.start` and every other call never create a schema —
+not grant. `grind.start` and every other call never create a schema —
 against a schema whose tables do not exist yet, they fail with an ordinary
 typed storage error instead (missing-relation errors from the same query
 that would otherwise have run).
@@ -230,17 +291,17 @@ error at all; see [docs/RISKS.md](docs/RISKS.md) risk 18.
 
 ## Observations
 
-`grind/observation` exposes Grind's own [Sinal](https://github.com/gleam-dream/sinal)
+`grind/telemetry` exposes Grind's own [Sinal](https://github.com/gleam-dream/sinal)
 event descriptors — Grind does not own a telemetry event sum type or a
 subscription API; attach with plain `sinal.observe`/`sinal.attach` exactly as
 you would to any other Sinal event:
 
 ```gleam
-import grind/observation
+import grind/telemetry
 import sinal
 
 let _attachment =
-  sinal.observe(observation.acknowledged(), fn(measurements, metadata) {
+  sinal.observe(telemetry.acknowledged(), fn(measurements, metadata) {
     // metadata.committed_state, metadata.proposed, metadata.confirmation, ...
     io.println("job " <> int.to_string(metadata.ref.job_id) <> " acknowledged")
   })
@@ -248,10 +309,9 @@ let _attachment =
 
 The events currently published, one per durable job-lifecycle transition:
 
-- `[grind, job, admitted]` — a plain `submit`/`submit_at`, a `submit_with_id`
-  commit, or a `submit_unique` decision (`Inserted`, `Existing`,
-  `Rescheduled`). `submission_id` is `Some` for both the `submit_with_id` and
-  `submit_unique` cases. Public `reconcile_unique` never emits (see below).
+- `[grind, job, admitted]` — a `grind.submit` with or without an id, or a
+  uniqueness decision (`Inserted`, `Existing`,
+  `Rescheduled`). `submission_id` is the job's id, or the one Grind generated. Public `grind.reconcile_submission` never emits (see below).
 - `[grind, job, claimed]` — one row atomically claimed for execution.
 - `[grind, job, quarantined]` — one abandoned attempt (an expired lease found
   by a claim-time scan, or the public `quarantine_expired` sweep) moved to
@@ -273,10 +333,10 @@ The events currently published, one per durable job-lifecycle transition:
   unlike `released` above, this job does not go back to `queued`.
 - `[grind, job, acknowledged]` — one committed disposition for one claimed
   attempt (the original descriptor; see its own doc comment in
-  `grind/observation` for the full detail this section summarizes below).
+  `grind/telemetry` for the full detail this section summarizes below).
 
 Every Grind observation is emitted through a `Database`'s own
-`sinal/forwarder.Forwarder` (sized by `postgres.with_observation_capacity`, default
+`sinal/forwarder.Forwarder` (sized by `grind.with_observation_capacity`, default
 1024, shared across lifecycle, pruning and diagnostic events — one `Forwarder` per
 `Database`, not one per event kind), never through a plain `sinal.emit`, so a
 slow or raising attached handler stalls only the forwarder process — never
@@ -310,7 +370,7 @@ acknowledged normally with no observations at all.
   can go entirely unobserved even after a caller successfully reconciles it).
 - **The durable truth is Grind's own tables and receipts, never an
   observation.** Do not build a system of record on an attached handler; read
-  `postgres.state`/`postgres.outcome`/`postgres.reconcile_acknowledgement`
+  `grind.state`/`grind.outcome`/`admin.reconcile_acknowledgement`
   for anything that must not be lost or double-counted.
 - **Handlers run in the forwarder process, not the coordinator or the
   worker.** `self()` inside a handler is the forwarder; process-dictionary
@@ -334,10 +394,10 @@ acknowledged normally with no observations at all.
   rather than silently committing a different outcome.
 - **A pure receipt-read recovery API never emits, period — not "to avoid
   double-reporting", but as its own real gap.** `reconcile_acknowledgement`
-  and `reconcile_unique` are offered for a caller to recover its own return
+  and `grind.reconcile_submission` are offered for a caller to recover its own return
   value after a lost reply, independently of whatever call originally
   produced that commit. When the originating call (`acknowledge`/
-  `submit_unique`/`cancel`/`resolve_uncertain`) itself already emitted —
+  `submit`/`cancel`/`resolve_uncertain`) itself already emitted —
   because its own transaction reply came back normally — a later
   reconciliation call correctly does not re-emit that same commit. But when
   the originating call returned a commit-unknown outcome, it never emitted
@@ -345,7 +405,7 @@ acknowledged normally with no observations at all.
   recovers the outcome does not emit either: that committed transition can
   end up with no observation at all, ever, even though the durable row and
   receipt are both fully correct. This is a real, accepted gap, not a
-  double-reporting safeguard — read `postgres.state`/`postgres.outcome`/the
+  double-reporting safeguard — read `grind.state`/`grind.outcome`/the
   reconciliation APIs themselves for anything that must account for a
   commit-unknown recovery.
 
@@ -355,7 +415,7 @@ evidence.
 
 ## Operational diagnostics
 
-`grind/diagnostic` provides six typed Sinal descriptors under
+`grind/telemetry` provides six typed Sinal descriptors under
 `[grind, diagnostic, …]`. Attach with `sinal.observe`, as above. They share the
 Database's bounded forwarder with lifecycle events, including renewal through
 the reserved pool. Subscriber delay, overflow and unavailability do not control
@@ -380,7 +440,7 @@ it excludes job payloads, error messages, SQL and connection settings.
 A missing live fence does not establish expiry. A skipped lock does not identify
 its owner. Completion-renewal budget exhaustion is a local limit, not proof of
 quarantine. An unknown ACK does not prove commit or rollback. The existing
-`observation.acknowledged()` event with `Reconciled` confirmation remains proof
+`telemetry.acknowledged()` event with `Reconciled` confirmation remains proof
 of a matching durable receipt.
 
 Checkout coverage includes queue quarantine scans, claims, batch renewal, ACK
@@ -395,17 +455,17 @@ See [the diagnostics contract and acceptance evidence](docs/OPERATIONAL-DIAGNOST
 
 ## Uniqueness
 
-`grind/unique` and `grind/submission` give `postgres.submit_unique` a typed
+`grind/unique` gives `job.unique` a typed
 policy: a full-input or selected key, a queue scope (`WithinQueue`/
 `AcrossQueues`), an occupancy period, and an eligible-states group. Admission
 runs inside one PostgreSQL transaction, serialized by a domain-wide advisory
 lock, and returns a typed handle (`Inserted`), an existing conflict
-(`Existing`), or a rescheduled conflict (`Rescheduled`). `submit_with_id`
+(`Existing`), or a rescheduled conflict (`Rescheduled`). `job.with_id`
 gives a plain admission — no uniqueness policy — the same retry safety by
 reusing the identical admission receipt, request fingerprint, and
-reconciliation machinery: a caller-supplied `SubmissionId` retry converges on
+reconciliation machinery: a caller-supplied job id retry converges on
 the original `Inserted` outcome instead of risking a duplicate row.
-`reconcile_unique` recovers a caller's own return value after a lost reply,
+`grind.reconcile_submission` recovers a caller's own return value after a lost reply,
 independently of whichever call produced the commit.
 
 Key equality is exact (PostgreSQL `jsonb::text` SHA-256), not containment;
@@ -417,7 +477,7 @@ replacement. `while_retained()` means "until pruned", not "forever" — see
 [docs/UNIQUENESS-CONTRACT.md](docs/UNIQUENESS-CONTRACT.md) for the full
 contract, its failure modes, and everything still out of scope (cross-worker
 uniqueness, general field replacement, unique bulk insertion, and the
-untested different-key/same-`SubmissionId` receipt race).
+untested different-key/same-job id receipt race).
 
 ## Guarantees and non-guarantees
 
@@ -429,14 +489,14 @@ real external effect:
   and the process, connection, or host can die before that outcome is ever
   durably recorded. Grind's tables and receipts prove what committed; they
   never prove the negative case. This extends to a pruned receipt exactly
-  the same way: `postgres.prune_finished` deletes a job's own
+  the same way: `admin.prune_finished` deletes a job's own
   acknowledgement, uniqueness-submission, and resolution receipts alongside
   it (see "Retention" below), so an absent receipt for an old job can also
   simply mean it aged out of the retention window — never proof the effect
   it recorded did not happen.
-- **Reconciliation and `SubmissionId` replay only work while the job is
-  retained.** `reconcile_acknowledgement`, `reconcile_unique`, and a
-  `submit_with_id`/`submit_unique` retry of the same request identity all
+- **Reconciliation and job id replay only work while the job is
+  retained.** `reconcile_acknowledgement`, `grind.reconcile_submission`, and a
+  a submit with `job.with_id` or `job.unique` retry of the same request identity all
   depend on reading back a receipt row that `prune_finished` deletes once
   its own job is old enough — see "Retention" below for exactly what each
   one does once that row is gone.
@@ -458,7 +518,7 @@ real external effect:
 - **Storage calls use a Grind-owned checkout deadline.** Claims run in
   the coordinator, acknowledgements in their attempt processes, and lease
   renewal in a separate actor with a reserved one-connection pool per consumer.
-  `postgres.with_statement_deadline` (default 4000ms, `D`, validated positive) is
+  `grind.with_statement_deadline` (default 4 s, `D`, validated positive) is
   enforced by Grind's own `grind_postgres_ffi.erl`, which checks out a
   connection from pog's own pool itself (`pgo:checkout/2`, with `timeout`
   set to `infinity` and one absolute `deadline` shared across candidate
@@ -498,7 +558,7 @@ real external effect:
   rows locked by acknowledgements. A slow ACK therefore cannot hold up a
   healthy sibling's renewal. Each consumer adds one PostgreSQL connection;
   include it when sizing the database's connection budget.
-  `queue.start` requires `L ≥ 4 × D`, independently of concurrency, for a
+  a queue requires `L ≥ 4 × D`, independently of concurrency, for a
   renewal cadence of `L / 3`. The next timer is armed before the current
   database call, so query duration does not extend every interval. This is
   a bound for progressing storage calls, not a guarantee through arbitrary
@@ -511,8 +571,7 @@ real external effect:
   renewer continues for at most one lease duration after receiving the
   completion notice. After that, retries may reconcile a committed receipt,
   but cannot write through an expired fence. A persistently unresolved job
-  eventually becomes `uncertain` when an expiry sweep reaches it. Manual
-  `process_one` calls still return their explicit acknowledgement errors.
+  eventually becomes `uncertain` when an expiry sweep reaches it.
 - **Observations are best-effort, never a system of record.** See
   "Observations" above for the full delivery semantics; do not build
   anything that must not be lost or double-counted on an attached handler.
@@ -520,13 +579,13 @@ real external effect:
   error.** Neither has a request identity to deduplicate against, so a
   `CommitUnknownWithoutId` reply does not mean the row was never inserted — the
   connection can be lost after PostgreSQL already committed it. Do not
-  blindly retry either one; use `submit_with_id` (a caller-supplied
-  `SubmissionId`, no uniqueness policy) or `submit_unique` (a uniqueness
+  blindly retry either one; use `job.with_id` (a caller-supplied
+  job id, no uniqueness policy) or `job.unique` (a uniqueness
   policy) for a job that might need to be resubmitted safely.
 
 ## Deadlines
 
-Three validated, positive settings on `postgres.Settings` bound how long a
+Three validated, positive settings on `grind.Config` bound how long a
 storage call, a migration step, and a uniqueness lock wait may take:
 
 - **`statement_deadline`** (`with_statement_deadline`, default 4000ms) bounds
@@ -546,10 +605,10 @@ storage call, a migration step, and a uniqueness lock wait may take:
   every lock wait inside the uniqueness admission transaction; it must clear
   `statement_deadline` by at least 1000ms
   (`UniqueLockWaitTooCloseToDeadline` otherwise), so contention surfaces as
-  `AdmissionContended` rather than a raw timeout.
+  `UniquenessContended` rather than a raw timeout.
 
-`queue.start` rejects a lease shorter than `4 × statement_deadline` before
-starting any process (`queue.LeaseTooShortForDeadline`). This minimum is
+`grind.start` rejects a lease shorter than `4 × statement_deadline` before
+starting any process (`grind.LeaseTooShort`). This minimum is
 independent of `maximum_concurrency`: renewal has its own actor, reserved
 connection, and batch statement. The old coordinator timing rule and its T2
 reproduction remain in [PERFORMANCE-EVIDENCE.md](docs/PERFORMANCE-EVIDENCE.md)
@@ -558,7 +617,7 @@ tracked in [RELEASE-EXECUTION.md](docs/RELEASE-EXECUTION.md).
 
 ## Migrations
 
-`postgres.migrate` applies `grind/internal/migrations.migrations()` —
+`grind.migrate` applies `grind/internal/migrations.migrations()` —
 Grind's own hand-maintained, forward-only list of versioned schema steps —
 in ascending order, one PostgreSQL transaction per step. Each step's
 transaction pins `READ COMMITTED` and opens by taking a
@@ -594,10 +653,10 @@ file in [cigogne](https://hexdocs.pm/cigogne)'s own format
 advisory-lock statement `migrate` itself runs, so an application applying
 Grind's migrations directly through cigogne
 (`cigogne.include_lib("grind", ..)`; see cigogne's own docs for the exact
-call) serialises against a concurrent `postgres.migrate` caller the same
+call) serialises against a concurrent `grind.migrate` caller the same
 way. Grind itself never reads these files at runtime — `migrations()` is
-the only thing `postgres.migrate` executes. **Pick one owner for Grind's
-schema per database — either `postgres.migrate` or cigogne, never both**;
+the only thing `grind.migrate` executes. **Pick one owner for Grind's
+schema per database — either `grind.migrate` or cigogne, never both**;
 mixing them against the same schema can fail on a duplicate-object error the
 first time the second mechanism tries to (re-)apply a step the other one
 already committed. **`grind_v11`'s own `down` section drops every Grind
@@ -612,12 +671,12 @@ byte-for-byte in lockstep with `migrations()`, and that every released file
 has a pinned sha256 that matches — so the two can never silently drift
 apart. A separate, real-database test proves the two mechanisms actually
 _interoperate_, not merely that the files match: cigogne itself applies
-every file to a fresh schema, `postgres.migrate` against the result is a
+every file to a fresh schema, `grind.migrate` against the result is a
 genuine no-op (`read_schema_generation` accepts it as a fully up-to-date
 install, never `IncompatibleSchema`/`UnsupportedSchemaVersion`), the
 cigogne-applied schema is fully functional for ordinary submit/claim/ack
 traffic, cigogne's own down-then-up of `grind_v12` round-trips, and a
-concurrent `postgres.migrate` caller genuinely queues behind cigogne's own
+concurrent `grind.migrate` caller genuinely queues behind cigogne's own
 held advisory lock and then no-ops once cigogne commits — see
 `docs/RECOVERY-EVIDENCE.md`, Increment 34.
 
@@ -635,7 +694,7 @@ let assert Ok(base_config) = config.get("grind")
 let cigogne_config =
   config.Config(
     ..base_config,
-    database: config.ConnectionDbConfig(postgres.connection(database)),
+    database: config.ConnectionDbConfig(grind.connection(jobs)),
   )
 let assert Ok(engine) = cigogne.create_engine(cigogne_config)
 let assert Ok(Nil) = cigogne.apply_all(engine)
@@ -643,7 +702,7 @@ let assert Ok(Nil) = cigogne.apply_all(engine)
 
 `config.get("grind")` reads the real, published `priv/cigogne.toml`
 (`migrations.migration_folder`, `"migrations"`), so this differs from the
-default config only in _how_ it connects — `postgres.connection`'s own
+default config only in _how_ it connects — `grind.connection`'s own
 `pog.Connection` is a pool handle just like the one every raw-SQL helper in
 this codebase's own test suite already passes around, so cigogne and the
 rest of the application genuinely share one pool.
@@ -653,9 +712,9 @@ Cigogne keeps its own migration-tracking table (`priv/cigogne.toml`'s
 `public`/`_migrations`), entirely independent bookkeeping from
 `grind_schema_migrations`: cigogne's own `applied`/`unapplied` computation
 never reads Grind's marker table, only its own. An application that also
-uses `postgres.with_schema` to put Grind's own tables in a non-`public`
+uses `grind.with_schema` to put Grind's own tables in a non-`public`
 schema gets that placement automatically for cigogne's _DDL_ too — the
-shared connection's `search_path`, which Grind's own `postgres.validate`
+shared connection's `search_path`, which Grind's own `grind.start`
 pins to exactly the configured schema, is what every unqualified
 `CREATE TABLE`/`ALTER TABLE` in `priv/migrations/*.sql` resolves against —
 but cigogne's own _tracking table_ location is a separate decision the
@@ -664,7 +723,7 @@ application must make explicitly (`priv/cigogne.toml`'s
 `config.MigrationTableConfig` override): left at the default, every Grind
 schema on one database would share the same `public._migrations` table,
 which is fine for a single schema but ambiguous once more than one
-`postgres.with_schema` install shares a database — point `migration-table`
+`grind.with_schema` install shares a database — point `migration-table`
 at the same schema `with_schema` names, or a schema dedicated to migration
 bookkeeping, to keep it unambiguous.
 
@@ -673,13 +732,13 @@ Each step's transaction also sets a constant, transaction-local
 DDL/DML statement that cannot acquire whatever lock it needs (typically an
 `ALTER`/`CREATE INDEX` against a large, actively used table under
 concurrent access) within that bound fails the step with
-`postgres.MigrationLockUnavailable(version)` instead of blocking for up to
+`grind.MigrationLockUnavailable(version)` instead of blocking for up to
 the full `migration_deadline_ms`; safe to retry `migrate` once the
 conflicting lock clears, exactly like `MigrationStepFailed`. Run
-`postgres.migrate`/`migrate_with` as an explicit deploy step, not at
+`grind.migrate` as an explicit deploy step, not at
 application/node boot, once a table this large is in play, so a slow or
 contended migration does not block every node's own startup. This
-`lock_timeout` is set only inside `postgres.migrate`'s own transaction, not
+`lock_timeout` is set only inside `grind.migrate`'s own transaction, not
 inside `priv/migrations/*.sql` itself — an application applying those files
 directly through cigogne does not get it automatically and should set its
 own `lock_timeout` first if it wants the same fast-fail behavior instead of
@@ -709,7 +768,7 @@ large-enough table can exceed the default and report
 against the same table fails the exact same way until either
 `migration_deadline_ms` is raised past the table's own measured cost, or the
 file is applied directly via cigogne/`psql` as its own deploy step outside
-Grind's deadline-bounded execution entirely. Run `postgres.migrate` (or
+Grind's deadline-bounded execution entirely. Run `grind.migrate` (or
 apply this file) as an explicit deploy step, well before node boot, once
 `grind_jobs` is this large.
 
@@ -746,13 +805,13 @@ version.
 A job is prunable once it has finished (reached one of the six terminal
 states — `succeeded`, `business_failed`, `runtime_failed`,
 `contract_mismatch`, `discarded`, `cancelled`) and stayed that way for at
-least a configured age; `postgres.prune_finished` deletes it, scoped to the
+least a configured age; `admin.prune_finished` deletes it, scoped to the
 caller's own schema (never by queue — retention is a property of the
 whole schema):
 
 ```gleam
-postgres.prune_finished(database, older_than_ms: 60_000, limit: 1_000)
-// -> Ok(postgres.PruneReport(jobs: 842))
+admin.prune_finished(jobs, older_than: duration.minutes(1), limit: 1000)
+// -> Ok(842)
 ```
 
 Deleting a job's own row also removes its acknowledgement, uniqueness-
@@ -760,54 +819,17 @@ submission, and resolution receipts — via `grind_v12`'s own `ON DELETE
 CASCADE` foreign keys on `job_id`, not a second delete `prune_finished`
 issues itself, so only `jobs` is counted.
 
-One call is one bounded batch, never an unbounded sweep — `report.jobs` can
-be fewer than `limit` but never more. A caller wanting to drain everything
-currently prunable loops while `report.jobs == limit`:
+One call is one bounded batch, never an unbounded sweep: the count can be
+fewer than `limit` but never more. A caller draining everything currently
+prunable loops while the count equals `limit`.
 
-```gleam
-fn prune_until_caught_up(database, older_than_ms, limit) {
-  case postgres.prune_finished(database, older_than_ms:, limit:) {
-    Ok(postgres.PruneReport(jobs:)) if jobs == limit ->
-      prune_until_caught_up(database, older_than_ms, limit)
-    result -> result
-  }
-}
-```
-
-`grind/pruner` is a supervised timer process wrapping one `prune_finished`
-call per tick — unlike the loop above, it never drains a backlog within one
-tick (matching Oban's own pruner, which does not either); a batch that
-comes back exactly `limit` rows is picked up again on the next scheduled
-tick instead. Its first tick fires `interval_ms` after it starts, not
-immediately. Defaults match Oban's own pruner (`interval_ms` 30000,
-`limit` 10000, `max_age_ms` 60000):
-
-```gleam
-import grind/pruner
-
-let assert Ok(running) = pruner.start(database, pruner.default_policy_validated())
-// pruner.stop(running) when the owning process is done with it.
-```
-
-`pruner.start` links its own dedicated supervisor to the calling process:
-a crash loop that exhausts that supervisor's restart budget exits the
-supervisor, and, being linked, the caller along with it (unless the caller
-traps exits).
-
-`pruner.supervised(database, policy)` gives a `supervision.ChildSpecification`
-instead, to embed directly into an application's own supervision tree
-(`static_supervisor.add`) rather than tracking the separate, dedicated
-supervisor `start` creates and returns as part of its own `Pruner` value —
-stopping it then means stopping or reconfiguring that child in the
-caller's own tree, the same as any other supervised worker there. A crash
-loop past budget here instead escalates into that tree the normal OTP way
-(the immediate supervisor is itself restarted or terminated by its own
-parent, and so on upward), rather than exiting an unrelated caller process
-the way `start`'s linked supervisor does.
-
-Customize with `pruner.default_policy() |> pruner.with_interval(...) |> ...
-|> pruner.validate_policy`, the same builder shape `grind/queue.QueuePolicy`
-uses. Unlike Oban's own plugin, there is **no leader election**: it is safe
+The runtime's pruner, on by default, runs one `prune_finished` batch every
+30 seconds with `limit` 10,000 and deletes jobs that finished more than
+7 days ago (`grind.with_pruner(max_age:)` changes the age;
+`grind.without_pruner` keeps everything). It never drains a backlog within
+one tick, matching Oban's pruner; a batch of exactly `limit` rows is picked
+up again on the next tick. Its first tick fires 30 seconds after it starts.
+Unlike Oban's own plugin, there is **no leader election**: it is safe
 to run a supervised pruner (or call `prune_finished` directly) on every
 node in a cluster at once, since candidates are selected `FOR UPDATE SKIP
 LOCKED` — a concurrent pruner (another node's, or a concurrent manual call)
@@ -815,7 +837,7 @@ simply skips whatever this one already holds, rather than either blocking
 or double-deleting. Every `prune_finished` call — whether from a supervised
 pruner's own tick or called directly — emits `[grind, prune, completed]` on
 success (the count deleted) or `[grind, prune, failed]` on error (see
-`grind/observation`), with a coarse classification of the underlying error
+`grind/telemetry`), with a coarse classification of the underlying error
 for the failed case, since a supervised pruner has no direct caller to
 return a `PruneError` to.
 
@@ -831,16 +853,16 @@ required to be positive. This is a real trade-off, not a free lunch:
   finds no row at all and reports `QueueAckStale(AckRecordMissing)` — the
   same shape an ordinary lost/reassigned row already produces, not a new
   failure mode, but one you can cause yourself by pruning too aggressively
-  relative to `queue.QueuePolicy.lease_duration_ms`.
+  relative to the queue's lease (`queue.with_lease`).
 - **`reconcile_acknowledgement` reports `ReceiptNotFound`** once a job's own
   acknowledgement receipt is pruned — read it before the retention window
   closes if you need to recover a return value after a lost reply.
-- **A `submit_with_id`/`submit_unique` retry of the same request identity
+- **A a submit with `job.with_id` or `job.unique` retry of the same request identity
   after its original receipt is pruned is indistinguishable from a genuinely
   new request**: it inserts a fresh row with a new job id instead of
-  returning the original one. The idempotency window `SubmissionId` gives
+  returning the original one. The idempotency window job id gives
   you is exactly the retention window, not forever.
-- **A pending `reconcile_unique` call for a submission whose underlying job
+- **A pending `grind.reconcile_submission` call for a submission whose underlying job
   was pruned before its own `CommitUnknown` was ever resolved can never
   recover that decision** — the receipt it would have read back is gone.
 - **An `AllRetained`/`while_retained()` uniqueness key reopens once its

@@ -1,5 +1,11 @@
 # Uniqueness contract
 
+> Names: this document describes the engine and names its modules as they
+> were before wave 3 (`grind/postgres`, `grind/queue`, `grind/submission`,
+> `grind/observation`, ...). Those modules now live under `grind/internal`;
+> [migration-wave-3.md](migration-wave-3.md) maps each name to the public
+> `grind` API.
+
 This document records the approved contract for Grind's uniqueness admission
 (`grind/unique`, `grind/submission`, `grind/internal/unique_admission`, and
 `submit_unique`/`reconcile_unique` in `grind/postgres`), the decisions behind

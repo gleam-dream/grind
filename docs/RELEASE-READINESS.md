@@ -1,5 +1,11 @@
 # Release readiness
 
+> Names: this document describes the engine and names its modules as they
+> were before wave 3 (`grind/postgres`, `grind/queue`, `grind/submission`,
+> `grind/observation`, ...). Those modules now live under `grind/internal`;
+> [migration-wave-3.md](migration-wave-3.md) maps each name to the public
+> `grind` API.
+
 Status checked on 2026-10-01 against Grind `75e50ae`. No release candidate is
 qualified yet. This checklist concerns the first experimental release; the
 before-1.0 API work below is separate.

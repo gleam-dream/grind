@@ -25,7 +25,7 @@ progress:
 
 - **Squirrel-generated (static queries)**: any query whose SQL text is fixed
   at compile time, given its own `.sql` file.
-- **Hand-written inline (`grind/postgres` and its `grind/internal/` collaborators)**:
+- **Hand-written inline (`grind/internal/postgres` and its `grind/internal/` collaborators)**:
   dynamic SQL — shared lease/period/lock predicate fragments spliced into
   more than one query, per-disposition acknowledgement SQL (branches on the
   proposed state), nullable-parameter queries whose bound value shape varies
@@ -36,7 +36,7 @@ progress:
 ## Adding a migration
 
 `src/grind/internal/migrations.gleam`'s `migrations()` is the single source
-of truth `postgres.migrate` executes; `priv/migrations/*.sql` is a
+of truth `grind.migrate` executes; `priv/migrations/*.sql` is a
 cigogne-format mirror Grind itself never reads (see README, "Migrations").
 Both must move together, and `migrate_with` requires `migrations()` to be
 exactly the contiguous range `{11..latest}` with no gaps or duplicate
@@ -50,7 +50,7 @@ exactly one new highest version at a time:
    **advisory-lock statement first** (copy it verbatim from
    `migrations.advisory_lock_statement()` or the existing baseline file — this
    is what makes an application applying migrations directly through cigogne
-   serialise against a concurrent `postgres.migrate` caller too), then the new
+   serialise against a concurrent `grind.migrate` caller too), then the new
    version's own statements (each ending `;`, its own trailing
    `INSERT INTO grind_schema_migrations (version) VALUES (<N>)` last),
    `--- migration:down` with the real, reverse-order `DROP`s (delete the

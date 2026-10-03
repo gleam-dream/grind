@@ -58,6 +58,30 @@ Blank lines and `#` comments are allowed. The matrix copies the profile file int
 its output. Point definitions live in [bench-matrix.sh](../scripts/bench-matrix.sh);
 the individual-run CLI is documented in [load.gleam](src/grind_bench/load.gleam).
 
+## Harness pools
+
+The harness's own bookkeeping queries (ledger writes, drain polling, the
+completion observer and the audits) go through
+[`harness_db.execute`](src/grind_bench/harness_db.gleam), not through
+Grind. The L3 open-loop scenario once crashed with `noproc` on its drain
+pool while nine package gates ran in parallel, and passed when run alone.
+The drain pool then had one connection, shared by the 10 ms completion
+observer and the drain poller, and every query ran with pog's 5 s default
+timeout. pgo arms that deadline at checkout and cancels it asynchronously
+at checkin; under heavy machine load a query can run close to it, and a
+deadline message that arrives after its connection was checked in or
+replaced can crash pgo's pool process. While the pool restarts its name is
+unregistered, so a concurrent query exits with `noproc`. The race is in the
+harness's plain pog usage under load, not in Grind's storage calls, which
+check out through Grind's bounded FFI.
+
+The observer now has its own pool, bookkeeping queries run with a 60 s
+timeout so no deadline fires near a slow query's completion, and a query
+that exits with `noproc` is retried for up to 5 s. The observer's stop line
+reports `harness_pool_restart_retries`; a nonzero count means a pool
+restarted during the run and the run should be repeated before its numbers
+are used as evidence.
+
 ## Comparability and validity
 
 - Match job count, handler cost, arrival pattern, concurrency, queue count,
