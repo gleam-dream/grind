@@ -167,8 +167,14 @@ for scenario in "l2 1 250 0 500" "l3 50 1000" "l5 0 3000" "l5 1 3000" "l7 40 1 4
       gleam run -m grind_bench/load -- $scenario
   ) | tee "$activation_log"
   if [[ "$scenario" != l2* ]]; then
-    grep -Eq '^completion_observer_stop_ack polls=([2-9]|[1-9][0-9]+)$' "$activation_log" || {
+    grep -Eq '^completion_observer_stop_ack polls=([2-9]|[1-9][0-9]+) harness_pool_restart_retries=[0-9]+$' "$activation_log" || {
       echo "completion observer did not survive multiple queries and acknowledge stop" >&2
+      exit 1
+    }
+    # A retried pgo pool restart keeps the run alive but makes it suspect as
+    # evidence (bench/README.md, "Harness pools").
+    grep -Eq ' harness_pool_restart_retries=0$' "$activation_log" || {
+      echo "a harness pool restarted during $scenario; repeat the run" >&2
       exit 1
     }
   fi
