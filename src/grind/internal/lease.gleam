@@ -47,6 +47,12 @@ pub fn expired_lease_predicate(now_expression: String) -> String {
 /// an already-expired `executing` row to `uncertain` under
 /// `expired_lease_predicate`, the single-sourced fragment both callers
 /// splice in.
+///
+/// `candidate_select` must select `id, attempt_id, attempt_count`: the
+/// `RETURNING` list reports the expired attempt from the candidate row as it
+/// was before the update, because a replay clears `attempt_id` and refunds
+/// `attempt_count` (a replay is a redelivery, not a business attempt, like a
+/// snooze), and every `RETURNING` expression on `job` reads the updated row.
 pub fn quarantine_update_sql(candidate_select: String) -> String {
   let replay = replay_condition("job")
   "WITH candidate AS ("
@@ -59,7 +65,9 @@ pub fn quarantine_update_sql(candidate_select: String) -> String {
   <> replay
   <> " THEN clock_timestamp() ELSE job.available_at END, attempt_id = CASE WHEN "
   <> replay
-  <> " THEN NULL ELSE job.attempt_id END, attempt_owner = CASE WHEN "
+  <> " THEN NULL ELSE job.attempt_id END, attempt_count = CASE WHEN "
+  <> replay
+  <> " THEN GREATEST(job.attempt_count - 1, 0) ELSE job.attempt_count END, attempt_owner = CASE WHEN "
   <> replay
   <> " THEN NULL ELSE job.attempt_owner END, lease_expires_at = CASE WHEN "
   <> replay
@@ -67,7 +75,7 @@ pub fn quarantine_update_sql(candidate_select: String) -> String {
   <> replay
   <> " THEN 'expired attempt replayed (' || (job.replay_count + 1)::text || ' of ' || job.max_replays::text || ')' WHEN job.cancel_requested_at IS NOT NULL THEN 'expired after cancellation request; prior effect unknown' WHEN job.failure_description IS NULL THEN 'expired attempt requires outcome reconciliation' ELSE job.failure_description || '; expired attempt requires outcome reconciliation' END, uncertain_at = CASE WHEN "
   <> replay
-  <> " THEN NULL ELSE clock_timestamp() END FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.attempt_id, job.attempt_epoch, job.attempt_count, (job.cancel_requested_at IS NOT NULL), job.state = 'queued', job.correlation"
+  <> " THEN NULL ELSE clock_timestamp() END FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, candidate.attempt_id, job.attempt_epoch, candidate.attempt_count, (job.cancel_requested_at IS NOT NULL), job.state = 'queued', job.correlation"
 }
 
 /// Whether an expired attempt of the row `alias` is replayed instead of held
@@ -170,7 +178,7 @@ pub fn quarantine_expired_in_queue_measured(
   // same row — see `attempt.claim_registered_job`'s identical reasoning.
   let sql =
     quarantine_update_sql(
-      "SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'executing' AND "
+      "SELECT id, attempt_id, attempt_count FROM grind_jobs WHERE queue = $1 AND state = 'executing' AND "
       <> expired_lease_predicate("clock_timestamp()")
       <> " ORDER BY id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1",
     )

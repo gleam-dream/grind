@@ -1,6 +1,7 @@
 //// Bounded handlers, snoozes and abandoned attempts; cancellation that
 //// reaches the handler; transactional submit; draining for tests.
 
+import exception
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{Some}
@@ -14,9 +15,13 @@ import grind/facade/support.{fast, int_codec, unique, with_runtime}
 import grind/job
 import grind/queue
 import grind/support/env.{mark_database_test_executed, queue_database_url}
+import grind/support/observers.{detach}
+import grind/telemetry
 import grind/testing
 import grind/worker
+import one_shot
 import pog
+import sinal
 
 pub fn facade_snooze_limit_ends_the_job_test() {
   case queue_database_url() {
@@ -119,24 +124,45 @@ pub fn facade_abandoned_attempt_replays_after_lease_expiry_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
     Ok(url) -> {
+      // The first delivery hangs past its timeout; the redelivery answers
+      // with the business attempt it was given.
+      let first_delivery = one_shot.armed()
       let replaying =
         worker.responding(
           unique("behavior.replay"),
           input: int_codec(),
           output: int_codec(),
           handle: fn(context, n) {
-            case worker.attempt(context) {
-              1 -> {
+            case one_shot.take(first_delivery) {
+              True -> {
                 process.sleep(30_000)
                 worker.Succeeded(n)
               }
-              _ -> worker.Succeeded(n * 2)
+              False -> worker.Succeeded(n * 10 + worker.attempt(context))
             }
           },
         )
         |> worker.with_queue(unique("behavior-replay"))
         |> worker.with_timeout(worker.After(duration.milliseconds(200)))
         |> worker.with_abandonment(worker.ReplayAfterLeaseExpiry(max_replays: 1))
+      let quarantined = process.new_subject()
+      let attachment =
+        sinal.observe(telemetry.quarantined(), fn(_measurements, metadata) {
+          case metadata.ref.worker_id == replaying.id {
+            True -> process.send(quarantined, metadata)
+            False -> Nil
+          }
+        })
+      use <- exception.defer(fn() { detach(attachment) })
+      let claimed = process.new_subject()
+      let claims =
+        sinal.observe(telemetry.claimed(), fn(_measurements, metadata) {
+          case metadata.ref.worker_id == replaying.id {
+            True -> process.send(claimed, metadata.attempt)
+            False -> Nil
+          }
+        })
+      use <- exception.defer(fn() { detach(claims) })
       use jobs <- with_runtime(url, fn(config) {
         config
         |> fast
@@ -152,7 +178,23 @@ pub fn facade_abandoned_attempt_replays_after_lease_expiry_test() {
       // The first attempt is stopped by its timeout and not acknowledged;
       // once its lease expires the claim-time scan replays the job.
       grind.await(jobs, handle, within: duration.seconds(30))
-      |> should.equal(Ok(grind.Succeeded(42)))
+      |> should.equal(Ok(grind.Succeeded(211)))
+      let assert Ok(first_claim) = process.receive(claimed, within: 1000)
+      let assert Ok(second_claim) = process.receive(claimed, within: 1000)
+
+      // The replay is observable, and names the attempt that expired.
+      let assert Ok(replay) = process.receive(quarantined, within: 1000)
+      replay.ref.job_id |> should.equal(job.id(handle))
+      replay.replayed |> should.be_true
+      replay.cancellation_was_requested |> should.be_false
+      replay.attempt |> should.equal(first_claim)
+
+      // The replay did not use a business attempt: the redelivery is
+      // attempt 1 again, under a new attempt id and epoch.
+      first_claim.attempt |> should.equal(1)
+      second_claim.attempt |> should.equal(1)
+      { second_claim.attempt_id != first_claim.attempt_id } |> should.be_true
+      second_claim.epoch |> should.equal(first_claim.epoch + 1)
       let assert Ok([summary]) =
         admin.list(
           jobs,
@@ -161,6 +203,7 @@ pub fn facade_abandoned_attempt_replays_after_lease_expiry_test() {
             |> admin.after(job.id(handle) - 1),
         )
       summary.replay_count |> should.equal(1)
+      summary.attempt |> should.equal(1)
       mark_database_test_executed("facade-abandonment-replay-passed")
     }
   }

@@ -1781,7 +1781,7 @@ pub fn quarantine_expired(
       // identical reasoning for its own candidate lock.
       let sql =
         lease.quarantine_update_sql(
-          "SELECT id FROM grind_jobs WHERE state = 'executing' AND "
+          "SELECT id, attempt_id, attempt_count FROM grind_jobs WHERE state = 'executing' AND "
           <> lease.expired_lease_predicate("clock_timestamp()")
           <> " ORDER BY id FOR NO KEY UPDATE SKIP LOCKED LIMIT $1",
         )

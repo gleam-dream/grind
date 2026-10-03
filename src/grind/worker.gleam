@@ -108,7 +108,10 @@ pub type Abandonment {
   HoldUncertain
   /// Requeue the job after its lease expires, at most `max_replays` times,
   /// then hold it `uncertain`. Choose it for handlers that are idempotent
-  /// by construction.
+  /// by construction. A replay redelivers the same business attempt: it
+  /// does not count against `with_max_attempts`, and `attempt` reads the
+  /// same number again. `[grind, job, quarantined]` reports it with
+  /// `replayed: True`.
   ReplayAfterLeaseExpiry(max_replays: Int)
 }
 

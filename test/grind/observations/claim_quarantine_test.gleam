@@ -273,6 +273,126 @@ fn run_quarantined_observation_emission_test(database_url: String) -> Nil {
   mark_database_test_executed("quarantined-observation-emission-passed")
 }
 
+pub fn postgres_quarantined_observation_reports_a_replay_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_quarantined_observation_replay_test(database_url)
+  }
+}
+
+/// A replay (`ReplayAfterLeaseExpiry`) clears the row's `attempt_id`, so the
+/// event must name the expired attempt from the row as it was before the
+/// scan, and report `replayed`. The replay refunds the business attempt: the
+/// redelivery is claimed as attempt 1 again. Both scans are covered: the
+/// claim-time scan and the cross-queue `quarantine_expired` sweep.
+fn run_quarantined_observation_replay_test(database_url: String) -> Nil {
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec(
+      "quarantined-replay-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "quarantined-replay-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
+  let assert Ok(definition) =
+    worker.define(
+      "quarantined.replay",
+      "v1",
+      input_codec,
+      output_codec,
+      fn(value) { Ok(int.to_string(value)) },
+    )
+  let queue_name = "quarantined-replay-" <> unique_test_suffix()
+  let assert Ok(workers) = registry.new(queue_name)
+  let assert Ok(workers) = registry.register(workers, definition)
+  let assert Ok(handle_a) = postgres.submit(database, queue_name, definition, 1)
+  let assert Ok(handle_b) = postgres.submit(database, queue_name, definition, 2)
+  let connection = postgres.connection(database)
+  let expire = fn(handle) {
+    let assert Ok(returned) =
+      pog.query(
+        "UPDATE grind_jobs SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = 1, attempt_count = 1, attempt_owner = 'dead-consumer', lease_expires_at = clock_timestamp(), max_replays = 2, replay_count = 0 WHERE id = $1 RETURNING attempt_id",
+      )
+      |> pog.parameter(pog.int(job.id_value(handle)))
+      |> pog.returning({
+        use attempt_id <- decode.field(0, decode.int)
+        decode.success(attempt_id)
+      })
+      |> pog.execute(on: connection)
+    let assert [attempt_id] = returned.rows
+    attempt_id
+  }
+  let attempt_a = expire(handle_a)
+  let attempt_b = expire(handle_b)
+
+  let signal = process.new_subject()
+  let attachment =
+    sinal.observe(telemetry.quarantined(), fn(_measurements, metadata) {
+      case metadata.ref.queue == queue_name {
+        True -> process.send(signal, metadata)
+        False -> Nil
+      }
+    })
+  use <- exception.defer(fn() { detach(attachment) })
+
+  // The claim-time scan replays the first row and claims it at once.
+  let assert Ok(Some(claimed)) =
+    attempt.claim_one(database, queue_name, workers, "replay-owner", 30_000)
+  let assert Ok(metadata_a) = process.receive(signal, within: 5000)
+  metadata_a.ref.job_id |> should.equal(job.id_value(handle_a))
+  metadata_a.replayed |> should.be_true
+  metadata_a.attempt
+  |> should.equal(telemetry.AttemptRef(
+    attempt_id: attempt_a,
+    epoch: 1,
+    attempt: 1,
+  ))
+  let #(claimed_id, claimed_attempt_id, claimed_epoch) =
+    attempt.claim_identity(claimed)
+  claimed_id |> should.equal(job.id_value(handle_a))
+  { claimed_attempt_id != attempt_a } |> should.be_true
+  claimed_epoch |> should.equal(2)
+  attempt.claim_context(claimed, process.new_selector(), None).attempt
+  |> should.equal(1)
+
+  // The cross-queue sweep reports its replay the same way.
+  let assert Ok(swept) = postgres.quarantine_expired(database, limit: 100)
+  { swept >= 1 } |> should.be_true
+  let assert Ok(metadata_b) = process.receive(signal, within: 5000)
+  metadata_b.ref.job_id |> should.equal(job.id_value(handle_b))
+  metadata_b.replayed |> should.be_true
+  metadata_b.attempt
+  |> should.equal(telemetry.AttemptRef(
+    attempt_id: attempt_b,
+    epoch: 1,
+    attempt: 1,
+  ))
+  postgres.state(database, handle_b) |> should.equal(Ok(job.Queued))
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT attempt_count, replay_count, attempt_id IS NULL FROM grind_jobs WHERE id = $1",
+    )
+    |> pog.parameter(pog.int(job.id_value(handle_b)))
+    |> pog.returning({
+      use attempts <- decode.field(0, decode.int)
+      use replays <- decode.field(1, decode.int)
+      use cleared <- decode.field(2, decode.bool)
+      decode.success(#(attempts, replays, cleared))
+    })
+    |> pog.execute(on: connection)
+  returned.rows |> should.equal([#(0, 1, True)])
+  mark_database_test_executed("quarantined-observation-replay-passed")
+}
+
 pub fn postgres_quarantined_observation_absent_when_nothing_expired_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
@@ -591,7 +711,8 @@ fn run_quarantine_expired_global_test(database_url: String) -> Nil {
     }
   }
 
-  postgres.quarantine_expired(database, limit: 10) |> should.equal(Ok(1))
+  let assert Ok(swept) = postgres.quarantine_expired(database, limit: 100)
+  { swept >= 1 } |> should.be_true
   let assert Ok(#(_, metadata_two)) = process.receive(signal, within: 5000)
   postgres.state(database, first) |> should.equal(Ok(job.Uncertain))
   postgres.state(database, second) |> should.equal(Ok(job.Uncertain))

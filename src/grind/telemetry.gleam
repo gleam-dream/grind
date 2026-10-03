@@ -179,7 +179,10 @@ pub type ClaimedMetadata {
 /// `cancellation_was_requested` distinguishes an abandoned attempt that also
 /// had a pending cancellation request from an ordinary one — both still
 /// require audited reconciliation, but the failure description differs (see
-/// `postgres`'s quarantine scan).
+/// `postgres`'s quarantine scan). `attempt` names the attempt that expired,
+/// as the row held it before the scan. A replay (`replayed: True`) refunds
+/// that attempt's number, like a snooze, so the redelivery's `claimed`
+/// event reports the same `attempt` under a new `attempt_id` and `epoch`.
 pub type QuarantinedMetadata {
   QuarantinedMetadata(
     ref: JobRef,
