@@ -44,12 +44,13 @@ let mailer =
   |> worker.with_queue("mailers")
 let assert Ok(pool) = pog.url_config(pool_name, database_url)
 // In the application's supervision tree:
-supervisor.add(tree, grind.supervised(grind.new(pool) |> grind.with_worker(mailer), name))
+let config = grind.new(pool) |> grind.with_worker(mailer) |> grind.with_startup_migration
+supervisor.add(tree, grind.supervised(config, name))
 // Anywhere:
 let jobs = grind.named(name)
-let assert Ok(Nil) = grind.migrate(jobs)
-let assert Ok(grind.Inserted(handle)) = grind.submit(jobs, job.new(mailer, Email("a@b.c", "hi")))
-let assert Ok(grind.Succeeded(message_id)) = grind.await(jobs, handle, within: duration.seconds(5))
+let assert Ok(admission) = grind.submit(jobs, job.new(mailer, Email("a@b.c", "hi")))
+let assert Ok(grind.Succeeded(message_id)) =
+  grind.await(jobs, grind.handle(admission), within: duration.seconds(5))
 ```
 
 Scripts and tests that own their runtime use
@@ -417,3 +418,35 @@ replaces the 38-line replay sweep for an idempotent run driver, and
 `admin.list` serves the operator sweep. RA-5: `worker.cancellation(context)`
 fires when `grind.cancel` commits, so the cancellation fan-out can go. RA-11:
 `grind.stop` works from any process, and one pool serves the app and Grind.
+
+## Follow-up fixes
+
+The apps' re-run against wave 3 found one defect and four hazards. These
+changes fix them; the app-side edits are listed after the table.
+
+| Finding                                           | Before                                                                                                                                                           | After                                                                                                                                                                                                                                                                                                                                              |
+| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RA-12: a replay emitted no `quarantined` event    | The scan's `RETURNING` read `attempt_id` after the replay had cleared it, so the event was skipped and `replayed: True` never reached a handler.                 | The event names the expired attempt from the row as it was before the scan (`attempt_id`, `epoch`, `attempt`), with `replayed: True`, from the claim-time scan and from `admin.quarantine_expired`.                                                                                                                                                |
+| RA-12: a replay used a business attempt           | The redelivery was claimed as attempt 2, contradicting `with_max_attempts`'s doc.                                                                                | A replay rolls back the attempt number, as a snooze does: the redelivery is claimed as the same attempt under a new `attempt_id` and `epoch`, and only `max_replays` bounds replays. A handler that told a replay apart by `worker.attempt(context) > 1` must keep its own marker.                                                                 |
+| Shared pool `search_path`                         | The pool built from the app's `pog.Config` pinned every session's `search_path` to Grind's schema, so an app kept Grind in `public` or qualified its own tables. | The pool keeps the app's `search_path`. Each Grind storage call sets Grind's schema when it checks out a connection and restores the session's value before the connection returns to the pool; a connection whose value cannot be restored is retired. `with_schema` works with unqualified app queries.                                          |
+| The worker could not reach the pool               | A handler captured `pog.named_connection(pool_name)` or called `grind.connection(grind.named(name))` per attempt.                                                | `worker.connection(context)` returns the runtime's pool; `testing.with_connection(context, connection)` sets it in a test.                                                                                                                                                                                                                         |
+| Consumers polled before the schema existed        | `grind.start` then `grind.migrate` left consumers polling missing tables.                                                                                        | A runtime that would start consumers checks the schema first. `start` fails with `SchemaNotMigrated(found:, required:)`, and `supervised` fails its child's start with the same text, until the schema is current. `grind.with_startup_migration` applies the migrations before any consumer starts. A runtime `without_consumers` is not checked. |
+| `submit_in` emits no `admitted` event             | Undocumented recipe.                                                                                                                                             | Documented on `submit_in`: record the admission after your commit, keyed by `job.id(grind.handle(admission))` and the job's correlation.                                                                                                                                                                                                           |
+| A plain submit matched three `Admission` variants | `Existing` and `Rescheduled` carried no handle, so a correct branch needed `grind.bind`.                                                                         | `grind.handle(admission)` returns the new or the occupying job. `Conflict` gains `handle` and the type parameters `Conflict(input, output, error)`.                                                                                                                                                                                                |
+| `queue.with_poll_interval` takes a `Duration`     | Two apps added `gleam_time` for it.                                                                                                                              | Kept: every bound in Grind is a `Duration`, so the unit is in the call and a lease in seconds cannot be read as milliseconds. `grind/queue`'s module doc says so.                                                                                                                                                                                  |
+
+| Before                                                                                      | After                                                                                                        |
+| ------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `grind.start(config, name)` then `grind.migrate(jobs)`                                      | `grind.start(config \|> grind.with_startup_migration, name)`; or migrate from a `without_consumers` runtime. |
+| `grind.supervised(config, name)` then `grind.migrate(grind.named(name))`                    | `grind.supervised(config \|> grind.with_startup_migration, name)`.                                           |
+| `pog.named_connection(pool_name)` or `grind.connection(grind.named(name))` inside a handler | `worker.connection(context)`.                                                                                |
+| `public.`-qualified app tables, or `with_schema` dropped, on Grind's pool                   | unqualified app tables, with `grind.with_schema` back if the app wants Grind apart.                          |
+| `case admission { Inserted(handle) -> .. Existing(c) \| Rescheduled(c) -> c.job_id }`       | `grind.handle(admission)` (and `job.id` of it).                                                              |
+| `worker.attempt(context)` to detect a lease replay                                          | an app-owned marker; `[grind, job, quarantined]` with `replayed: True` observes it.                          |
+| `grind.Conflict` in a type annotation                                                       | `grind.Conflict(input, output, error)`.                                                                      |
+
+The apps' remaining findings for Grind are unchanged here: the handler's
+`Cancelled(reason)` is replaced by `"cancelled by caller"` when a
+cancellation was requested (research_agent), `worker.deadline` stays an
+absolute `Timestamp` (checkout, research_agent), and a result write inside
+the acknowledgement transaction (extractor, EXT-9) is not offered.

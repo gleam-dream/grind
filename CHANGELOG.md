@@ -11,6 +11,36 @@ public modules with one `grind` facade; see
 [docs/migration-wave-3.md](docs/migration-wave-3.md) for every changed item.
 Earlier changes are in [docs/migration-wave-2.md](docs/migration-wave-2.md).
 
+### Follow-up fixes
+
+Found by the apps' re-run against wave 3; see
+[docs/migration-wave-3.md](docs/migration-wave-3.md), "Follow-up fixes".
+
+- Fixed: a replayed attempt (`ReplayAfterLeaseExpiry`) now emits
+  `[grind, job, quarantined]` with `replayed: True` and the expired
+  attempt's id, epoch and number. The scan read the attempt after the
+  replay had cleared it, so the event was never sent (RA-12).
+- Changed: a replay rolls back the attempt number, as a snooze does, so it
+  no longer uses one of `with_max_attempts`'s business attempts; the
+  redelivery reads the same `worker.attempt`.
+- Changed: a pool built from the application's `pog.Config` keeps the
+  application's `search_path`. Grind sets its schema for each of its own
+  storage calls and restores the session's value before the connection
+  returns to the pool, so `grind.with_schema` and unqualified application
+  tables work on one pool.
+- Added: `worker.connection(context)`, the runtime's pool inside a handler,
+  and `testing.with_connection`.
+- Changed: a runtime that would start consumers refuses a schema behind its
+  migrations: `start` returns `SchemaNotMigrated(found:, required:)` and
+  `supervised` fails its child's start. Added `grind.with_startup_migration`,
+  which migrates before any consumer starts, and
+  `StartupMigrationFailed(MigrateError)`.
+- Added: `grind.handle(admission)`, the admitted or occupying job.
+  `Conflict` is now `Conflict(input, output, error)` with a `handle` field.
+- Documented: the post-commit recipe for observing a `submit_in` admission,
+  and why every bound, including `queue.with_poll_interval`, takes a
+  `Duration`.
+
 ### Public surface
 
 - Eight public modules: `grind`, `grind/worker`, `grind/job`, `grind/queue`,
