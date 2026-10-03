@@ -256,7 +256,7 @@ fn run_rejected_output_test(database_url: String) -> Nil {
   postgres.state(database, handle) |> should.equal(Ok(job.RuntimeFailed))
   postgres.outcome(database, handle)
   |> should.equal(
-    Ok(job.FailedOperationally(
+    Ok(job.RuntimeFailedWith(
       "output codec rejected the handler's output: longer than 4 bytes",
     )),
   )
@@ -284,7 +284,7 @@ fn run_rejected_error_test(database_url: String) -> Nil {
   postgres.state(database, handle) |> should.equal(Ok(job.RuntimeFailed))
   postgres.outcome(database, handle)
   |> should.equal(
-    Ok(job.FailedOperationally(
+    Ok(job.RuntimeFailedWith(
       "error codec rejected the handler's error: account id must be at least 0",
     )),
   )

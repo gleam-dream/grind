@@ -46,7 +46,7 @@ import grind/internal/worker.{type BusinessFailureCause, type Codec, type Worker
 /// PostgreSQL schema itself (see README, "Isolation"), which this token
 /// never influences and nothing here is ever written to a row or compared
 /// against one.
-pub opaque type Installation {
+pub type Installation {
   Installation(
     database_oid: Int,
     schema: String,
@@ -60,6 +60,11 @@ pub fn new_installation(
   cluster_identifier: Option(Int),
 ) -> Installation {
   Installation(database_oid:, schema:, cluster_identifier:)
+}
+
+pub fn installation_database_oid(installation: Installation) -> Int {
+  let Installation(database_oid:, ..) = installation
+  database_oid
 }
 
 pub fn installation_schema(installation: Installation) -> String {
@@ -102,7 +107,7 @@ pub fn same_installation(a: Installation, b: Installation) -> Bool {
 }
 
 /// A typed reference to a persisted job. Codecs are retained from its definition.
-pub opaque type JobHandle(input, output, error) {
+pub type JobHandle(input, output, error) {
   JobHandle(
     id: Int,
     installation: Installation,
@@ -115,12 +120,12 @@ pub opaque type JobHandle(input, output, error) {
   )
 }
 
-pub opaque type JobId {
+pub type JobId {
   JobId(Int)
 }
 
 /// A checked absolute Unix-millisecond time at which a job may run.
-pub opaque type AvailableAt {
+pub type AvailableAt {
   AvailableAt(Int)
 }
 
@@ -207,11 +212,16 @@ pub type Outcome(output, error) {
   BusinessFailedWithCause(error, BusinessFailureCause)
   DiscardedWithReason(String)
   CancelledWithReason(String)
-  /// A terminal failure that carries no typed error: invalid stored input, a
-  /// handler output or error that its codec rejected (both `RuntimeFailed`),
-  /// a codec contract mismatch, or a business failure without an error codec.
+  /// A business failure with no stored typed error: the worker has no error
+  /// codec, or the snooze limit ended the job.
   FailedOperationally(String)
   FailedOperationallyWithCause(String, BusinessFailureCause)
+  /// `runtime_failed`: invalid stored input, a handler output or error that
+  /// its codec rejected, or one larger than the payload limit.
+  RuntimeFailedWith(String)
+  /// `contract_mismatch`: the stored codec versions no longer match the
+  /// registered worker.
+  ContractMismatchWith(String)
   /// A worker declared or recovery detected an uncertain outcome needing an
   /// explicit audited resolution.
   ReconciliationRequired(String)

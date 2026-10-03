@@ -37,6 +37,15 @@ pub fn submission_id(value: String) -> Result(SubmissionId, SubmissionIdError) {
   }
 }
 
+/// A fresh identity for an admission that the caller gave no id: 128 random
+/// bits, so a lost reply can still be reconciled.
+pub fn generated_submission_id() -> SubmissionId {
+  SubmissionId("grind-generated-" <> random_hex())
+}
+
+@external(erlang, "grind_unique_ffi", "random_hex")
+fn random_hex() -> String
+
 pub fn submission_id_value(id: SubmissionId) -> String {
   let SubmissionId(value) = id
   value
@@ -48,6 +57,8 @@ pub fn submission_id_value(id: SubmissionId) -> String {
 pub type Availability {
   Immediately
   At(job.AvailableAt)
+  /// This many milliseconds after the admission's own database time.
+  Delayed(milliseconds: Int)
 }
 
 /// The submission's own availability, as a millisecond value (`None` for
@@ -56,6 +67,7 @@ pub fn availability_ms(availability: Availability) -> Option(Int) {
   case availability {
     Immediately -> None
     At(at) -> Some(job.available_at_unix_milliseconds(at))
+    Delayed(_) -> None
   }
 }
 
@@ -213,24 +225,20 @@ pub type SubmitError(input, output, error) {
   /// admission transaction's own receipt lookup, not candidate selection,
   /// resolves a genuinely committed prior attempt once it becomes visible).
   CommitUnknown(PendingSubmission(input, output, error))
-  /// The same genuinely-uncertain outcome `CommitUnknown` describes, for a
-  /// plain `submit`/`submit_at` call instead: its insert query failed or its
-  /// reply was lost, but a `pog.QueryError` here can also mean the
-  /// connection was lost after PostgreSQL already committed the row. Also
-  /// reported, conservatively, for a pool-checkout failure that never sent
-  /// anything at all (knowably not committed, the same case `NotCommitted`
-  /// distinguishes for `submit_unique`/`submit_with_id`) — plain
-  /// `submit`/`submit_at` makes no checkout-vs-mid-transaction distinction
-  /// of its own, so both shapes are folded into this one variant. Unlike
-  /// `submit_unique`/`submit_with_id`, plain `submit`/`submit_at` has no
-  /// request identity of its own to retain, so there is no `PendingSubmission`
-  /// to reconcile from — retrying can create a duplicate job. A caller that
-  /// must retry safely should use `submit_unique`/`submit_with_id` with a
-  /// caller-chosen `SubmissionId` instead: its admission transaction records
-  /// that identity durably, so a retried request converges on the original
-  /// outcome rather than inserting again.
-  CommitUnknownWithoutId(pog.QueryError)
-  /// `reconcile_unique` only: this `PendingSubmission` was minted against a
+  /// The encoded input is larger than the payload limit
+  /// (`postgres.with_max_payload_bytes`, default 1 MiB). Checked before any
+  /// storage call; nothing was written.
+  PayloadTooLarge(bytes: Int, limit: Int)
+  /// `submit_in` only: the connection is a pool, not a transaction. Nothing
+  /// was written.
+  NotInTransaction
+  /// `submit_in` only: the caller's transaction is not `READ COMMITTED`,
+  /// which the admission's lock-then-read protocol requires. Nothing was
+  /// written.
+  TransactionIsolationUnsupported(isolation: String)
+  /// `reconcile_unique` and `submit_in`: this `PendingSubmission`, or the
+  /// caller's transaction, belongs to a
+  /// different database than this one. For `reconcile_unique`, it was minted against a
   /// different `postgres.Database` (a different physical database, or the
   /// same database under a different configured schema — see
   /// `postgres.with_schema`) than the one it was just used against. Checked

@@ -1,266 +1,96 @@
-import exception
-import gleam/dynamic/decode
+//// Telemetry from outside the package: handlers attached to the public
+//// descriptors see each job's correlation and committed state.
+
 import gleam/erlang/process
-import gleam/int
-import gleam/json
-import gleam/option.{None}
+import gleam/time/duration
 import gleeunit/should
-import grind/internal/consumer as queue
-import grind/internal/diagnostic
-import grind/internal/job
-import grind/internal/observation
-import grind/internal/postgres
-import grind/internal/registry
-import grind/internal/worker
+import grind
+import grind/job
+import grind/telemetry
+import grind/worker
+import grind_consumer
 import grind_consumer/support/env
 import sinal
+import sinal/correlation
 
-/// Attaches `sinal.observe` to `grind/observation.acknowledged()` using only
-/// public imports (`grind/observation`, `sinal`), runs one typed job through
-/// the public consumer API, and decodes the resulting record — proving the
-/// descriptor Grind owns is usable end to end from outside the package,
-/// exactly as an application would use it.
-pub fn public_consumer_observes_acknowledged_test() {
-  case env.database_url() {
-    Error(Nil) -> Nil
-    Ok(url) -> run_public_consumer_observation_test(url)
-  }
-}
-
-fn run_public_consumer_observation_test(url: String) -> Nil {
-  let assert Ok(settings) =
-    postgres.settings(url)
-    |> postgres.validate
-  let assert Ok(database) = postgres.start(settings)
-  use <- exception.defer(fn() { postgres.close(database) })
-  let assert Ok(Nil) = postgres.migrate(database)
-
-  let assert Ok(input_codec) =
-    worker.codec(
-      "consumer-observation-input-v1",
-      worker.infallible(json.int),
-      decode.int,
-    )
-  let assert Ok(output_codec) =
-    worker.codec(
-      "consumer-observation-output-v1",
-      worker.infallible(json.string),
-      decode.string,
-    )
-  let assert Ok(echo_worker) =
-    worker.define(
-      "consumer.observation.echo",
-      "v1",
-      input_codec,
-      output_codec,
-      fn(value) { Ok(int.to_string(value)) },
-    )
-  let assert Ok(workers) = registry.new("external-consumer-observation")
-  let assert Ok(workers) = registry.register(workers, echo_worker)
-  let assert Ok(handle) =
-    postgres.submit(database, "external-consumer-observation", echo_worker, 41)
-
-  let signal = process.new_subject()
-  let attachment =
-    sinal.observe(observation.acknowledged(), fn(measurements, metadata) {
-      process.send(signal, #(measurements, metadata))
-    })
-  use <- exception.defer(fn() {
-    let assert Ok(Nil) = sinal.detach(attachment)
-    Nil
-  })
-
-  let assert Ok(consumer) = queue.start(database, workers, env.manual_policy())
-  use <- exception.defer(fn() { queue.stop(consumer) })
-  queue.process_one(consumer) |> should.equal(Ok(True))
-
-  let assert Ok(#(measurements, metadata)) =
-    process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.AcknowledgedMeasurements(count: 1))
-  metadata.ref.job_id |> should.equal(job.id_value(handle))
-  metadata.ref.queue |> should.equal("external-consumer-observation")
-  metadata.ref.worker_id |> should.equal("consumer.observation.echo")
-  metadata.committed_state |> should.equal(job.Succeeded)
-  metadata.proposed |> should.equal(observation.ProposedSuccess)
-  metadata.confirmation |> should.equal(observation.Replied)
-  env.mark("consumer-observes-acknowledged-passed")
+fn double() -> worker.Worker(Int, Int, Nil) {
+  worker.new(
+    env.unique("observed.double"),
+    input: grind_consumer.amount_codec(),
+    output: grind_consumer.amount_codec(),
+    perform: fn(amount) { Ok(amount * 2) },
+  )
+  |> worker.with_queue(env.unique("observed"))
 }
 
 pub fn public_consumer_observes_claimed_test() {
   case env.database_url() {
     Error(Nil) -> Nil
-    Ok(url) -> run_public_consumer_claimed_observation_test(url)
+    Ok(url) -> {
+      let double = double()
+      let claimed = process.new_subject()
+      let capacity = process.new_subject()
+      let claimed_handler =
+        sinal.observe(telemetry.claimed(), fn(_measurements, metadata) {
+          case metadata.ref.queue == double.queue {
+            True -> process.send(claimed, metadata)
+            False -> Nil
+          }
+        })
+      let capacity_handler =
+        sinal.observe(telemetry.capacity(), fn(measurements, metadata) {
+          case metadata.queue.queue == double.queue {
+            True -> process.send(capacity, measurements)
+            False -> Nil
+          }
+        })
+      use jobs <- env.with_grind(url, grind.with_worker(_, double))
+      let assert Ok(order) = correlation.from_string(env.unique("order"))
+      let assert Ok(grind.Inserted(handle)) =
+        grind.submit(jobs, job.new(double, 4) |> job.with_correlation(order))
+      let assert Ok(claim) = process.receive(claimed, within: 10_000)
+      claim.ref.job_id |> should.equal(job.id(handle))
+      claim.ref.correlation |> should.equal(order)
+      claim.previous_state |> should.equal(job.Queued)
+      env.mark("consumer-observes-claimed-passed")
+      let assert Ok(initial) = process.receive(capacity, within: 5000)
+      initial.maximum |> should.equal(10)
+      env.mark("consumer-observes-capacity-passed")
+      let _ = sinal.detach(claimed_handler)
+      let _ = sinal.detach(capacity_handler)
+      Nil
+    }
   }
 }
 
-/// Round 2's `[grind, job, claimed]` descriptor, attached the same way an
-/// application would from outside the package (public imports only).
-fn run_public_consumer_claimed_observation_test(url: String) -> Nil {
-  let assert Ok(settings) =
-    postgres.settings(url)
-    |> postgres.validate
-  let assert Ok(database) = postgres.start(settings)
-  use <- exception.defer(fn() { postgres.close(database) })
-  let assert Ok(Nil) = postgres.migrate(database)
-
-  let assert Ok(input_codec) =
-    worker.codec(
-      "consumer-claimed-input-v1",
-      worker.infallible(json.int),
-      decode.int,
-    )
-  let assert Ok(output_codec) =
-    worker.codec(
-      "consumer-claimed-output-v1",
-      worker.infallible(json.string),
-      decode.string,
-    )
-  let assert Ok(echo_worker) =
-    worker.define(
-      "consumer.claimed.echo",
-      "v1",
-      input_codec,
-      output_codec,
-      fn(value) { Ok(int.to_string(value)) },
-    )
-  let assert Ok(workers) = registry.new("external-consumer-claimed")
-  let assert Ok(workers) = registry.register(workers, echo_worker)
-
-  let signal = process.new_subject()
-  let attachment =
-    sinal.observe(observation.claimed(), fn(measurements, metadata) {
-      process.send(signal, #(measurements, metadata))
-    })
-  use <- exception.defer(fn() {
-    let assert Ok(Nil) = sinal.detach(attachment)
-    Nil
-  })
-
-  let capacity = process.new_subject()
-  let capacity_attachment =
-    sinal.observe(diagnostic.capacity(), fn(measurements, metadata) {
-      case
-        metadata.queue.queue == "external-consumer-claimed"
-        && measurements.running == 1
-      {
-        True -> process.send(capacity, #(measurements, metadata))
-        False -> Nil
-      }
-    })
-  use <- exception.defer(fn() {
-    let assert Ok(Nil) = sinal.detach(capacity_attachment)
-    Nil
-  })
-
-  let assert Ok(handle) =
-    postgres.submit(database, "external-consumer-claimed", echo_worker, 41)
-  let assert Ok(consumer) = queue.start(database, workers, env.manual_policy())
-  use <- exception.defer(fn() { queue.stop(consumer) })
-  queue.process_one(consumer) |> should.equal(Ok(True))
-
-  let assert Ok(#(measurements, metadata)) =
-    process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.ClaimedMeasurements(count: 1))
-  metadata.ref.job_id |> should.equal(job.id_value(handle))
-  metadata.ref.queue |> should.equal("external-consumer-claimed")
-  metadata.ref.worker_id |> should.equal("consumer.claimed.echo")
-  metadata.previous_state |> should.equal(job.Queued)
-  let assert Ok(#(occupied, local)) = process.receive(capacity, within: 5000)
-  occupied |> should.equal(diagnostic.CapacityMeasurements(1, 1, 1, 0, 0))
-  local.queue.queue |> should.equal("external-consumer-claimed")
-  local.queue.consumer.node |> should.not_equal("")
-  local.queue.consumer.consumer |> should.not_equal("")
-  local.draining |> should.equal(False)
-  env.mark("consumer-observes-claimed-passed")
-  env.mark("consumer-observes-capacity-passed")
-}
-
-/// All descriptors and their public records are usable without internal imports.
-/// Synthetic synchronous dispatch proves the external codec surface; the test
-/// above separately proves a real runtime capacity event reaches an application.
-pub fn public_diagnostic_descriptors_are_usable_test() {
-  let consumer = diagnostic.ConsumerRef("public@host", "public-consumer")
-  let local = diagnostic.QueueRef("public.queue", consumer)
-  let context =
-    diagnostic.AttemptContext(
-      observation.JobRef(1, "public.queue", "public.worker", "v1"),
-      observation.AttemptRef(2, 3, 1),
-      consumer,
-    )
-  public_diagnostic(
-    diagnostic.renewal(),
-    "renewal",
-    diagnostic.RenewalMeasurements(1, 20, None),
-    diagnostic.RenewalMetadata(
-      context,
-      diagnostic.HandlerRunning,
-      diagnostic.StorageFailed,
-    ),
-  )
-  public_diagnostic(
-    diagnostic.acknowledgement(),
-    "acknowledgement",
-    diagnostic.AcknowledgementMeasurements(1, 30),
-    diagnostic.AcknowledgementMetadata(
-      context,
-      "public-command",
-      diagnostic.AckReconciled,
-    ),
-  )
-  public_diagnostic(
-    diagnostic.acknowledgement_retry(),
-    "acknowledgement_retry",
-    diagnostic.RetryMeasurements(1, 1, 10, 40),
-    diagnostic.RetryMetadata(
-      context,
-      "public-command",
-      diagnostic.RetryAfterUnknown,
-    ),
-  )
-  public_diagnostic(
-    diagnostic.checkout(),
-    "checkout",
-    diagnostic.CheckoutMeasurements(1, 10, 20, 1),
-    diagnostic.CheckoutMetadata(
-      local,
-      diagnostic.LeaseRenewal,
-      diagnostic.ReservedPool,
-      diagnostic.CheckoutAcquired,
-      diagnostic.CallSucceeded,
-    ),
-  )
-  public_diagnostic(
-    diagnostic.claim_failed(),
-    "claim_failed",
-    diagnostic.ClaimFailedMeasurements(1, 20),
-    diagnostic.ClaimFailedMetadata(
-      local,
-      diagnostic.ClaimCandidate,
-      diagnostic.ConnectionUnavailable,
-    ),
-  )
-  public_diagnostic(
-    diagnostic.capacity(),
-    "capacity",
-    diagnostic.CapacityMeasurements(2, 1, 0, 1, 1),
-    diagnostic.CapacityMetadata(local, False),
-  )
-}
-
-fn public_diagnostic(
-  event: sinal.Event(m, d),
-  part: String,
-  measurements: m,
-  metadata: d,
-) -> Nil {
-  sinal.name(event) |> should.equal(["grind", "diagnostic", part])
-  let signal = process.new_subject()
-  let attachment =
-    sinal.observe(event, fn(m, d) { process.send(signal, #(m, d)) })
-  use <- exception.defer(fn() {
-    let assert Ok(Nil) = sinal.detach(attachment)
-    Nil
-  })
-  sinal.emit(event, measurements, metadata)
-  process.receive(signal, 1000) |> should.equal(Ok(#(measurements, metadata)))
+pub fn public_consumer_observes_acknowledged_test() {
+  case env.database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let double = double()
+      let acknowledged = process.new_subject()
+      let handler =
+        sinal.observe(telemetry.acknowledged(), fn(measurements, metadata) {
+          case metadata.ref.queue == double.queue {
+            True -> process.send(acknowledged, #(measurements, metadata))
+            False -> Nil
+          }
+        })
+      use jobs <- env.with_grind(url, grind.with_worker(_, double))
+      let assert Ok(order) = correlation.from_string(env.unique("order"))
+      let assert Ok(grind.Inserted(handle)) =
+        grind.submit(jobs, job.new(double, 4) |> job.with_correlation(order))
+      grind.await(jobs, handle, within: duration.seconds(10))
+      |> should.equal(Ok(grind.Succeeded(8)))
+      let assert Ok(#(measurements, ack)) =
+        process.receive(acknowledged, within: 5000)
+      measurements.count |> should.equal(1)
+      ack.ref.correlation |> should.equal(order)
+      ack.committed_state |> should.equal(job.Succeeded)
+      ack.confirmation |> should.equal(telemetry.Replied)
+      env.mark("consumer-observes-acknowledged-passed")
+      let _ = sinal.detach(handler)
+      Nil
+    }
+  }
 }

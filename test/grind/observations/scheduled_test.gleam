@@ -6,10 +6,10 @@ import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/consumer as queue
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/concurrency.{LongHandlerStarted, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
@@ -19,6 +19,7 @@ import grind/support/observation_fixtures.{
 import grind/support/observers.{detach}
 import grind/support/queue_timing.{database_time_milliseconds}
 import grind/support/worker_failure.{AccountMissing}
+import grind/telemetry
 
 pub fn postgres_acknowledged_observation_available_at_for_committed_retry_test() {
   case queue_database_url() {
@@ -53,7 +54,7 @@ fn run_acknowledged_observation_available_at_retry_test(
     )
   let assert Ok(definition) =
     worker.define(
-      "observation.available-at.retry",
+      "telemetry.available-at.retry",
       "v1",
       input_codec,
       output_codec,
@@ -80,11 +81,12 @@ fn run_acknowledged_observation_available_at_retry_test(
 
   let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
     process.receive(signal, within: 5000)
-  metadata.proposed |> should.equal(observation.ProposedRetryable)
-  metadata.committed_state |> should.equal(job.Retryable)
+  metadata.proposed |> should.equal(telemetry.ProposedRetryable)
+  metadata.committed_state |> should.equal(public_job.Retryable)
   let assert Some(available_at_ms) = metadata.available_at_unix_ms
   should.be_true(available_at_ms >= before_ack_ms + 15_000)
-  should.be_true(available_at_ms <= after_ack_ms + 15_000)
+  // The default backoff adds up to 10% jitter.
+  should.be_true(available_at_ms <= after_ack_ms + 16_500)
   mark_database_test_executed(
     "acknowledged-observation-available-at-committed-retry-passed",
   )
@@ -123,7 +125,7 @@ fn run_acknowledged_observation_available_at_snooze_test(
   let assert Ok(delay) = worker.retry_delay(60_000)
   let assert Ok(ordinary) =
     worker.define(
-      "observation.available-at.snooze",
+      "telemetry.available-at.snooze",
       "v1",
       input_codec,
       output_codec,
@@ -154,8 +156,8 @@ fn run_acknowledged_observation_available_at_snooze_test(
 
   let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
     process.receive(signal, within: 5000)
-  metadata.proposed |> should.equal(observation.ProposedSnoozed)
-  metadata.committed_state |> should.equal(job.Scheduled)
+  metadata.proposed |> should.equal(telemetry.ProposedSnoozed)
+  metadata.committed_state |> should.equal(public_job.Scheduled)
   let assert Some(available_at_ms) = metadata.available_at_unix_ms
   should.be_true(available_at_ms >= before_ack_ms + 60_000)
   should.be_true(available_at_ms <= after_ack_ms + 60_000)
@@ -205,7 +207,7 @@ fn run_acknowledged_observation_available_at_cancel_overrides_retry_test(
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
-      "observation.available-at.cancel-retry",
+      "telemetry.available-at.cancel-retry",
       "v1",
       input_codec,
       output_codec,
@@ -251,8 +253,8 @@ fn run_acknowledged_observation_available_at_cancel_overrides_retry_test(
 
   let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
     process.receive(signal, within: 5000)
-  metadata.proposed |> should.equal(observation.ProposedRetryable)
-  metadata.committed_state |> should.equal(job.Cancelled)
+  metadata.proposed |> should.equal(telemetry.ProposedRetryable)
+  metadata.committed_state |> should.equal(public_job.Cancelled)
   metadata.available_at_unix_ms |> should.equal(None)
   mark_database_test_executed(
     "acknowledged-observation-available-at-none-cancel-overrides-retry-passed",

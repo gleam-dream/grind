@@ -93,6 +93,13 @@ pub fn migrations() -> List(Migration) {
       v12_foreign_keys(),
       v12_forbidden_columns(),
     ),
+    Migration(
+      13,
+      v13_statements(),
+      v13_shape(),
+      v12_foreign_keys(),
+      v12_forbidden_columns(),
+    ),
   ]
 }
 
@@ -385,5 +392,58 @@ fn v12_forbidden_columns() -> List(#(String, String)) {
     #("grind_job_resolutions", "storage_owner"),
     #("grind_job_acknowledgements", "storage_owner"),
     #("grind_unique_submissions", "storage_owner"),
+  ]
+}
+
+/// Version 13 adds three job columns and widens one receipt check:
+///
+/// - `correlation`: the caller's `sinal/correlation` value, carried into the
+///   worker context and every job event. `NULL` on rows admitted before v13.
+/// - `max_replays` and `replay_count`: the worker's abandonment policy. A
+///   `NULL` `max_replays` holds an abandoned attempt `uncertain`; a positive
+///   one lets lease-expiry recovery replay the job that many times.
+/// - `snooze_limit_reached` becomes a valid acknowledgement `failure_cause`.
+/// - `grind_jobs_uncertain_idx` serves operator sweeps of uncertain jobs.
+fn v13_statements() -> List(String) {
+  [
+    advisory_lock_statement(),
+    "ALTER TABLE grind_jobs ADD COLUMN correlation text",
+    "ALTER TABLE grind_jobs ADD COLUMN max_replays bigint",
+    "ALTER TABLE grind_jobs ADD COLUMN replay_count bigint NOT NULL DEFAULT 0",
+    "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_correlation_check CHECK (correlation IS NULL OR octet_length(correlation) BETWEEN 1 AND 128)",
+    "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_max_replays_check CHECK (max_replays IS NULL OR max_replays > 0)",
+    "ALTER TABLE grind_job_acknowledgements DROP CONSTRAINT grind_job_acknowledgements_failure_cause_check",
+    "ALTER TABLE grind_job_acknowledgements ADD CONSTRAINT grind_job_acknowledgements_failure_cause_check CHECK (failure_cause IS NULL OR failure_cause IN ('budget_exhausted', 'retry_declined', 'snooze_limit_reached'))",
+    "CREATE INDEX grind_jobs_uncertain_idx ON grind_jobs (id) WHERE state = 'uncertain'",
+    "INSERT INTO grind_schema_migrations (version) VALUES (13)",
+  ]
+}
+
+fn v13_shape() -> List(ExpectedRelation) {
+  [
+    ExpectedRelation("grind_schema_migrations", Table, []),
+    ExpectedRelation("grind_schema_migrations_pkey", Index, []),
+    ExpectedRelation("grind_jobs", Table, [
+      "unique_key_contract", "unique_key_sha256", "finished_at", "correlation",
+      "max_replays", "replay_count",
+    ]),
+    ExpectedRelation("grind_jobs_id_seq", Sequence, []),
+    ExpectedRelation("grind_jobs_pkey", Index, []),
+    ExpectedRelation("grind_jobs_unique_candidate_idx", Index, []),
+    ExpectedRelation("grind_jobs_finished_idx", Index, []),
+    ExpectedRelation("grind_jobs_claim_idx", Index, []),
+    ExpectedRelation("grind_jobs_quarantine_idx", Index, []),
+    ExpectedRelation("grind_jobs_uncertain_idx", Index, []),
+    ExpectedRelation("grind_job_resolutions", Table, []),
+    ExpectedRelation("grind_job_resolutions_pkey", Index, []),
+    ExpectedRelation("grind_job_resolutions_job_idx", Index, []),
+    ExpectedRelation("grind_job_acknowledgements", Table, []),
+    ExpectedRelation("grind_job_acknowledgements_pkey", Index, []),
+    ExpectedRelation("grind_job_acknowledgements_attempt_key", Index, []),
+    ExpectedRelation("grind_job_acknowledgements_job_idx", Index, []),
+    ExpectedRelation("grind_attempts_id_seq", Sequence, []),
+    ExpectedRelation("grind_unique_submissions", Table, []),
+    ExpectedRelation("grind_unique_submissions_pkey", Index, []),
+    ExpectedRelation("grind_unique_submissions_job_idx", Index, []),
   ]
 }

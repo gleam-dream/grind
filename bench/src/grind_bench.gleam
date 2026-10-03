@@ -15,6 +15,7 @@ import gleam/otp/actor
 import gleam/result
 import gleam/string
 import grind/internal/postgres
+import grind_bench/harness_db
 import pog
 import simplifile
 
@@ -151,7 +152,7 @@ fn ensure_ledger_schema(
     |> list.filter(fn(statement) { statement != "" })
   list.try_each(statements, fn(statement) {
     pog.query(statement)
-    |> pog.execute(connection)
+    |> harness_db.execute(connection)
     |> result.map(fn(_) { Nil })
     |> result.map_error(LedgerSchemaSetupFailed)
   })
@@ -169,7 +170,7 @@ pub fn reset_ledger(connection: pog.Connection) -> Result(Nil, pog.QueryError) {
   pog.query(
     "TRUNCATE grind_bench.bench_submissions, grind_bench.bench_effects, grind_bench.bench_lease_log, grind_bench.bench_slow_ack_targets, grind_bench.bench_lease_samples, grind_bench.bench_durable_completions",
   )
-  |> pog.execute(connection)
+  |> harness_db.execute(connection)
   |> result.map(fn(_) { Nil })
 }
 
@@ -234,7 +235,7 @@ pub fn drop_schema(
   schema: String,
 ) -> Result(Nil, pog.QueryError) {
   pog.query("DROP SCHEMA IF EXISTS \"" <> schema <> "\" CASCADE")
-  |> pog.execute(connection)
+  |> harness_db.execute(connection)
   |> result.map(fn(_) { Nil })
 }
 
@@ -265,7 +266,8 @@ fn bench_schema_names(
       use name <- decode.field(0, decode.string)
       decode.success(name)
     })
-  pog.execute(query, connection) |> result.map(fn(returned) { returned.rows })
+  harness_db.execute(query, connection)
+  |> result.map(fn(returned) { returned.rows })
 }
 
 /// Item 1: "assert the queue is empty before preload" -- guards against a
@@ -280,6 +282,7 @@ pub fn assert_queue_empty(database: postgres.Database) -> Nil {
       use count <- decode.field(0, decode.int)
       decode.success(count)
     })
-  let assert Ok(pog.Returned(rows: [0], ..)) = pog.execute(query, connection)
+  let assert Ok(pog.Returned(rows: [0], ..)) =
+    harness_db.execute(query, connection)
   Nil
 }

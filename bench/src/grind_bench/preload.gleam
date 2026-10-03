@@ -27,6 +27,7 @@ import gleam/result
 import gleam/string
 import grind/internal/postgres
 import grind/internal/worker
+import grind_bench/harness_db
 import pog
 
 /// One job to preload. `available_at_ms: None` means immediately available
@@ -103,7 +104,8 @@ fn existing_columns(
       use column_name <- decode.field(0, decode.string)
       decode.success(column_name)
     })
-  pog.execute(query, connection) |> result.map(fn(returned) { returned.rows })
+  harness_db.execute(query, connection)
+  |> result.map(fn(returned) { returned.rows })
 }
 
 fn required_columns_without_default(
@@ -117,7 +119,8 @@ fn required_columns_without_default(
       use column_name <- decode.field(0, decode.string)
       decode.success(column_name)
     })
-  pog.execute(query, connection) |> result.map(fn(returned) { returned.rows })
+  harness_db.execute(query, connection)
+  |> result.map(fn(returned) { returned.rows })
 }
 
 /// Preloads `jobs` under `queue` and `meta` (a real `worker.Metadata`,
@@ -225,7 +228,8 @@ fn preload_batch(
       use bench_index <- decode.field(1, decode.int)
       decode.success(#(bench_index, job_id))
     })
-  pog.execute(query, connection) |> result.map(fn(returned) { returned.rows })
+  harness_db.execute(query, connection)
+  |> result.map(fn(returned) { returned.rows })
 }
 
 fn itoa(value: Int) -> String {

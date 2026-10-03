@@ -24,6 +24,7 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
+import grind_bench/harness_db
 import pog
 
 /// The six terminal `grind_jobs.state` values, kept as a bench-owned literal
@@ -127,7 +128,7 @@ fn rows_query(
     use value <- decode.field(0, decode.int)
     decode.success(value)
   })
-  |> pog.execute(ledger)
+  |> harness_db.execute(ledger)
   |> result.map_error(QueryFailed)
   |> result.map(fn(returned) { returned.rows })
 }
@@ -143,7 +144,7 @@ fn count_query(sql: String, ledger: pog.Connection) -> Result(Int, AuditError) {
       decode.success(count)
     })
   use returned <- result.try(
-    pog.execute(query, ledger) |> result.map_error(QueryFailed),
+    harness_db.execute(query, ledger) |> result.map_error(QueryFailed),
   )
   case returned.rows {
     [count] -> Ok(count)
@@ -591,7 +592,7 @@ pub fn fault_completions(
       valid:,
     ))
   })
-  |> pog.execute(ledger)
+  |> harness_db.execute(ledger)
   |> result.map_error(QueryFailed)
   |> result.map(fn(returned) { returned.rows })
 }

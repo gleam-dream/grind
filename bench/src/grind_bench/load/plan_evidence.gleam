@@ -11,6 +11,7 @@ import gleam/string
 import grind/internal/consumer as queue
 import grind/internal/postgres
 import grind/internal/registry
+import grind_bench/harness_db
 import grind_bench/load/context
 import grind_bench/load/report
 import grind_bench/load/runtime
@@ -31,7 +32,7 @@ pub fn count_rows(connection: pog.Connection) -> Counts {
       use retained_succeeded <- decode.field(1, decode.int)
       decode.success(Counts(total:, retained_succeeded:))
     })
-    |> pog.execute(connection)
+    |> harness_db.execute(connection)
   counts
 }
 
@@ -63,7 +64,7 @@ pub fn capture(
       "SET auto_explain.log_min_duration = 0",
     ],
     fn(sql) {
-      let assert Ok(_) = pog.execute(pog.query(sql), connection)
+      let assert Ok(_) = harness_db.execute(pog.query(sql), connection)
       Nil
     },
   )

@@ -6,7 +6,6 @@ import gleam/json
 import gleeunit/should
 import grind/internal/attempt
 import grind/internal/consumer as queue
-import grind/internal/diagnostic
 import grind/internal/job
 import grind/internal/postgres
 import grind/internal/registry
@@ -29,6 +28,7 @@ import grind/support/syncrep.{
   wait_for_syncrep_trigger_backend,
 }
 import grind/support/worker_failure.{AccountMissing}
+import grind/telemetry
 import pog
 
 pub fn postgres_ack_commit_connection_loss_is_unknown_test() {
@@ -199,12 +199,12 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   let assert Ok(handle) =
     postgres.submit(database, "auto-ack-commit-loss", definition, 41)
   let #(acks, ack_attachment) =
-    diagnostics.capture(diagnostic.acknowledgement(), fn(meta) {
+    diagnostics.capture(telemetry.acknowledgement(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(ack_attachment) })
   let #(retries, retry_attachment) =
-    diagnostics.capture(diagnostic.acknowledgement_retry(), fn(meta) {
+    diagnostics.capture(telemetry.acknowledgement_retry(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(retry_attachment) })
@@ -286,9 +286,9 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   retry_transient_query(fn() { postgres.outcome(database, handle) }, 20)
   |> should.equal(Ok(job.SucceededWith("auto-terminated-41")))
   let assert Ok(#(_, unknown)) = process.receive(acks, 5000)
-  unknown.outcome |> should.equal(diagnostic.AckUnknown)
+  unknown.outcome |> should.equal(telemetry.AckUnknown)
   let assert Ok(#(retried, retry)) = process.receive(retries, 5000)
-  retry.reason |> should.equal(diagnostic.RetryAfterUnknown)
+  retry.reason |> should.equal(telemetry.RetryAfterUnknown)
   retried.retry_number |> should.equal(1)
   retried.delay_ms |> should.equal(1336)
   retry.context |> should.equal(unknown.context)
@@ -296,7 +296,7 @@ fn run_automatic_ack_commit_connection_loss_recovers_test(
   let assert Ok(#(_, completed)) =
     diagnostics.await(
       acks,
-      fn(sample) { sample.1.outcome == diagnostic.AckReplied },
+      fn(sample) { sample.1.outcome == telemetry.AckReplied },
       5000,
     )
   completed.context |> should.equal(unknown.context)

@@ -6,10 +6,10 @@ import gleam/json
 import gleeunit/should
 import grind/internal/consumer as queue
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/ack_queries.{wait_for_commit_trigger_backend}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{
@@ -19,6 +19,7 @@ import grind/support/job_state.{retry_transient_query}
 import grind/support/observers.{detach}
 import grind/support/syncrep.{terminate_backend}
 import grind/support/unique_fixture.{unique_test_suffix}
+import grind/telemetry
 import pog
 import sinal
 
@@ -80,7 +81,7 @@ fn run_resolved_observation_replied_reconciled_test(
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.resolved(), fn(measurements, metadata) {
+    sinal.observe(telemetry.resolved(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -98,14 +99,14 @@ fn run_resolved_observation_replied_reconciled_test(
   |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
   let assert Ok(#(measurements, first_metadata)) =
     process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.ResolvedMeasurements(count: 1))
+  measurements.count |> should.equal(1)
   first_metadata.ref.job_id |> should.equal(job.id_value(handle))
   first_metadata.ref.queue |> should.equal("resolved-emission")
-  first_metadata.decision |> should.equal(observation.DecisionAuthorizeReplay)
-  first_metadata.committed_state |> should.equal(job.Queued)
+  first_metadata.decision |> should.equal(telemetry.DecisionAuthorizeReplay)
+  first_metadata.committed_state |> should.equal(public_job.Queued)
   first_metadata.resolution_id |> should.equal("resolution-emission-1")
   first_metadata.resolved_by |> should.equal("on-call")
-  first_metadata.confirmation |> should.equal(observation.Replied)
+  first_metadata.confirmation |> should.equal(telemetry.Replied)
 
   postgres.resolve_uncertain(
     database,
@@ -120,7 +121,7 @@ fn run_resolved_observation_replied_reconciled_test(
   |> should.equal(Ok(postgres.ResolutionAlreadyApplied(job.Queued)))
   let assert Ok(#(_, second_metadata)) = process.receive(signal, within: 5000)
   second_metadata.ref.job_id |> should.equal(job.id_value(handle))
-  second_metadata.confirmation |> should.equal(observation.Reconciled)
+  second_metadata.confirmation |> should.equal(telemetry.Reconciled)
   mark_database_test_executed("resolved-observation-replied-reconciled-passed")
 }
 
@@ -181,7 +182,7 @@ fn run_resolved_observation_absent_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.resolved(), fn(measurements, metadata) {
+    sinal.observe(telemetry.resolved(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -330,7 +331,7 @@ fn run_resolved_observation_commit_unknown_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.resolved(), fn(measurements, metadata) {
+    sinal.observe(telemetry.resolved(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -390,7 +391,7 @@ fn run_resolved_observation_commit_unknown_test(database_url: String) -> Nil {
   |> should.equal(Ok(postgres.ResolutionApplied(job.Queued)))
   let assert Ok(#(_, sentinel_metadata)) = process.receive(signal, within: 5000)
   sentinel_metadata.ref.job_id |> should.equal(job.id_value(sentinel_handle))
-  sentinel_metadata.confirmation |> should.equal(observation.Replied)
+  sentinel_metadata.confirmation |> should.equal(telemetry.Replied)
   mark_database_test_executed(
     "resolved-observation-absent-on-commit-unknown-passed",
   )

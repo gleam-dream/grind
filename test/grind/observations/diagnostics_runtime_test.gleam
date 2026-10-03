@@ -8,9 +8,7 @@ import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/attempt
 import grind/internal/consumer as queue
-import grind/internal/diagnostic
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
@@ -22,6 +20,7 @@ import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/job_state.{wait_for_succeeded}
 import grind/support/observers.{detach}
+import grind/telemetry
 import pog
 
 pub fn postgres_diagnostic_locked_renewal_recovers_after_row_unlock_test() {
@@ -52,7 +51,7 @@ fn locked_renewal(url: String) -> Nil {
   let started = process.new_subject()
   let invoked = process.new_subject()
   let assert Ok(definition) =
-    worker.define("diagnostic.lock", "v1", codec, codec, fn(value) {
+    worker.define("telemetry.lock", "v1", codec, codec, fn(value) {
       let release = process.new_subject()
       process.send(invoked, Nil)
       process.send(started, release)
@@ -64,7 +63,7 @@ fn locked_renewal(url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "diagnostic-lock", definition, 9)
   let #(renewals, attachment) =
-    diagnostics.capture(diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(telemetry.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -104,10 +103,10 @@ fn locked_renewal(url: String) -> Nil {
   let assert Ok(#(locked, lock_metadata)) =
     diagnostics.await(
       renewals,
-      fn(sample) { sample.1.outcome == diagnostic.SkippedLocked },
+      fn(sample) { sample.1.outcome == telemetry.SkippedLocked },
       5000,
     )
-  lock_metadata.phase |> should.equal(diagnostic.HandlerRunning)
+  lock_metadata.phase |> should.equal(telemetry.HandlerRunning)
   lock_metadata.context.attempt.attempt |> should.equal(1)
   locked.count |> should.equal(1)
   { locked.duration_us > 0 } |> should.be_true()
@@ -119,11 +118,11 @@ fn locked_renewal(url: String) -> Nil {
   let assert Ok(#(renewed, renewal_metadata)) =
     diagnostics.await(
       renewals,
-      fn(sample) { sample.1.outcome == diagnostic.Renewed },
+      fn(sample) { sample.1.outcome == telemetry.Renewed },
       5000,
     )
   renewal_metadata.context |> should.equal(lock_metadata.context)
-  renewal_metadata.phase |> should.equal(diagnostic.HandlerRunning)
+  renewal_metadata.phase |> should.equal(telemetry.HandlerRunning)
   let assert Some(renewed_headroom) = renewed.remaining_lease_ms
   { renewed_headroom > 0 && renewed_headroom <= 6000 } |> should.be_true()
   process.send(release_handler, Nil)
@@ -154,7 +153,7 @@ fn claim_failures(url: String) -> Nil {
     )
   let invoked = process.new_subject()
   let assert Ok(definition) =
-    worker.define("diagnostic.claim", "v1", codec, codec, fn(value) {
+    worker.define("telemetry.claim", "v1", codec, codec, fn(value) {
       process.send(invoked, value)
       Ok(value)
     })
@@ -164,12 +163,12 @@ fn claim_failures(url: String) -> Nil {
     postgres.submit(database, "diagnostic-claim", definition, 7)
   let id = job.id_value(handle)
   let #(failed, failed_attachment) =
-    diagnostics.capture(diagnostic.claim_failed(), fn(meta) {
+    diagnostics.capture(telemetry.claim_failed(), fn(meta) {
       meta.queue.queue == "diagnostic-claim"
     })
   use <- exception.defer(fn() { detach(failed_attachment) })
   let #(checkouts, checkout_attachment) =
-    diagnostics.capture(diagnostic.checkout(), fn(meta) {
+    diagnostics.capture(telemetry.checkout(), fn(meta) {
       meta.queue.queue == "diagnostic-claim"
     })
   use <- exception.defer(fn() { detach(checkout_attachment) })
@@ -199,8 +198,8 @@ fn claim_failures(url: String) -> Nil {
     queue.process_one(consumer)
   let assert Ok(#(claim_measurements, claim_metadata)) =
     process.receive(failed, 5000)
-  claim_metadata.stage |> should.equal(diagnostic.ClaimCandidate)
-  claim_metadata.failure |> should.equal(diagnostic.Rejected)
+  claim_metadata.stage |> should.equal(telemetry.ClaimCandidate)
+  claim_metadata.failure |> should.equal(telemetry.Rejected)
   claim_measurements.count |> should.equal(1)
   { claim_measurements.duration_us > 0 } |> should.be_true()
   claim_metadata.queue.consumer.node |> should.not_equal("")
@@ -209,14 +208,14 @@ fn claim_failures(url: String) -> Nil {
     diagnostics.await(
       checkouts,
       fn(sample) {
-        sample.1.operation == diagnostic.ClaimCandidate
-        && sample.1.returned == diagnostic.CallFailed
+        sample.1.operation == telemetry.ClaimCandidate
+        && sample.1.returned == telemetry.CallFailed
       },
       5000,
     )
   claim_checkout.queue |> should.equal(claim_metadata.queue)
-  claim_checkout.pool |> should.equal(diagnostic.MainPool)
-  claim_checkout.checkout |> should.equal(diagnostic.CheckoutAcquired)
+  claim_checkout.pool |> should.equal(telemetry.MainPool)
+  claim_checkout.checkout |> should.equal(telemetry.CheckoutAcquired)
   postgres.state(database, handle) |> should.equal(Ok(job.Queued))
   process.receive(invoked, 0) |> should.equal(Error(Nil))
   execute(connection, "DROP TRIGGER diagnostic_reject_claim ON grind_jobs")
@@ -264,8 +263,8 @@ fn claim_failures(url: String) -> Nil {
     queue.process_one(consumer)
   let assert Ok(#(quarantine_measurements, quarantine_metadata)) =
     process.receive(failed, 5000)
-  quarantine_metadata.stage |> should.equal(diagnostic.QuarantineScan)
-  quarantine_metadata.failure |> should.equal(diagnostic.Rejected)
+  quarantine_metadata.stage |> should.equal(telemetry.QuarantineScan)
+  quarantine_metadata.failure |> should.equal(telemetry.Rejected)
   quarantine_metadata.queue |> should.equal(claim_metadata.queue)
   quarantine_measurements.count |> should.equal(1)
   { quarantine_measurements.duration_us > 0 } |> should.be_true()
@@ -273,14 +272,14 @@ fn claim_failures(url: String) -> Nil {
     diagnostics.await(
       checkouts,
       fn(sample) {
-        sample.1.operation == diagnostic.QuarantineScan
-        && sample.1.returned == diagnostic.CallFailed
+        sample.1.operation == telemetry.QuarantineScan
+        && sample.1.returned == telemetry.CallFailed
       },
       5000,
     )
   quarantine_checkout.queue |> should.equal(quarantine_metadata.queue)
-  quarantine_checkout.pool |> should.equal(diagnostic.MainPool)
-  quarantine_checkout.checkout |> should.equal(diagnostic.CheckoutAcquired)
+  quarantine_checkout.pool |> should.equal(telemetry.MainPool)
+  quarantine_checkout.checkout |> should.equal(telemetry.CheckoutAcquired)
   // ClaimFailedMetadata contains a QueueRef, never an invented job/attempt.
   postgres.state(database, handle) |> should.equal(Ok(job.Executing))
   process.receive(invoked, 0) |> should.equal(Error(Nil))
@@ -318,7 +317,7 @@ fn completion_budget(url: String) -> Nil {
   let invoked = process.new_subject()
   let held = process.new_subject()
   let assert Ok(definition) =
-    worker.define("diagnostic.budget", "v1", codec, codec, fn(value) {
+    worker.define("telemetry.budget", "v1", codec, codec, fn(value) {
       case value {
         1 -> {
           process.send(invoked, Nil)
@@ -362,12 +361,12 @@ fn completion_budget(url: String) -> Nil {
   // One subject preserves the single renewer's producer order across the
   // exhausted attempt and the sibling that remains eligible for renewal.
   let #(renewals, renewal_attachment) =
-    diagnostics.capture(diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(telemetry.renewal(), fn(meta) {
       meta.context.ref.queue == "diagnostic-budget"
     })
   use <- exception.defer(fn() { detach(renewal_attachment) })
   let #(quarantines, quarantine_attachment) =
-    diagnostics.capture(observation.quarantined(), fn(meta) {
+    diagnostics.capture(telemetry.quarantined(), fn(meta) {
       meta.ref.job_id == first_id
     })
   use <- exception.defer(fn() { detach(quarantine_attachment) })
@@ -388,11 +387,11 @@ fn completion_budget(url: String) -> Nil {
       renewals,
       fn(sample) {
         sample.1.context.ref.job_id == first_id
-        && sample.1.outcome == diagnostic.CompletionBudgetExhausted
+        && sample.1.outcome == telemetry.CompletionBudgetExhausted
       },
       12_000,
     )
-  budget_metadata.phase |> should.equal(diagnostic.AcknowledgementPending)
+  budget_metadata.phase |> should.equal(telemetry.AcknowledgementPending)
   budget_measurements.count |> should.equal(1)
   budget_measurements.duration_us |> should.equal(0)
   budget_measurements.remaining_lease_ms |> should.equal(None)
@@ -407,15 +406,15 @@ fn completion_budget(url: String) -> Nil {
         fn(sample) {
           {
             sample.1.context.ref.job_id == first_id
-            && sample.1.outcome == diagnostic.CompletionBudgetExhausted
+            && sample.1.outcome == telemetry.CompletionBudgetExhausted
           }
           |> should.be_false()
           sample.1.context.ref.job_id == second_id
-          && sample.1.outcome == diagnostic.Renewed
+          && sample.1.outcome == telemetry.Renewed
         },
         5000,
       )
-    metadata.phase |> should.equal(diagnostic.HandlerRunning)
+    metadata.phase |> should.equal(telemetry.HandlerRunning)
     metadata.context.consumer |> should.equal(budget_metadata.context.consumer)
     let assert Some(remaining) = measurements.remaining_lease_ms
     { remaining > 0 } |> should.be_true()

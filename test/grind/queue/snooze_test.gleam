@@ -175,7 +175,7 @@ fn run_snooze_receipt_rollback_test(database_url: String) -> Nil {
       attempt_owner,
       30_000,
     )
-  let proposed = attempt.execute_claim(claimed)
+  let proposed = attempt.execute_claim_inline(claimed)
   let assert Ok(_) =
     pog.query(
       "CREATE FUNCTION grind_test_reject_snooze_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.committed_state = 'scheduled' THEN RAISE EXCEPTION 'injected snooze receipt failure'; END IF; RETURN NEW; END $$",

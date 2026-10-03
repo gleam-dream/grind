@@ -1,16 +1,10 @@
 import gleam/erlang/process
 import gleeunit
 import gleeunit/should
-import grind
 import pog
 
 pub fn main() -> Nil {
   gleeunit.main()
-}
-
-pub fn version_test() {
-  grind.version()
-  |> should.equal("0.1.0")
 }
 
 /// Canary for `grind_postgres_ffi`'s own dependency on pog's private

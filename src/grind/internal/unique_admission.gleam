@@ -35,97 +35,181 @@ pub type Commit(input, output, error) {
   )
 }
 
-/// Admits one job under a uniqueness policy, reached through
-/// `postgres.submit_unique`. Rejects an empty queue name before touching
-/// any resource.
-pub fn submit(
+/// One admission command: everything `admit` needs besides the connection.
+/// `policy: None` admits with a receipt and no uniqueness key.
+pub type Spec(input, output, error) {
+  Spec(
+    queue: String,
+    submission_id: submission.SubmissionId,
+    worker: Worker(input, output, error),
+    input: input,
+    availability: submission.Availability,
+    policy: Option(#(unique.Policy(input), unique.ConflictAction)),
+    correlation: Option(String),
+  )
+}
+
+/// Builds the request for `spec`, rejecting an empty queue, a rejected or
+/// over-large input and a rejected key before any storage call.
+fn request_for(
+  installation: job.Installation,
+  max_payload_bytes: Int,
+  spec: Spec(input, output, error),
+) -> Result(
+  Request(input, output, error),
+  submission.SubmitError(input, output, error),
+) {
+  let Spec(
+    queue:,
+    submission_id:,
+    worker: worker_def,
+    input:,
+    availability:,
+    policy:,
+    correlation:,
+  ) = spec
+  case queue {
+    "" -> Error(submission.EmptyQueueName)
+    _ ->
+      unique_admission_request.build_request(
+        installation,
+        submission_id,
+        queue,
+        worker_def,
+        input,
+        availability,
+        correlation,
+        max_payload_bytes,
+        fn(input_version, encoded_input) {
+          case policy {
+            None -> Ok(None)
+            Some(#(policy, on_conflict)) -> {
+              let unique.PolicyFields(key:, scope:, period:, states:) =
+                unique.policy_fields(policy)
+              use #(key_contract, encoded_key) <- result.map(
+                unique.key_material(key, input, input_version, encoded_input),
+              )
+              Some(PolicyPart(
+                key_contract:,
+                encoded_key:,
+                scope:,
+                period:,
+                states:,
+                on_conflict:,
+              ))
+            }
+          }
+        },
+      )
+  }
+}
+
+/// Admits one job in its own transaction on `connection`'s pool. Every
+/// admission records a receipt under its `SubmissionId`, so an outcome lost
+/// with its reply is reconcilable.
+pub fn admit(
   connection: pog.Connection,
   installation: job.Installation,
   lock_wait_ms: Int,
-  queue: String,
-  submission_id: submission.SubmissionId,
-  worker_def: Worker(input, output, error),
-  input: input,
-  availability: submission.Availability,
-  policy: unique.Policy(input),
-  on_conflict: unique.ConflictAction,
+  max_payload_bytes: Int,
+  spec: Spec(input, output, error),
 ) -> Result(
   Commit(input, output, error),
   submission.SubmitError(input, output, error),
 ) {
-  case queue {
-    "" -> Error(submission.EmptyQueueName)
-    _ -> {
-      let unique.PolicyFields(key:, scope:, period:, states:) =
-        unique.policy_fields(policy)
-      use request <- result.try(
-        unique_admission_request.build_request(
-          installation,
-          submission_id,
-          queue,
-          worker_def,
-          input,
-          availability,
-          fn(input_version, encoded_input) {
-            use #(key_contract, encoded_key) <- result.map(unique.key_material(
-              key,
-              input,
-              input_version,
-              encoded_input,
-            ))
-            Some(PolicyPart(
-              key_contract:,
-              encoded_key:,
-              scope:,
-              period:,
-              states:,
-              on_conflict:,
-            ))
-          },
-        ),
+  use request <- result.try(request_for(installation, max_payload_bytes, spec))
+  run(connection, request, lock_wait_ms)
+}
+
+/// Admits one job inside the caller's open transaction `tx`, without
+/// `BEGIN` or `COMMIT`: the job, its receipt and any uniqueness decision
+/// commit or roll back with the caller's own writes.
+///
+/// The caller's transaction must be `READ COMMITTED` on this installation's
+/// database. For the duration of the admission, `search_path` and
+/// `lock_timeout` are set transaction-locally to Grind's schema and lock
+/// wait, then restored to the caller's values. A statement that fails aborts
+/// the caller's transaction, as any failed statement does.
+pub fn admit_in_transaction(
+  tx: pog.Connection,
+  installation: job.Installation,
+  lock_wait_ms: Int,
+  max_payload_bytes: Int,
+  quoted_schema: String,
+  spec: Spec(input, output, error),
+) -> Result(
+  Commit(input, output, error),
+  submission.SubmitError(input, output, error),
+) {
+  use request <- result.try(request_for(installation, max_payload_bytes, spec))
+  case is_single_connection(tx) {
+    False -> Error(submission.NotInTransaction)
+    True -> {
+      use #(isolation, database_oid, search_path, lock_timeout) <- result.try(
+        transaction_settings(tx),
       )
-      run(connection, request, lock_wait_ms)
+      case
+        isolation,
+        database_oid == job.installation_database_oid(installation)
+      {
+        "read committed", True -> {
+          use _ <- result.try(set_local(
+            tx,
+            quoted_schema,
+            int.to_string(lock_wait_ms) <> "ms",
+          ))
+          let outcome = transaction_body(tx, request)
+          case set_local(tx, search_path, lock_timeout), outcome {
+            _, Error(error) -> Error(error)
+            Error(error), Ok(_) -> Error(error)
+            Ok(Nil), Ok(commit) -> Ok(commit)
+          }
+        }
+        "read committed", False ->
+          Error(submission.HandleFromAnotherInstallation)
+        other, _ -> Error(submission.TransactionIsolationUnsupported(other))
+      }
     }
   }
 }
 
-/// Admits one job with a caller-supplied `SubmissionId` and no uniqueness
-/// policy, reached through `postgres.submit_with_id`. Rejects an empty
-/// queue name before touching any resource, exactly like `submit` above.
-/// No domain-wide advisory lock is ever acquired for this request — see
-/// `admission_transaction`'s own doc comment and
-/// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts", for the full
-/// justification.
-pub fn submit_plain(
-  connection: pog.Connection,
-  installation: job.Installation,
-  lock_wait_ms: Int,
-  queue: String,
-  submission_id: submission.SubmissionId,
-  worker_def: Worker(input, output, error),
-  input: input,
-  availability: submission.Availability,
+@external(erlang, "grind_postgres_ffi", "is_single_connection")
+fn is_single_connection(connection: pog.Connection) -> Bool
+
+fn transaction_settings(
+  tx: pog.Connection,
 ) -> Result(
-  Commit(input, output, error),
+  #(String, Int, String, String),
   submission.SubmitError(input, output, error),
 ) {
-  case queue {
-    "" -> Error(submission.EmptyQueueName)
-    _ -> {
-      use request <- result.try(
-        unique_admission_request.build_request(
-          installation,
-          submission_id,
-          queue,
-          worker_def,
-          input,
-          availability,
-          fn(_input_version, _encoded_input) { Ok(None) },
-        ),
-      )
-      run(connection, request, lock_wait_ms)
-    }
-  }
+  let query =
+    pog.query(
+      "SELECT current_setting('transaction_isolation'), (SELECT oid::int4 FROM pg_database WHERE datname = current_database()), current_setting('search_path'), current_setting('lock_timeout')",
+    )
+    |> pog.returning({
+      use isolation <- decode.field(0, decode.string)
+      use oid <- decode.field(1, decode.int)
+      use search_path <- decode.field(2, decode.string)
+      use lock_timeout <- decode.field(3, decode.string)
+      decode.success(#(isolation, oid, search_path, lock_timeout))
+    })
+  use returned <- result.try(unique_execute(query, tx))
+  Ok(single_row(returned.rows))
+}
+
+fn set_local(
+  tx: pog.Connection,
+  search_path: String,
+  lock_timeout: String,
+) -> Result(Nil, submission.SubmitError(input, output, error)) {
+  let query =
+    pog.query(
+      "SELECT set_config('search_path', $1, true), set_config('lock_timeout', $2, true)",
+    )
+    |> pog.parameter(pog.text(search_path))
+    |> pog.parameter(pog.text(lock_timeout))
+  use _ <- result.try(unique_execute(query, tx))
+  Ok(Nil)
 }
 
 /// Re-reads the receipt a `CommitUnknown` command would have written. A
@@ -250,7 +334,9 @@ fn reconcile_from_receipt(
     | Error(submission.EmptyQueueName)
     | Error(submission.InvalidInput(_))
     | Error(submission.CommitUnknown(_))
-    | Error(submission.CommitUnknownWithoutId(_)) ->
+    | Error(submission.PayloadTooLarge(_, _))
+    | Error(submission.NotInTransaction)
+    | Error(submission.TransactionIsolationUnsupported(_)) ->
       Error(submission.CommitUnknown(pending))
   }
 }
@@ -305,6 +391,19 @@ fn admission_transaction(
 ) {
   use _ <- result.try(pin_read_committed(connection))
   use _ <- result.try(set_lock_timeout(connection, lock_wait_ms))
+  transaction_body(connection, request)
+}
+
+/// The admission after its isolation and lock wait are set: the uniqueness
+/// lock (with a policy), the receipt lookup, then the insert or conflict
+/// decision.
+fn transaction_body(
+  connection: pog.Connection,
+  request: Request(input, output, error),
+) -> Result(
+  Commit(input, output, error),
+  submission.SubmitError(input, output, error),
+) {
   use _ <- result.try(case request.policy {
     Some(policy_part) ->
       acquire_lock(
@@ -561,6 +660,11 @@ fn initial_state(
         False -> #(job.Scheduled, target_ms)
       }
     }
+    submission.Delayed(milliseconds) ->
+      case milliseconds <= 0 {
+        True -> #(job.Queued, now_ms)
+        False -> #(job.Scheduled, now_ms + milliseconds)
+      }
   }
 }
 
@@ -681,11 +785,38 @@ fn insert_job(
     <> unique_admission_query.to_timestamptz_sql(10, "1000.0")
     <> ", "
     <> unique_admission_query.to_timestamptz_sql(11, "1000000.0")
+  // The v13 columns are written only when set, so the statement text of a
+  // request without them is unchanged.
+  let optional =
+    [
+      #("correlation", option.map(request.correlation, pog.text)),
+      #("max_replays", option.map(request.max_replays, pog.int)),
+    ]
+    |> list.filter_map(fn(column) {
+      case column.1 {
+        Some(value) -> Ok(#(column.0, value))
+        None -> Error(Nil)
+      }
+    })
+  let #(base_columns, base_values, _) =
+    list.fold(optional, #(base_columns, base_values, 12), fn(acc, column) {
+      let #(columns, values, next) = acc
+      #(
+        columns <> ", " <> column.0,
+        values <> ", $" <> int.to_string(next),
+        next + 1,
+      )
+    })
+  let first_key_parameter = 12 + list.length(optional)
   let #(columns, values, key_params) = case policy_part {
     None -> #(base_columns, base_values, [])
     Some(PolicyPart(key_contract:, encoded_key:, ..)) -> #(
       base_columns <> ", unique_key_contract, unique_key_sha256",
-      base_values <> ", $12, " <> unique_admission_query.key_digest_sql(13),
+      base_values
+        <> ", $"
+        <> int.to_string(first_key_parameter)
+        <> ", "
+        <> unique_admission_query.key_digest_sql(first_key_parameter + 1),
       [pog.text(key_contract), pog.text(encoded_key)],
     )
   }
@@ -708,6 +839,10 @@ fn insert_job(
     |> pog.parameter(pog.text(job.state_to_stored(state)))
     |> pog.parameter(pog.int(available_at_ms))
     |> pog.parameter(pog.int(now_us))
+  let query =
+    list.fold(optional, query, fn(query, column) {
+      pog.parameter(query, column.1)
+    })
   let query = list.fold(key_params, query, pog.parameter)
   let query =
     query

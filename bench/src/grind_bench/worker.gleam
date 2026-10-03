@@ -7,6 +7,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
 import grind/internal/worker.{type Worker}
+import grind_bench/harness_db
 import pog
 
 /// `bench_index`: this run's own submission sequence number (assigned by the
@@ -54,7 +55,7 @@ fn record_effect(
     |> pog.parameter(pog.int(bench_index))
     |> pog.parameter(pog.int(delivery_count))
     |> pog.parameter(pog.text(node_name()))
-  case pog.execute(query, ledger) {
+  case harness_db.execute(query, ledger) {
     Ok(_) -> Nil
     Error(_) -> {
       let _ = next_delivery_count(-1)
@@ -89,7 +90,7 @@ pub fn build(
       )
       |> pog.parameter(pog.int(bench_index))
       |> pog.parameter(pog.int(delivery_count))
-    case pog.execute(query, ledger) {
+    case harness_db.execute(query, ledger) {
       Ok(_) -> Nil
       Error(_) -> {
         let _ = next_delivery_count(-1)

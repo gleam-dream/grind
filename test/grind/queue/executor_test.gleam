@@ -7,7 +7,6 @@ import gleam/list
 import gleam/string
 import gleeunit/should
 import grind/internal/consumer as queue
-import grind/internal/diagnostic
 import grind/internal/job
 import grind/internal/postgres
 import grind/internal/registry
@@ -17,6 +16,7 @@ import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/job_state.{wait_for_succeeded}
 import grind/support/lease_queries.{lease_expiration}
 import grind/support/observers.{detach}
+import grind/telemetry
 import pog
 
 pub fn postgres_first_ack_rollback_retries_proposal_without_rerun_test() {
@@ -49,17 +49,17 @@ fn first_ack_rollback(url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "first-rollback", definition, 41)
   let #(acks, ack_attachment) =
-    diagnostics.capture(diagnostic.acknowledgement(), fn(meta) {
+    diagnostics.capture(telemetry.acknowledgement(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(ack_attachment) })
   let #(retries, retry_attachment) =
-    diagnostics.capture(diagnostic.acknowledgement_retry(), fn(meta) {
+    diagnostics.capture(telemetry.acknowledgement_retry(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(retry_attachment) })
   let #(capacity, capacity_attachment) =
-    diagnostics.capture(diagnostic.capacity(), fn(meta) {
+    diagnostics.capture(telemetry.capacity(), fn(meta) {
       meta.queue.queue == "first-rollback"
     })
   use <- exception.defer(fn() { detach(capacity_attachment) })
@@ -96,18 +96,18 @@ fn first_ack_rollback(url: String) -> Nil {
   postgres.outcome(database, handle) |> should.equal(Ok(job.SucceededWith(42)))
   process.receive(invoked, 0) |> should.equal(Error(Nil))
   let assert Ok(#(failed_measurements, failed)) = process.receive(acks, 5000)
-  failed.outcome |> should.equal(diagnostic.AckRolledBack)
+  failed.outcome |> should.equal(telemetry.AckRolledBack)
   failed_measurements.count |> should.equal(1)
   { failed_measurements.duration_us > 0 } |> should.be_true()
   let assert Ok(#(retry_measurements, retry)) = process.receive(retries, 5000)
-  retry.reason |> should.equal(diagnostic.RetryAfterFailure)
+  retry.reason |> should.equal(telemetry.RetryAfterFailure)
   retry_measurements.retry_number |> should.equal(1)
   retry_measurements.delay_ms |> should.equal(2000)
   { retry_measurements.pending_duration_us >= 0 } |> should.be_true()
   retry.context |> should.equal(failed.context)
   retry.command_id |> should.equal(failed.command_id)
   let assert Ok(#(_, completed)) = process.receive(acks, 5000)
-  completed.outcome |> should.equal(diagnostic.AckReplied)
+  completed.outcome |> should.equal(telemetry.AckReplied)
   completed.context |> should.equal(failed.context)
   completed.context.attempt.attempt |> should.equal(1)
   completed.context.consumer.node |> should.not_equal("")

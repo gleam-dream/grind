@@ -6,12 +6,13 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import grind/internal/consumer as queue
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/pruner
 import grind/internal/registry
+import grind/telemetry
 import grind_bench
 import grind_bench/audit
+import grind_bench/harness_db
 import grind_bench/instrumentation
 import grind_bench/latency
 import grind_bench/load/context
@@ -45,7 +46,7 @@ pub fn run_l5(pruner_on: Int, duration_ms: Int, repeat: Int) -> Nil {
   // rows outlive this window, so timing/audits cannot lose fast survivors.
   report.insert_filler_succeeded(postgres.connection(database), 10_000)
   let assert Ok(_) =
-    pog.execute(
+    harness_db.execute(
       pog.query(
         "UPDATE grind_jobs SET finished_at = clock_timestamp() - interval '1 day' WHERE queue = 'l2-filler'",
       ),
@@ -70,7 +71,7 @@ pub fn run_l5(pruner_on: Int, duration_ms: Int, repeat: Int) -> Nil {
 
   let prune_events = process.new_subject()
   let prune_observer =
-    sinal.observe(observation.prune_completed(), fn(measurements, _) {
+    sinal.observe(telemetry.prune_completed(), fn(measurements, _) {
       process.send(prune_events, #(runtime.monotonic_ms(), measurements.jobs))
     })
   let maybe_pruner = case pruner_on == 1 {
@@ -190,7 +191,7 @@ pub fn run_l5(pruner_on: Int, duration_ms: Int, repeat: Int) -> Nil {
       // Remove only synthetic filler, then run the complete workload audit
       // in both arms; measured jobs were not eligible for pruning.
       let assert Ok(_) =
-        pog.execute(
+        harness_db.execute(
           pog.query("DELETE FROM grind_jobs WHERE queue = 'l2-filler'"),
           postgres.connection(database),
         )

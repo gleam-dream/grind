@@ -6,6 +6,7 @@ import gleam/string
 import grind/internal/job
 import grind/internal/postgres
 import grind_bench
+import grind_bench/harness_db
 import grind_bench/load/runtime
 import grind_bench/preload
 import pog
@@ -43,7 +44,10 @@ pub fn stop_observer(harness: Harness) -> Nil {
           let assert 0 =
             runtime.counter_value(runtime.completion_observer_error_counter)
           io.println(
-            "completion_observer_stop_ack polls=" <> int.to_string(polls),
+            "completion_observer_stop_ack polls="
+            <> int.to_string(polls)
+            <> " harness_pool_restart_retries="
+            <> int.to_string(harness_db.pool_restart_retries()),
           )
         }
         Error(_) -> {
@@ -143,13 +147,17 @@ fn setup_with_settings(
   let completion_observer = case observe {
     True -> {
       let ready = process.new_subject()
+      // The observer polls every 10 ms on its own pool, so it never queues
+      // behind the drain poller's audit queries on a shared connection.
+      let assert Ok(observer_connection) =
+        grind_bench.start_drain_connection(config)
       let pid =
         process.spawn_unlinked(fn() {
           // Only the receiving process may create this subject. The parent
           // receives the handle through its own ready subject before returning.
           let stop = process.new_subject()
           process.send(ready, stop)
-          observe_completions(drain, schema_of(database), stop, 0)
+          observe_completions(observer_connection, schema_of(database), stop, 0)
         })
       let assert Ok(stop) = process.receive(ready, within: 5000)
       Some(CompletionObserver(pid:, stop:))
@@ -191,7 +199,7 @@ fn observe_completions(
     "INSERT INTO grind_bench.bench_durable_completions (job_id) SELECT a.job_id FROM \""
     <> schema
     <> "\".grind_job_acknowledgements a JOIN grind_bench.bench_submissions s ON s.job_id = a.job_id WHERE a.committed_state = 'succeeded' ON CONFLICT DO NOTHING"
-  case pog.execute(pog.query(sql), drain) {
+  case harness_db.execute(pog.query(sql), drain) {
     Error(error) -> {
       let _ = runtime.bump(runtime.completion_observer_error_counter)
       io.println(

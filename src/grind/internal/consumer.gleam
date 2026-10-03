@@ -24,7 +24,6 @@ import gleam/result
 import gleam/string
 import grind/internal/attempt
 import grind/internal/consumer_hooks.{type Hooks}
-import grind/internal/diagnostic
 import grind/internal/diagnostics
 import grind/internal/pool
 import grind/internal/postgres.{type Database}
@@ -34,6 +33,7 @@ import grind/internal/queue/renewer as queue_renewer
 import grind/internal/queue/timing as queue_timing
 import grind/internal/queue/worker as queue_worker
 import grind/internal/registry.{type Registry}
+import grind/telemetry
 import pog
 import sinal/forwarder
 
@@ -336,7 +336,9 @@ pub type RenewalStatus {
   LeaseRenewalLost
 }
 
-type Message {
+/// A coordinator's messages. Public so a supervised consumer's stable
+/// `process.Name(Message)` can be created by its owner.
+pub opaque type Message {
   Poll
   FillSlots
   BeginShutdown(process.Subject(ShutdownReply))
@@ -353,6 +355,8 @@ type Message {
     result: Result(Bool, postgres.QueueRunError),
   )
   WorkerDown(process.Down)
+  /// A trapped exit; only a supervised coordinator traps exits.
+  Exited(process.ExitMessage)
 }
 
 /// Exposed `@internal` only so `begin_shutdown_for_test` can hand its reply
@@ -446,6 +450,12 @@ type ConsumerState {
     shutting_down: Bool,
     shutdown_generation: Int,
     shutdown_replies: List(process.Subject(ShutdownReply)),
+    /// A supervised coordinator's supervisor is shutting it down: it stops
+    /// once drained or when its grace expires.
+    stopping: Bool,
+    /// The supervisor a supervised coordinator drains for, when it traps
+    /// exits.
+    parent: Option(process.Pid),
   )
 }
 
@@ -539,125 +549,19 @@ fn start_configured_consumer_with_handoff(
   actor_ready: process.Subject(process.Subject(Message)),
   stop_handoff: process.Subject(Nil),
 ) -> Result(Consumer, StartError) {
-  let ValidatedPolicy(
-    polling:,
-    maximum_batch_jobs:,
-    maximum_concurrency: _,
-    lease_duration_ms:,
-    shutdown_grace_ms:,
-  ) = policy
-  let auto_poll = case polling {
-    PollEvery(_) -> True
-    Manual -> False
-  }
-  let renewal_interval_ms = case lease_duration_ms / 3 > 0 {
-    True -> lease_duration_ms / 3
-    False -> 1
-  }
-  let renewal_pool_name = process.new_name("grind_queue_renewals")
-  let renewal_config = postgres.renewal_pool_config(database, renewal_pool_name)
-  let renewal_connection = pog.named_connection(renewal_pool_name)
-  let worker_factory_builder =
-    factory_supervisor.worker_child(fn(request) {
-      actor.start(queue_worker.worker_actor(request))
-    })
-    |> factory_supervisor.restart_strategy(supervision.Temporary)
-  let builder =
-    actor.new_with_initialiser(1000, fn(subject) {
-      // Computed fresh on every incarnation (initial start and every
-      // supervised restart both run this closure), so each incarnation has
-      // its own distinct owner label. attempt_owner is itself part of the
-      // SQL fence checked alongside attempt_id and epoch on renewal,
-      // release, and resolution (grind/internal/attempt's `renew`,
-      // `release_unstarted`, `acknowledge`, and the resolution
-      // route); attempt_id is already globally unique on its own (a
-      // noncycling sequence), so this label does not change which row a
-      // correct claim can match, but a distinct label per incarnation means
-      // a coordinator that somehow still held stale in-memory claim state
-      // from a previous incarnation could never accidentally satisfy a
-      // fence it does not legitimately own.
-      let attempt_owner = "grind-consumer-" <> int.to_string(unique_integer())
-      // Fresh per incarnation, unlike `subject`: see the field's doc
-      // comment on `ConsumerState` for why every self-scheduled timer uses
-      // this instead of the named `subject`.
-      let incarnation_subject = process.new_subject()
-      queue_timing.start_polling(incarnation_subject, auto_poll, Poll)
-      case factory_supervisor.start(worker_factory_builder) {
-        Error(error) -> Error(string.inspect(error))
-        Ok(started_factory) -> {
-          use started_renewer <- result.try(
-            queue_renewer.start_observed(
-              renewal_connection,
-              queue_name,
-              attempt_owner,
-              lease_duration_ms,
-              renewal_interval_ms,
-              fn(attempt_id, epoch, status) {
-                process.send(
-                  incarnation_subject,
-                  RenewalObserved(attempt_id, epoch, status),
-                )
-              },
-              postgres.forwarder(database),
-            )
-            |> result.map_error(string.inspect),
-          )
-
-          let selector =
-            process.new_selector()
-            |> process.select(for: subject)
-            |> process.select(for: incarnation_subject)
-            |> process.select_monitors(fn(down) { WorkerDown(down) })
-          Ok(
-            actor.initialised(
-              ConsumerState(
-                database:,
-                workers:,
-                worker_factory: started_factory.data,
-                queue: queue_name,
-                attempt_owner:,
-                subject:,
-                incarnation_subject:,
-                auto_poll:,
-                policy:,
-                lease_duration_ms:,
-                renewal_interval_ms:,
-                renewer: started_renewer.data,
-                active: [],
-                poll_scheduled: auto_poll,
-                fill_pending: False,
-                hooks:,
-                shutting_down: False,
-                shutdown_generation: 0,
-                shutdown_replies: [],
-              )
-              |> emit_capacity,
-            )
-            |> actor.selecting(selector)
-            |> actor.returning(subject),
-          )
-        }
-      }
-    })
-    |> actor.on_message(handle_message)
-    |> actor.named(coordinator_name)
-  let child =
-    supervision.worker(fn() {
-      case actor.start(builder) {
-        Error(error) -> Error(error)
-        Ok(started) -> {
-          process.send(actor_ready, started.data)
-          Ok(started)
-        }
-      }
-    })
+  let ValidatedPolicy(maximum_batch_jobs:, shutdown_grace_ms:, ..) = policy
   let supervisor =
-    static_supervisor.new(static_supervisor.OneForAll)
-    |> static_supervisor.add(pool.supervised(
-      renewal_config,
-      postgres.statement_deadline_ms(database),
-    ))
-    |> static_supervisor.add(child)
+    consumer_supervisor(
+      database,
+      workers,
+      queue_name,
+      policy,
+      hooks,
+      coordinator_name,
+      process.new_name("grind_queue_renewals"),
+      fn(subject) { process.send(actor_ready, subject) },
+      False,
+    )
   case static_supervisor.start(supervisor) {
     Error(error) -> {
       process.send(stop_handoff, Nil)
@@ -692,6 +596,234 @@ fn start_configured_consumer_with_handoff(
         }
       }
   }
+}
+
+/// A consumer as one child of a caller's supervision tree: its renewal pool
+/// and coordinator under one `OneForAll` supervisor. The coordinator
+/// registers `coordinator`, so it stays reachable by name across restarts.
+/// `database` is read each time the child starts, so a restarted consumer
+/// uses its runtime's current `Database`.
+pub fn supervised(
+  database: fn() -> Result(Database, String),
+  workers: Registry,
+  policy: ValidatedPolicy,
+  coordinator: process.Name(Message),
+  renewal_pool: process.Name(pog.Message),
+) -> supervision.ChildSpecification(Nil) {
+  supervision.supervisor(fn() {
+    case database() {
+      Error(reason) -> Error(actor.InitFailed(reason))
+      Ok(database) -> {
+        let ValidatedPolicy(maximum_concurrency:, lease_duration_ms:, ..) =
+          policy
+        let minimum_lease_ms =
+          minimum_lease_for_deadline(
+            maximum_concurrency,
+            postgres.statement_deadline_ms(database),
+          )
+        case lease_duration_ms < minimum_lease_ms {
+          True ->
+            Error(actor.InitFailed(
+              "lease of "
+              <> int.to_string(lease_duration_ms)
+              <> " ms is shorter than the minimum of "
+              <> int.to_string(minimum_lease_ms)
+              <> " ms for the statement deadline",
+            ))
+          False ->
+            consumer_supervisor(
+              database,
+              workers,
+              registry.queue(workers),
+              policy,
+              consumer_hooks.none(),
+              coordinator,
+              renewal_pool,
+              fn(_subject) { Nil },
+              True,
+            )
+            |> static_supervisor.start
+            |> result.map(fn(started) { actor.Started(started.pid, Nil) })
+        }
+      }
+    }
+  })
+}
+
+/// How a drain requested by name ended.
+pub type DrainOutcome {
+  /// The coordinator finished every active attempt within its grace.
+  Drained
+  /// The grace elapsed with this many attempts still active.
+  DrainedWithActiveWork(active_attempts: Int)
+  /// No coordinator is registered under the name.
+  NotRunning
+  /// The coordinator did not answer within its grace and one second.
+  DrainUnconfirmed
+}
+
+/// Stops a coordinator, reached by name, from claiming, and waits up to
+/// `grace_ms` (plus one second) for its active attempts. Callable from any
+/// process; it does not stop the consumer's processes.
+pub fn drain(
+  coordinator: process.Name(Message),
+  grace_ms: Int,
+) -> DrainOutcome {
+  let reply = process.new_subject()
+  let sent =
+    exception.rescue(fn() {
+      process.send(process.named_subject(coordinator), BeginShutdown(reply))
+    })
+  case sent {
+    Error(_) -> NotRunning
+    Ok(Nil) ->
+      case process.receive(reply, within: grace_ms + 1000) {
+        Ok(ShutdownDrained) -> Drained
+        Ok(ShutdownForced(active)) -> DrainedWithActiveWork(active)
+        Error(Nil) -> DrainUnconfirmed
+      }
+  }
+}
+
+/// The consumer's supervisor: its renewal pool, then its coordinator.
+fn consumer_supervisor(
+  database: Database,
+  workers: Registry,
+  queue_name: String,
+  policy: ValidatedPolicy,
+  hooks: Hooks,
+  coordinator_name: process.Name(Message),
+  renewal_pool_name: process.Name(pog.Message),
+  on_started: fn(process.Subject(Message)) -> Nil,
+  drain_on_exit: Bool,
+) -> static_supervisor.Builder {
+  let ValidatedPolicy(polling:, lease_duration_ms:, ..) = policy
+  let auto_poll = case polling {
+    PollEvery(_) -> True
+    Manual -> False
+  }
+  let renewal_interval_ms = case lease_duration_ms / 3 > 0 {
+    True -> lease_duration_ms / 3
+    False -> 1
+  }
+  let renewal_config = postgres.renewal_pool_config(database, renewal_pool_name)
+  let renewal_connection = pog.named_connection(renewal_pool_name)
+  let worker_factory_builder =
+    factory_supervisor.worker_child(fn(request) {
+      actor.start(queue_worker.worker_actor(request))
+    })
+    |> factory_supervisor.restart_strategy(supervision.Temporary)
+  let builder =
+    actor.new_with_initialiser(1000, fn(subject) {
+      // Computed fresh on every incarnation (initial start and every
+      // supervised restart both run this closure), so each incarnation has
+      // its own distinct owner label. attempt_owner is itself part of the
+      // SQL fence checked alongside attempt_id and epoch on renewal,
+      // release, and resolution (grind/internal/attempt's `renew`,
+      // `release_unstarted`, `acknowledge`, and the resolution
+      // route); attempt_id is already globally unique on its own (a
+      // noncycling sequence), so this label does not change which row a
+      // correct claim can match, but a distinct label per incarnation means
+      // a coordinator that somehow still held stale in-memory claim state
+      // from a previous incarnation could never accidentally satisfy a
+      // fence it does not legitimately own.
+      let attempt_owner = "grind-consumer-" <> int.to_string(unique_integer())
+      // Fresh per incarnation, unlike `subject`: see the field's doc
+      // comment on `ConsumerState` for why every self-scheduled timer uses
+      // this instead of the named `subject`.
+      let incarnation_subject = process.new_subject()
+      // A supervised coordinator drains before its supervisor stops it.
+      let parent = case drain_on_exit {
+        True -> {
+          process.trap_exits(True)
+          Some(parent_pid())
+        }
+        False -> None
+      }
+      queue_timing.start_polling(incarnation_subject, auto_poll, Poll)
+      case factory_supervisor.start(worker_factory_builder) {
+        Error(error) -> Error(string.inspect(error))
+        Ok(started_factory) -> {
+          use started_renewer <- result.try(
+            queue_renewer.start_observed(
+              renewal_connection,
+              queue_name,
+              attempt_owner,
+              lease_duration_ms,
+              renewal_interval_ms,
+              fn(attempt_id, epoch, status) {
+                process.send(
+                  incarnation_subject,
+                  RenewalObserved(attempt_id, epoch, status),
+                )
+              },
+              postgres.forwarder(database),
+            )
+            |> result.map_error(string.inspect),
+          )
+
+          let selector =
+            process.new_selector()
+            |> process.select(for: subject)
+            |> process.select(for: incarnation_subject)
+            |> process.select_monitors(fn(down) { WorkerDown(down) })
+          let selector = case parent {
+            Some(_) -> process.select_trapped_exits(selector, Exited)
+            None -> selector
+          }
+          Ok(
+            actor.initialised(
+              ConsumerState(
+                database:,
+                workers:,
+                worker_factory: started_factory.data,
+                queue: queue_name,
+                attempt_owner:,
+                subject:,
+                incarnation_subject:,
+                auto_poll:,
+                policy:,
+                lease_duration_ms:,
+                renewal_interval_ms:,
+                renewer: started_renewer.data,
+                active: [],
+                poll_scheduled: auto_poll,
+                fill_pending: False,
+                hooks:,
+                shutting_down: False,
+                shutdown_generation: 0,
+                shutdown_replies: [],
+                stopping: False,
+                parent:,
+              )
+              |> emit_capacity,
+            )
+            |> actor.selecting(selector)
+            |> actor.returning(subject),
+          )
+        }
+      }
+    })
+    |> actor.on_message(handle_message)
+    |> actor.named(coordinator_name)
+  let ValidatedPolicy(shutdown_grace_ms:, ..) = policy
+  let child =
+    supervision.worker(fn() {
+      case actor.start(builder) {
+        Error(error) -> Error(error)
+        Ok(started) -> {
+          on_started(started.data)
+          Ok(started)
+        }
+      }
+    })
+    |> supervision.timeout(shutdown_grace_ms + 2000)
+  static_supervisor.new(static_supervisor.OneForAll)
+  |> static_supervisor.add(pool.supervised(
+    renewal_config,
+    postgres.statement_deadline_ms(database),
+  ))
+  |> static_supervisor.add(child)
 }
 
 /// Sends through a consumer's named coordinator subject. That name is a
@@ -930,6 +1062,14 @@ fn stop_consumer_supervisor(pid: process.Pid) -> Result(Nil, Nil)
 @external(erlang, "erlang", "unique_integer")
 fn unique_integer() -> Int
 
+@external(erlang, "grind_runtime_ffi", "parent_pid")
+fn parent_pid() -> process.Pid
+
+/// Ends a supervised coordinator with reason `shutdown`, the reason its
+/// supervisor expects from a child it is stopping.
+@external(erlang, "grind_runtime_ffi", "exit_shutdown")
+fn exit_shutdown() -> a
+
 fn handle_message(
   state: ConsumerState,
   message: Message,
@@ -968,6 +1108,12 @@ fn handle_message(
     ShutdownGraceExpired(generation) ->
       case generation == state.shutdown_generation {
         False -> actor.continue(state)
+        True if state.stopping -> {
+          list.each(state.shutdown_replies, fn(waiter) {
+            process.send(waiter, ShutdownForced(list.length(state.active)))
+          })
+          exit_shutdown()
+        }
         True -> {
           list.each(state.shutdown_replies, fn(waiter) {
             process.send(waiter, ShutdownForced(list.length(state.active)))
@@ -1017,8 +1163,8 @@ fn handle_message(
         Error(Nil) -> actor.continue(state)
         Ok(active) ->
           case active.phase {
-            diagnostic.AcknowledgementPending -> actor.continue(state)
-            diagnostic.HandlerRunning -> {
+            telemetry.AcknowledgementPending -> actor.continue(state)
+            telemetry.HandlerRunning -> {
               let active_attempts =
                 queue_active.replace_active(
                   state.active,
@@ -1027,7 +1173,7 @@ fn handle_message(
                   epoch,
                   ActiveAttempt(
                     ..active,
-                    phase: diagnostic.AcknowledgementPending,
+                    phase: telemetry.AcknowledgementPending,
                   ),
                 )
               actor.continue(emit_capacity(
@@ -1040,6 +1186,39 @@ fn handle_message(
     AttemptFinished(id, attempt_id, epoch, result) ->
       finish_attempt(state, id, attempt_id, epoch, result)
     WorkerDown(down) -> handle_worker_down(state, down)
+    Exited(process.ExitMessage(pid:, reason:)) ->
+      case Some(pid) == state.parent, reason {
+        True, _ -> stop_when_drained(state)
+        False, process.Normal -> actor.continue(state)
+        False, _ -> actor.stop_abnormal("a linked process exited")
+      }
+  }
+}
+
+/// The supervisor is stopping this coordinator: stop claiming, let active
+/// attempts finish within the grace, then stop.
+fn stop_when_drained(
+  state: ConsumerState,
+) -> actor.Next(ConsumerState, Message) {
+  let state = case state.shutting_down {
+    True -> ConsumerState(..state, stopping: True)
+    False ->
+      emit_capacity(ConsumerState(..state, shutting_down: True, stopping: True))
+  }
+  case list.is_empty(state.active) {
+    True -> exit_shutdown()
+    False -> {
+      let ValidatedPolicy(shutdown_grace_ms:, ..) = state.policy
+      let generation =
+        next_shutdown_generation(state.shutdown_generation, False)
+      let _ =
+        process.send_after(
+          state.incarnation_subject,
+          shutdown_grace_ms,
+          ShutdownGraceExpired(generation),
+        )
+      actor.continue(ConsumerState(..state, shutdown_generation: generation))
+    }
   }
 }
 
@@ -1167,7 +1346,7 @@ fn start_attempt(
                   monitor:,
                   completion:,
                   renewal_status: LeaseRenewalConfirmed,
-                  phase: diagnostic.HandlerRunning,
+                  phase: telemetry.HandlerRunning,
                 )
               let state =
                 ConsumerState(
@@ -1429,7 +1608,11 @@ fn continue_if_idle(
           list.each(state.shutdown_replies, fn(reply) {
             process.send(reply, ShutdownDrained)
           })
-          actor.continue(ConsumerState(..state, shutdown_replies: []))
+          case state.stopping {
+            True -> exit_shutdown()
+            False ->
+              actor.continue(ConsumerState(..state, shutdown_replies: []))
+          }
         }
         False -> actor.continue(state)
       }
@@ -1530,22 +1713,20 @@ fn emit_capacity(state: ConsumerState) -> ConsumerState {
   let active = list.length(state.active)
   let ack_pending =
     state.active
-    |> list.filter(fn(entry) {
-      entry.phase == diagnostic.AcknowledgementPending
-    })
+    |> list.filter(fn(entry) { entry.phase == telemetry.AcknowledgementPending })
     |> list.length
   let _ =
     forwarder.emit(
       postgres.forwarder(state.database),
-      diagnostic.capacity(),
-      diagnostic.CapacityMeasurements(
+      telemetry.capacity(),
+      telemetry.CapacityMeasurements(
         maximum: maximum_concurrency,
         active:,
         running: active - ack_pending,
         ack_pending:,
         available: maximum_concurrency - active,
       ),
-      diagnostic.CapacityMetadata(
+      telemetry.CapacityMetadata(
         queue: diagnostics.queue_ref(state.queue, state.attempt_owner),
         draining: state.shutting_down,
       ),

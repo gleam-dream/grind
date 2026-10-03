@@ -18,6 +18,7 @@ import gleam/json
 import gleam/list
 import gleam/string
 import gleam/time/timestamp
+import grind_bench/harness_db
 import pog
 import simplifile
 
@@ -113,7 +114,7 @@ fn activity_counts(connection: pog.Connection) -> List(#(String, Int)) {
       use count <- decode.field(1, decode.int)
       decode.success(#(state, count))
     })
-  case pog.execute(query, connection) {
+  case harness_db.execute(query, connection) {
     Ok(returned) -> returned.rows
     Error(_) -> []
   }
@@ -126,7 +127,7 @@ fn waiting_lock_count(connection: pog.Connection) -> Int {
       use count <- decode.field(0, decode.int)
       decode.success(count)
     })
-  case pog.execute(query, connection) {
+  case harness_db.execute(query, connection) {
     Ok(returned) ->
       case returned.rows {
         [count] -> count
@@ -161,7 +162,7 @@ fn statement_deltas(
       use total_exec_time <- decode.field(2, decode.float)
       decode.success(#(queryid, calls, total_exec_time))
     })
-  case pog.execute(query, connection) {
+  case harness_db.execute(query, connection) {
     Error(_) -> #([], previous_statements)
     Ok(returned) -> {
       let next_statements =

@@ -5,9 +5,9 @@ import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
-import grind/internal/diagnostic
-import grind/internal/observation
+import grind/telemetry
 import sinal
+import sinal/correlation
 
 @external(erlang, "grind_diagnostic_wire_probe", "attach")
 fn native_attach(
@@ -35,16 +35,22 @@ fn native_put(map: Dynamic, key: String, value: Dynamic) -> Dynamic
 @external(erlang, "grind_diagnostic_wire_probe", "remove")
 fn native_remove(map: Dynamic, key: String) -> Dynamic
 
-fn context() -> diagnostic.AttemptContext {
-  diagnostic.AttemptContext(
-    ref: observation.JobRef(41, "wire.queue", "wire.worker", "v1"),
-    attempt: observation.AttemptRef(72, 3, 2),
-    consumer: diagnostic.ConsumerRef("node@host", "consumer-17"),
+fn context() -> telemetry.AttemptContext {
+  telemetry.AttemptContext(
+    ref: telemetry.JobRef(
+      41,
+      "wire.queue",
+      "wire.worker",
+      "v1",
+      correlation.from_key("wire-correlation"),
+    ),
+    attempt: telemetry.AttemptRef(72, 3, 2),
+    consumer: telemetry.ConsumerRef("node@host", "consumer-17"),
   )
 }
 
-fn queue() -> diagnostic.QueueRef {
-  diagnostic.QueueRef("wire.queue", context().consumer)
+fn queue() -> telemetry.QueueRef {
+  telemetry.QueueRef("wire.queue", context().consumer)
 }
 
 fn queue_entries() -> List(#(String, Dynamic)) {
@@ -60,6 +66,7 @@ fn context_entries() -> List(#(String, Dynamic)) {
     #("job_id", dynamic.int(41)),
     #("worker_id", dynamic.string("wire.worker")),
     #("worker_version", dynamic.string("v1")),
+    #("correlation", dynamic.string("wire-correlation")),
     #("attempt_id", dynamic.int(72)),
     #("epoch", dynamic.int(3)),
     #("attempt", dynamic.int(2)),
@@ -148,7 +155,7 @@ fn rejects_enum(
 }
 
 pub fn renewal_native_contract_test() {
-  let event = diagnostic.renewal()
+  let event = telemetry.renewal()
   let measurements =
     native_map([
       #("count", dynamic.int(1)),
@@ -164,24 +171,24 @@ pub fn renewal_native_contract_test() {
     )
   list.each(
     [
-      #(diagnostic.HandlerRunning, "handler_running"),
-      #(diagnostic.AcknowledgementPending, "acknowledgement_pending"),
+      #(telemetry.HandlerRunning, "handler_running"),
+      #(telemetry.AcknowledgementPending, "acknowledgement_pending"),
     ],
     fn(phase) {
       list.each(
         [
-          #(diagnostic.Renewed, "renewed"),
-          #(diagnostic.SkippedLocked, "skipped_locked"),
-          #(diagnostic.LiveFenceUnavailable, "live_fence_unavailable"),
-          #(diagnostic.StorageFailed, "storage_failed"),
-          #(diagnostic.CompletionBudgetExhausted, "completion_budget_exhausted"),
+          #(telemetry.Renewed, "renewed"),
+          #(telemetry.SkippedLocked, "skipped_locked"),
+          #(telemetry.LiveFenceUnavailable, "live_fence_unavailable"),
+          #(telemetry.StorageFailed, "storage_failed"),
+          #(telemetry.CompletionBudgetExhausted, "completion_budget_exhausted"),
         ],
         fn(outcome) {
           round_trip(
             event,
             "renewal",
-            diagnostic.RenewalMeasurements(1, 1234, Some(-3)),
-            diagnostic.RenewalMetadata(context(), phase.0, outcome.0),
+            telemetry.RenewalMeasurements(1, 1234, Some(-3)),
+            telemetry.RenewalMetadata(context(), phase.0, outcome.0),
             measurements,
             base
               |> native_put("phase", dynamic.string(phase.1))
@@ -194,11 +201,11 @@ pub fn renewal_native_contract_test() {
   round_trip(
     event,
     "renewal",
-    diagnostic.RenewalMeasurements(1, 1234, None),
-    diagnostic.RenewalMetadata(
+    telemetry.RenewalMeasurements(1, 1234, None),
+    telemetry.RenewalMetadata(
       context(),
-      diagnostic.HandlerRunning,
-      diagnostic.StorageFailed,
+      telemetry.HandlerRunning,
+      telemetry.StorageFailed,
     ),
     native_remove(measurements, "remaining_lease_ms"),
     native_put(base, "outcome", dynamic.string("storage_failed")),
@@ -214,7 +221,7 @@ pub fn renewal_native_contract_test() {
 }
 
 pub fn acknowledgement_native_contract_test() {
-  let event = diagnostic.acknowledgement()
+  let event = telemetry.acknowledgement()
   let measurements =
     native_map([#("count", dynamic.int(1)), #("duration_us", dynamic.int(1234))])
   let base =
@@ -226,20 +233,20 @@ pub fn acknowledgement_native_contract_test() {
     )
   list.each(
     [
-      #(diagnostic.AckReplied, "replied"),
-      #(diagnostic.AckReconciled, "reconciled"),
-      #(diagnostic.AckRolledBack, "rolled_back"),
-      #(diagnostic.AckUnknown, "unknown"),
-      #(diagnostic.AckFenceRejected, "fence_rejected"),
-      #(diagnostic.AckCommandConflict, "command_conflict"),
-      #(diagnostic.AckFailed, "failed"),
+      #(telemetry.AckReplied, "replied"),
+      #(telemetry.AckReconciled, "reconciled"),
+      #(telemetry.AckRolledBack, "rolled_back"),
+      #(telemetry.AckUnknown, "unknown"),
+      #(telemetry.AckFenceRejected, "fence_rejected"),
+      #(telemetry.AckCommandConflict, "command_conflict"),
+      #(telemetry.AckFailed, "failed"),
     ],
     fn(outcome) {
       round_trip(
         event,
         "acknowledgement",
-        diagnostic.AcknowledgementMeasurements(1, 1234),
-        diagnostic.AcknowledgementMetadata(context(), "ack-41-72-3", outcome.0),
+        telemetry.AcknowledgementMeasurements(1, 1234),
+        telemetry.AcknowledgementMetadata(context(), "ack-41-72-3", outcome.0),
         measurements,
         native_put(base, "outcome", dynamic.string(outcome.1)),
       )
@@ -255,7 +262,7 @@ pub fn acknowledgement_native_contract_test() {
 }
 
 pub fn acknowledgement_retry_native_contract_test() {
-  let event = diagnostic.acknowledgement_retry()
+  let event = telemetry.acknowledgement_retry()
   let measurements =
     native_map([
       #("count", dynamic.int(1)),
@@ -272,15 +279,15 @@ pub fn acknowledgement_retry_native_contract_test() {
     )
   list.each(
     [
-      #(diagnostic.RetryAfterFailure, "after_failure"),
-      #(diagnostic.RetryAfterUnknown, "after_unknown"),
+      #(telemetry.RetryAfterFailure, "after_failure"),
+      #(telemetry.RetryAfterUnknown, "after_unknown"),
     ],
     fn(reason) {
       round_trip(
         event,
         "acknowledgement_retry",
-        diagnostic.RetryMeasurements(1, 2, 100, 3001),
-        diagnostic.RetryMetadata(context(), "ack-41-72-3", reason.0),
+        telemetry.RetryMeasurements(1, 2, 100, 3001),
+        telemetry.RetryMetadata(context(), "ack-41-72-3", reason.0),
         measurements,
         native_put(base, "reason", dynamic.string(reason.1)),
       )
@@ -289,18 +296,18 @@ pub fn acknowledgement_retry_native_contract_test() {
   rejects_enum(event, measurements, base, "reason")
 }
 
-fn operations() -> List(#(diagnostic.Operation, String)) {
+fn operations() -> List(#(telemetry.Operation, String)) {
   [
-    #(diagnostic.QuarantineScan, "quarantine_scan"),
-    #(diagnostic.ClaimCandidate, "claim_candidate"),
-    #(diagnostic.LeaseRenewal, "lease_renewal"),
-    #(diagnostic.Acknowledge, "acknowledge"),
-    #(diagnostic.ReconcileAcknowledgement, "reconcile_acknowledgement"),
+    #(telemetry.QuarantineScan, "quarantine_scan"),
+    #(telemetry.ClaimCandidate, "claim_candidate"),
+    #(telemetry.LeaseRenewal, "lease_renewal"),
+    #(telemetry.Acknowledge, "acknowledge"),
+    #(telemetry.ReconcileAcknowledgement, "reconcile_acknowledgement"),
   ]
 }
 
 pub fn checkout_native_contract_test() {
-  let event = diagnostic.checkout()
+  let event = telemetry.checkout()
   let measurements =
     native_map([
       #("count", dynamic.int(1)),
@@ -319,25 +326,25 @@ pub fn checkout_native_contract_test() {
     )
   list.each(operations(), fn(operation) {
     list.each(
-      [#(diagnostic.MainPool, "main"), #(diagnostic.ReservedPool, "reserved")],
+      [#(telemetry.MainPool, "main"), #(telemetry.ReservedPool, "reserved")],
       fn(pool) {
         list.each(
           [
-            #(diagnostic.CheckoutAcquired, "acquired"),
-            #(diagnostic.CheckoutUnavailable, "unavailable"),
+            #(telemetry.CheckoutAcquired, "acquired"),
+            #(telemetry.CheckoutUnavailable, "unavailable"),
           ],
           fn(checkout) {
             list.each(
               [
-                #(diagnostic.CallSucceeded, "succeeded"),
-                #(diagnostic.CallFailed, "failed"),
+                #(telemetry.CallSucceeded, "succeeded"),
+                #(telemetry.CallFailed, "failed"),
               ],
               fn(returned) {
                 round_trip(
                   event,
                   "checkout",
-                  diagnostic.CheckoutMeasurements(1, 23, 45, 2),
-                  diagnostic.CheckoutMetadata(
+                  telemetry.CheckoutMeasurements(1, 23, 45, 2),
+                  telemetry.CheckoutMetadata(
                     queue(),
                     operation.0,
                     pool.0,
@@ -365,7 +372,7 @@ pub fn checkout_native_contract_test() {
 }
 
 pub fn claim_failed_native_contract_test() {
-  let event = diagnostic.claim_failed()
+  let event = telemetry.claim_failed()
   let measurements =
     native_map([#("count", dynamic.int(1)), #("duration_us", dynamic.int(1234))])
   let base =
@@ -377,19 +384,19 @@ pub fn claim_failed_native_contract_test() {
     )
   list.each(
     [
-      #(diagnostic.TimedOut, "timed_out"),
-      #(diagnostic.ConnectionUnavailable, "connection_unavailable"),
-      #(diagnostic.Rejected, "rejected"),
-      #(diagnostic.UnexpectedResult, "unexpected_result"),
+      #(telemetry.TimedOut, "timed_out"),
+      #(telemetry.ConnectionUnavailable, "connection_unavailable"),
+      #(telemetry.Rejected, "rejected"),
+      #(telemetry.UnexpectedResult, "unexpected_result"),
     ],
     fn(failure) {
       round_trip(
         event,
         "claim_failed",
-        diagnostic.ClaimFailedMeasurements(1, 1234),
-        diagnostic.ClaimFailedMetadata(
+        telemetry.ClaimFailedMeasurements(1, 1234),
+        telemetry.ClaimFailedMetadata(
           queue(),
-          diagnostic.ClaimCandidate,
+          telemetry.ClaimCandidate,
           failure.0,
         ),
         measurements,
@@ -402,7 +409,7 @@ pub fn claim_failed_native_contract_test() {
 }
 
 pub fn capacity_native_contract_test() {
-  let event = diagnostic.capacity()
+  let event = telemetry.capacity()
   let measurements =
     native_map([
       #("maximum", dynamic.int(10)),
@@ -418,8 +425,8 @@ pub fn capacity_native_contract_test() {
   round_trip(
     event,
     "capacity",
-    diagnostic.CapacityMeasurements(10, 7, 4, 3, 3),
-    diagnostic.CapacityMetadata(queue(), True),
+    telemetry.CapacityMeasurements(10, 7, 4, 3, 3),
+    telemetry.CapacityMetadata(queue(), True),
     measurements,
     metadata,
   )

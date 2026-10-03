@@ -327,7 +327,7 @@ fn run_t1(base_url: String) -> Nil {
       attempt_owner,
       30_000,
     )
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
   let job_id = job.id_value(handle)
   let #(_, attempt_id, epoch) = attempt.claim_identity(claimed)
   let command_id = attempt.acknowledgement_command_id(job_id, attempt_id, epoch)
@@ -458,7 +458,7 @@ fn run_t2(base_url: String) -> Nil {
       attempt_owner,
       30_000,
     )
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
   let job_id = job.id_value(handle)
   let #(_, attempt_id, epoch) = attempt.claim_identity(claimed)
   let command_id = attempt.acknowledgement_command_id(job_id, attempt_id, epoch)
@@ -678,7 +678,7 @@ fn run_t5(base_url: String) -> Nil {
       attempt_owner,
       30_000,
     )
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
   let job_id = job.id_value(handle)
   let #(_, attempt_id, epoch) = attempt.claim_identity(claimed)
   let command_id = attempt.acknowledgement_command_id(job_id, attempt_id, epoch)

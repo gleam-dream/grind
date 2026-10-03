@@ -3,13 +3,16 @@
 
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import grind/internal/convert
+import grind/internal/events
 import grind/internal/job.{type JobHandle, type State, Queued, Scheduled}
-import grind/internal/observation
 import grind/internal/postgres/resolution_queries.{
   type ResolutionCommand, ResolutionCommand,
 } as postgres_resolution_queries
 import grind/internal/store
+import grind/telemetry
 import pog
+import sinal/correlation.{type Correlation}
 import sinal/forwarder.{type Forwarder}
 
 pub type Decision(output, error) {
@@ -147,14 +150,12 @@ pub fn resolve_uncertain(
           Error(Nil) -> Nil
           Ok(decision) -> {
             let #(committed_state, confirmation) = case result {
-              ResolutionApplied(state) -> #(state, observation.Replied)
-              ResolutionAlreadyApplied(state) -> #(
-                state,
-                observation.Reconciled,
-              )
+              ResolutionApplied(state) -> #(state, telemetry.Replied)
+              ResolutionAlreadyApplied(state) -> #(state, telemetry.Reconciled)
             }
             emit_resolved(
               fwd,
+              events.read_correlation(connection, id),
               queue,
               id,
               worker_id,
@@ -185,25 +186,32 @@ pub fn resolve_uncertain(
 /// `resolution_receipt_outcome`.
 fn emit_resolved(
   fwd: Forwarder,
+  correlation: Correlation,
   queue: String,
   job_id: Int,
   worker_id: String,
   worker_version: String,
-  decision: observation.ResolutionDecision,
+  decision: telemetry.ResolutionDecision,
   committed_state: State,
   resolution_id: String,
   resolved_by: String,
-  confirmation: observation.Confirmation,
+  confirmation: telemetry.Confirmation,
 ) -> Nil {
   let _ =
     forwarder.emit(
       fwd,
-      observation.resolved(),
-      observation.ResolvedMeasurements(count: 1),
-      observation.ResolvedMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
+      telemetry.resolved(),
+      events.job_measurements(),
+      telemetry.ResolvedMetadata(
+        ref: telemetry.JobRef(
+          job_id:,
+          queue:,
+          worker_id:,
+          worker_version:,
+          correlation:,
+        ),
         decision:,
-        committed_state:,
+        committed_state: convert.state(committed_state),
         resolution_id:,
         resolved_by:,
         confirmation:,
@@ -214,11 +222,11 @@ fn emit_resolved(
 
 fn resolution_decision_of_stored(
   decision: String,
-) -> Result(observation.ResolutionDecision, Nil) {
+) -> Result(telemetry.ResolutionDecision, Nil) {
   case decision {
-    "confirm_success" -> Ok(observation.DecisionConfirmSuccess)
-    "confirm_business_failure" -> Ok(observation.DecisionConfirmBusinessFailure)
-    "authorize_replay" -> Ok(observation.DecisionAuthorizeReplay)
+    "confirm_success" -> Ok(telemetry.DecisionConfirmSuccess)
+    "confirm_business_failure" -> Ok(telemetry.DecisionConfirmBusinessFailure)
+    "authorize_replay" -> Ok(telemetry.DecisionAuthorizeReplay)
     _ -> Error(Nil)
   }
 }

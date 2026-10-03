@@ -1,26 +1,19 @@
-import exception
-import gleeunit/should
-import grind/internal/postgres
+//// An unreachable database fails `start` with a typed error within the
+//// connect timeout.
+
+import gleam/erlang/process
+import gleam/time/duration
+import grind
 import grind_consumer/support/env
 
-pub fn storage_start_failure_is_reported_test() {
+pub fn an_unreachable_database_fails_start_test() {
   case env.storage_failure_url() {
     Error(Nil) -> Nil
     Ok(url) -> {
-      let assert Ok(settings) =
-        postgres.settings(url)
-        |> postgres.validate
-      let failure_observed = case postgres.start(settings) {
-        Error(_) -> True
-        Ok(database) -> {
-          use <- exception.defer(fn() { postgres.close(database) })
-          case postgres.migrate(database) {
-            Error(_) -> True
-            Ok(Nil) -> False
-          }
-        }
-      }
-      failure_observed |> should.equal(True)
+      let assert Error(grind.Unavailable(_)) =
+        grind.new(env.pool(url))
+        |> grind.with_connect_timeout(duration.seconds(1))
+        |> grind.start(process.new_name("consumer_unreachable"))
       env.mark("consumer-storage-failure-passed")
     }
   }

@@ -7,7 +7,6 @@ import gleam/list
 import gleam/result
 import gleeunit/should
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/submission
 import grind/internal/unique
@@ -25,6 +24,7 @@ import grind/support/retention_rows.{
   seed_resolution_receipt, seed_terminal_job, seed_unique_submission_receipt,
 }
 import grind/support/submissions.{submit_keep_existing, unique_test_worker}
+import grind/telemetry
 import pog
 import sinal
 
@@ -213,7 +213,7 @@ fn run_prune_finished_test(database_url: String, owner_b_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.prune_completed(), fn(measurements, metadata) {
+    sinal.observe(telemetry.prune_completed(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -224,9 +224,9 @@ fn run_prune_finished_test(database_url: String, owner_b_url: String) -> Nil {
 
   let assert Ok(#(measurements, metadata)) =
     process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.PruneCompletedMeasurements(jobs: 6))
+  measurements |> should.equal(telemetry.PruneCompletedMeasurements(jobs: 6))
   metadata
-  |> should.equal(observation.PruneCompletedMetadata(
+  |> should.equal(telemetry.PruneCompletedMetadata(
     older_than_ms: 1000,
     limit: 100,
   ))

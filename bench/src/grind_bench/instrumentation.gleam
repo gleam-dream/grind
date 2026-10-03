@@ -28,6 +28,7 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/result
+import grind_bench/harness_db
 import pog
 
 fn qualify(schema: String, name: String) -> String {
@@ -38,7 +39,7 @@ fn exec(
   connection: pog.Connection,
   sql: String,
 ) -> Result(Nil, pog.QueryError) {
-  pog.execute(pog.query(sql), connection) |> result.map(fn(_) { Nil })
+  harness_db.execute(pog.query(sql), connection) |> result.map(fn(_) { Nil })
 }
 
 // -- Lease-log trigger -------------------------------------------------------
@@ -121,7 +122,8 @@ pub fn renewal_headroom_ms(
           use value <- decode.field(0, decode.float)
           decode.success(value)
         })
-      pog.execute(query, ledger) |> result.map(fn(returned) { returned.rows })
+      harness_db.execute(query, ledger)
+      |> result.map(fn(returned) { returned.rows })
     }
   }
 }
@@ -145,7 +147,7 @@ pub fn quarantine_transition_count(
           use value <- decode.field(0, decode.int)
           decode.success(value)
         })
-      use returned <- result.try(pog.execute(query, ledger))
+      use returned <- result.try(harness_db.execute(query, ledger))
       case returned.rows {
         [count] -> Ok(count)
         _ -> Ok(0)
@@ -253,7 +255,7 @@ pub fn clear_slow_ack_targets(
     )
     |> pog.parameter(pog.text(grind_schema))
     |> pog.returning(decode.at([0], decode.string))
-  use returned <- result.try(pog.execute(query, ledger))
+  use returned <- result.try(harness_db.execute(query, ledger))
   use Nil <- result.try(
     list.try_each(returned.rows, fn(name) {
       exec(ledger, "DROP SEQUENCE " <> qualify(grind_schema, name))
@@ -280,7 +282,7 @@ pub fn slow_ack_target_activations(
         <> slow_ack_target_sequence(grind_schema, job_id),
       )
       |> pog.returning(decode.at([0], decode.int))
-    use returned <- result.try(pog.execute(query, ledger))
+    use returned <- result.try(harness_db.execute(query, ledger))
     let assert [count] = returned.rows
     Ok(#(job_id, count))
   })
@@ -341,7 +343,7 @@ pub fn lease_evidence(
         renewals_during_slow_ack:,
       ))
     })
-  use returned <- result.try(pog.execute(query, ledger))
+  use returned <- result.try(harness_db.execute(query, ledger))
   let assert [evidence] = returned.rows
   Ok(evidence)
 }
@@ -359,7 +361,7 @@ pub fn slow_ack_activations(
       use value <- decode.field(0, decode.int)
       decode.success(value)
     })
-  use returned <- result.try(pog.execute(query, ledger))
+  use returned <- result.try(harness_db.execute(query, ledger))
   let assert [count] = returned.rows
   Ok(count)
 }

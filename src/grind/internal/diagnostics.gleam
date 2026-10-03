@@ -1,7 +1,7 @@
 //// Payload-free projections and bounded forwarding for queue diagnostics.
 
-import grind/internal/diagnostic
 import grind/internal/store
+import grind/telemetry
 import pog
 import sinal/forwarder.{type Forwarder}
 
@@ -11,43 +11,43 @@ pub fn monotonic_us() -> Int
 @external(erlang, "grind_queue_ffi", "node_name")
 fn node_name() -> String
 
-pub fn consumer_ref(owner: String) -> diagnostic.ConsumerRef {
-  diagnostic.ConsumerRef(node: node_name(), consumer: owner)
+pub fn consumer_ref(owner: String) -> telemetry.ConsumerRef {
+  telemetry.ConsumerRef(node: node_name(), consumer: owner)
 }
 
-pub fn queue_ref(queue: String, owner: String) -> diagnostic.QueueRef {
-  diagnostic.QueueRef(queue:, consumer: consumer_ref(owner))
+pub fn queue_ref(queue: String, owner: String) -> telemetry.QueueRef {
+  telemetry.QueueRef(queue:, consumer: consumer_ref(owner))
 }
 
 pub fn checkout(
   fwd: Forwarder,
-  queue: diagnostic.QueueRef,
-  operation: diagnostic.Operation,
-  pool: diagnostic.PoolRole,
+  queue: telemetry.QueueRef,
+  operation: telemetry.Operation,
+  pool: telemetry.PoolRole,
   measured: store.Measured(Result(a, b)),
 ) -> Result(a, b) {
   case measured.checkout {
     store.NoCheckout -> Nil
     store.CheckoutTiming(wait_us:, candidates:, outcome:) -> {
       let checkout = case outcome {
-        store.CheckedOut -> diagnostic.CheckoutAcquired
-        store.CheckoutUnavailable -> diagnostic.CheckoutUnavailable
+        store.CheckedOut -> telemetry.CheckoutAcquired
+        store.CheckoutUnavailable -> telemetry.CheckoutUnavailable
       }
       let returned = case measured.value {
-        Ok(_) -> diagnostic.CallSucceeded
-        Error(_) -> diagnostic.CallFailed
+        Ok(_) -> telemetry.CallSucceeded
+        Error(_) -> telemetry.CallFailed
       }
       let _ =
         forwarder.emit(
           fwd,
-          diagnostic.checkout(),
-          diagnostic.CheckoutMeasurements(
+          telemetry.checkout(),
+          telemetry.CheckoutMeasurements(
             count: 1,
             wait_us:,
             call_duration_us: measured.call_duration_us,
             candidates:,
           ),
-          diagnostic.CheckoutMetadata(
+          telemetry.CheckoutMetadata(
             queue:,
             operation:,
             pool:,
@@ -63,25 +63,25 @@ pub fn checkout(
 
 pub fn claim_failed(
   fwd: Forwarder,
-  queue: diagnostic.QueueRef,
-  stage: diagnostic.Operation,
+  queue: telemetry.QueueRef,
+  stage: telemetry.Operation,
   error: pog.QueryError,
   duration_us: Int,
 ) -> Nil {
   let failure = case error {
-    pog.QueryTimeout -> diagnostic.TimedOut
-    pog.ConnectionUnavailable -> diagnostic.ConnectionUnavailable
-    pog.ConstraintViolated(..) | pog.PostgresqlError(..) -> diagnostic.Rejected
+    pog.QueryTimeout -> telemetry.TimedOut
+    pog.ConnectionUnavailable -> telemetry.ConnectionUnavailable
+    pog.ConstraintViolated(..) | pog.PostgresqlError(..) -> telemetry.Rejected
     pog.UnexpectedArgumentCount(..)
     | pog.UnexpectedArgumentType(..)
-    | pog.UnexpectedResultType(..) -> diagnostic.UnexpectedResult
+    | pog.UnexpectedResultType(..) -> telemetry.UnexpectedResult
   }
   let _ =
     forwarder.emit(
       fwd,
-      diagnostic.claim_failed(),
-      diagnostic.ClaimFailedMeasurements(count: 1, duration_us:),
-      diagnostic.ClaimFailedMetadata(queue:, stage:, failure:),
+      telemetry.claim_failed(),
+      telemetry.ClaimFailedMeasurements(count: 1, duration_us:),
+      telemetry.ClaimFailedMetadata(queue:, stage:, failure:),
     )
   Nil
 }

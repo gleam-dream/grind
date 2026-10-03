@@ -1,13 +1,13 @@
 import exception
 import gleam/erlang/process
 import gleeunit/should
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/pruner
 import grind/internal/worker
 import grind/support/env.{mark_database_test_executed, monotonic_ms, prune_url}
 import grind/support/observers.{detach}
 import grind/support/retention_rows.{job_row_exists, seed_terminal_job}
+import grind/telemetry
 import pog
 import sinal
 
@@ -111,7 +111,7 @@ fn run_supervised_pruner_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.prune_completed(), fn(measurements, _metadata) {
+    sinal.observe(telemetry.prune_completed(), fn(measurements, _metadata) {
       process.send(signal, measurements)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -135,7 +135,7 @@ fn run_supervised_pruner_test(database_url: String) -> Nil {
   // The timer path itself emits `[grind, prune, completed]`, not only a
   // direct `prune_finished` call — the tick that pruned `old_id` must have
   // reported at least one deleted job.
-  let assert Ok(observation.PruneCompletedMeasurements(jobs:)) =
+  let assert Ok(telemetry.PruneCompletedMeasurements(jobs:)) =
     process.receive(signal, within: 5000)
   { jobs >= 1 } |> should.equal(True)
 
@@ -202,7 +202,7 @@ fn run_supervised_pruner_restart_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.prune_completed(), fn(_measurements, _metadata) {
+    sinal.observe(telemetry.prune_completed(), fn(_measurements, _metadata) {
       process.send(signal, Nil)
     })
   use <- exception.defer(fn() { detach(attachment) })

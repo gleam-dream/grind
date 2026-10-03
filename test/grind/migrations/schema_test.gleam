@@ -119,7 +119,7 @@ fn run_schema_v10_install_test(database_url: String) -> Nil {
   postgres.migrate(database) |> should.equal(Ok(Nil))
   let assert Ok(preserved) =
     pog.query(
-      "SELECT (SELECT count(*) = 2 AND min(version) = 11 AND max(version) = 12 FROM grind_schema_migrations), (SELECT count(*) = 1 FROM grind_jobs WHERE id = $1 AND state = 'succeeded' AND finished_at IS NOT NULL), (SELECT count(*) = 1 FROM grind_job_acknowledgements WHERE command_id = 'schema-command' AND job_id = $1 AND attempt_id = $2 AND proposal_sha256 = sha256(convert_to('synthetic proposal', 'UTF8'))), (SELECT last_value = $2 AND is_called FROM grind_attempts_id_seq)",
+      "SELECT (SELECT count(*) = 3 AND min(version) = 11 AND max(version) = 13 FROM grind_schema_migrations), (SELECT count(*) = 1 FROM grind_jobs WHERE id = $1 AND state = 'succeeded' AND finished_at IS NOT NULL), (SELECT count(*) = 1 FROM grind_job_acknowledgements WHERE command_id = 'schema-command' AND job_id = $1 AND attempt_id = $2 AND proposal_sha256 = sha256(convert_to('synthetic proposal', 'UTF8'))), (SELECT last_value = $2 AND is_called FROM grind_attempts_id_seq)",
     )
     |> pog.parameter(pog.int(job_id))
     |> pog.parameter(pog.int(attempt_id))
@@ -243,10 +243,10 @@ fn run_schema_marker_rejection_test(database_url: String) -> Nil {
     pog.query("DELETE FROM grind_schema_migrations")
     |> pog.execute(on: connection)
   let assert Ok(_) =
-    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (13)")
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (14)")
     |> pog.execute(on: connection)
   postgres.migrate(database)
-  |> should.equal(Error(postgres.UnsupportedSchemaVersion(13)))
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(14)))
 
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations")
@@ -440,7 +440,7 @@ fn run_schema_atomic_install_test(database_url: String) -> Nil {
 /// shape-first implementation would evaluate the now-broken shape and
 /// misreport `IncompatibleSchema` (or, worse, never notice the higher
 /// marker at all); the required version-first ordering still reports
-/// `UnsupportedSchemaVersion(13)` regardless — the version check never
+/// `UnsupportedSchemaVersion(14)` regardless — the version check never
 /// reaches a shape check at all once `max > latest`.
 pub fn postgres_migration_future_version_precedes_shape_check_test() {
   case schema_future_foreign_url() {
@@ -461,10 +461,10 @@ fn run_future_version_with_foreign_objects_test(database_url: String) -> Nil {
     pog.query("DROP TABLE grind_unique_submissions")
     |> pog.execute(on: connection)
   let assert Ok(_) =
-    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (13)")
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (14)")
     |> pog.execute(on: connection)
   postgres.migrate(database)
-  |> should.equal(Error(postgres.UnsupportedSchemaVersion(13)))
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(14)))
   mark_database_test_executed("future-version-precedes-shape-check-passed")
 }
 
@@ -521,22 +521,22 @@ fn real_v11_migration() -> migrations.Migration {
 /// step-by-step commit/skip behaviour is under test here, not any real
 /// schema change. Numbered `13` (one past the real, current highest version)
 /// rather than `12`, since `12` is now a genuine released step.
-fn synthetic_v13_ok_migration() -> migrations.Migration {
+fn synthetic_v14_ok_migration() -> migrations.Migration {
   migrations.Migration(
-    13,
+    14,
     [
-      "CREATE TABLE grind_test_synthetic_v13 (id integer PRIMARY KEY)",
-      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
+      "CREATE TABLE grind_test_synthetic_v14 (id integer PRIMARY KEY)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
     ],
     list.append(latest_migration().shape, [
       migrations.ExpectedRelation(
-        "grind_test_synthetic_v13",
+        "grind_test_synthetic_v14",
         migrations.Table,
         [],
       ),
       // `id integer PRIMARY KEY` also creates this backing index implicitly.
       migrations.ExpectedRelation(
-        "grind_test_synthetic_v13_pkey",
+        "grind_test_synthetic_v14_pkey",
         migrations.Index,
         [],
       ),
@@ -546,57 +546,57 @@ fn synthetic_v13_ok_migration() -> migrations.Migration {
   )
 }
 
-/// Like `synthetic_v13_ok_migration`, but its own `CREATE TABLE` is the
-/// exact object identity `install_synthetic_v14_failure_trigger` arms an
+/// Like `synthetic_v14_ok_migration`, but its own `CREATE TABLE` is the
+/// exact object identity `install_synthetic_v15_failure_trigger` arms an
 /// event trigger to reject.
-fn synthetic_v14_migration() -> migrations.Migration {
+fn synthetic_v15_migration() -> migrations.Migration {
   migrations.Migration(
-    14,
+    15,
     [
-      "CREATE TABLE grind_test_synthetic_v14 (id integer PRIMARY KEY)",
-      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
+      "CREATE TABLE grind_test_synthetic_v15 (id integer PRIMARY KEY)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (15)",
     ],
-    list.append(synthetic_v13_ok_migration().shape, [
+    list.append(synthetic_v14_ok_migration().shape, [
       migrations.ExpectedRelation(
-        "grind_test_synthetic_v14",
+        "grind_test_synthetic_v15",
         migrations.Table,
         [],
       ),
       migrations.ExpectedRelation(
-        "grind_test_synthetic_v14_pkey",
+        "grind_test_synthetic_v15_pkey",
         migrations.Index,
         [],
       ),
     ]),
-    synthetic_v13_ok_migration().foreign_keys,
-    synthetic_v13_ok_migration().forbidden_columns,
+    synthetic_v14_ok_migration().foreign_keys,
+    synthetic_v14_ok_migration().forbidden_columns,
   )
 }
 
 /// Installs a `ddl_command_end` event trigger that raises whenever
-/// `grind_test_synthetic_v14` is created — the same fault-injection shape
+/// `grind_test_synthetic_v15` is created — the same fault-injection shape
 /// `run_schema_atomic_install_test` above uses against a real Grind table,
 /// aimed instead at the partial-failure test's own synthetic step 14.
-fn install_synthetic_v14_failure_trigger(connection: pog.Connection) -> Nil {
+fn install_synthetic_v15_failure_trigger(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
     pog.query(
-      "CREATE FUNCTION fail_grind_synthetic_v14() RETURNS event_trigger LANGUAGE plpgsql AS $body$ DECLARE command record; BEGIN FOR command IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP IF command.object_identity LIKE '%grind_test_synthetic_v14' THEN RAISE EXCEPTION 'injected Grind migration failure'; END IF; END LOOP; END $body$",
+      "CREATE FUNCTION fail_grind_synthetic_v15() RETURNS event_trigger LANGUAGE plpgsql AS $body$ DECLARE command record; BEGIN FOR command IN SELECT * FROM pg_event_trigger_ddl_commands() LOOP IF command.object_identity LIKE '%grind_test_synthetic_v15' THEN RAISE EXCEPTION 'injected Grind migration failure'; END IF; END LOOP; END $body$",
     )
     |> pog.execute(on: connection)
   let assert Ok(_) =
     pog.query(
-      "CREATE EVENT TRIGGER fail_grind_synthetic_v14 ON ddl_command_end EXECUTE FUNCTION fail_grind_synthetic_v14()",
+      "CREATE EVENT TRIGGER fail_grind_synthetic_v15 ON ddl_command_end EXECUTE FUNCTION fail_grind_synthetic_v15()",
     )
     |> pog.execute(on: connection)
   Nil
 }
 
-fn drop_synthetic_v14_failure_trigger(connection: pog.Connection) -> Nil {
+fn drop_synthetic_v15_failure_trigger(connection: pog.Connection) -> Nil {
   let assert Ok(_) =
-    pog.query("DROP EVENT TRIGGER fail_grind_synthetic_v14")
+    pog.query("DROP EVENT TRIGGER fail_grind_synthetic_v15")
     |> pog.execute(on: connection)
   let assert Ok(_) =
-    pog.query("DROP FUNCTION fail_grind_synthetic_v14()")
+    pog.query("DROP FUNCTION fail_grind_synthetic_v15()")
     |> pog.execute(on: connection)
   Nil
 }
@@ -621,14 +621,14 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let connection = postgres.connection(database)
-  install_synthetic_v14_failure_trigger(connection)
+  install_synthetic_v15_failure_trigger(connection)
 
   let steps =
     list.append(migrations.migrations(), [
-      synthetic_v13_ok_migration(),
-      synthetic_v14_migration(),
+      synthetic_v14_ok_migration(),
+      synthetic_v15_migration(),
     ])
-  let assert Error(postgres.MigrationStepFailed(14, _)) =
+  let assert Error(postgres.MigrationStepFailed(15, _)) =
     postgres.migrate_with(database, steps)
 
   let assert Ok(markers) =
@@ -640,10 +640,10 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
       decode.success(versions)
     })
     |> pog.execute(on: connection)
-  markers.rows |> should.equal([[11, 12, 13]])
+  markers.rows |> should.equal([[11, 12, 13, 14]])
   let assert Ok(objects) =
     pog.query(
-      "SELECT to_regclass(current_schema() || '.grind_test_synthetic_v13') IS NOT NULL, to_regclass(current_schema() || '.grind_test_synthetic_v14') IS NOT NULL",
+      "SELECT to_regclass(current_schema() || '.grind_test_synthetic_v14') IS NOT NULL, to_regclass(current_schema() || '.grind_test_synthetic_v15') IS NOT NULL",
     )
     |> pog.returning({
       use v13_present <- decode.field(0, decode.bool)
@@ -653,7 +653,7 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
     |> pog.execute(on: connection)
   objects.rows |> should.equal([#(True, False)])
 
-  drop_synthetic_v14_failure_trigger(connection)
+  drop_synthetic_v15_failure_trigger(connection)
   postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
   let assert Ok(resumed_markers) =
     pog.query(
@@ -664,7 +664,7 @@ fn run_partial_failure_migration_test(database_url: String) -> Nil {
       decode.success(versions)
     })
     |> pog.execute(on: connection)
-  resumed_markers.rows |> should.equal([[11, 12, 13, 14]])
+  resumed_markers.rows |> should.equal([[11, 12, 13, 14, 15]])
   mark_database_test_executed("migrate-partial-failure-resumes-passed")
 }
 
@@ -688,10 +688,10 @@ fn run_missing_relation_shape_test(database_url: String) -> Nil {
   use <- exception.defer(fn() { postgres.close(database) })
   let connection = postgres.connection(database)
   let steps =
-    list.append(migrations.migrations(), [synthetic_v13_ok_migration()])
+    list.append(migrations.migrations(), [synthetic_v14_ok_migration()])
   postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
   let assert Ok(_) =
-    pog.query("DROP TABLE grind_test_synthetic_v13")
+    pog.query("DROP TABLE grind_test_synthetic_v14")
     |> pog.execute(on: connection)
   postgres.migrate_with(database, steps)
   |> should.equal(Error(postgres.IncompatibleSchema))

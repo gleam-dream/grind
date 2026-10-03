@@ -6,10 +6,10 @@ import gleam/json
 import gleeunit/should
 import grind/internal/consumer as queue
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/ack_queries.{wait_for_commit_trigger_backend}
 import grind/support/concurrency.{LongHandlerStarted, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
@@ -20,6 +20,7 @@ import grind/support/observers.{detach}
 import grind/support/syncrep.{terminate_backend}
 import grind/support/unique_fixture.{unique_test_suffix}
 import grind/support/worker_failure.{AccountMissing}
+import grind/telemetry
 import pog
 import sinal
 
@@ -80,24 +81,21 @@ fn run_cancellation_observation_emission_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(
-      observation.cancellation_decided(),
-      fn(measurements, metadata) {
-        process.send(signal, #(measurements, metadata))
-      },
-    )
+    sinal.observe(telemetry.cancellation_decided(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   postgres.cancel(database, queued_handle)
   |> should.equal(Ok(postgres.CancelledBeforeRun))
   let assert Ok(#(measurements, before_run_metadata)) =
     process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.CancellationMeasurements(count: 1))
+  measurements.count |> should.equal(1)
   before_run_metadata.ref.job_id |> should.equal(job.id_value(queued_handle))
   before_run_metadata.ref.queue |> should.equal("cancellation-emission")
-  before_run_metadata.previous_state |> should.equal(job.Queued)
+  before_run_metadata.previous_state |> should.equal(public_job.Queued)
   before_run_metadata.outcome
-  |> should.equal(observation.CancellationDecidedBeforeRun)
+  |> should.equal(telemetry.CancellationDecidedBeforeRun)
 
   let reply = process.new_subject()
   let _ =
@@ -114,9 +112,9 @@ fn run_cancellation_observation_emission_test(database_url: String) -> Nil {
     process.receive(signal, within: 5000)
   requested_metadata_1.ref.job_id
   |> should.equal(job.id_value(executing_handle))
-  requested_metadata_1.previous_state |> should.equal(job.Executing)
+  requested_metadata_1.previous_state |> should.equal(public_job.Executing)
   requested_metadata_1.outcome
-  |> should.equal(observation.CancellationDecidedWhileRunning)
+  |> should.equal(telemetry.CancellationDecidedWhileRunning)
 
   // Idempotent re-request: the same outcome, delivered again.
   postgres.cancel(database, executing_handle)
@@ -124,7 +122,7 @@ fn run_cancellation_observation_emission_test(database_url: String) -> Nil {
   let assert Ok(#(_, requested_metadata_2)) =
     process.receive(signal, within: 5000)
   requested_metadata_2.outcome
-  |> should.equal(observation.CancellationDecidedWhileRunning)
+  |> should.equal(telemetry.CancellationDecidedWhileRunning)
 
   process.send(release, ReleaseAttempt)
   let assert Ok(_) = process.receive(reply, within: 5000)
@@ -185,12 +183,9 @@ fn run_cancellation_observation_absent_test(database_url: String) -> Nil {
   // have it queued — removes that race entirely.
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(
-      observation.cancellation_decided(),
-      fn(measurements, metadata) {
-        process.send(signal, #(measurements, metadata))
-      },
-    )
+    sinal.observe(telemetry.cancellation_decided(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   postgres.cancel(database, handle)
@@ -296,12 +291,9 @@ fn run_cancellation_observation_commit_unknown_test(
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(
-      observation.cancellation_decided(),
-      fn(measurements, metadata) {
-        process.send(signal, #(measurements, metadata))
-      },
-    )
+    sinal.observe(telemetry.cancellation_decided(), fn(measurements, metadata) {
+      process.send(signal, #(measurements, metadata))
+    })
   use <- exception.defer(fn() { detach(attachment) })
 
   let reply = process.new_subject()

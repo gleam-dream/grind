@@ -5,13 +5,13 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import grind/internal/diagnostic
 import grind/internal/diagnostics
 import grind/internal/job
 import grind/internal/lease
 import grind/internal/postgres
 import grind/internal/store
 import grind/internal/worker
+import grind/telemetry
 import pog
 import sinal/forwarder.{type Forwarder}
 
@@ -31,6 +31,7 @@ pub type Claim {
     snooze_count: Int,
     delivery_count: Int,
     previous_state: String,
+    correlation: Option(String),
   )
 }
 
@@ -80,7 +81,7 @@ pub fn resolve_ack_transaction_result(
     pog.TransactionError(postgres.QueueRunError),
   ),
   forwarder: Forwarder,
-  reference: diagnostic.QueueRef,
+  reference: telemetry.QueueRef,
 ) -> Result(AckCommit, postgres.QueueRunError) {
   case transaction_result {
     Ok(commit) -> Ok(commit)
@@ -109,7 +110,7 @@ fn reconcile_unknown_ack(
   proposal: AckProposal,
   execution: worker.Execution,
   forwarder: Forwarder,
-  reference: diagnostic.QueueRef,
+  reference: telemetry.QueueRef,
 ) -> Result(AckCommit, postgres.QueueRunError) {
   case
     matching_acknowledgement_observed(
@@ -198,7 +199,7 @@ pub fn acknowledge_transaction(
         "business_failed" -> #(
           "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'business_failed' END, output = NULL, error = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $1::jsonb END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $2 END, failure_cause = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE $3 END, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL, finished_at = clock_timestamp() WHERE id = $4 AND queue = $5 AND state = 'executing' AND attempt_id = $6 AND attempt_epoch = $7 AND attempt_owner = $8 AND error_version IS NOT DISTINCT FROM $9 AND "
             <> lease.live_lease_predicate("clock_timestamp()")
-            <> " AND (cancel_requested_at IS NOT NULL OR (($3 = 'budget_exhausted' AND attempt_count >= max_attempts) OR ($3 = 'retry_declined' AND attempt_count < max_attempts))) RETURNING id, state, failure_description, (extract(epoch FROM available_at) * 1000)::bigint",
+            <> " AND (cancel_requested_at IS NOT NULL OR (($3 = 'budget_exhausted' AND attempt_count >= max_attempts) OR ($3 = 'retry_declined' AND attempt_count < max_attempts) OR $3 = 'snooze_limit_reached')) RETURNING id, state, failure_description, (extract(epoch FROM available_at) * 1000)::bigint",
           [
             pog.nullable(pog.text, error),
             pog.nullable(pog.text, failure_description),
@@ -576,7 +577,7 @@ fn matching_acknowledgement_observed(
   claim: Claim,
   command_id: String,
   proposal: AckProposal,
-  observer: Option(#(Forwarder, diagnostic.QueueRef)),
+  observer: Option(#(Forwarder, telemetry.QueueRef)),
 ) -> Result(Option(#(Bool, String, Option(String))), postgres.QueueRunError) {
   let Claim(id:, attempt_id:, epoch:, worker_id:, worker_version:, ..) = claim
   let AckProposal(
@@ -626,8 +627,8 @@ fn matching_acknowledgement_observed(
       diagnostics.checkout(
         forwarder,
         reference,
-        diagnostic.ReconcileAcknowledgement,
-        diagnostic.MainPool,
+        telemetry.ReconcileAcknowledgement,
+        telemetry.MainPool,
         store.execute_measured(query, on: connection),
       )
   }

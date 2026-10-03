@@ -8,6 +8,7 @@ import gleam/result
 import gleam/string
 import grind/internal/postgres
 import grind_bench/audit
+import grind_bench/harness_db
 import grind_bench/load/context
 import grind_bench/load/runtime
 import grind_bench/statement_split
@@ -36,7 +37,7 @@ fn unix_ms_query(sql: String, ledger: pog.Connection) -> Result(Int, Nil) {
       use value <- decode.field(0, decode.optional(decode.int))
       decode.success(value)
     })
-  case pog.execute(query, ledger) {
+  case harness_db.execute(query, ledger) {
     Ok(pog.Returned(rows: [Some(value)], ..)) -> Ok(value)
     _ -> Error(Nil)
   }
@@ -209,7 +210,7 @@ pub fn count_jobs_in_queue(
       decode.success(count)
     })
   let assert Ok(pog.Returned(rows: [count], ..)) =
-    pog.execute(query, connection)
+    harness_db.execute(query, connection)
   count
 }
 
@@ -226,7 +227,7 @@ pub fn dead_tuple_count(
       use count <- decode.field(0, decode.int)
       decode.success(count)
     })
-  case pog.execute(query, connection) {
+  case harness_db.execute(query, connection) {
     Ok(pog.Returned(rows: [count], ..)) -> count
     _ -> -1
   }
@@ -241,7 +242,8 @@ pub fn submitted_job_ids_ordered(
       use id <- decode.field(0, decode.int)
       decode.success(id)
     })
-  pog.execute(query, ledger) |> result.map(fn(returned) { returned.rows })
+  harness_db.execute(query, ledger)
+  |> result.map(fn(returned) { returned.rows })
 }
 
 /// A bulk, direct-SQL insert of `count` already-`succeeded` filler rows
@@ -270,7 +272,7 @@ fn insert_filler_batch(connection: pog.Connection, count: Int) -> Nil {
       <> "FROM generate_series(1, $1)",
     )
     |> pog.parameter(pog.int(count))
-  let assert Ok(_) = pog.execute(query, connection)
+  let assert Ok(_) = harness_db.execute(query, connection)
   Nil
 }
 

@@ -22,14 +22,15 @@ import gleam/json
 import gleam/list
 import gleeunit/should
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/worker
+import grind/telemetry
 import grind_bench
 import grind_bench/audit
 import grind_bench/load
 import pog
 import sinal
+import sinal/correlation
 import sinal/forwarder
 
 @external(erlang, "bench_test_env", "database_url")
@@ -730,17 +731,19 @@ pub fn quarantine_and_forwarder_drop_counters_bumped_by_real_events_test() {
   let dropped_before = load.counter_value(load.forwarder_drop_counter)
 
   sinal.emit(
-    observation.quarantined(),
-    observation.QuarantinedMeasurements(count: 1),
-    observation.QuarantinedMetadata(
-      ref: observation.JobRef(
+    telemetry.quarantined(),
+    telemetry.JobMeasurements(count: 1, monotonic_ms: 0),
+    telemetry.QuarantinedMetadata(
+      ref: telemetry.JobRef(
         job_id: 1,
         queue: "bench-audit-guard",
         worker_id: "bench-audit-wiring",
         worker_version: "v1",
+        correlation: correlation.from_key("bench-audit"),
       ),
-      attempt: observation.AttemptRef(attempt_id: 1, epoch: 0, attempt: 1),
+      attempt: telemetry.AttemptRef(attempt_id: 1, epoch: 0, attempt: 1),
       cancellation_was_requested: False,
+      replayed: False,
     ),
   )
   load.counter_value(load.quarantine_counter)

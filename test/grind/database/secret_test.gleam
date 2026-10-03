@@ -16,7 +16,7 @@ pub fn settings_do_not_print_the_password_test() {
   let settings = postgres.settings(url)
   string.contains(string.inspect(settings), password) |> should.be_false
   // The URL is still available to the caller that holds the settings.
-  settings.database_url() |> should.equal(url)
+  postgres.database_url(settings) |> should.equal(Ok(url))
 }
 
 pub fn validated_settings_do_not_print_the_password_test() {

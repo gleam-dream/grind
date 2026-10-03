@@ -112,7 +112,8 @@ fn run_default_retry_backoff_test(database_url: String) -> Nil {
   let assert [#("retryable", 1, 20, 1, available_at_us, "retryable", None, 32)] =
     evidence.rows
   should.be_true(available_at_us >= before_ack_us + 15_000_000)
-  should.be_true(available_at_us <= after_ack_us + 15_000_000)
+  // The default backoff adds up to 10% jitter.
+  should.be_true(available_at_us <= after_ack_us + 16_500_000)
   queue.process_one(consumer) |> should.equal(Ok(False))
   mark_database_test_executed("default-retry-backoff-database-time-passed")
 }

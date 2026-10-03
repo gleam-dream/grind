@@ -7,12 +7,11 @@ import gleam/option.{None}
 import gleeunit/should
 import grind/internal/attempt
 import grind/internal/consumer as queue
-import grind/internal/diagnostic
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/ack_queries.{
   stored_attempt_identity, wait_for_commit_trigger_backend,
 }
@@ -34,6 +33,7 @@ import grind/support/syncrep.{
   terminate_backend, wait_for_syncrep_trigger_backend,
 }
 import grind/support/worker_failure.{AccountMissing}
+import grind/telemetry
 import pog
 
 /// Carries a release gate created *inside* a blocked handler (so it is owned
@@ -87,7 +87,7 @@ fn run_acknowledged_commit_ordering_test(database_url: String) -> Nil {
     )
   let assert Ok(definition) =
     worker.define(
-      "observation.ordering",
+      "telemetry.ordering",
       "v1",
       input_codec,
       output_codec,
@@ -121,19 +121,19 @@ fn run_acknowledged_commit_ordering_test(database_url: String) -> Nil {
   let assert Ok(#(observed_state, AcknowledgedSignal(measurements, metadata))) =
     process.receive(signal, within: 5000)
   observed_state |> should.equal(Ok(job.Succeeded))
-  measurements |> should.equal(observation.AcknowledgedMeasurements(count: 1))
+  measurements.count |> should.equal(1)
   metadata.ref.job_id |> should.equal(job_id)
   metadata.ref.queue |> should.equal("observation-ordering")
-  metadata.ref.worker_id |> should.equal("observation.ordering")
+  metadata.ref.worker_id |> should.equal("telemetry.ordering")
   metadata.ref.worker_version |> should.equal("v1")
   metadata.attempt.attempt_id |> should.equal(attempt_id)
   metadata.attempt.epoch |> should.equal(epoch)
   metadata.attempt.attempt |> should.equal(1)
-  metadata.proposed |> should.equal(observation.ProposedSuccess)
-  metadata.committed_state |> should.equal(job.Succeeded)
+  metadata.proposed |> should.equal(telemetry.ProposedSuccess)
+  metadata.committed_state |> should.equal(public_job.Succeeded)
   metadata.failure_cause |> should.equal(None)
   metadata.available_at_unix_ms |> should.equal(None)
-  metadata.confirmation |> should.equal(observation.Replied)
+  metadata.confirmation |> should.equal(telemetry.Replied)
   metadata.command_id |> should.equal(expected_command_id)
   process.receive(signal, within: 0) |> should.equal(Error(Nil))
   mark_database_test_executed("acknowledged-observation-commit-ordering-passed")
@@ -179,7 +179,7 @@ fn run_acknowledged_observation_isolation_test(database_url: String) -> Nil {
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
-      "observation.isolation",
+      "telemetry.isolation",
       "v1",
       input_codec,
       output_codec,
@@ -304,7 +304,7 @@ fn run_acknowledged_observation_absent_on_commit_unknown_test(
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define(
-      "observation.commit.unknown",
+      "telemetry.commit.unknown",
       "v1",
       input_codec,
       output_codec,
@@ -433,7 +433,7 @@ fn run_acknowledged_observation_absent_on_stale_ack_test(
   let invoked = process.new_subject()
   let assert Ok(slow_worker) =
     worker.define(
-      "observation.stale.ack",
+      "telemetry.stale.ack",
       "v1",
       input_codec,
       output_codec,
@@ -546,7 +546,7 @@ fn run_acknowledged_observation_reconciled_after_lost_reply_test(
   let invoked = process.new_subject()
   let assert Ok(definition) =
     worker.define(
-      "observation.reply.lost",
+      "telemetry.reply.lost",
       "v1",
       input_codec,
       output_codec,
@@ -567,14 +567,14 @@ fn run_acknowledged_observation_reconciled_after_lost_reply_test(
   let assert Ok(handle) =
     postgres.submit(database, "observation-reply-lost", definition, 33)
   let #(ack_diagnostics, diagnostic_attachment) =
-    diagnostics.capture(diagnostic.acknowledgement(), fn(meta) {
+    diagnostics.capture(telemetry.acknowledgement(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(diagnostic_attachment) })
   let #(checkouts, checkout_attachment) =
-    diagnostics.capture(diagnostic.checkout(), fn(meta) {
+    diagnostics.capture(telemetry.checkout(), fn(meta) {
       meta.queue.queue == "observation-reply-lost"
-      && meta.operation == diagnostic.ReconcileAcknowledgement
+      && meta.operation == telemetry.ReconcileAcknowledgement
     })
   use <- exception.defer(fn() { detach(checkout_attachment) })
   let signal = process.new_subject()
@@ -618,23 +618,23 @@ fn run_acknowledged_observation_reconciled_after_lost_reply_test(
 
   let assert Ok(AcknowledgedSignal(measurements, metadata)) =
     process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.AcknowledgedMeasurements(count: 1))
+  measurements.count |> should.equal(1)
   metadata.ref.job_id |> should.equal(job_id)
-  metadata.committed_state |> should.equal(job.Succeeded)
-  metadata.confirmation |> should.equal(observation.Reconciled)
+  metadata.committed_state |> should.equal(public_job.Succeeded)
+  metadata.confirmation |> should.equal(telemetry.Reconciled)
   metadata.command_id |> should.equal(expected_command_id)
 
   let assert Ok(#(ack_timing, ack_diagnostic)) =
     process.receive(ack_diagnostics, 5000)
-  ack_diagnostic.outcome |> should.equal(diagnostic.AckReconciled)
+  ack_diagnostic.outcome |> should.equal(telemetry.AckReconciled)
   ack_diagnostic.context.ref |> should.equal(metadata.ref)
   ack_diagnostic.context.attempt |> should.equal(metadata.attempt)
   ack_diagnostic.command_id |> should.equal(expected_command_id)
   { ack_timing.duration_us > 0 } |> should.be_true()
   let assert Ok(#(checkout_timing, checkout)) = process.receive(checkouts, 5000)
-  checkout.pool |> should.equal(diagnostic.MainPool)
-  checkout.checkout |> should.equal(diagnostic.CheckoutAcquired)
-  checkout.returned |> should.equal(diagnostic.CallSucceeded)
+  checkout.pool |> should.equal(telemetry.MainPool)
+  checkout.checkout |> should.equal(telemetry.CheckoutAcquired)
+  checkout.returned |> should.equal(telemetry.CallSucceeded)
   { checkout_timing.candidates >= 1 } |> should.be_true()
   { checkout_timing.call_duration_us >= checkout_timing.wait_us }
   |> should.be_true()
@@ -695,7 +695,7 @@ fn run_acknowledged_observation_committed_state_overrides_proposal_test(
   let started = process.new_subject()
   let assert Ok(definition) =
     worker.define(
-      "observation.cancel.running",
+      "telemetry.cancel.running",
       "v1",
       input_codec,
       output_codec,
@@ -739,9 +739,9 @@ fn run_acknowledged_observation_committed_state_overrides_proposal_test(
 
   let assert Ok(AcknowledgedSignal(_measurements, metadata)) =
     process.receive(signal, within: 5000)
-  metadata.proposed |> should.equal(observation.ProposedSuccess)
-  metadata.committed_state |> should.equal(job.Cancelled)
-  metadata.confirmation |> should.equal(observation.Replied)
+  metadata.proposed |> should.equal(telemetry.ProposedSuccess)
+  metadata.committed_state |> should.equal(public_job.Cancelled)
+  metadata.confirmation |> should.equal(telemetry.Replied)
 
   let assert Ok(sentinel) =
     postgres.submit(database, "observation-cancel-running", sentinel_worker, 10)

@@ -29,8 +29,18 @@ pub fn invocation_preserves_the_application_error_test() {
       fn(account_id) { Error(AccountMissing(account_id)) },
     )
 
-  worker.invoke(account_lookup, 42)
-  |> should.equal(Error(AccountMissing(42)))
+  worker.respond(account_lookup, context(), 42)
+  |> should.equal(worker.WorkerFailed(AccountMissing(42)))
+}
+
+fn context() -> worker.Context {
+  worker.synthetic_context(
+    job_id: 1,
+    attempt: 1,
+    max_attempts: 20,
+    snooze_count: 0,
+    queue: "default",
+  )
 }
 
 pub fn queue_response_adapter_keeps_the_ordinary_worker_result_test() {
@@ -67,12 +77,10 @@ pub fn queue_response_adapter_keeps_the_ordinary_worker_result_test() {
       worker.WorkerSnoozed(delay, "wait for account")
     })
 
-  worker.invoke(queue_lookup, 42)
-  |> should.equal(Ok("ordinary result"))
-  worker.respond(queue_lookup, 42)
+  worker.respond(queue_lookup, context(), 42)
   |> should.equal(worker.WorkerSnoozed(delay, "wait for account"))
   process.receive(probe, within: 1000) |> should.equal(Ok(WorkerInvoked))
-  worker.respond(lookup, 42)
+  worker.respond(lookup, context(), 42)
   |> should.equal(worker.WorkerSucceeded("ordinary result"))
 }
 

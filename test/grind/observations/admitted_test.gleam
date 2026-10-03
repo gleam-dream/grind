@@ -6,11 +6,11 @@ import gleam/json
 import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/submission
 import grind/internal/unique
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/concurrency.{spawn_submit}
 import grind/support/env.{
   database_url, mark_database_test_executed, queue_database_url,
@@ -24,6 +24,7 @@ import grind/support/syncrep.{
   wait_for_syncrep_trigger_backend,
 }
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
+import grind/telemetry
 import pog
 import sinal
 
@@ -47,9 +48,8 @@ pub fn postgres_admitted_observation_plain_submit_test() {
 }
 
 /// Plain `submit`/`submit_at`: `committed_state` and `available_at_unix_ms`
-/// come from the insert's own `RETURNING`, `submission_id` is `None`, and
-/// `confirmation` is always `Replied` (a plain submission has no receipt
-/// concept to reconcile from).
+/// come from the insert's own `RETURNING`, `submission_id` is the id Grind
+/// generated for the submission's receipt, and `confirmation` is `Replied`.
 fn run_admitted_plain_submit_test(database_url: String) -> Nil {
   let assert Ok(validated) =
     postgres.settings(database_url) |> postgres.validate
@@ -74,7 +74,7 @@ fn run_admitted_plain_submit_test(database_url: String) -> Nil {
     })
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -83,14 +83,15 @@ fn run_admitted_plain_submit_test(database_url: String) -> Nil {
     postgres.submit(database, "admitted-plain", definition, 5)
   let assert Ok(#(measurements, metadata)) =
     process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.AdmittedMeasurements(count: 1))
+  measurements.count |> should.equal(1)
   metadata.ref.job_id |> should.equal(job.id_value(handle))
   metadata.ref.queue |> should.equal("admitted-plain")
   metadata.ref.worker_id |> should.equal("admitted.plain")
   metadata.ref.worker_version |> should.equal("v1")
-  metadata.committed_state |> should.equal(job.Queued)
-  metadata.submission_id |> should.equal(None)
-  metadata.confirmation |> should.equal(observation.Replied)
+  metadata.committed_state |> should.equal(public_job.Queued)
+  // Plain submits record a receipt under a generated id.
+  let assert Some("grind-generated-" <> _) = metadata.submission_id
+  metadata.confirmation |> should.equal(telemetry.Replied)
   let assert Some(immediate_available_at) = metadata.available_at_unix_ms
   immediate_available_at |> should.not_equal(0)
 
@@ -101,10 +102,10 @@ fn run_admitted_plain_submit_test(database_url: String) -> Nil {
     process.receive(signal, within: 5000)
   scheduled_metadata.ref.job_id
   |> should.equal(job.id_value(scheduled_handle))
-  scheduled_metadata.committed_state |> should.equal(job.Scheduled)
+  scheduled_metadata.committed_state |> should.equal(public_job.Scheduled)
   scheduled_metadata.available_at_unix_ms
   |> should.equal(Some(immediate_available_at + 3_600_000))
-  scheduled_metadata.confirmation |> should.equal(observation.Replied)
+  scheduled_metadata.confirmation |> should.equal(telemetry.Replied)
 
   // A `submit_at` whose target is already in the past by the *database's*
   // clock still commits `queued` (`grind_jobs`'s own `CASE ... <=
@@ -116,7 +117,7 @@ fn run_admitted_plain_submit_test(database_url: String) -> Nil {
     postgres.submit_at(database, "admitted-plain", definition, 7, past)
   let assert Ok(#(_, past_metadata)) = process.receive(signal, within: 5000)
   past_metadata.ref.job_id |> should.equal(job.id_value(past_handle))
-  past_metadata.committed_state |> should.equal(job.Queued)
+  past_metadata.committed_state |> should.equal(public_job.Queued)
   mark_database_test_executed("admitted-observation-plain-submit-passed")
 }
 
@@ -157,7 +158,7 @@ fn run_admitted_unique_inserted_reconciled_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -174,8 +175,8 @@ fn run_admitted_unique_inserted_reconciled_test(database_url: String) -> Nil {
   let assert Ok(#(_, first_metadata)) = process.receive(signal, within: 5000)
   first_metadata.ref.job_id |> should.equal(job.id_value(handle))
   first_metadata.submission_id |> should.equal(Some(submission_text))
-  first_metadata.confirmation |> should.equal(observation.Replied)
-  first_metadata.committed_state |> should.equal(job.Queued)
+  first_metadata.confirmation |> should.equal(telemetry.Replied)
+  first_metadata.committed_state |> should.equal(public_job.Queued)
   let assert Some(_) = first_metadata.available_at_unix_ms
 
   let assert Ok(submission.Inserted(replayed)) =
@@ -191,7 +192,7 @@ fn run_admitted_unique_inserted_reconciled_test(database_url: String) -> Nil {
   let assert Ok(#(_, second_metadata)) = process.receive(signal, within: 5000)
   second_metadata.ref.job_id |> should.equal(job.id_value(handle))
   second_metadata.submission_id |> should.equal(Some(submission_text))
-  second_metadata.confirmation |> should.equal(observation.Reconciled)
+  second_metadata.confirmation |> should.equal(telemetry.Reconciled)
   second_metadata.available_at_unix_ms |> should.equal(None)
   mark_database_test_executed(
     "admitted-observation-unique-inserted-reconciled-passed",
@@ -233,7 +234,7 @@ fn run_admitted_unique_existing_test(database_url: String) -> Nil {
   // call returns can still race that call's own not-yet-processed emission.
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -250,7 +251,7 @@ fn run_admitted_unique_existing_test(database_url: String) -> Nil {
   let assert Ok(#(_, first_metadata)) = process.receive(signal, within: 5000)
   first_metadata.submission_id
   |> should.equal(Some("admitted-existing-1-" <> suffix))
-  first_metadata.confirmation |> should.equal(observation.Replied)
+  first_metadata.confirmation |> should.equal(telemetry.Replied)
 
   let assert Ok(submission.Existing(conflict)) =
     submit_keep_existing(
@@ -265,8 +266,8 @@ fn run_admitted_unique_existing_test(database_url: String) -> Nil {
   metadata.ref.job_id |> should.equal(submission.conflict_job_id(conflict))
   metadata.ref.job_id |> should.equal(job.id_value(handle))
   metadata.submission_id |> should.equal(Some("admitted-existing-2-" <> suffix))
-  metadata.confirmation |> should.equal(observation.Replied)
-  metadata.committed_state |> should.equal(job.Queued)
+  metadata.confirmation |> should.equal(telemetry.Replied)
+  metadata.committed_state |> should.equal(public_job.Queued)
   mark_database_test_executed(
     "admitted-observation-unique-existing-conflict-passed",
   )
@@ -322,7 +323,7 @@ fn run_admitted_existing_over_executing_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -339,7 +340,7 @@ fn run_admitted_existing_over_executing_test(database_url: String) -> Nil {
   submission.conflict_state(conflict) |> should.equal(job.Executing)
   let assert Ok(#(_, metadata)) = process.receive(signal, within: 5000)
   metadata.ref.job_id |> should.equal(job.id_value(handle))
-  metadata.committed_state |> should.equal(job.Executing)
+  metadata.committed_state |> should.equal(public_job.Executing)
   metadata.available_at_unix_ms |> should.equal(None)
   mark_database_test_executed(
     "admitted-observation-existing-over-executing-available-at-none-passed",
@@ -379,7 +380,7 @@ fn run_admitted_absent_on_conflict_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -444,7 +445,7 @@ fn run_admitted_absent_from_reconcile_unique_test(database_url: String) -> Nil {
   let suffix = unique_test_suffix()
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -563,7 +564,7 @@ fn run_admitted_in_call_reconciled_test(database_url: String) -> Nil {
   let suffix = unique_test_suffix()
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -618,7 +619,7 @@ fn run_admitted_in_call_reconciled_test(database_url: String) -> Nil {
   let assert Ok(#(_, metadata)) = process.receive(signal, within: 5000)
   metadata.ref.job_id |> should.equal(job.id_value(handle))
   metadata.submission_id |> should.equal(Some(submission_text))
-  metadata.confirmation |> should.equal(observation.Reconciled)
+  metadata.confirmation |> should.equal(telemetry.Reconciled)
   metadata.available_at_unix_ms |> should.equal(None)
 
   // Exactly one: the sentinel through the exact same producer is the very
@@ -665,7 +666,7 @@ fn run_admitted_observation_submit_with_id_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.admitted(), fn(measurements, metadata) {
+    sinal.observe(telemetry.admitted(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -681,8 +682,8 @@ fn run_admitted_observation_submit_with_id_test(database_url: String) -> Nil {
   let assert Ok(#(_, first_metadata)) = process.receive(signal, within: 5000)
   first_metadata.ref.job_id |> should.equal(job.id_value(handle))
   first_metadata.submission_id |> should.equal(Some(submission_text))
-  first_metadata.confirmation |> should.equal(observation.Replied)
-  first_metadata.committed_state |> should.equal(job.Queued)
+  first_metadata.confirmation |> should.equal(telemetry.Replied)
+  first_metadata.committed_state |> should.equal(public_job.Queued)
   let assert Some(_) = first_metadata.available_at_unix_ms
 
   let assert Ok(submission.Inserted(replayed)) =
@@ -697,7 +698,7 @@ fn run_admitted_observation_submit_with_id_test(database_url: String) -> Nil {
   let assert Ok(#(_, second_metadata)) = process.receive(signal, within: 5000)
   second_metadata.ref.job_id |> should.equal(job.id_value(handle))
   second_metadata.submission_id |> should.equal(Some(submission_text))
-  second_metadata.confirmation |> should.equal(observation.Reconciled)
+  second_metadata.confirmation |> should.equal(telemetry.Reconciled)
   second_metadata.available_at_unix_ms |> should.equal(None)
 
   mark_database_test_executed("admitted-observation-submit-with-id-passed")

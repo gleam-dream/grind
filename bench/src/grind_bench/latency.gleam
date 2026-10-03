@@ -13,6 +13,7 @@
 
 import gleam/dynamic/decode
 import gleam/result
+import grind_bench/harness_db
 import pog
 
 fn qualify(schema: String, table: String) -> String {
@@ -66,7 +67,8 @@ fn run_float_query(
       use value <- decode.field(0, decode.float)
       decode.success(value)
     })
-  pog.execute(query, ledger) |> result.map(fn(returned) { returned.rows })
+  harness_db.execute(query, ledger)
+  |> result.map(fn(returned) { returned.rows })
 }
 
 /// Handler completion is separate from independently observed durable ACK.

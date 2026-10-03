@@ -3,10 +3,10 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/internal/observation
 import grind/internal/registry
 import grind/internal/worker
 import grind/support/worker_failure.{type LookupFailure}
+import grind/telemetry
 import sinal
 import sinal/forwarder
 
@@ -20,8 +20,8 @@ import sinal/forwarder
 
 pub type AcknowledgedSignal {
   AcknowledgedSignal(
-    measurements: observation.AcknowledgedMeasurements,
-    metadata: observation.AcknowledgedMetadata,
+    measurements: telemetry.JobMeasurements,
+    metadata: telemetry.AcknowledgedMetadata,
   )
 }
 
@@ -37,12 +37,9 @@ pub type OverflowGateEntered {
 }
 
 pub fn attach_acknowledged_observer(
-  run: fn(
-    observation.AcknowledgedMeasurements,
-    observation.AcknowledgedMetadata,
-  ) -> Nil,
+  run: fn(telemetry.JobMeasurements, telemetry.AcknowledgedMetadata) -> Nil,
 ) -> sinal.Attachment {
-  sinal.observe(observation.acknowledged(), run)
+  sinal.observe(telemetry.acknowledged(), run)
 }
 
 pub fn attach_dropped_observer(
@@ -104,7 +101,7 @@ pub fn register_sentinel_worker(
     )
   let assert Ok(definition) =
     worker.define(
-      "observation.sentinel." <> id_suffix,
+      "telemetry.sentinel." <> id_suffix,
       "v1",
       input_codec,
       output_codec,

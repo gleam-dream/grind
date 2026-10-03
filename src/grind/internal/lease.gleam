@@ -7,8 +7,9 @@
 import gleam/dynamic/decode
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import grind/internal/observation
+import grind/internal/events
 import grind/internal/store
+import grind/telemetry
 import pog
 import sinal/forwarder.{type Forwarder}
 
@@ -47,14 +48,64 @@ pub fn expired_lease_predicate(now_expression: String) -> String {
 /// `expired_lease_predicate`, the single-sourced fragment both callers
 /// splice in.
 pub fn quarantine_update_sql(candidate_select: String) -> String {
+  let replay = replay_condition("job")
   "WITH candidate AS ("
   <> candidate_select
-  <> ") UPDATE grind_jobs AS job SET state = 'uncertain', failure_description = CASE WHEN job.cancel_requested_at IS NOT NULL THEN 'expired after cancellation request; prior effect unknown' WHEN job.failure_description IS NULL THEN 'expired attempt requires outcome reconciliation' ELSE job.failure_description || '; expired attempt requires outcome reconciliation' END, uncertain_at = clock_timestamp() FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.attempt_id, job.attempt_epoch, job.attempt_count, (job.cancel_requested_at IS NOT NULL)"
+  <> ") UPDATE grind_jobs AS job SET state = CASE WHEN "
+  <> replay
+  <> " THEN 'queued' ELSE 'uncertain' END, replay_count = CASE WHEN "
+  <> replay
+  <> " THEN job.replay_count + 1 ELSE job.replay_count END, available_at = CASE WHEN "
+  <> replay
+  <> " THEN clock_timestamp() ELSE job.available_at END, attempt_id = CASE WHEN "
+  <> replay
+  <> " THEN NULL ELSE job.attempt_id END, attempt_owner = CASE WHEN "
+  <> replay
+  <> " THEN NULL ELSE job.attempt_owner END, lease_expires_at = CASE WHEN "
+  <> replay
+  <> " THEN NULL ELSE job.lease_expires_at END, failure_description = CASE WHEN "
+  <> replay
+  <> " THEN 'expired attempt replayed (' || (job.replay_count + 1)::text || ' of ' || job.max_replays::text || ')' WHEN job.cancel_requested_at IS NOT NULL THEN 'expired after cancellation request; prior effect unknown' WHEN job.failure_description IS NULL THEN 'expired attempt requires outcome reconciliation' ELSE job.failure_description || '; expired attempt requires outcome reconciliation' END, uncertain_at = CASE WHEN "
+  <> replay
+  <> " THEN NULL ELSE clock_timestamp() END FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.attempt_id, job.attempt_epoch, job.attempt_count, (job.cancel_requested_at IS NOT NULL), job.state = 'queued', job.correlation"
 }
 
-pub fn quarantine_row_decoder() -> decode.Decoder(
-  #(Int, String, String, String, Option(Int), Int, Int, Bool),
-) {
+/// Whether an expired attempt of the row `alias` is replayed instead of held
+/// `uncertain`: its worker opted into `ReplayAfterLeaseExpiry`, it has
+/// replays left, and no cancellation is pending. Evaluated against the row
+/// before the update, as every `SET` expression is.
+fn replay_condition(alias: String) -> String {
+  "("
+  <> alias
+  <> ".max_replays IS NOT NULL AND "
+  <> alias
+  <> ".replay_count < "
+  <> alias
+  <> ".max_replays AND "
+  <> alias
+  <> ".cancel_requested_at IS NULL)"
+}
+
+/// One row a quarantine scan moved: id, queue, worker id and version, the
+/// expired attempt's id, epoch and number, whether a cancellation was
+/// pending, whether the row was replayed rather than held, and its stored
+/// correlation.
+pub type QuarantinedRow {
+  QuarantinedRow(
+    id: Int,
+    queue: String,
+    worker_id: String,
+    worker_version: String,
+    attempt_id: Option(Int),
+    attempt_epoch: Int,
+    attempt_count: Int,
+    cancellation_was_requested: Bool,
+    replayed: Bool,
+    correlation: Option(String),
+  )
+}
+
+pub fn quarantine_row_decoder() -> decode.Decoder(QuarantinedRow) {
   use id <- decode.field(0, decode.int)
   use queue <- decode.field(1, decode.string)
   use worker_id <- decode.field(2, decode.string)
@@ -63,15 +114,19 @@ pub fn quarantine_row_decoder() -> decode.Decoder(
   use attempt_epoch <- decode.field(5, decode.int)
   use attempt_count <- decode.field(6, decode.int)
   use cancellation_was_requested <- decode.field(7, decode.bool)
-  decode.success(#(
-    id,
-    queue,
-    worker_id,
-    worker_version,
-    attempt_id,
-    attempt_epoch,
-    attempt_count,
-    cancellation_was_requested,
+  use replayed <- decode.field(8, decode.bool)
+  use correlation <- decode.field(9, decode.optional(decode.string))
+  decode.success(QuarantinedRow(
+    id:,
+    queue:,
+    worker_id:,
+    worker_version:,
+    attempt_id:,
+    attempt_epoch:,
+    attempt_count:,
+    cancellation_was_requested:,
+    replayed:,
+    correlation:,
   ))
 }
 
@@ -146,19 +201,18 @@ pub fn quarantine_expired_in_queue_measured(
 /// which always has one), but decoded as optional defensively rather than
 /// asserted, and skipped (fail-closed, like every other stored-state mapping
 /// in this module) rather than guessed at.
-pub fn emit_quarantined(
-  fwd: Forwarder,
-  row: #(Int, String, String, String, Option(Int), Int, Int, Bool),
-) -> Nil {
-  let #(
-    job_id,
-    queue,
-    worker_id,
-    worker_version,
-    attempt_id,
-    epoch,
-    attempt,
-    cancellation_was_requested,
+pub fn emit_quarantined(fwd: Forwarder, row: QuarantinedRow) -> Nil {
+  let QuarantinedRow(
+    id: job_id,
+    queue:,
+    worker_id:,
+    worker_version:,
+    attempt_id:,
+    attempt_epoch: epoch,
+    attempt_count: attempt,
+    cancellation_was_requested:,
+    replayed:,
+    correlation:,
   ) = row
   case attempt_id {
     None -> Nil
@@ -166,17 +220,19 @@ pub fn emit_quarantined(
       let _ =
         forwarder.emit(
           fwd,
-          observation.quarantined(),
-          observation.QuarantinedMeasurements(count: 1),
-          observation.QuarantinedMetadata(
-            ref: observation.JobRef(
+          telemetry.quarantined(),
+          events.job_measurements(),
+          telemetry.QuarantinedMetadata(
+            ref: telemetry.JobRef(
               job_id:,
               queue:,
               worker_id:,
               worker_version:,
+              correlation: events.correlation(job_id, correlation),
             ),
-            attempt: observation.AttemptRef(attempt_id:, epoch:, attempt:),
+            attempt: telemetry.AttemptRef(attempt_id:, epoch:, attempt:),
             cancellation_was_requested:,
+            replayed:,
           ),
         )
       Nil

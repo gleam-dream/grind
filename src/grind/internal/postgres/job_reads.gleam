@@ -536,11 +536,11 @@ fn outcome_value(
       }
     }
     "runtime_failed" ->
-      Ok(job.FailedOperationally(
+      Ok(job.RuntimeFailedWith(
         failure_description |> unwrap("worker runtime failed"),
       ))
     "contract_mismatch" ->
-      Ok(job.FailedOperationally(
+      Ok(job.ContractMismatchWith(
         failure_description |> unwrap("worker codec contract mismatch"),
       ))
     "uncertain" ->

@@ -123,7 +123,7 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
   let reply = process.new_subject()
   let _ =
     process.spawn_unlinked(fn() {
-      let execution = attempt.execute_claim(claimed)
+      let execution = attempt.execute_claim_inline(claimed)
       let ack_result =
         attempt.acknowledge(
           database,
@@ -236,7 +236,7 @@ fn run_ack_receipt_test(database_url: String) -> Nil {
       "ack-receipt-owner",
       30_000,
     )
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
   process.receive(invocation, within: 1000) |> should.equal(Ok(WorkerInvoked))
   attempt.acknowledge(
     database,
@@ -538,7 +538,7 @@ fn run_ack_duplicate_repeatable_read_test(database_url: String) -> Nil {
     postgres.submit(database_a, test_queue, definition, 8)
   let assert Ok(Some(claimed)) =
     attempt.claim_one(database_a, test_queue, workers, attempt_owner, 30_000)
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
   let #(job_id, _, _) = attempt.claim_identity(claimed)
 
   let lock_key = unique_test_lock_key(4)

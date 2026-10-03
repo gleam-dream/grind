@@ -19,6 +19,7 @@
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/result
+import grind_bench/harness_db
 import pog
 
 pub type Bucket {
@@ -76,7 +77,7 @@ pub fn snapshot(connection: pog.Connection) -> Result(Totals, Nil) {
       use total_ms <- decode.field(2, decode.float)
       decode.success(#(bucket_from_name(bucket), calls, total_ms))
     })
-  case pog.execute(query, connection) {
+  case harness_db.execute(query, connection) {
     Error(_) -> Error(Nil)
     Ok(returned) ->
       Ok(

@@ -1,4 +1,4 @@
-import grind/internal/observation
+import grind/telemetry
 import grind_bench/load/runtime
 import sinal
 import sinal/forwarder
@@ -10,7 +10,7 @@ import sinal/forwarder
 /// attachment a fresh handler id, so repeated calls never collide. Both
 /// observers live for the caller's own process lifetime -- never detached.
 pub fn attach_audit_observers() -> Nil {
-  sinal.observe(observation.quarantined(), fn(_m, _d) {
+  sinal.observe(telemetry.quarantined(), fn(_m, _d) {
     let _ = runtime.bump(runtime.quarantine_counter)
     Nil
   })

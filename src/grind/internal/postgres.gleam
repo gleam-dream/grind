@@ -21,10 +21,11 @@ import gleam/otp/static_supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import grind/internal/convert
+import grind/internal/events
 import grind/internal/job.{type JobHandle, type State}
 import grind/internal/lease
 import grind/internal/migrations
-import grind/internal/observation
 import grind/internal/pool
 import grind/internal/postgres/job_reads as postgres_job_reads
 import grind/internal/postgres/migration as postgres_migration
@@ -35,7 +36,9 @@ import grind/internal/submission
 import grind/internal/unique
 import grind/internal/unique_admission
 import grind/internal/worker.{type Worker}
+import grind/telemetry
 import pog
+import sinal/correlation.{type Correlation}
 import sinal/forwarder.{type Forwarder}
 
 /// Pure PostgreSQL pool settings. Validation does not acquire a resource.
@@ -52,14 +55,40 @@ import sinal/forwarder.{type Forwarder}
 /// `settings.database_url()` to read the URL back.
 pub type Settings {
   Settings(
-    database_url: fn() -> String,
+    source: PoolSource,
     pool_size: Int,
     unique_lock_wait_ms: Int,
     observation_capacity: Int,
     statement_deadline_ms: Int,
     migration_deadline_ms: Int,
     schema: String,
+    max_payload_bytes: Int,
+    connect_timeout_ms: Int,
   )
+}
+
+/// Where the pool configuration comes from. Both are closures, so neither
+/// the URL nor the configuration's password prints.
+pub type PoolSource {
+  /// A database URL; the pool is named by `validate` and sized by
+  /// `Settings.pool_size`.
+  FromUrl(database_url: fn() -> String)
+  /// The application's own `pog.Config`, used with its pool name and size.
+  FromConfig(config: fn() -> pog.Config)
+}
+
+/// The default payload limit: 1 MiB per encoded input, output or error.
+pub const default_max_payload_bytes = 1_048_576
+
+/// The default bound on the initial connection at `start`: 15 seconds.
+pub const default_connect_timeout_ms = 15_000
+
+/// The database URL of URL-sourced settings, for tests.
+pub fn database_url(settings: Settings) -> Result(String, Nil) {
+  case settings.source {
+    FromUrl(database_url:) -> Ok(database_url())
+    FromConfig(_) -> Error(Nil)
+  }
 }
 
 /// `statement_deadline_ms` defaults to 4000, not pog's own hardcoded
@@ -71,14 +100,37 @@ pub type Settings {
 /// "Acknowledgement deadline".
 pub fn settings(database_url: String) -> Settings {
   Settings(
-    database_url: fn() { database_url },
+    source: FromUrl(fn() { database_url }),
     pool_size: 10,
     unique_lock_wait_ms: 2000,
     observation_capacity: 1024,
     statement_deadline_ms: 4000,
     migration_deadline_ms: 30_000,
     schema: "public",
+    max_payload_bytes: default_max_payload_bytes,
+    connect_timeout_ms: default_connect_timeout_ms,
   )
+}
+
+/// Settings over the application's own pool configuration. The pool keeps
+/// the configuration's name and size; `validate` adds Grind's connection
+/// parameters.
+pub fn settings_from_config(config: pog.Config) -> Settings {
+  Settings(
+    ..settings(""),
+    source: FromConfig(fn() { config }),
+    pool_size: config.pool_size,
+  )
+}
+
+/// Sets the limit on each encoded input, output and error, in bytes.
+pub fn with_max_payload_bytes(settings: Settings, bytes: Int) -> Settings {
+  Settings(..settings, max_payload_bytes: bytes)
+}
+
+/// Sets how long `start` waits for a first connection, in milliseconds.
+pub fn with_connect_timeout(settings: Settings, milliseconds: Int) -> Settings {
+  Settings(..settings, connect_timeout_ms: milliseconds)
 }
 
 pub fn with_pool_size(settings: Settings, pool_size: Int) -> Settings {
@@ -211,6 +263,10 @@ pub type ConfigError {
   /// surfacing as `MigrationCommitUnknown` instead of the typed
   /// `MigrationLockUnavailable`.
   MigrationDeadlineTooCloseToLockTimeout
+  /// `max_payload_bytes` is not positive.
+  InvalidMaxPayloadBytes
+  /// `connect_timeout_ms` is not positive.
+  InvalidConnectTimeout
 }
 
 /// The pog configuration holds the database password, so it is kept behind a
@@ -223,6 +279,8 @@ pub opaque type ValidatedSettings {
     statement_deadline_ms: Int,
     migration_deadline_ms: Int,
     schema: String,
+    max_payload_bytes: Int,
+    connect_timeout_ms: Int,
   )
 }
 
@@ -323,20 +381,27 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
     settings.observation_capacity > 0,
     migration_lock_timeout_ms + migration_lock_timeout_margin_ms
     < settings.migration_deadline_ms,
-    schema_is_valid(settings.schema)
+    schema_is_valid(settings.schema),
+    settings.max_payload_bytes > 0,
+    settings.connect_timeout_ms > 0
   {
-    False, _, _, _, _, _, _, _ -> Error(InvalidPoolSize)
-    True, False, _, _, _, _, _, _ -> Error(InvalidStatementDeadline)
-    True, True, False, _, _, _, _, _ -> Error(InvalidMigrationDeadline)
-    True, True, True, False, _, _, _, _ -> Error(InvalidUniqueLockWait)
-    True, True, True, True, False, _, _, _ ->
+    False, _, _, _, _, _, _, _, _, _ -> Error(InvalidPoolSize)
+    True, False, _, _, _, _, _, _, _, _ -> Error(InvalidStatementDeadline)
+    True, True, False, _, _, _, _, _, _, _ -> Error(InvalidMigrationDeadline)
+    True, True, True, False, _, _, _, _, _, _ -> Error(InvalidUniqueLockWait)
+    True, True, True, True, False, _, _, _, _, _ ->
       Error(UniqueLockWaitTooCloseToDeadline)
-    True, True, True, True, True, False, _, _ ->
+    True, True, True, True, True, False, _, _, _, _ ->
       Error(InvalidObservationCapacity)
-    True, True, True, True, True, True, False, _ ->
+    True, True, True, True, True, True, False, _, _, _ ->
       Error(MigrationDeadlineTooCloseToLockTimeout)
-    True, True, True, True, True, True, True, False -> Error(InvalidSchema)
-    True, True, True, True, True, True, True, True ->
+    True, True, True, True, True, True, True, False, _, _ ->
+      Error(InvalidSchema)
+    True, True, True, True, True, True, True, True, False, _ ->
+      Error(InvalidMaxPayloadBytes)
+    True, True, True, True, True, True, True, True, True, False ->
+      Error(InvalidConnectTimeout)
+    True, True, True, True, True, True, True, True, True, True ->
       // The pool's own name, created here rather than accepted from the
       // caller (`Settings` carries no pog type of its own) — and created
       // once, here, rather than fresh on every `start`: a `ValidatedSettings`
@@ -351,17 +416,11 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
       // `start` would silently orphan any consumer across a close/reopen
       // cycle instead of letting it recover once the same name is
       // re-registered.
-      case
-        pog.url_config(
-          process.new_name("grind_postgres_pool"),
-          settings.database_url(),
-        )
-      {
-        Error(_) -> Error(InvalidDatabaseUrl)
+      case base_config(settings) {
+        Error(Nil) -> Error(InvalidDatabaseUrl)
         Ok(config) -> {
           let config =
             config
-            |> pog.pool_size(settings.pool_size)
             |> pog.connection_parameter(
               name: "default_transaction_isolation",
               value: "read committed",
@@ -377,12 +436,7 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
             // `grind/internal/unique_admission/query.lock_key_sql`) and every
             // `current_schema()`-based query elsewhere in this module
             // (`read_schema_generation` and friends) agree by
-            // construction: there is exactly one schema in `search_path`,
-            // so `current_schema()` can only ever resolve to it (or to
-            // nothing at all, before `migrate` first creates it) — never
-            // silently fall through to an unrelated schema earlier in a
-            // longer `search_path`, the `$user` hazard this pinning
-            // exists to close.
+            // construction.
             |> pog.connection_parameter(
               name: "search_path",
               value: quote_ident(settings.schema),
@@ -394,9 +448,23 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
             statement_deadline_ms: settings.statement_deadline_ms,
             migration_deadline_ms: settings.migration_deadline_ms,
             schema: settings.schema,
+            max_payload_bytes: settings.max_payload_bytes,
+            connect_timeout_ms: settings.connect_timeout_ms,
           ))
         }
       }
+  }
+}
+
+/// The pool configuration before Grind's connection parameters. A URL source
+/// gets a pool name created here, once per `validate`; an application
+/// configuration keeps its own name and size.
+fn base_config(settings: Settings) -> Result(pog.Config, Nil) {
+  case settings.source {
+    FromUrl(database_url:) ->
+      pog.url_config(process.new_name("grind_postgres_pool"), database_url())
+      |> result.map(pog.pool_size(_, settings.pool_size))
+    FromConfig(config:) -> Ok(config())
   }
 }
 
@@ -417,7 +485,24 @@ pub opaque type Database {
     statement_deadline_ms: Int,
     migration_deadline_ms: Int,
     forwarder: Forwarder,
+    schema: String,
+    max_payload_bytes: Int,
   )
+}
+
+/// The limit on each encoded input, output and error, in bytes.
+pub fn max_payload_bytes(database: Database) -> Int {
+  database.max_payload_bytes
+}
+
+/// The configured schema.
+pub fn schema(database: Database) -> String {
+  database.schema
+}
+
+/// The bounded wait for a uniqueness admission lock, in milliseconds.
+pub fn unique_lock_wait_ms(database: Database) -> Int {
+  database.unique_lock_wait_ms
 }
 
 /// This `Database`'s own installation token — see `grind/job`'s
@@ -504,6 +589,58 @@ pub type StartError {
 /// `docs/RECOVERY-EVIDENCE.md`, "Acknowledged
 /// observation".
 pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
+  let supervisor =
+    static_supervisor.new(static_supervisor.OneForOne)
+    |> static_supervisor.add(pool_child(settings))
+    |> static_supervisor.add(forwarder_child(settings))
+  case pool.start_unlinked(fn() { static_supervisor.start(supervisor) }) {
+    Ok(started) ->
+      case attach(settings, started.pid) {
+        Error(error) -> {
+          pool.abort_start(started.pid)
+          Error(error)
+        }
+        Ok(database) -> Ok(database)
+      }
+    Error(error) -> Error(PoolStartFailed(error))
+  }
+}
+
+/// The pool and its checkout-deadline owner, as one supervised child.
+pub fn pool_child(
+  settings: ValidatedSettings,
+) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
+  let ValidatedSettings(reveal_config, statement_deadline_ms:, ..) = settings
+  pool.supervised(reveal_config(), statement_deadline_ms)
+}
+
+/// The observation forwarder under its own temporary supervisor; see
+/// `start`.
+pub fn forwarder_child(
+  settings: ValidatedSettings,
+) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
+  let ValidatedSettings(forwarder: fwd, ..) = settings
+  static_supervisor.new(static_supervisor.OneForOne)
+  |> static_supervisor.add(forwarder.supervised(fwd))
+  |> static_supervisor.supervised()
+  |> supervision.restart(supervision.Temporary)
+}
+
+/// The pool name these settings start.
+pub fn pool_name(settings: ValidatedSettings) -> process.Name(pog.Message) {
+  let ValidatedSettings(reveal_config, ..) = settings
+  let pog.Config(pool_name:, ..) = reveal_config()
+  pool_name
+}
+
+/// Reads the installation identity over an already-running pool and builds
+/// the `Database` that `supervisor_pid` owns. Waits up to the connect timeout
+/// for a first connection; a lost reply or any other failure after a
+/// connection was obtained fails at once.
+pub fn attach(
+  settings: ValidatedSettings,
+  supervisor_pid: process.Pid,
+) -> Result(Database, StartError) {
   let ValidatedSettings(
     reveal_config,
     forwarder: fwd,
@@ -511,46 +648,55 @@ pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
     statement_deadline_ms:,
     migration_deadline_ms:,
     schema:,
+    max_payload_bytes:,
+    connect_timeout_ms:,
   ) = settings
-  let config = reveal_config()
-  let pog.Config(pool_name:, ..) = config
-  let forwarder_supervisor =
-    static_supervisor.new(static_supervisor.OneForOne)
-    |> static_supervisor.add(forwarder.supervised(fwd))
-    |> static_supervisor.supervised()
-    |> supervision.restart(supervision.Temporary)
-  let supervisor =
-    static_supervisor.new(static_supervisor.OneForOne)
-    |> static_supervisor.add(pool.supervised(config, statement_deadline_ms))
-    |> static_supervisor.add(forwarder_supervisor)
+  let pog.Config(pool_name:, ..) = reveal_config()
   let connection = pog.named_connection(pool_name)
-  case pool.start_unlinked(fn() { static_supervisor.start(supervisor) }) {
-    Ok(started) -> {
-      case read_database_oid(connection) {
-        Error(error) -> {
-          pool.abort_start(started.pid)
-          Error(InstallationQueryFailed(error))
-        }
-        Ok(database_oid) ->
-          Ok(Database(
-            connection,
-            reveal_config,
-            started.pid,
-            job.new_installation(
-              database_oid,
-              schema,
-              read_cluster_identifier(connection),
-            ),
-            unique_lock_wait_ms,
-            statement_deadline_ms,
-            migration_deadline_ms,
-            fwd,
-          ))
-      }
-    }
-    Error(error) -> Error(PoolStartFailed(error))
+  let give_up_at = monotonic_ms() + connect_timeout_ms
+  case read_database_oid_within(connection, give_up_at) {
+    Error(error) -> Error(InstallationQueryFailed(error))
+    Ok(database_oid) ->
+      Ok(Database(
+        connection,
+        reveal_config,
+        supervisor_pid,
+        job.new_installation(
+          database_oid,
+          schema,
+          read_cluster_identifier(connection),
+        ),
+        unique_lock_wait_ms,
+        statement_deadline_ms,
+        migration_deadline_ms,
+        fwd,
+        schema,
+        max_payload_bytes,
+      ))
   }
 }
+
+/// Retries `read_database_oid` while no connection can be checked out, until
+/// `give_up_at` (monotonic milliseconds).
+fn read_database_oid_within(
+  connection: pog.Connection,
+  give_up_at: Int,
+) -> Result(Int, pog.QueryError) {
+  case read_database_oid(connection) {
+    Error(pog.ConnectionUnavailable) ->
+      case monotonic_ms() < give_up_at {
+        True -> {
+          process.sleep(100)
+          read_database_oid_within(connection, give_up_at)
+        }
+        False -> Error(pog.ConnectionUnavailable)
+      }
+    result -> result
+  }
+}
+
+@external(erlang, "grind_queue_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
 
 /// This physical database's own OID (`pg_database.oid`), used only to build
 /// this `Database`'s in-memory `Installation` token — see `grind/job`'s doc
@@ -963,14 +1109,9 @@ fn migration_error(error: postgres_migration.RunnerError) -> StorageError {
   }
 }
 
-/// Persists an immediate job without invoking its worker. May return
-/// `submission.EmptyQueueName` (an empty `queue`),
-/// `submission.InvalidInput` (the input codec rejected `input`; nothing is
-/// written), or `submission.CommitUnknownWithoutId` (the insert's own query failed, its
-/// reply was lost, or its checkout failed outright — see that variant's doc
-/// comment); never `submission.AdmissionContended`, `submission.SubmissionConflict`,
-/// `submission.NotCommitted`, or `submission.CommitUnknown`, which only ever come
-/// from `submit_unique`/`submit_with_id`'s admission transaction.
+/// Persists an immediate job without invoking its worker, under a generated
+/// submission id, so a lost reply is `CommitUnknown` with a reconcilable
+/// `PendingSubmission`.
 pub fn submit(
   database: Database,
   queue: String,
@@ -980,15 +1121,11 @@ pub fn submit(
   JobHandle(input, output, error),
   submission.SubmitError(input, output, error),
 ) {
-  submit_with_availability(database, queue, worker, input, None)
+  submit_generated(database, queue, worker, input, submission.Immediately)
 }
 
-/// Persists a job at an absolute Unix-millisecond availability time. May
-/// return `submission.EmptyQueueName`, `submission.InvalidInput` or
-/// `submission.CommitUnknownWithoutId`; never
-/// `submission.AdmissionContended`, `submission.SubmissionConflict`,
-/// `submission.NotCommitted`, or `submission.CommitUnknown` — the same possible and
-/// impossible variants as `submit`.
+/// Persists a job at an absolute Unix-millisecond availability time; see
+/// `submit`.
 pub fn submit_at(
   database: Database,
   queue: String,
@@ -999,96 +1136,120 @@ pub fn submit_at(
   JobHandle(input, output, error),
   submission.SubmitError(input, output, error),
 ) {
-  submit_with_availability(
-    database,
-    queue,
-    worker,
-    input,
-    Some(job.available_at_unix_milliseconds(available_at)),
-  )
+  submit_generated(database, queue, worker, input, submission.At(available_at))
 }
 
-fn submit_with_availability(
+fn submit_generated(
   database: Database,
   queue: String,
   worker: Worker(input, output, error),
   input: input,
-  available_at_unix_ms: Option(Int),
+  availability: submission.Availability,
 ) -> Result(
   JobHandle(input, output, error),
   submission.SubmitError(input, output, error),
 ) {
-  case queue, worker.encode_input(worker, input) {
-    "", _ -> Error(submission.EmptyQueueName)
-    _, Error(reason) -> Error(submission.InvalidInput(reason))
-    _, Ok(encoded_input) -> {
-      let Database(connection:, forwarder:, installation:, ..) = database
-      let worker.Metadata(
-        id: worker_id,
-        worker_version:,
-        input_version:,
-        output_version:,
-        error_version:,
-        max_attempts:,
-      ) = worker.metadata(worker)
-      let error_parameter = case error_version {
-        Some(version) -> pog.text(version)
-        None -> pog.null()
-      }
-      let availability_parameter = case available_at_unix_ms {
-        Some(availability) -> pog.int(availability)
-        None -> pog.null()
-      }
-      let sql =
-        "INSERT INTO grind_jobs (queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at) "
-        <> "VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, "
-        <> "CASE WHEN $9::bigint IS NULL OR $9::bigint <= (extract(epoch FROM clock_timestamp()) * 1000)::bigint THEN 'queued' ELSE 'scheduled' END, "
-        <> "CASE WHEN $9::bigint IS NULL THEN clock_timestamp() ELSE to_timestamp($9::double precision / 1000.0) END) RETURNING id, state, (extract(epoch FROM available_at) * 1000)::bigint"
-      let query =
-        pog.query(sql)
-        |> pog.parameter(pog.text(queue))
-        |> pog.parameter(pog.text(worker_id))
-        |> pog.parameter(pog.text(worker_version))
-        |> pog.parameter(pog.text(input_version))
-        |> pog.parameter(pog.text(encoded_input))
-        |> pog.parameter(pog.text(output_version))
-        |> pog.parameter(error_parameter)
-        |> pog.parameter(pog.int(max_attempts))
-        |> pog.parameter(availability_parameter)
-        |> pog.returning({
-          use id <- decode.field(0, decode.int)
-          use state <- decode.field(1, decode.string)
-          use available_at_ms <- decode.field(2, decode.int)
-          decode.success(#(id, state, available_at_ms))
-        })
-      case store.execute_safely(query, on: connection) {
-        Error(error) -> Error(submission.CommitUnknownWithoutId(error))
-        Ok(returned) ->
-          case returned.rows {
-            [#(id, state, available_at_ms)] -> {
-              case job.state_of_stored(state) {
-                Error(Nil) -> Nil
-                Ok(committed_state) ->
-                  emit_admitted(
-                    forwarder,
-                    queue,
-                    id,
-                    worker_id,
-                    worker_version,
-                    committed_state,
-                    Some(available_at_ms),
-                    None,
-                    observation.Replied,
-                  )
-              }
-              Ok(job.new_handle(id, installation, queue, worker))
-            }
-            _ ->
-              panic as "submit: unconditional single-row INSERT ... RETURNING returned a row count other than one"
-          }
-      }
-    }
+  let spec =
+    unique_admission.Spec(
+      queue:,
+      submission_id: submission.generated_submission_id(),
+      worker:,
+      input:,
+      availability:,
+      policy: None,
+      correlation: None,
+    )
+  case admit(database, spec) {
+    Ok(submission.Inserted(handle)) -> Ok(handle)
+    Ok(submission.Existing(_)) | Ok(submission.Rescheduled(_)) ->
+      panic as "submit: an admission without a uniqueness policy always inserts"
+    Error(error) -> Error(error)
   }
+}
+
+/// Admits one job in its own transaction and emits `admitted` once the
+/// commit is proven.
+pub fn admit(
+  database: Database,
+  spec: unique_admission.Spec(input, output, error),
+) -> Result(
+  submission.Admission(input, output, error),
+  submission.SubmitError(input, output, error),
+) {
+  let Database(
+    connection:,
+    unique_lock_wait_ms:,
+    forwarder:,
+    installation:,
+    max_payload_bytes:,
+    ..,
+  ) = database
+  case
+    unique_admission.admit(
+      connection,
+      installation,
+      unique_lock_wait_ms,
+      max_payload_bytes,
+      spec,
+    )
+  {
+    Ok(unique_admission.Commit(
+      outcome:,
+      committed_state:,
+      available_at_unix_ms:,
+      via_receipt_match:,
+    )) -> {
+      let confirmation = case via_receipt_match {
+        True -> telemetry.Reconciled
+        False -> telemetry.Replied
+      }
+      let worker.Metadata(id: worker_id, worker_version:, ..) =
+        worker.metadata(spec.worker)
+      let job_id = admission_job_id(outcome)
+      emit_admitted(
+        forwarder,
+        events.correlation(job_id, spec.correlation),
+        spec.queue,
+        job_id,
+        worker_id,
+        worker_version,
+        committed_state,
+        available_at_unix_ms,
+        Some(submission.submission_id_value(spec.submission_id)),
+        confirmation,
+      )
+      Ok(outcome)
+    }
+    Error(error) -> Error(error)
+  }
+}
+
+/// Admits one job inside the caller's open transaction `tx`. Emits nothing:
+/// the caller's own commit decides whether the job exists.
+pub fn admit_in(
+  database: Database,
+  tx: pog.Connection,
+  spec: unique_admission.Spec(input, output, error),
+) -> Result(
+  submission.Admission(input, output, error),
+  submission.SubmitError(input, output, error),
+) {
+  let Database(
+    unique_lock_wait_ms:,
+    installation:,
+    max_payload_bytes:,
+    schema:,
+    ..,
+  ) = database
+  unique_admission.admit_in_transaction(
+    tx,
+    installation,
+    unique_lock_wait_ms,
+    max_payload_bytes,
+    quote_ident(schema),
+    spec,
+  )
+  |> result.map(fn(commit) { commit.outcome })
 }
 
 /// Builds and forwards `[grind, job, admitted]`, shared by a plain
@@ -1098,6 +1259,7 @@ fn submit_with_availability(
 /// its own fresh commit); see `AdmittedMetadata` for the unique case.
 fn emit_admitted(
   fwd: Forwarder,
+  correlation: Correlation,
   queue: String,
   job_id: Int,
   worker_id: String,
@@ -1105,16 +1267,22 @@ fn emit_admitted(
   committed_state: State,
   available_at_unix_ms: Option(Int),
   submission_id: Option(String),
-  confirmation: observation.Confirmation,
+  confirmation: telemetry.Confirmation,
 ) -> Nil {
   let _ =
     forwarder.emit(
       fwd,
-      observation.admitted(),
-      observation.AdmittedMeasurements(count: 1),
-      observation.AdmittedMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
-        committed_state:,
+      telemetry.admitted(),
+      events.job_measurements(),
+      telemetry.AdmittedMetadata(
+        ref: telemetry.JobRef(
+          job_id:,
+          queue:,
+          worker_id:,
+          worker_version:,
+          correlation:,
+        ),
+        committed_state: convert.state(committed_state),
         available_at_unix_ms:,
         submission_id:,
         confirmation:,
@@ -1320,6 +1488,7 @@ pub fn cancel(
             Some(outcome), Ok(previous_state) ->
               emit_cancellation(
                 forwarder,
+                events.read_correlation(connection, id),
                 queue,
                 id,
                 worker_id,
@@ -1350,31 +1519,38 @@ pub fn cancel(
 /// `AlreadyFinished`) maps to `None` and must never emit.
 fn cancellation_outcome_of(
   result: CancellationResult,
-) -> Option(observation.CancellationOutcome) {
+) -> Option(telemetry.CancellationOutcome) {
   case result {
-    CancelledBeforeRun -> Some(observation.CancellationDecidedBeforeRun)
-    CancellationRequested -> Some(observation.CancellationDecidedWhileRunning)
+    CancelledBeforeRun -> Some(telemetry.CancellationDecidedBeforeRun)
+    CancellationRequested -> Some(telemetry.CancellationDecidedWhileRunning)
     AlreadyCancelled | AlreadyUncertain | AlreadyFinished(_) -> None
   }
 }
 
 fn emit_cancellation(
   fwd: Forwarder,
+  correlation: Correlation,
   queue: String,
   job_id: Int,
   worker_id: String,
   worker_version: String,
   previous_state: State,
-  outcome: observation.CancellationOutcome,
+  outcome: telemetry.CancellationOutcome,
 ) -> Nil {
   let _ =
     forwarder.emit(
       fwd,
-      observation.cancellation_decided(),
-      observation.CancellationMeasurements(count: 1),
-      observation.CancellationMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
-        previous_state:,
+      telemetry.cancellation_decided(),
+      events.job_measurements(),
+      telemetry.CancellationMetadata(
+        ref: telemetry.JobRef(
+          job_id:,
+          queue:,
+          worker_id:,
+          worker_version:,
+          correlation:,
+        ),
+        previous_state: convert.state(previous_state),
         outcome:,
       ),
     )
@@ -1796,9 +1972,9 @@ fn emit_prune_completed(
   let _ =
     forwarder.emit(
       fwd,
-      observation.prune_completed(),
-      observation.PruneCompletedMeasurements(jobs:),
-      observation.PruneCompletedMetadata(older_than_ms:, limit:),
+      telemetry.prune_completed(),
+      telemetry.PruneCompletedMeasurements(jobs:),
+      telemetry.PruneCompletedMetadata(older_than_ms:, limit:),
     )
   Nil
 }
@@ -1906,49 +2082,18 @@ pub fn submit_unique(
   submission.Admission(input, output, error),
   submission.SubmitError(input, output, error),
 ) {
-  let Database(connection:, unique_lock_wait_ms:, forwarder:, installation:, ..) =
-    database
-  let worker.Metadata(id: worker_id, worker_version:, ..) =
-    worker.metadata(worker)
-  case
-    unique_admission.submit(
-      connection,
-      installation,
-      unique_lock_wait_ms,
-      queue,
-      submission_id,
-      worker,
-      input,
-      availability,
-      policy,
-      on_conflict,
-    )
-  {
-    Ok(unique_admission.Commit(
-      outcome:,
-      committed_state:,
-      available_at_unix_ms:,
-      via_receipt_match:,
-    )) -> {
-      let confirmation = case via_receipt_match {
-        True -> observation.Reconciled
-        False -> observation.Replied
-      }
-      emit_admitted(
-        forwarder,
-        queue,
-        admission_job_id(outcome),
-        worker_id,
-        worker_version,
-        committed_state,
-        available_at_unix_ms,
-        Some(submission.submission_id_value(submission_id)),
-        confirmation,
-      )
-      Ok(outcome)
-    }
-    Error(error) -> Error(error)
-  }
+  admit(
+    database,
+    unique_admission.Spec(
+      queue:,
+      submission_id:,
+      worker:,
+      input:,
+      availability:,
+      policy: Some(#(policy, on_conflict)),
+      correlation: None,
+    ),
+  )
 }
 
 /// Persists a job (immediately, or at an absolute availability time — see
@@ -1985,47 +2130,18 @@ pub fn submit_with_id(
   submission.Admission(input, output, error),
   submission.SubmitError(input, output, error),
 ) {
-  let Database(connection:, unique_lock_wait_ms:, forwarder:, installation:, ..) =
-    database
-  let worker.Metadata(id: worker_id, worker_version:, ..) =
-    worker.metadata(worker)
-  case
-    unique_admission.submit_plain(
-      connection,
-      installation,
-      unique_lock_wait_ms,
-      queue,
-      submission_id,
-      worker,
-      input,
-      availability,
-    )
-  {
-    Ok(unique_admission.Commit(
-      outcome:,
-      committed_state:,
-      available_at_unix_ms:,
-      via_receipt_match:,
-    )) -> {
-      let confirmation = case via_receipt_match {
-        True -> observation.Reconciled
-        False -> observation.Replied
-      }
-      emit_admitted(
-        forwarder,
-        queue,
-        admission_job_id(outcome),
-        worker_id,
-        worker_version,
-        committed_state,
-        available_at_unix_ms,
-        Some(submission.submission_id_value(submission_id)),
-        confirmation,
-      )
-      Ok(outcome)
-    }
-    Error(error) -> Error(error)
-  }
+  admit(
+    database,
+    unique_admission.Spec(
+      queue:,
+      submission_id:,
+      worker:,
+      input:,
+      availability:,
+      policy: None,
+      correlation: None,
+    ),
+  )
 }
 
 /// The persisted job id an `Admission` decision is about, whichever variant
@@ -2058,5 +2174,118 @@ pub fn reconcile_unique(
   case job.same_installation(pending_installation, database_installation) {
     False -> Error(submission.HandleFromAnotherInstallation)
     True -> unique_admission.reconcile(connection, pending)
+  }
+}
+
+// -- Operator listing ---------------------------------------------------------
+
+/// The largest `list_jobs` page.
+pub const list_limit_maximum = 10_000
+
+/// One job row as an operator sees it, without its typed payloads.
+pub type JobRow {
+  JobRow(
+    id: Int,
+    queue: String,
+    worker_id: String,
+    worker_version: String,
+    state: State,
+    attempt: Int,
+    max_attempts: Int,
+    snooze_count: Int,
+    replay_count: Int,
+    inserted_at_us: Int,
+    available_at_us: Int,
+    finished_at_us: Option(Int),
+    failure_description: Option(String),
+    correlation: Option(String),
+  )
+}
+
+pub type ListError {
+  NonPositiveListLimit
+  ListLimitTooLarge
+  ListQueryFailed(pog.QueryError)
+  ListInvalidStoredState(String)
+}
+
+/// Lists up to `limit` jobs with an id above `after_id`, in id order,
+/// optionally in one queue and one state. A sweep pages by passing the last
+/// id it saw. Uncertain jobs are listed through their own index; other
+/// states scan in id order.
+pub fn list_jobs(
+  database: Database,
+  queue: Option(String),
+  state: Option(State),
+  after_id: Int,
+  limit: Int,
+) -> Result(List(JobRow), ListError) {
+  case limit <= 0, limit > list_limit_maximum {
+    True, _ -> Error(NonPositiveListLimit)
+    _, True -> Error(ListLimitTooLarge)
+    False, False -> {
+      let Database(connection:, ..) = database
+      let query =
+        pog.query(
+          "SELECT id, queue, worker_id, worker_version, state, attempt_count, max_attempts, snooze_count, replay_count, (extract(epoch FROM inserted_at) * 1000000)::bigint, (extract(epoch FROM available_at) * 1000000)::bigint, (extract(epoch FROM finished_at) * 1000000)::bigint, failure_description, correlation FROM grind_jobs WHERE id > $1 AND ($2::text IS NULL OR queue = $2) AND ($3::text IS NULL OR state = $3) ORDER BY id LIMIT $4",
+        )
+        |> pog.parameter(pog.int(after_id))
+        |> pog.parameter(pog.nullable(pog.text, queue))
+        |> pog.parameter(pog.nullable(
+          pog.text,
+          option.map(state, job.state_to_stored),
+        ))
+        |> pog.parameter(pog.int(limit))
+        |> pog.returning({
+          use id <- decode.field(0, decode.int)
+          use queue <- decode.field(1, decode.string)
+          use worker_id <- decode.field(2, decode.string)
+          use worker_version <- decode.field(3, decode.string)
+          use state <- decode.field(4, decode.string)
+          use attempt <- decode.field(5, decode.int)
+          use max_attempts <- decode.field(6, decode.int)
+          use snooze_count <- decode.field(7, decode.int)
+          use replay_count <- decode.field(8, decode.int)
+          use inserted_at_us <- decode.field(9, decode.int)
+          use available_at_us <- decode.field(10, decode.int)
+          use finished_at_us <- decode.field(11, decode.optional(decode.int))
+          use failure_description <- decode.field(
+            12,
+            decode.optional(decode.string),
+          )
+          use correlation <- decode.field(13, decode.optional(decode.string))
+          decode.success(
+            #(state, fn(state) {
+              JobRow(
+                id:,
+                queue:,
+                worker_id:,
+                worker_version:,
+                state:,
+                attempt:,
+                max_attempts:,
+                snooze_count:,
+                replay_count:,
+                inserted_at_us:,
+                available_at_us:,
+                finished_at_us:,
+                failure_description:,
+                correlation:,
+              )
+            }),
+          )
+        })
+      case store.execute_safely(query, on: connection) {
+        Error(error) -> Error(ListQueryFailed(error))
+        Ok(returned) ->
+          list.try_map(returned.rows, fn(row) {
+            let #(stored, build) = row
+            case job.state_of_stored(stored) {
+              Ok(state) -> Ok(build(state))
+              Error(Nil) -> Error(ListInvalidStoredState(stored))
+            }
+          })
+      }
+    }
   }
 }

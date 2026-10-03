@@ -6,7 +6,6 @@ import gleam/json
 import gleam/result
 import gleeunit/should
 import grind/internal/consumer as queue
-import grind/internal/diagnostic
 import grind/internal/job
 import grind/internal/postgres
 import grind/internal/registry
@@ -19,6 +18,7 @@ import grind/support/observers.{detach}
 import grind/support/queue_signals.{CapacityWorkerStarted}
 import grind/support/queue_timing.{database_time_ms}
 import grind/support/worker_failure.{AccountMissing}
+import grind/telemetry
 import pog
 
 pub fn postgres_consumer_enforces_configured_capacity_test() {
@@ -68,7 +68,7 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
   let assert Ok(third_handle) =
     postgres.submit(database, "consumer-capacity", definition, 3)
   let #(capacity, attachment) =
-    diagnostics.capture(diagnostic.capacity(), fn(meta) {
+    diagnostics.capture(telemetry.capacity(), fn(meta) {
       meta.queue.queue == "consumer-capacity"
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -106,12 +106,12 @@ fn run_consumer_capacity_test(database_url: String) -> Nil {
   process.receive(started, within: 0) |> should.equal(Error(Nil))
   postgres.state(database, third_handle) |> should.equal(Ok(job.Queued))
   let assert Ok(#(initial, identity)) = process.receive(capacity, 5000)
-  initial |> should.equal(diagnostic.CapacityMeasurements(2, 0, 0, 0, 2))
+  initial |> should.equal(telemetry.CapacityMeasurements(2, 0, 0, 0, 2))
   identity.draining |> should.equal(False)
   let assert Ok(#(one, _)) = process.receive(capacity, 5000)
-  one |> should.equal(diagnostic.CapacityMeasurements(2, 1, 1, 0, 1))
+  one |> should.equal(telemetry.CapacityMeasurements(2, 1, 1, 0, 1))
   let assert Ok(#(full, _)) = process.receive(capacity, 5000)
-  full |> should.equal(diagnostic.CapacityMeasurements(2, 2, 2, 0, 0))
+  full |> should.equal(telemetry.CapacityMeasurements(2, 2, 2, 0, 0))
 
   process.send(first_release, ReleaseAttempt)
   process.send(second_release, ReleaseAttempt)

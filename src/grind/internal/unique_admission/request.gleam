@@ -5,6 +5,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 import grind/internal/job
 import grind/internal/submission
 import grind/internal/unique
@@ -53,6 +54,11 @@ pub type Request(input, output, error) {
     availability: submission.Availability,
     policy: Option(PolicyPart),
     request_sha256: BitArray,
+    /// Stored with the job; not part of the fingerprint, so a retried
+    /// submission converges whatever correlation it carries.
+    correlation: Option(String),
+    /// The worker's abandonment replay limit; not part of the fingerprint.
+    max_replays: Option(Int),
   )
 }
 
@@ -68,6 +74,8 @@ pub fn build_request(
   worker_def: Worker(input, output, error),
   input: input,
   availability: submission.Availability,
+  correlation: Option(String),
+  max_payload_bytes: Int,
   build_policy: fn(String, String) -> Result(Option(PolicyPart), String),
 ) -> Result(
   Request(input, output, error),
@@ -85,6 +93,14 @@ pub fn build_request(
     worker.encode_input(worker_def, input)
     |> result.map_error(submission.InvalidInput),
   )
+  use Nil <- result.try({
+    let bytes = string.byte_size(encoded_input)
+    case bytes > max_payload_bytes {
+      True ->
+        Error(submission.PayloadTooLarge(bytes:, limit: max_payload_bytes))
+      False -> Ok(Nil)
+    }
+  })
   use policy <- result.try(
     build_policy(input_version, encoded_input)
     |> result.map_error(submission.InvalidInput),
@@ -105,6 +121,8 @@ pub fn build_request(
       availability:,
       policy:,
       request_sha256: <<>>,
+      correlation:,
+      max_replays: worker.max_replays(worker_def),
     )
   Ok(Request(..request, request_sha256: fingerprint(request)))
 }
@@ -158,7 +176,21 @@ fn fingerprint(request: Request(input, output, error)) -> BitArray {
       ]
     }
   }
-  let availability_ms = submission.availability_ms(request.availability)
+  // `Delayed` is relative to admission time, so a retry converges; it is
+  // encoded with a string tag, which no absolute availability can produce.
+  let availability_fields = case request.availability {
+    submission.Delayed(milliseconds) -> [
+      json.string("delayed"),
+      json.int(milliseconds),
+    ]
+    _ -> {
+      let availability_ms = submission.availability_ms(request.availability)
+      [
+        json.bool(option.is_some(availability_ms)),
+        json.nullable(availability_ms, json.int),
+      ]
+    }
+  }
   let envelope =
     list.flatten([
       [
@@ -170,9 +202,8 @@ fn fingerprint(request: Request(input, output, error)) -> BitArray {
         json.string(request.encoded_input),
       ],
       policy_fields,
+      availability_fields,
       [
-        json.bool(option.is_some(availability_ms)),
-        json.nullable(availability_ms, json.int),
         json.string(request.output_version),
         json.bool(option.is_some(request.error_version)),
         json.nullable(request.error_version, json.string),

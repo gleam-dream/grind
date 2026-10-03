@@ -262,3 +262,9 @@ pub fn reschedule_target_ms(action: ConflictAction) -> Option(Int) {
     RescheduleScheduledTo(at) -> Some(job.available_at_unix_milliseconds(at))
   }
 }
+
+/// A uniqueness policy together with what a conflict does: the value
+/// `grind/unique` builds.
+pub type Uniqueness(input) {
+  Uniqueness(policy: Policy(input), on_conflict: ConflictAction)
+}

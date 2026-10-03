@@ -10,7 +10,8 @@
     transaction_safely/2,
     transaction_measured/2,
     transaction_or_checkout_failure/2,
-    migration_transaction_safely/3
+    migration_transaction_safely/3,
+    is_single_connection/1
 ]).
 
 %% Grind's own checkout deadline (`postgres.Settings.statement_deadline_ms`;
@@ -417,3 +418,8 @@ stop_supervisor(Pid) ->
                 exit:timeout -> {error, nil}
             end
     end.
+
+%% Whether a pog `Connection` is one checked-out connection (the `tx` a
+%% `pog.transaction` callback receives) rather than a pool.
+is_single_connection({single_connection, _}) -> true;
+is_single_connection(_) -> false.

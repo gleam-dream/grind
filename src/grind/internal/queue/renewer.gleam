@@ -6,8 +6,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import grind/internal/attempt
-import grind/internal/diagnostic
 import grind/internal/diagnostics
+import grind/telemetry
 import pog
 import sinal/forwarder.{type Forwarder}
 
@@ -18,7 +18,9 @@ pub type Status {
 }
 
 pub type Message {
-  Track(attempt.ClaimedJob, process.Pid)
+  /// Starts renewing a claim. `on_cancel` runs once, from the renewer, when
+  /// a renewal sees that a cancellation of this attempt has committed.
+  Track(attempt.ClaimedJob, process.Pid, on_cancel: fn() -> Nil)
   AwaitAcknowledgement(attempt_id: Int, epoch: Int)
   Untrack(attempt_id: Int, epoch: Int)
   Tick
@@ -39,6 +41,8 @@ type Entry {
     epoch: Int,
     monitor: process.Monitor,
     phase: Phase,
+    on_cancel: fn() -> Nil,
+    cancel_delivered: Bool,
   )
 }
 
@@ -140,7 +144,7 @@ fn start_with_forwarder(
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
-    Track(claim, pid) -> {
+    Track(claim, pid, on_cancel) -> {
       let #(_, attempt_id, epoch) = attempt.claim_identity(claim)
       let entry =
         Entry(
@@ -149,6 +153,8 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
           epoch:,
           monitor: process.monitor(pid),
           phase: Running,
+          on_cancel:,
+          cancel_delivered: False,
         )
       actor.continue(State(..state, entries: [entry, ..state.entries]))
     }
@@ -205,7 +211,7 @@ fn renew(state: State) -> State {
           emit_renewal(
             state,
             entry,
-            diagnostic.CompletionBudgetExhausted,
+            telemetry.CompletionBudgetExhausted,
             0,
             None,
           )
@@ -239,8 +245,8 @@ fn renew(state: State) -> State {
           diagnostics.checkout(
             fwd,
             diagnostics.queue_ref(state.queue, state.owner),
-            diagnostic.LeaseRenewal,
-            diagnostic.ReservedPool,
+            telemetry.LeaseRenewal,
+            telemetry.ReservedPool,
             measured,
           )
       }
@@ -250,7 +256,7 @@ fn renew(state: State) -> State {
             emit_renewal(
               state,
               entry,
-              diagnostic.StorageFailed,
+              telemetry.StorageFailed,
               measured.call_duration_us,
               None,
             )
@@ -269,10 +275,19 @@ fn renew(state: State) -> State {
               {
                 Error(Nil) -> entry
                 Ok(result) -> {
+                  let entry = case
+                    result.cancel_requested && !entry.cancel_delivered
+                  {
+                    True -> {
+                      entry.on_cancel()
+                      Entry(..entry, cancel_delivered: True)
+                    }
+                    False -> entry
+                  }
                   let outcome = case result.status {
-                    attempt.BatchLocked -> diagnostic.SkippedLocked
-                    attempt.BatchRenewed -> diagnostic.Renewed
-                    attempt.BatchLeaseLost -> diagnostic.LiveFenceUnavailable
+                    attempt.BatchLocked -> telemetry.SkippedLocked
+                    attempt.BatchRenewed -> telemetry.Renewed
+                    attempt.BatchLeaseLost -> telemetry.LiveFenceUnavailable
                   }
                   emit_renewal(
                     state,
@@ -305,7 +320,7 @@ fn renew(state: State) -> State {
 fn emit_renewal(
   state: State,
   entry: Entry,
-  outcome: diagnostic.RenewalOutcome,
+  outcome: telemetry.RenewalOutcome,
   duration_us: Int,
   remaining_lease_ms: Option(Int),
 ) -> Nil {
@@ -313,20 +328,20 @@ fn emit_renewal(
     None -> Nil
     Some(fwd) -> {
       let phase = case entry.phase {
-        Running -> diagnostic.HandlerRunning
+        Running -> telemetry.HandlerRunning
         Acknowledging(_) | CompletionBudgetFinished | OwnershipLost ->
-          diagnostic.AcknowledgementPending
+          telemetry.AcknowledgementPending
       }
       let _ =
         forwarder.emit(
           fwd,
-          diagnostic.renewal(),
-          diagnostic.RenewalMeasurements(
+          telemetry.renewal(),
+          telemetry.RenewalMeasurements(
             count: 1,
             duration_us:,
             remaining_lease_ms:,
           ),
-          diagnostic.RenewalMetadata(
+          telemetry.RenewalMetadata(
             context: attempt.diagnostic_context(
               entry.claim,
               state.queue,

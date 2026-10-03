@@ -41,13 +41,13 @@ import pog
 /// likely to interact badly with rows a previous release already wrote —
 /// layered on top of the real `v12` (`finished_at`) this harness now also
 /// exercises for real, rather than only against a synthetic stand-in.
-fn synthetic_v13_alter_migration() -> migrations.Migration {
+fn synthetic_v14_alter_migration() -> migrations.Migration {
   migrations.Migration(
-    13,
+    14,
     [
       "ALTER TABLE grind_jobs ADD COLUMN grind_test_note text",
       "CREATE INDEX grind_test_note_idx ON grind_jobs (grind_test_note)",
-      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
     ],
     list.append(latest_migration().shape, [
       migrations.ExpectedRelation("grind_test_note_idx", migrations.Index, []),
@@ -305,7 +305,7 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
     |> pog.execute(on: upgrade_connection)
 
   let steps =
-    list.append(migrations.migrations(), [synthetic_v13_alter_migration()])
+    list.append(migrations.migrations(), [synthetic_v14_alter_migration()])
   postgres.migrate_with(upgrade_database, steps) |> should.equal(Ok(Nil))
   postgres.migrate_with(fresh_database, steps) |> should.equal(Ok(Nil))
 

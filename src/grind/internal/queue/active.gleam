@@ -4,8 +4,8 @@
 import gleam/erlang/process
 import gleam/list
 import grind/internal/attempt
-import grind/internal/diagnostic
 import grind/internal/queue/worker as queue_worker
+import grind/telemetry
 
 pub type ActiveAttempt(completion, status) {
   ActiveAttempt(
@@ -17,7 +17,7 @@ pub type ActiveAttempt(completion, status) {
     monitor: process.Monitor,
     completion: completion,
     renewal_status: status,
-    phase: diagnostic.AttemptPhase,
+    phase: telemetry.AttemptPhase,
   )
 }
 

@@ -8,7 +8,6 @@ import gleam/result
 import gleeunit/should
 import grind/internal/consumer as queue
 import grind/internal/consumer_hooks
-import grind/internal/diagnostic
 import grind/internal/job
 import grind/internal/postgres
 import grind/internal/registry
@@ -26,6 +25,7 @@ import grind/support/queue_signals.{
   ConcurrentClaimWorkerStarted, WorkerDeathStarted, WorkerInvoked,
 }
 import grind/support/worker_failure.{AccountMissing}
+import grind/telemetry
 import one_shot
 import pog
 
@@ -514,7 +514,7 @@ fn run_temporary_worker_death_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "worker-death", definition, 31)
   let #(capacity, attachment) =
-    diagnostics.capture(diagnostic.capacity(), fn(meta) {
+    diagnostics.capture(telemetry.capacity(), fn(meta) {
       meta.queue.queue == "worker-death"
     })
   use <- exception.defer(fn() { detach(attachment) })

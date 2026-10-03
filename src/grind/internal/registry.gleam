@@ -22,7 +22,23 @@ type Selection {
     input_version: String,
     output_version: String,
     error_version: Option(String),
-    run: fn(String, String, worker.RetryContext) -> worker.Execution,
+    run: fn(String, String, worker.Context, Int) -> worker.Execution,
+    timeout_ms: Option(Int),
+    abandonment: worker.Abandonment,
+  )
+}
+
+/// A registered worker selected for one claimed row: its codec contract, its
+/// erased execution (stored input version, encoded input, context, payload
+/// limit) and the policies the attempt process enforces around it.
+pub type Selected {
+  Selected(
+    input_version: String,
+    output_version: String,
+    error_version: Option(String),
+    run: fn(String, String, worker.Context, Int) -> worker.Execution,
+    timeout_ms: Option(Int),
+    abandonment: worker.Abandonment,
   )
 }
 
@@ -41,10 +57,10 @@ pub fn new(queue: String) -> Result(Registry, RegisterError) {
 /// Binds the typed worker before adding it to the heterogeneous registry.
 pub fn register(
   registry: Registry,
-  worker: Worker(input, output, error),
+  definition: Worker(input, output, error),
 ) -> Result(Registry, RegisterError) {
   let Registry(queue:, workers: workers) = registry
-  let metadata = worker.metadata(worker)
+  let metadata = worker.metadata(definition)
   let worker.Metadata(
     id:,
     worker_version: version,
@@ -70,14 +86,17 @@ pub fn register(
             input_version:,
             output_version:,
             error_version:,
-            run: fn(input_version, encoded_input, context) {
+            run: fn(input_version, encoded_input, context, max_payload_bytes) {
               worker.execute_encoded(
-                worker,
+                definition,
                 input_version,
                 encoded_input,
                 context,
+                max_payload_bytes,
               )
             },
+            timeout_ms: definition.timeout_ms,
+            abandonment: definition.abandonment,
           ),
           ..workers
         ]),
@@ -109,15 +128,7 @@ pub fn select(
   queue: String,
   id: String,
   version: String,
-) -> Result(
-  #(
-    String,
-    String,
-    Option(String),
-    fn(String, String, worker.RetryContext) -> worker.Execution,
-  ),
-  SelectionError,
-) {
+) -> Result(Selected, SelectionError) {
   let Registry(queue: registered_queue, workers: workers) = registry
   case registered_queue == queue {
     False -> Error(WrongQueue(expected: registered_queue, actual: queue))
@@ -129,8 +140,23 @@ pub fn select(
           registered_id == id && registered_version == version
         })
       case matching {
-        Ok(Selection(input_version:, output_version:, error_version:, run:, ..)) ->
-          Ok(#(input_version, output_version, error_version, run))
+        Ok(Selection(
+          input_version:,
+          output_version:,
+          error_version:,
+          run:,
+          timeout_ms:,
+          abandonment:,
+          ..,
+        )) ->
+          Ok(Selected(
+            input_version:,
+            output_version:,
+            error_version:,
+            run:,
+            timeout_ms:,
+            abandonment:,
+          ))
         Error(Nil) -> Error(WorkerNotRegistered(id:, version:))
       }
     }

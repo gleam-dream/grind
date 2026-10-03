@@ -76,10 +76,10 @@ fn run_concurrent_migrators_test(database_url: String) -> Nil {
       decode.success(count)
     })
     |> pog.execute(on: connection)
-  // One marker row per real step (11 and 12) — never a duplicate for either,
+  // One marker row per real step (11, 12 and 13) — never a duplicate for any,
   // which is what would show up here had the advisory lock not actually
   // serialised the two concurrent migrators against each step.
-  marker.rows |> should.equal([2])
+  marker.rows |> should.equal([3])
   mark_database_test_executed("migrate-concurrent-migrators-single-marker")
 }
 
@@ -162,7 +162,7 @@ fn run_concurrent_schema_creation_test(base_url: String) -> Nil {
   process.receive(result_a, within: 10_000) |> should.equal(Ok(Ok(Nil)))
   process.receive(result_b, within: 10_000) |> should.equal(Ok(Ok(Nil)))
 
-  schema_marker_max_version(connection_a) |> should.equal(12)
+  schema_marker_max_version(connection_a) |> should.equal(13)
   mark_database_test_executed("migrate-concurrent-schema-creation-both-succeed")
 }
 
@@ -233,9 +233,9 @@ fn migration_lock_url() -> Result(String, Nil)
 /// docs/RECOVERY-EVIDENCE.md, "Acknowledgement deadline", for the mutation
 /// this characterizes: a step run under the pool's shared deadline instead
 /// of its own times out at ~4s instead of succeeding at ~6s.
-fn synthetic_v13_slow_migration() -> migrations.Migration {
+fn synthetic_v14_slow_migration() -> migrations.Migration {
   migrations.Migration(
-    13,
+    14,
     [
       // `pg_types` cannot decode a bare `void` result (`pg_sleep`'s own
       // return type — see `grind/internal/unique_admission`'s identical
@@ -243,7 +243,7 @@ fn synthetic_v13_slow_migration() -> migrations.Migration {
       // its own doc comment for the full driver note), so the sleep is
       // wrapped in an outer scalar `SELECT` rather than selected directly.
       "SELECT true FROM (SELECT pg_sleep(6)) AS grind_migration_deadline_probe",
-      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
     ],
     latest_migration().shape,
     latest_migration().foreign_keys,
@@ -266,7 +266,7 @@ fn run_migration_deadline_long_step_test(database_url: String) -> Nil {
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let steps =
-    list.append(migrations.migrations(), [synthetic_v13_slow_migration()])
+    list.append(migrations.migrations(), [synthetic_v14_slow_migration()])
   let start_ms = monotonic_ms()
   postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
   let elapsed_ms = monotonic_ms() - start_ms
@@ -279,10 +279,10 @@ fn run_migration_deadline_long_step_test(database_url: String) -> Nil {
 
 fn migration_lock_timeout_probe_migration() -> migrations.Migration {
   migrations.Migration(
-    13,
+    14,
     [
       "ALTER TABLE grind_jobs ADD COLUMN grind_lock_timeout_probe text",
-      "INSERT INTO grind_schema_migrations (version) VALUES (13)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
     ],
     latest_migration().shape,
     latest_migration().foreign_keys,
@@ -370,7 +370,7 @@ fn run_migration_step_lock_timeout_test(database_url: String) -> Nil {
   let start_ms = monotonic_ms()
   let outcome = postgres.migrate_with(main_database, steps)
   let elapsed_ms = monotonic_ms() - start_ms
-  outcome |> should.equal(Error(postgres.MigrationLockUnavailable(13)))
+  outcome |> should.equal(Error(postgres.MigrationLockUnavailable(14)))
   // Comfortably clears the 2000ms lock_timeout plus ordinary scheduling
   // jitter, but well under the 3500ms `migration_deadline_ms` configured
   // above (never mind the 30000ms default) a caller who removed

@@ -7,7 +7,6 @@ import gleam/option.{None, Some}
 import gleam/result
 import gleeunit/should
 import grind/internal/consumer as queue
-import grind/internal/diagnostic
 import grind/internal/job
 import grind/internal/postgres
 import grind/internal/registry
@@ -21,6 +20,7 @@ import grind/support/lease_queries.{
 import grind/support/observers.{detach}
 import grind/support/queue_signals.{FirstAttemptStarted}
 import grind/support/worker_failure.{AccountMissing}
+import grind/telemetry
 import pog
 
 pub fn postgres_queue_renews_running_attempt_before_ack_test() {
@@ -83,7 +83,7 @@ fn run_lease_renewal_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "lease-renewal", slow_worker, 7)
   let #(renewals, attachment) =
-    diagnostics.capture(diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(telemetry.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -116,8 +116,8 @@ fn run_lease_renewal_test(database_url: String) -> Nil {
   let assert Ok(Ok(True)) = process.receive(reply, within: 5000)
   observed_renewal |> should.equal(True)
   let assert Ok(#(measurement, metadata)) = process.receive(renewals, 5000)
-  metadata.outcome |> should.equal(diagnostic.Renewed)
-  metadata.phase |> should.equal(diagnostic.HandlerRunning)
+  metadata.outcome |> should.equal(telemetry.Renewed)
+  metadata.phase |> should.equal(telemetry.HandlerRunning)
   measurement.count |> should.equal(1)
   { measurement.duration_us > 0 } |> should.be_true()
   let assert Some(headroom) = measurement.remaining_lease_ms
@@ -169,7 +169,7 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "lease-renewal-loss", slow_worker, 7)
   let #(renewals, attachment) =
-    diagnostics.capture(diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(telemetry.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -192,10 +192,10 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
   let assert Ok(#(measurement, metadata)) =
     diagnostics.await(
       renewals,
-      fn(sample) { sample.1.outcome == diagnostic.LiveFenceUnavailable },
+      fn(sample) { sample.1.outcome == telemetry.LiveFenceUnavailable },
       5000,
     )
-  metadata.phase |> should.equal(diagnostic.HandlerRunning)
+  metadata.phase |> should.equal(telemetry.HandlerRunning)
   let assert Some(headroom) = measurement.remaining_lease_ms
   { headroom < 0 } |> should.be_true()
   queue.process_one(consumer) |> should.equal(Error(queue.QueueBusy))
@@ -258,7 +258,7 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
   let assert Ok(handle) =
     postgres.submit(database, "renewal-storage-error", slow_worker, 18)
   let #(renewals, attachment) =
-    diagnostics.capture(diagnostic.renewal(), fn(meta) {
+    diagnostics.capture(telemetry.renewal(), fn(meta) {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -307,11 +307,11 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
   let assert Ok(#(failed, failure)) =
     diagnostics.await(
       renewals,
-      fn(sample) { sample.1.outcome == diagnostic.StorageFailed },
+      fn(sample) { sample.1.outcome == telemetry.StorageFailed },
       5000,
     )
   failed.remaining_lease_ms |> should.equal(None)
-  failure.phase |> should.equal(diagnostic.HandlerRunning)
+  failure.phase |> should.equal(telemetry.HandlerRunning)
   queue.process_one(consumer) |> should.equal(Error(queue.QueueBusy))
   let assert Ok(_) =
     pog.query("DROP TRIGGER grind_test_reject_renewal ON grind_jobs")
@@ -324,7 +324,7 @@ fn run_renewal_storage_error_test(database_url: String) -> Nil {
   let assert Ok(#(recovered, success)) =
     diagnostics.await(
       renewals,
-      fn(sample) { sample.1.outcome == diagnostic.Renewed },
+      fn(sample) { sample.1.outcome == telemetry.Renewed },
       5000,
     )
   let assert Some(headroom) = recovered.remaining_lease_ms

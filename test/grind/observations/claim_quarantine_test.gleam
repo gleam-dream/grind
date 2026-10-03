@@ -9,10 +9,10 @@ import gleeunit/should
 import grind/internal/attempt
 import grind/internal/consumer as queue
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{
   database_url, mark_database_test_executed, quarantine_url, queue_database_url,
@@ -22,6 +22,7 @@ import grind/support/submissions.{
   unique_test_worker, unique_test_worker_versioned,
 }
 import grind/support/unique_fixture.{unique_test_suffix}
+import grind/telemetry
 import pog
 import sinal
 
@@ -67,7 +68,7 @@ fn run_claimed_observation_emission_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.claimed(), fn(measurements, metadata) {
+    sinal.observe(telemetry.claimed(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -87,7 +88,7 @@ fn run_claimed_observation_emission_test(database_url: String) -> Nil {
 
   let assert Ok(#(measurements, metadata)) =
     process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.ClaimedMeasurements(count: 1))
+  measurements.count |> should.equal(1)
   metadata.ref.job_id |> should.equal(claimed_id)
   metadata.ref.queue |> should.equal("claimed-emission")
   metadata.ref.worker_id |> should.equal("claimed.emission")
@@ -95,7 +96,7 @@ fn run_claimed_observation_emission_test(database_url: String) -> Nil {
   metadata.attempt.attempt_id |> should.equal(attempt_id)
   metadata.attempt.epoch |> should.equal(epoch)
   metadata.attempt.attempt |> should.equal(1)
-  metadata.previous_state |> should.equal(job.Queued)
+  metadata.previous_state |> should.equal(public_job.Queued)
   mark_database_test_executed("claimed-observation-emission-passed")
 }
 
@@ -139,7 +140,7 @@ fn run_claimed_observation_absent_when_nothing_due_test(
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.claimed(), fn(measurements, metadata) {
+    sinal.observe(telemetry.claimed(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -232,7 +233,7 @@ fn run_quarantined_observation_emission_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.quarantined(), fn(measurements, metadata) {
+    sinal.observe(telemetry.quarantined(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -247,7 +248,7 @@ fn run_quarantined_observation_emission_test(database_url: String) -> Nil {
   |> should.equal(Ok(None))
   let assert Ok(#(measurements_a, metadata_a)) =
     process.receive(signal, within: 5000)
-  measurements_a |> should.equal(observation.QuarantinedMeasurements(count: 1))
+  measurements_a.count |> should.equal(1)
   metadata_a.ref.job_id |> should.equal(job.id_value(handle_a))
   metadata_a.ref.queue |> should.equal("quarantined-emission")
   metadata_a.ref.worker_id |> should.equal("quarantined.emission")
@@ -314,7 +315,7 @@ fn run_quarantined_observation_absent_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.quarantined(), fn(measurements, metadata) {
+    sinal.observe(telemetry.quarantined(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -399,12 +400,12 @@ fn run_claimed_precedes_acknowledged_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let claimed_attachment =
-    sinal.observe(observation.claimed(), fn(_measurements, metadata) {
+    sinal.observe(telemetry.claimed(), fn(_measurements, metadata) {
       process.send(signal, ClaimedOrderingEvent(metadata.attempt.attempt_id))
     })
   use <- exception.defer(fn() { detach(claimed_attachment) })
   let acknowledged_attachment =
-    sinal.observe(observation.acknowledged(), fn(_measurements, metadata) {
+    sinal.observe(telemetry.acknowledged(), fn(_measurements, metadata) {
       process.send(
         signal,
         AcknowledgedOrderingEvent(metadata.attempt.attempt_id),
@@ -552,7 +553,7 @@ fn run_quarantine_expired_global_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.quarantined(), fn(measurements, metadata) {
+    sinal.observe(telemetry.quarantined(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -569,7 +570,8 @@ fn run_quarantine_expired_global_test(database_url: String) -> Nil {
   let assert Ok(#(measurements_one, metadata_one)) =
     process.receive(signal, within: 5000)
   measurements_one
-  |> should.equal(observation.QuarantinedMeasurements(count: 1))
+  |> fn(m: telemetry.JobMeasurements) { m.count }
+  |> should.equal(1)
   let states_after_one = [
     postgres.state(database, first),
     postgres.state(database, second),

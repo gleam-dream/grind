@@ -12,27 +12,38 @@
 //// cannot pattern-match its fields directly.
 
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import gleam/time/timestamp
 import grind/internal/attempt/acknowledgement.{type Claim, AckProposal, Claim} as attempt_acknowledgement
-import grind/internal/diagnostic
+import grind/internal/convert
 import grind/internal/diagnostics
+import grind/internal/events
 import grind/internal/job.{type State}
 import grind/internal/lease
-import grind/internal/observation
 import grind/internal/postgres.{type Database}
 import grind/internal/registry.{type Registry}
 import grind/internal/sql
 import grind/internal/store
 import grind/internal/worker
+import grind/telemetry
 import pog
+import sinal/correlation
 import sinal/forwarder.{type Forwarder}
 
-/// A claimed row bound to its registered typed execution closure.
+/// A claimed row bound to its registered typed execution closure and the
+/// worker policies its attempt process enforces.
 pub opaque type ClaimedJob {
-  ClaimedJob(claim: Claim, run: fn() -> worker.Execution)
+  ClaimedJob(
+    claim: Claim,
+    queue: String,
+    run: fn(worker.Context) -> worker.Execution,
+    timeout_ms: Option(Int),
+    abandonment: worker.Abandonment,
+  )
 }
 
 /// Atomically claims one due row without running its handler in the caller.
@@ -57,8 +68,8 @@ pub fn claim_one(
     diagnostics.checkout(
       fwd,
       reference,
-      diagnostic.QuarantineScan,
-      diagnostic.MainPool,
+      telemetry.QuarantineScan,
+      telemetry.MainPool,
       measured,
     )
   {
@@ -66,7 +77,7 @@ pub fn claim_one(
       diagnostics.claim_failed(
         fwd,
         reference,
-        diagnostic.QuarantineScan,
+        telemetry.QuarantineScan,
         error,
         measured.call_duration_us,
       )
@@ -85,9 +96,72 @@ pub fn claim_one(
 }
 
 /// Executes only the typed closure captured when a matching job was claimed.
-pub fn execute_claim(claimed: ClaimedJob) -> worker.Execution {
+pub fn execute_claim(
+  claimed: ClaimedJob,
+  context: worker.Context,
+) -> worker.Execution {
   let ClaimedJob(run:, ..) = claimed
-  run()
+  run(context)
+}
+
+/// The worker's handler timeout, `None` when it has none.
+pub fn claim_timeout_ms(claimed: ClaimedJob) -> Option(Int) {
+  claimed.timeout_ms
+}
+
+/// The worker's abandonment policy.
+pub fn claim_abandonment(claimed: ClaimedJob) -> worker.Abandonment {
+  claimed.abandonment
+}
+
+/// The handler context for this claim. `cancellation` must select on a
+/// subject owned by the process that runs the handler.
+pub fn claim_context(
+  claimed: ClaimedJob,
+  cancellation: process.Selector(Nil),
+  deadline: Option(timestamp.Timestamp),
+) -> worker.Context {
+  let Claim(
+    id:,
+    current_attempt:,
+    max_attempts:,
+    snooze_count:,
+    correlation:,
+    ..,
+  ) = claimed.claim
+  worker.Context(
+    job_id: id,
+    attempt: current_attempt,
+    max_attempts:,
+    snooze_count:,
+    queue: claimed.queue,
+    correlation: stored_correlation(id, correlation),
+    cancellation:,
+    deadline:,
+  )
+}
+
+/// Runs the claim's handler in the calling process with a context whose
+/// cancellation never fires and that has no deadline. The consumer runs
+/// handlers through its attempt process instead; tests drive claims with
+/// this.
+pub fn execute_claim_inline(claimed: ClaimedJob) -> worker.Execution {
+  execute_claim(claimed, claim_context(claimed, process.new_selector(), None))
+}
+
+/// The correlation stored with a job, or one derived from its id for a row
+/// admitted before correlations were stored.
+pub fn stored_correlation(
+  job_id: Int,
+  stored: Option(String),
+) -> correlation.Correlation {
+  events.correlation(job_id, stored)
+}
+
+/// The claimed row's correlation.
+pub fn claim_correlation(claimed: ClaimedJob) -> correlation.Correlation {
+  let Claim(id:, correlation:, ..) = claimed.claim
+  stored_correlation(id, correlation)
 }
 
 /// Returns stable fencing fields for the queue actor's private active entry.
@@ -101,7 +175,7 @@ pub fn diagnostic_context(
   claimed: ClaimedJob,
   queue: String,
   owner: String,
-) -> diagnostic.AttemptContext {
+) -> telemetry.AttemptContext {
   let ClaimedJob(claim:, ..) = claimed
   diagnostic_context_from_claim(claim, queue, owner)
 }
@@ -110,7 +184,7 @@ fn diagnostic_context_from_claim(
   claim: Claim,
   queue: String,
   owner: String,
-) -> diagnostic.AttemptContext {
+) -> telemetry.AttemptContext {
   let Claim(
     id:,
     attempt_id:,
@@ -120,13 +194,15 @@ fn diagnostic_context_from_claim(
     worker_version:,
     ..,
   ) = claim
-  diagnostic.AttemptContext(
-    ref: observation.JobRef(job_id: id, queue:, worker_id:, worker_version:),
-    attempt: observation.AttemptRef(
-      attempt_id:,
-      epoch:,
-      attempt: current_attempt,
+  telemetry.AttemptContext(
+    ref: telemetry.JobRef(
+      job_id: id,
+      queue:,
+      worker_id:,
+      worker_version:,
+      correlation: events.correlation(id, claim.correlation),
     ),
+    attempt: telemetry.AttemptRef(attempt_id:, epoch:, attempt: current_attempt),
     consumer: diagnostics.consumer_ref(owner),
   )
 }
@@ -179,6 +255,8 @@ pub type ObservedRenewal {
     epoch: Int,
     status: BatchRenewal,
     remaining_lease_ms: Option(Int),
+    /// A caller's cancellation of this attempt has committed.
+    cancel_requested: Bool,
   )
 }
 
@@ -199,7 +277,7 @@ pub fn renew_many_observed(
       <> live
       <> " RETURNING j.id, j.lease_expires_at AS new_lease_expires_at) SELECT f.attempt_id, f.epoch, CASE WHEN r.id IS NOT NULL THEN 1 WHEN j.state = 'executing' AND j.queue = $4 AND j.attempt_owner = $5 AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch AND j."
       <> live
-      <> " THEN 2 ELSE 0 END, CASE WHEN r.id IS NOT NULL THEN floor(extract(epoch FROM (r.new_lease_expires_at - clock_timestamp())) * 1000)::bigint WHEN j.queue = $4 AND j.attempt_owner = $5 AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch THEN floor(extract(epoch FROM (j.lease_expires_at - clock_timestamp())) * 1000)::bigint ELSE NULL::bigint END FROM fences f LEFT JOIN renewed r ON r.id = f.id LEFT JOIN grind_jobs j ON j.id = f.id",
+      <> " THEN 2 ELSE 0 END, CASE WHEN r.id IS NOT NULL THEN floor(extract(epoch FROM (r.new_lease_expires_at - clock_timestamp())) * 1000)::bigint WHEN j.queue = $4 AND j.attempt_owner = $5 AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch THEN floor(extract(epoch FROM (j.lease_expires_at - clock_timestamp())) * 1000)::bigint ELSE NULL::bigint END, coalesce(j.cancel_requested_at IS NOT NULL AND j.attempt_id = f.attempt_id AND j.attempt_epoch = f.epoch, false) FROM fences f LEFT JOIN renewed r ON r.id = f.id LEFT JOIN grind_jobs j ON j.id = f.id",
     )
     |> pog.parameter(pog.array(pog.int, list.map(identities, fn(x) { x.0 })))
     |> pog.parameter(pog.array(pog.int, list.map(identities, fn(x) { x.1 })))
@@ -217,11 +295,13 @@ pub fn renew_many_observed(
         _ -> BatchLeaseLost
       }
       use remaining_lease_ms <- decode.field(3, decode.optional(decode.int))
+      use cancel_requested <- decode.field(4, decode.bool)
       decode.success(ObservedRenewal(
         attempt_id:,
         epoch:,
         status:,
         remaining_lease_ms:,
+        cancel_requested:,
       ))
     })
   let measured = store.execute_measured(query, on: connection)
@@ -311,6 +391,7 @@ pub fn release_unstarted(
             Ok(restored_state) ->
               emit_released(
                 forwarder,
+                events.correlation(claim.id, claim.correlation),
                 queue,
                 id,
                 worker_id,
@@ -338,6 +419,7 @@ pub fn release_unstarted(
 /// might read it back.
 fn emit_released(
   fwd: Forwarder,
+  correlation: correlation.Correlation,
   queue: String,
   job_id: Int,
   worker_id: String,
@@ -350,12 +432,18 @@ fn emit_released(
   let _ =
     forwarder.emit(
       fwd,
-      observation.released(),
-      observation.ReleasedMeasurements(count: 1),
-      observation.ReleasedMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
-        attempt: observation.AttemptRef(attempt_id:, epoch:, attempt:),
-        restored_state:,
+      telemetry.released(),
+      events.job_measurements(),
+      telemetry.ReleasedMetadata(
+        ref: telemetry.JobRef(
+          job_id:,
+          queue:,
+          worker_id:,
+          worker_version:,
+          correlation:,
+        ),
+        attempt: telemetry.AttemptRef(attempt_id:, epoch:, attempt:),
+        restored_state: convert.state(restored_state),
       ),
     )
   Nil
@@ -436,6 +524,7 @@ pub fn acknowledge(
         output_version,
       )
     worker.ExecutedSnoozed(_, _)
+    | worker.ExecutedSnoozeLimitReached(_, _)
     | worker.ExecutedDiscarded(_)
     | worker.ExecutedCancelled(_)
     | worker.ExecutedUncertain(_) ->
@@ -497,7 +586,7 @@ fn claim_registered_job(
     <> eligible_state
     <> " AND cancel_requested_at IS NULL AND ("
     <> eligibility
-    <> ") ORDER BY available_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $2, lease_expires_at = clock_timestamp() + ($3::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1, delivery_count = job.delivery_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version, job.attempt_count, job.max_attempts, job.snooze_count, job.delivery_count, candidate.previous_state"
+    <> ") ORDER BY available_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $2, lease_expires_at = clock_timestamp() + ($3::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1, delivery_count = job.delivery_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version, job.attempt_count, job.max_attempts, job.snooze_count, job.delivery_count, candidate.previous_state, job.correlation"
   let parameters =
     list.append(
       [pog.text(queue), pog.text(attempt_owner), pog.int(lease_duration_ms)],
@@ -525,6 +614,7 @@ fn claim_registered_job(
       use snooze_count <- decode.field(11, decode.int)
       use delivery_count <- decode.field(12, decode.int)
       use previous_state <- decode.field(13, decode.string)
+      use correlation <- decode.field(14, decode.optional(decode.string))
       decode.success(Claim(
         id:,
         attempt_id:,
@@ -540,6 +630,7 @@ fn claim_registered_job(
         snooze_count:,
         delivery_count:,
         previous_state:,
+        correlation:,
       ))
     })
   let reference = diagnostics.queue_ref(queue, attempt_owner)
@@ -548,8 +639,8 @@ fn claim_registered_job(
     diagnostics.checkout(
       forwarder,
       reference,
-      diagnostic.ClaimCandidate,
-      diagnostic.MainPool,
+      telemetry.ClaimCandidate,
+      telemetry.MainPool,
       measured,
     )
   {
@@ -557,7 +648,7 @@ fn claim_registered_job(
       diagnostics.claim_failed(
         forwarder,
         reference,
-        diagnostic.ClaimCandidate,
+        telemetry.ClaimCandidate,
         error,
         measured.call_duration_us,
       )
@@ -578,8 +669,6 @@ fn claim_registered_job(
             output_version:,
             error_version:,
             current_attempt:,
-            max_attempts:,
-            snooze_count:,
             previous_state:,
             ..,
           ) = claim
@@ -588,6 +677,7 @@ fn claim_registered_job(
             Ok(previous_state) ->
               emit_claimed(
                 forwarder,
+                events.correlation(claim.id, claim.correlation),
                 queue,
                 claimed_id,
                 worker_id,
@@ -600,7 +690,14 @@ fn claim_registered_job(
           }
           case registry.select(workers, queue, worker_id, worker_version) {
             Error(_) -> Error(postgres.QueueStorageInvariantViolated)
-            Ok(#(registered_input, registered_output, registered_error, run)) ->
+            Ok(registry.Selected(
+              input_version: registered_input,
+              output_version: registered_output,
+              error_version: registered_error,
+              run:,
+              timeout_ms:,
+              abandonment:,
+            )) ->
               case
                 codec_contract_mismatch(
                   input_version,
@@ -638,22 +735,25 @@ fn claim_registered_job(
                     Ok(False) -> Error(postgres.QueueStorageInvariantViolated)
                   }
                 }
-                None ->
+                None -> {
+                  let max_payload_bytes = postgres.max_payload_bytes(database)
                   Ok(
-                    Some(
-                      ClaimedJob(claim:, run: fn() {
+                    Some(ClaimedJob(
+                      claim:,
+                      queue:,
+                      run: fn(context) {
                         run(
                           input_version,
                           encoded_input,
-                          worker.RetryContext(
-                            current_attempt:,
-                            max_attempts:,
-                            snooze_count:,
-                          ),
+                          context,
+                          max_payload_bytes,
                         )
-                      }),
-                    ),
+                      },
+                      timeout_ms:,
+                      abandonment:,
+                    )),
                   )
+                }
               }
           }
         }
@@ -670,6 +770,7 @@ fn claim_registered_job(
 /// semantics.
 fn emit_claimed(
   fwd: Forwarder,
+  correlation: correlation.Correlation,
   queue: String,
   job_id: Int,
   worker_id: String,
@@ -682,12 +783,18 @@ fn emit_claimed(
   let _ =
     forwarder.emit(
       fwd,
-      observation.claimed(),
-      observation.ClaimedMeasurements(count: 1),
-      observation.ClaimedMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
-        attempt: observation.AttemptRef(attempt_id:, epoch:, attempt:),
-        previous_state:,
+      telemetry.claimed(),
+      events.job_measurements(),
+      telemetry.ClaimedMetadata(
+        ref: telemetry.JobRef(
+          job_id:,
+          queue:,
+          worker_id:,
+          worker_version:,
+          correlation:,
+        ),
+        attempt: telemetry.AttemptRef(attempt_id:, epoch:, attempt:),
+        previous_state: convert.state(previous_state),
       ),
     )
   Nil
@@ -780,6 +887,7 @@ fn mark_contract_mismatch(
             Ok(kind) ->
               emit_contract_mismatch(
                 forwarder,
+                events.correlation(claim.id, claim.correlation),
                 queue,
                 id,
                 worker_id,
@@ -805,6 +913,7 @@ fn mark_contract_mismatch(
 /// `UPDATE ... RETURNING` already returned that row.
 fn emit_contract_mismatch(
   fwd: Forwarder,
+  correlation: correlation.Correlation,
   queue: String,
   job_id: Int,
   worker_id: String,
@@ -819,12 +928,18 @@ fn emit_contract_mismatch(
   let _ =
     forwarder.emit(
       fwd,
-      observation.contract_mismatch_recorded(),
-      observation.ContractMismatchMeasurements(count: 1),
-      observation.ContractMismatchMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
-        attempt: observation.AttemptRef(attempt_id:, epoch:, attempt:),
-        kind:,
+      telemetry.contract_mismatch_recorded(),
+      events.job_measurements(),
+      telemetry.ContractMismatchMetadata(
+        ref: telemetry.JobRef(
+          job_id:,
+          queue:,
+          worker_id:,
+          worker_version:,
+          correlation:,
+        ),
+        attempt: telemetry.AttemptRef(attempt_id:, epoch:, attempt:),
+        kind: convert.codec_kind(kind),
         expected_version:,
         actual_version:,
       ),
@@ -916,6 +1031,19 @@ fn run_acknowledgement(
         error: None,
         failure_description: Some(worker.unencodable_description(codec, reason)),
       )
+    worker.ExecutedSnoozeLimitReached(limit:, reason:) ->
+      AckProposal(
+        proposed_state: "business_failed",
+        failure_cause: Some(worker.business_failure_cause_to_string(
+          worker.SnoozeLimitReached,
+        )),
+        requested_delay_ms: None,
+        output_version: None,
+        output: None,
+        error_version: claim.error_version,
+        error: None,
+        failure_description: Some(worker.snooze_limit_description(limit, reason)),
+      )
     worker.ExecutedSnoozed(delay_ms, reason) ->
       AckProposal(
         proposed_state: "snoozed",
@@ -982,8 +1110,8 @@ fn run_acknowledgement(
     diagnostics.checkout(
       forwarder,
       reference,
-      diagnostic.Acknowledge,
-      diagnostic.MainPool,
+      telemetry.Acknowledge,
+      telemetry.MainPool,
       measured,
     )
   let resolved =
@@ -1006,11 +1134,12 @@ fn run_acknowledgement(
         Error(Nil) -> Nil
         Ok(committed_state) -> {
           let confirmation = case commit.via_receipt_match {
-            True -> observation.Reconciled
-            False -> observation.Replied
+            True -> telemetry.Reconciled
+            False -> telemetry.Replied
           }
           emit_acknowledged(
             forwarder,
+            events.correlation(claim.id, claim.correlation),
             queue,
             id,
             worker_id,
@@ -1033,27 +1162,27 @@ fn run_acknowledgement(
   let outcome = case resolved {
     Ok(commit) ->
       case commit.via_receipt_match {
-        True -> diagnostic.AckReconciled
-        False -> diagnostic.AckReplied
+        True -> telemetry.AckReconciled
+        False -> telemetry.AckReplied
       }
-    Error(postgres.QueueAckUnknown(..)) -> diagnostic.AckUnknown
-    Error(postgres.QueueAckStale(..)) -> diagnostic.AckFenceRejected
-    Error(postgres.QueueAckCommandConflict) -> diagnostic.AckCommandConflict
+    Error(postgres.QueueAckUnknown(..)) -> telemetry.AckUnknown
+    Error(postgres.QueueAckStale(..)) -> telemetry.AckFenceRejected
+    Error(postgres.QueueAckCommandConflict) -> telemetry.AckCommandConflict
     Error(_) ->
       case transaction_result {
-        Error(pog.TransactionRolledBack(_)) -> diagnostic.AckRolledBack
-        _ -> diagnostic.AckFailed
+        Error(pog.TransactionRolledBack(_)) -> telemetry.AckRolledBack
+        _ -> telemetry.AckFailed
       }
   }
   let _ =
     forwarder.emit(
       forwarder,
-      diagnostic.acknowledgement(),
-      diagnostic.AcknowledgementMeasurements(
+      telemetry.acknowledgement(),
+      telemetry.AcknowledgementMeasurements(
         count: 1,
         duration_us: diagnostics.monotonic_us() - started_at,
       ),
-      diagnostic.AcknowledgementMetadata(
+      telemetry.AcknowledgementMetadata(
         context: diagnostic_context_from_claim(claim, queue, attempt_owner),
         command_id:,
         outcome:,
@@ -1071,6 +1200,7 @@ fn run_acknowledgement(
 /// never affect a job's committed outcome.
 fn emit_acknowledged(
   fwd: Forwarder,
+  correlation: correlation.Correlation,
   queue: String,
   job_id: Int,
   worker_id: String,
@@ -1078,24 +1208,30 @@ fn emit_acknowledged(
   attempt_id: Int,
   epoch: Int,
   attempt: Int,
-  proposed: observation.Proposed,
+  proposed: telemetry.Proposed,
   committed_state: State,
   failure_cause: Option(worker.BusinessFailureCause),
   available_at_unix_ms: Option(Int),
-  confirmation: observation.Confirmation,
+  confirmation: telemetry.Confirmation,
   command_id: String,
 ) -> Nil {
   let _ =
     forwarder.emit(
       fwd,
-      observation.acknowledged(),
-      observation.AcknowledgedMeasurements(count: 1),
-      observation.AcknowledgedMetadata(
-        ref: observation.JobRef(job_id:, queue:, worker_id:, worker_version:),
-        attempt: observation.AttemptRef(attempt_id:, epoch:, attempt:),
+      telemetry.acknowledged(),
+      events.job_measurements(),
+      telemetry.AcknowledgedMetadata(
+        ref: telemetry.JobRef(
+          job_id:,
+          queue:,
+          worker_id:,
+          worker_version:,
+          correlation:,
+        ),
+        attempt: telemetry.AttemptRef(attempt_id:, epoch:, attempt:),
         proposed:,
-        committed_state:,
-        failure_cause:,
+        committed_state: convert.state(committed_state),
+        failure_cause: option.map(failure_cause, convert.terminal_cause),
         available_at_unix_ms:,
         confirmation:,
         command_id:,
@@ -1104,18 +1240,19 @@ fn emit_acknowledged(
   Nil
 }
 
-fn proposed_of_execution(execution: worker.Execution) -> observation.Proposed {
+fn proposed_of_execution(execution: worker.Execution) -> telemetry.Proposed {
   case execution {
-    worker.ExecutedSuccess(_, _) -> observation.ProposedSuccess
+    worker.ExecutedSuccess(_, _) -> telemetry.ProposedSuccess
     worker.ExecutedBusinessFailure(_, _, _, _) ->
-      observation.ProposedBusinessFailure
-    worker.ExecutedRetryable(_, _, _, _) -> observation.ProposedRetryable
-    worker.ExecutedInvalidInput(_) -> observation.ProposedRuntimeFailed
-    worker.ExecutedUnencodable(_, _) -> observation.ProposedRuntimeFailed
-    worker.ExecutedSnoozed(_, _) -> observation.ProposedSnoozed
-    worker.ExecutedDiscarded(_) -> observation.ProposedDiscarded
-    worker.ExecutedCancelled(_) -> observation.ProposedCancelled
-    worker.ExecutedUncertain(_) -> observation.ProposedUncertain
+      telemetry.ProposedBusinessFailure
+    worker.ExecutedRetryable(_, _, _, _) -> telemetry.ProposedRetryable
+    worker.ExecutedInvalidInput(_) -> telemetry.ProposedRuntimeFailed
+    worker.ExecutedUnencodable(_, _) -> telemetry.ProposedRuntimeFailed
+    worker.ExecutedSnoozed(_, _) -> telemetry.ProposedSnoozed
+    worker.ExecutedSnoozeLimitReached(_, _) -> telemetry.ProposedBusinessFailure
+    worker.ExecutedDiscarded(_) -> telemetry.ProposedDiscarded
+    worker.ExecutedCancelled(_) -> telemetry.ProposedCancelled
+    worker.ExecutedUncertain(_) -> telemetry.ProposedUncertain
   }
 }
 

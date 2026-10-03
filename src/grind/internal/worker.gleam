@@ -1,31 +1,24 @@
-//// Defines typed, versioned workers and the JSON codecs that persist their
-//// input, output and error.
+//// The engine's worker definition: codecs, the handler, retry, snooze,
+//// timeout and abandonment policies, and the erased execution that the
+//// consumer runs for one claimed row.
 ////
-//// A `Worker` binds an id and a version to a handler
-//// `fn(input) -> Result(output, error)` and to a `Codec` for each persisted
-//// value. Build codecs with `codec`, and workers with `define`, or with
-//// `define_with_error_codec` when the error must be stored and read back.
-////
-//// A codec's encoder returns `Result(json.Json, String)`, so a validating
-//// codec (a json_blueprint codec with refinements such as `integer_between`)
-//// can reject a value. Wrap a plain gleam_json encoder with `infallible`.
-//// A rejected input fails `submit` with `submission.InvalidInput` before
-//// anything is written. A rejected output or error, after the handler ran,
-//// ends the job as `job.RuntimeFailed`: it is not retried, and
-//// `postgres.outcome` returns `job.FailedOperationally` with the reason.
-//// `with_queue_handler` lets a handler return a `WorkerResponse` that snoozes,
-//// discards, cancels or reports an uncertain outcome. `with_max_attempts` and
-//// `with_retry_policy` control retries. Register workers in a `grind/registry`,
-//// submit jobs with `grind/postgres` and run them with `grind/queue`.
+//// `grind/worker` builds these values for callers. The test suite also uses
+//// the engine-level constructors here (`codec`, `define`,
+//// `define_with_error_codec`, `with_queue_handler`), which keep the shapes
+//// the storage tests were written against.
 
 import gleam/dynamic/decode
+import gleam/erlang/process
+import gleam/int
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import gleam/time/timestamp.{type Timestamp}
+import sinal/correlation.{type Correlation}
 
 /// A versioned JSON boundary for one caller-owned value type.
-pub opaque type Codec(value) {
+pub type Codec(value) {
   Codec(
     version: String,
     encode: fn(value) -> Result(json.Json, String),
@@ -37,30 +30,7 @@ pub type CodecError {
   EmptyCodecVersion
 }
 
-/// Creates a JSON codec whose version is persisted with each job.
-///
-/// `encode` may reject a value with a reason, which Grind reports without
-/// parsing it: `submit` returns `submission.InvalidInput(reason)` and writes
-/// nothing, and a worker whose output or error is rejected ends the job as
-/// `job.RuntimeFailed`. A plain gleam_json encoder cannot fail; wrap it with
-/// `infallible`:
-///
-/// ```gleam
-/// worker.codec("email-v1", worker.infallible(encode_email), email_decoder())
-/// ```
-///
-/// A json_blueprint codec maps its encode error to the reason:
-///
-/// ```gleam
-/// worker.codec(
-///   "invoice-v1",
-///   fn(value) {
-///     codec.to_json(invoice_codec, value)
-///     |> result.map_error(codec.describe_encode_error)
-///   },
-///   codec.decoder(invoice_codec),
-/// )
-/// ```
+/// Creates a codec, rejecting an empty version.
 pub fn codec(
   version: String,
   encode: fn(value) -> Result(json.Json, String),
@@ -72,8 +42,7 @@ pub fn codec(
   }
 }
 
-/// Adapts an encoder that cannot fail, such as `json.string` or a
-/// hand-written gleam_json encoder, to the encoder shape `codec` takes.
+/// Adapts an encoder that cannot fail to the encoder shape a codec takes.
 pub fn infallible(
   encode: fn(value) -> json.Json,
 ) -> fn(value) -> Result(json.Json, String) {
@@ -86,7 +55,7 @@ pub type DefinitionError {
 }
 
 /// A checked relative duration returned by a queue-aware worker.
-pub opaque type RetryDelay {
+pub type RetryDelay {
   RetryDelay(milliseconds: Int)
 }
 
@@ -99,24 +68,30 @@ pub type RetryDelayError {
 /// The conversion multiplies by a one-millisecond interval at PostgreSQL's
 /// microsecond resolution, so this conservative bound keeps the interval value
 /// within the exact-integer range of `double precision`.
+pub const retry_delay_maximum = 9_007_199_254_740
+
 pub fn retry_delay_maximum_milliseconds() -> Int {
-  9_007_199_254_740
+  retry_delay_maximum
 }
 
 pub fn retry_delay(milliseconds: Int) -> Result(RetryDelay, RetryDelayError) {
   case milliseconds < 0 {
     True -> Error(RetryDelayMustNotBeNegative)
     False ->
-      case milliseconds > retry_delay_maximum_milliseconds() {
+      case milliseconds > retry_delay_maximum {
         True -> Error(RetryDelayExceedsSupportedMaximum)
         False -> Ok(RetryDelay(milliseconds))
       }
   }
 }
 
+/// Clamps a millisecond delay into the supported range.
+pub fn clamped_retry_delay(milliseconds: Int) -> RetryDelay {
+  RetryDelay(int.clamp(milliseconds, min: 0, max: retry_delay_maximum))
+}
+
 pub fn retry_delay_milliseconds(delay: RetryDelay) -> Int {
-  let RetryDelay(milliseconds) = delay
-  milliseconds
+  delay.milliseconds
 }
 
 /// A typed queue response. String reasons are operational evidence and do not
@@ -148,7 +123,7 @@ pub type RetryDecision {
   DoNotRetry
 }
 
-pub opaque type RetryPolicy(error) {
+pub type RetryPolicy(error) {
   RetryPolicy(fn(RetryFailure(error), RetryContext) -> RetryDecision)
 }
 
@@ -158,54 +133,116 @@ pub type RetryPolicyError {
 }
 
 /// Largest attempt limit representable by the PostgreSQL `bigint` column.
+pub const max_attempts_maximum = 9_223_372_036_854_775_807
+
 pub fn max_attempts_supported_maximum() -> Int {
-  9_223_372_036_854_775_807
+  max_attempts_maximum
 }
 
-/// Creates a pure retry policy callback. It is bound to a worker definition
-/// before the worker is registered or any queue resources are acquired.
 pub fn retry_policy(
   choose: fn(RetryFailure(error), RetryContext) -> RetryDecision,
 ) -> RetryPolicy(error) {
   RetryPolicy(choose)
 }
 
-/// Sets the persisted business-attempt limit while retaining default backoff.
-pub fn with_max_attempts(
-  worker: Worker(input, output, error),
-  max_attempts: Int,
-) -> Result(Worker(input, output, error), RetryPolicyError) {
-  case max_attempts > 0 {
-    True ->
-      case max_attempts <= max_attempts_supported_maximum() {
-        True -> Ok(Worker(..worker, max_attempts:))
-        False -> Error(AttemptLimitExceedsSupportedMaximum)
-      }
-    False -> Error(AttemptLimitMustBePositive)
-  }
+/// What happens to an attempt whose node died, whose handler was killed by
+/// its timeout, or whose lease otherwise expired before an acknowledgement.
+pub type Abandonment {
+  /// The job becomes `uncertain` and waits for an audited resolution.
+  HoldUncertain
+  /// Lease-expiry recovery requeues the job up to `max_replays` times, then
+  /// holds it `uncertain`.
+  ReplayAfterLeaseExpiry(max_replays: Int)
 }
 
-pub fn from_result(
-  result: Result(output, error),
-) -> WorkerResponse(output, error) {
-  case result {
-    Ok(output) -> WorkerSucceeded(output)
-    Error(error) -> WorkerFailed(error)
-  }
+/// What a running handler knows about its job.
+pub type Context {
+  Context(
+    job_id: Int,
+    attempt: Int,
+    max_attempts: Int,
+    snooze_count: Int,
+    queue: String,
+    correlation: Correlation,
+    cancellation: process.Selector(Nil),
+    deadline: Option(Timestamp),
+  )
 }
+
+/// A context for running a handler outside a consumer, as `grind/testing`
+/// and the unit tests do. Its cancellation selector never fires.
+pub fn synthetic_context(
+  job_id job_id: Int,
+  attempt attempt: Int,
+  max_attempts max_attempts: Int,
+  snooze_count snooze_count: Int,
+  queue queue: String,
+) -> Context {
+  Context(
+    job_id:,
+    attempt:,
+    max_attempts:,
+    snooze_count:,
+    queue:,
+    correlation: correlation.from_key("grind-job-" <> int.to_string(job_id)),
+    cancellation: process.new_selector(),
+    deadline: None,
+  )
+}
+
+/// The default handler timeout: 15 minutes.
+pub const default_timeout_ms = 900_000
+
+/// The default snooze limit per job.
+pub const default_max_snoozes = 100
+
+/// The default business-attempt limit.
+pub const default_max_attempts = 20
+
+/// The default queue.
+pub const default_queue = "default"
 
 /// A typed worker definition retaining its handler and all persistence codecs.
-pub opaque type Worker(input, output, error) {
+pub type Worker(input, output, error) {
   Worker(
     id: String,
     version: String,
+    queue: String,
     input: Codec(input),
     output: Codec(output),
     error: Option(Codec(error)),
-    perform: fn(input) -> Result(output, error),
-    queue_handler: Option(fn(input) -> WorkerResponse(output, error)),
+    handle: fn(Context, input) -> WorkerResponse(output, error),
     max_attempts: Int,
     retry_policy: Option(fn(RetryFailure(error), RetryContext) -> RetryDecision),
+    timeout_ms: Option(Int),
+    max_snoozes: Int,
+    abandonment: Abandonment,
+  )
+}
+
+/// Builds a worker with the engine defaults. The public constructors in
+/// `grind/worker` check the strings first.
+pub fn new(
+  id: String,
+  version: String,
+  input: Codec(input),
+  output: Codec(output),
+  error: Option(Codec(error)),
+  handle: fn(Context, input) -> WorkerResponse(output, error),
+) -> Worker(input, output, error) {
+  Worker(
+    id:,
+    version:,
+    queue: default_queue,
+    input:,
+    output:,
+    error:,
+    handle:,
+    max_attempts: default_max_attempts,
+    retry_policy: None,
+    timeout_ms: Some(default_timeout_ms),
+    max_snoozes: default_max_snoozes,
+    abandonment: HoldUncertain,
   )
 }
 
@@ -244,37 +281,52 @@ fn create(
     "", _ -> Error(EmptyWorkerId)
     _, "" -> Error(EmptyWorkerVersion)
     _, _ ->
-      Ok(Worker(
-        id:,
-        version:,
-        input:,
-        output:,
-        error:,
-        perform:,
-        queue_handler: None,
-        max_attempts: 20,
-        retry_policy: None,
-      ))
+      Ok(
+        new(id, version, input, output, error, fn(_context, input) {
+          from_result(perform(input))
+        }),
+      )
   }
 }
 
-/// Calls the worker handler and preserves its caller-owned output and error types.
-pub fn invoke(
+/// Sets the persisted business-attempt limit while retaining default backoff.
+pub fn with_max_attempts(
   worker: Worker(input, output, error),
-  input: input,
-) -> Result(output, error) {
-  let Worker(perform:, ..) = worker
-  perform(input)
+  max_attempts: Int,
+) -> Result(Worker(input, output, error), RetryPolicyError) {
+  case max_attempts > 0 {
+    True ->
+      case max_attempts <= max_attempts_maximum {
+        True -> Ok(Worker(..worker, max_attempts:))
+        False -> Error(AttemptLimitExceedsSupportedMaximum)
+      }
+    False -> Error(AttemptLimitMustBePositive)
+  }
 }
 
-/// Uses a scheduling-aware queue callback without changing ordinary `invoke`.
-/// The worker's ID, versions, and codecs remain bound to the original
-/// definition.
+pub fn from_result(
+  result: Result(output, error),
+) -> WorkerResponse(output, error) {
+  case result {
+    Ok(output) -> WorkerSucceeded(output)
+    Error(error) -> WorkerFailed(error)
+  }
+}
+
+/// Uses a scheduling-aware handler that ignores the job context.
 pub fn with_queue_handler(
   worker: Worker(input, output, error),
   handler: fn(input) -> WorkerResponse(output, error),
 ) -> Worker(input, output, error) {
-  Worker(..worker, queue_handler: Some(handler))
+  Worker(..worker, handle: fn(_context, input) { handler(input) })
+}
+
+/// Uses a handler that receives the job context.
+pub fn with_handler(
+  worker: Worker(input, output, error),
+  handle: fn(Context, input) -> WorkerResponse(output, error),
+) -> Worker(input, output, error) {
+  Worker(..worker, handle:)
 }
 
 /// Replaces the default retry callback on a worker definition. The attempt
@@ -289,39 +341,28 @@ pub fn with_retry_policy(
   Worker(..worker, retry_policy: Some(choose))
 }
 
-/// Runs the queue-specific callback, adapting ordinary `Result` handlers when
-/// no queue callback was supplied. A worker is invoked exactly once.
+/// Runs the handler once.
 pub fn respond(
   worker: Worker(input, output, error),
+  context: Context,
   input: input,
 ) -> WorkerResponse(output, error) {
-  let Worker(perform:, queue_handler:, ..) = worker
-  case queue_handler {
-    Some(handler) -> handler(input)
-    None -> from_result(perform(input))
-  }
+  worker.handle(context, input)
 }
 
-/// Why a worker's business failure is terminal — never retried again, either
-/// because its retry budget is spent or because the worker itself declined
-/// a retry. Carried by `Execution.ExecutedBusinessFailure.cause` and, from
-/// there, by `job.Outcome`'s `BusinessFailedWithCause`/
-/// `FailedOperationallyWithCause`; lives here rather than on `grind/job`
-/// since `grind/job` already depends on `grind/worker` (for `Codec`/
-/// `Worker`), not the other way around.
+/// Why a worker's business failure is terminal.
 pub type BusinessFailureCause {
   BudgetExhausted
   RetryDeclined
+  SnoozeLimitReached
 }
 
-/// The stable, storage-facing string for a `BusinessFailureCause` — the one
-/// place this mapping is written. `business_failure_cause_from_string` is
-/// its inverse. Internal: only Grind's own storage/observation code needs
-/// this mapping; a caller holds a typed `BusinessFailureCause` already.
+/// The stable, storage-facing string for a `BusinessFailureCause`.
 pub fn business_failure_cause_to_string(cause: BusinessFailureCause) -> String {
   case cause {
     BudgetExhausted -> "budget_exhausted"
     RetryDeclined -> "retry_declined"
+    SnoozeLimitReached -> "snooze_limit_reached"
   }
 }
 
@@ -331,6 +372,7 @@ pub fn business_failure_cause_from_string(
   case raw {
     "budget_exhausted" -> Ok(BudgetExhausted)
     "retry_declined" -> Ok(RetryDeclined)
+    "snooze_limit_reached" -> Ok(SnoozeLimitReached)
     _ -> Error(Nil)
   }
 }
@@ -340,6 +382,7 @@ pub type ResolvedResponse(output, error) {
   ResolvedRetryable(error, RetryDelay)
   ResolvedBusinessFailure(error, BusinessFailureCause)
   ResolvedSnoozed(RetryDelay, String)
+  ResolvedSnoozeLimitReached(limit: Int, reason: String)
   ResolvedDiscarded(String)
   ResolvedCancelled(String)
   ResolvedUncertain(String)
@@ -360,8 +403,7 @@ pub fn resolve_response(
       case current_attempt >= max_attempts {
         True -> ResolvedBusinessFailure(application_error, BudgetExhausted)
         False -> {
-          let Worker(retry_policy:, ..) = worker
-          let decision = case retry_policy {
+          let decision = case worker.retry_policy {
             Some(choose) -> choose(BusinessFailure(application_error), context)
             None -> RetryAfter(default_retry_delay(current_attempt))
           }
@@ -373,7 +415,11 @@ pub fn resolve_response(
         }
       }
     }
-    WorkerSnoozed(delay, reason) -> ResolvedSnoozed(delay, reason)
+    WorkerSnoozed(delay, reason) ->
+      case context.snooze_count >= worker.max_snoozes {
+        True -> ResolvedSnoozeLimitReached(worker.max_snoozes, reason)
+        False -> ResolvedSnoozed(delay, reason)
+      }
     WorkerDiscarded(reason) -> ResolvedDiscarded(reason)
     WorkerCancelled(reason) -> ResolvedCancelled(reason)
     WorkerUncertain(evidence) -> ResolvedUncertain(evidence)
@@ -404,46 +450,42 @@ pub type Metadata {
 
 /// Internal persistence view; callers should define a worker once and submit it.
 pub fn metadata(worker: Worker(input, output, error)) -> Metadata {
-  let Worker(
-    id:,
-    version: worker_version,
-    input: Codec(version: input_version, ..),
-    output: Codec(version: output_version, ..),
-    error:,
-    max_attempts:,
-    ..,
-  ) = worker
-  let error_version = case error {
+  let error_version = case worker.error {
     Some(Codec(version:, ..)) -> Some(version)
     None -> None
   }
   Metadata(
-    id:,
-    worker_version:,
-    input_version:,
-    output_version:,
+    id: worker.id,
+    worker_version: worker.version,
+    input_version: worker.input.version,
+    output_version: worker.output.version,
     error_version:,
-    max_attempts:,
+    max_attempts: worker.max_attempts,
   )
 }
 
-/// Internal JSON encoding used at admission. `Error` carries the input
-/// codec's own rejection reason.
+/// The abandonment replay limit persisted with each admitted job.
+pub fn max_replays(worker: Worker(input, output, error)) -> Option(Int) {
+  case worker.abandonment {
+    HoldUncertain -> None
+    ReplayAfterLeaseExpiry(max_replays:) -> Some(max_replays)
+  }
+}
+
+/// JSON encoding used at admission. `Error` carries the input codec's own
+/// rejection reason.
 pub fn encode_input(
   worker: Worker(input, output, error),
   input: input,
 ) -> Result(String, String) {
-  let Worker(input: Codec(encode:, ..), ..) = worker
-  encode(input) |> result.map(json.to_string)
+  worker.input.encode(input) |> result.map(json.to_string)
 }
 
-/// Internal codec result used by typed job retrieval.
 pub fn input_codec(worker: Worker(input, output, error)) -> Codec(input) {
-  let Worker(input:, ..) = worker
-  input
+  worker.input
 }
 
-/// Internal JSON decoding that rejects stored data from another codec version.
+/// JSON decoding that rejects stored data from another codec version.
 pub fn decode_codec(
   codec: Codec(value),
   stored_version: String,
@@ -456,8 +498,8 @@ pub fn decode_codec(
   }
 }
 
-/// Internal version and JSON encoding view used by audited typed outcomes
-/// and unique keys. `Error` carries the codec's own rejection reason.
+/// Version and JSON encoding view used by audited typed outcomes and unique
+/// keys. `Error` carries the codec's own rejection reason.
 pub fn encode_value(
   codec: Codec(value),
   value: value,
@@ -468,8 +510,7 @@ pub fn encode_value(
 }
 
 pub fn codec_version(codec: Codec(value)) -> String {
-  let Codec(version:, ..) = codec
-  version
+  codec.version
 }
 
 pub type StoredCodecError {
@@ -493,38 +534,50 @@ pub type Execution {
     delay_ms: Int,
   )
   ExecutedSnoozed(delay_ms: Int, reason: String)
+  /// The handler snoozed once more than its worker's `max_snoozes` allows.
+  /// Committed as `business_failed` with cause `snooze_limit_reached` and
+  /// no stored error.
+  ExecutedSnoozeLimitReached(limit: Int, reason: String)
   ExecutedDiscarded(String)
   ExecutedCancelled(String)
   ExecutedUncertain(String)
   ExecutedInvalidInput(String)
   /// The handler ran, and its output codec (`OutputCodec`) or error codec
-  /// (`ErrorCodec`) rejected the value it returned. Committed as
-  /// `runtime_failed`, which is terminal: the job is not retried, because
-  /// the handler's effects already happened.
+  /// (`ErrorCodec`) rejected the value it returned, or the encoded value was
+  /// larger than the payload limit. Committed as `runtime_failed`, which is
+  /// terminal: the job is not retried, because the handler's effects already
+  /// happened.
   ExecutedUnencodable(codec: CodecKind, reason: String)
 }
 
-/// Internal erased invocation. The closure remains bound to this worker's types.
+/// The erased invocation. The closure remains bound to this worker's types.
+/// `max_payload_bytes` bounds the encoded output and error.
 pub fn execute_encoded(
   worker: Worker(input, output, error),
   input_version: String,
   encoded_input: String,
-  context: RetryContext,
+  context: Context,
+  max_payload_bytes: Int,
 ) -> Execution {
-  let Worker(input: input_codec, output: output_codec, ..) = worker
-  case decode_codec(input_codec, input_version, encoded_input) {
+  case decode_codec(worker.input, input_version, encoded_input) {
     Error(decode_error) -> ExecutedInvalidInput(string.inspect(decode_error))
     Ok(input) -> {
-      let response = respond(worker, input)
-      case resolve_response(worker, response, context) {
+      let response = respond(worker, context, input)
+      let retry_context =
+        RetryContext(
+          current_attempt: context.attempt,
+          max_attempts: context.max_attempts,
+          snooze_count: context.snooze_count,
+        )
+      case resolve_response(worker, response, retry_context) {
         ResolvedSucceeded(output) ->
-          case encode_value(output_codec, output) {
+          case bounded(encode_value(worker.output, output), max_payload_bytes) {
             Ok(#(output_version, encoded_output)) ->
               ExecutedSuccess(output_version, encoded_output)
             Error(reason) -> ExecutedUnencodable(OutputCodec, reason)
           }
         ResolvedRetryable(application_error, delay) ->
-          case encode_error(worker, application_error) {
+          case encode_error(worker, application_error, max_payload_bytes) {
             Ok(#(error_version, encoded_error)) ->
               ExecutedRetryable(
                 error_version,
@@ -535,7 +588,7 @@ pub fn execute_encoded(
             Error(reason) -> ExecutedUnencodable(ErrorCodec, reason)
           }
         ResolvedBusinessFailure(application_error, cause) ->
-          case encode_error(worker, application_error) {
+          case encode_error(worker, application_error, max_payload_bytes) {
             Ok(#(error_version, encoded_error)) ->
               ExecutedBusinessFailure(
                 error_version,
@@ -547,6 +600,8 @@ pub fn execute_encoded(
           }
         ResolvedSnoozed(delay, reason) ->
           ExecutedSnoozed(retry_delay_milliseconds(delay), reason)
+        ResolvedSnoozeLimitReached(limit:, reason:) ->
+          ExecutedSnoozeLimitReached(limit:, reason:)
         ResolvedDiscarded(reason) -> ExecutedDiscarded(reason)
         ResolvedCancelled(reason) -> ExecutedCancelled(reason)
         ResolvedUncertain(evidence) -> ExecutedUncertain(evidence)
@@ -555,14 +610,35 @@ pub fn execute_encoded(
   }
 }
 
+/// The reason a payload of `bytes` bytes is refused under `limit`.
+pub fn payload_too_large_reason(bytes: Int, limit: Int) -> String {
+  "encoded payload of "
+  <> int.to_string(bytes)
+  <> " bytes exceeds the limit of "
+  <> int.to_string(limit)
+  <> " bytes"
+}
+
+fn bounded(
+  encoded: Result(#(String, String), String),
+  max_payload_bytes: Int,
+) -> Result(#(String, String), String) {
+  use #(version, text) <- result.try(encoded)
+  let bytes = string.byte_size(text)
+  case bytes > max_payload_bytes {
+    True -> Error(payload_too_large_reason(bytes, max_payload_bytes))
+    False -> Ok(#(version, text))
+  }
+}
+
 fn encode_error(
   worker: Worker(input, output, error),
   application_error: error,
+  max_payload_bytes: Int,
 ) -> Result(#(Option(String), Option(String)), String) {
-  let Worker(error:, ..) = worker
-  case error {
+  case worker.error {
     Some(codec) ->
-      encode_value(codec, application_error)
+      bounded(encode_value(codec, application_error), max_payload_bytes)
       |> result.map(fn(encoded) {
         let #(version, encoded_error) = encoded
         #(Some(version), Some(encoded_error))
@@ -580,14 +656,30 @@ pub fn unencodable_description(codec: CodecKind, reason: String) -> String {
   }
 }
 
-fn default_retry_delay(current_attempt: Int) -> RetryDelay {
-  let delay_ms = default_retry_delay_milliseconds(current_attempt)
-  let assert Ok(delay) = retry_delay(delay_ms)
-  delay
+/// The stored failure description for an `ExecutedSnoozeLimitReached`
+/// proposal.
+pub fn snooze_limit_description(limit: Int, reason: String) -> String {
+  "snooze limit of " <> int.to_string(limit) <> " reached: " <> reason
 }
 
-/// Deterministic exponential backoff used when a worker has no custom policy.
-/// The first failed business attempt waits 15 seconds, capped at one day.
+/// The default delay before retry `current_attempt + 1`, with up to 10%
+/// random jitter added so that jobs that failed together do not retry
+/// together.
+fn default_retry_delay(current_attempt: Int) -> RetryDelay {
+  let base = default_retry_delay_milliseconds(current_attempt)
+  clamped_retry_delay(base + jitter(base / 10))
+}
+
+fn jitter(span: Int) -> Int {
+  case span > 0 {
+    True -> int.random(span + 1)
+    False -> 0
+  }
+}
+
+/// Deterministic exponential backoff used when a worker has no custom policy,
+/// before jitter. The first failed business attempt waits 15 seconds, capped
+/// at one day.
 pub fn default_retry_delay_milliseconds(current_attempt: Int) -> Int {
   let exponent = case current_attempt > 1 {
     True -> current_attempt - 1
@@ -607,10 +699,9 @@ fn default_retry_delay_loop(exponent: Int, current_ms: Int) -> Int {
   }
 }
 
-/// Internal typed fields retained by admitted job handles.
+/// Typed fields retained by admitted job handles.
 pub fn handle_data(
   worker: Worker(input, output, error),
 ) -> #(Metadata, Codec(input), Codec(output), Option(Codec(error))) {
-  let Worker(input:, output:, error:, ..) = worker
-  #(metadata(worker), input, output, error)
+  #(metadata(worker), worker.input, worker.output, worker.error)
 }

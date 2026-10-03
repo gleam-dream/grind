@@ -7,6 +7,7 @@ import gleam/string
 import grind/internal/postgres
 import grind/internal/worker
 import grind_bench/audit
+import grind_bench/harness_db
 import grind_bench/load/runtime
 import grind_bench/preload
 import grind_bench/worker as bench_worker
@@ -92,7 +93,7 @@ pub fn record_submissions(
       |> pog.parameter(pog.int(bench_index))
       |> pog.parameter(pog.int(job_id))
       |> pog.parameter(pog.text(queue_name))
-    pog.execute(query, ledger) |> result.map(fn(_) { Nil })
+    harness_db.execute(query, ledger) |> result.map(fn(_) { Nil })
   })
 }
 
@@ -124,12 +125,12 @@ pub fn analyze_and_checkpoint(
   ledger: pog.Connection,
 ) -> Nil {
   let connection = postgres.connection(database)
-  case pog.execute(pog.query("ANALYZE grind_jobs"), connection) {
+  case harness_db.execute(pog.query("ANALYZE grind_jobs"), connection) {
     Ok(_) -> Nil
     Error(err) ->
       io.println("grind_bench/load: ANALYZE failed: " <> string.inspect(err))
   }
-  case pog.execute(pog.query("CHECKPOINT"), ledger) {
+  case harness_db.execute(pog.query("CHECKPOINT"), ledger) {
     Ok(_) -> Nil
     Error(err) ->
       io.println("grind_bench/load: CHECKPOINT failed: " <> string.inspect(err))
@@ -160,7 +161,7 @@ fn poll_drain(
           decode.success(value)
         })
       let assert Ok(pog.Returned(rows: [missing], ..)) =
-        pog.execute(query, drain)
+        harness_db.execute(query, drain)
       case missing == 0 {
         True -> Ok(Nil)
         False ->

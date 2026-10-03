@@ -39,6 +39,10 @@ const released_migration_sha256 = [
     "20260925000000-grind_v11.sql",
     "2B79E6CBD28A36850E31E1D69CC0C353D9CCFC4A4D8CEC688B0DC9C4ECEF17A0",
   ),
+  #(
+    "20260926000000-grind_v12.sql",
+    "47364E79BB2EDB52C1BB99BA0D2E3498AB0B73ECF4B6EB0B3F39C5DD5F4DB32F",
+  ),
 ]
 
 /// Proves `grind/internal/migrations.migrations()` (what `postgres.migrate`
@@ -225,19 +229,19 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   // DDL, through cigogne's own public engine, not Grind's `migrate`.
   let cigogne_config = cigogne_config_for(connection)
   let assert Ok(engine) = cigogne.create_engine(cigogne_config)
-  cigogne.get_unapplied_migrations(engine) |> list.length |> should.equal(2)
+  cigogne.get_unapplied_migrations(engine) |> list.length |> should.equal(3)
   let assert Ok(Nil) = cigogne.apply_all(engine)
 
   // 2. Grind accepts the result: `read_schema_generation` (exercised via
   // `migrate`'s own version read) recognizes the schema as a legitimate,
-  // fully up-to-date v12 install rather than `IncompatibleSchema`/
+  // fully up-to-date v13 install rather than `IncompatibleSchema`/
   // `UnsupportedSchemaVersion` — and running `migrate` against it is a
   // genuine no-op: no new marker rows, `Ok(Nil)` with zero steps run.
   let assert Ok(marker_count_before) = schema_marker_count(connection)
-  marker_count_before |> should.equal(2)
+  marker_count_before |> should.equal(3)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(marker_count_after) = schema_marker_count(connection)
-  marker_count_after |> should.equal(2)
+  marker_count_after |> should.equal(3)
 
   // 3. Fully functional for ordinary API traffic: submit, claim, and run a
   // job to completion against the cigogne-applied schema.
@@ -308,14 +312,14 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   let assert Ok(engine_at_v12) = cigogne.create_engine(cigogne_config)
   let assert Ok(Nil) = cigogne.rollback(engine_at_v12)
   let assert Ok(marker_after_rollback) = schema_marker_count(connection)
-  marker_after_rollback |> should.equal(1)
+  marker_after_rollback |> should.equal(2)
   let assert Ok(engine_at_v11) = cigogne.create_engine(cigogne_config)
   let assert Ok(Nil) = cigogne.apply(engine_at_v11)
   let assert Ok(marker_after_reapply) = schema_marker_count(connection)
-  marker_after_reapply |> should.equal(2)
+  marker_after_reapply |> should.equal(3)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(marker_after_migrate_noop) = schema_marker_count(connection)
-  marker_after_migrate_noop |> should.equal(2)
+  marker_after_migrate_noop |> should.equal(3)
   postgres.outcome(database, handle)
   |> should.equal(Ok(job.SucceededWith("cigogne-9")))
 
@@ -460,7 +464,7 @@ fn run_cigogne_concurrent_test(database_url: String) -> Nil {
   let assert Ok(engine_v12) = engine_v12
   cigogne.get_unapplied_migrations(engine_v12)
   |> list.length
-  |> should.equal(1)
+  |> should.equal(2)
 
   let cigogne_result = process.new_subject()
   let migrate_result = process.new_subject()
@@ -504,6 +508,6 @@ fn run_cigogne_concurrent_test(database_url: String) -> Nil {
   process.receive(migrate_result, within: 10_000) |> should.equal(Ok(Ok(Nil)))
 
   let assert Ok(marker_count) = schema_marker_count(connection)
-  marker_count |> should.equal(2)
+  marker_count |> should.equal(3)
   mark_database_test_executed("cigogne-migrate-concurrent-serialize-passed")
 }

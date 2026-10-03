@@ -8,12 +8,11 @@ import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/attempt
 import grind/internal/consumer as queue
-import grind/internal/diagnostic
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/ack_queries.{count_acknowledgements_for_job}
 import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt, spawn_lock_holder,
@@ -31,6 +30,7 @@ import grind/support/observation_fixtures.{
 }
 import grind/support/observers.{detach}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_databases}
+import grind/telemetry
 import pog
 import sinal
 
@@ -70,7 +70,7 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
     )
   let assert Ok(definition) =
     worker.define(
-      "observation.overflow",
+      "telemetry.overflow",
       "v1",
       input_codec,
       output_codec,
@@ -80,7 +80,7 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
   let assert Ok(workers) = registry.register(workers, definition)
   let gate_entered = process.new_subject()
   let attachment =
-    sinal.observe(diagnostic.checkout(), fn(_, metadata) {
+    sinal.observe(telemetry.checkout(), fn(_, metadata) {
       case metadata.queue.queue == "observation-overflow" {
         False -> Nil
         True -> {
@@ -125,7 +125,7 @@ fn run_acknowledged_observation_overflow_reports_dropped_test(
         "overflow-owner",
         30_000,
       )
-    let execution = attempt.execute_claim(claimed)
+    let execution = attempt.execute_claim_inline(claimed)
     attempt.acknowledge(
       database,
       "observation-overflow",
@@ -184,7 +184,7 @@ fn run_acknowledged_observation_raising_handler_test(
     )
   let assert Ok(definition) =
     worker.define(
-      "observation.raising",
+      "telemetry.raising",
       "v1",
       input_codec,
       output_codec,
@@ -261,7 +261,7 @@ fn run_forwarder_crash_loop_test(database_url: String) -> Nil {
   let assert Ok(workers) = registry.register(workers, definition)
 
   let attachment =
-    sinal.observe(observation.acknowledged(), fn(_measurements, _metadata) {
+    sinal.observe(telemetry.acknowledged(), fn(_measurements, _metadata) {
       process.kill(process.self())
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -274,7 +274,7 @@ fn run_forwarder_crash_loop_test(database_url: String) -> Nil {
   // "the restart budget must be exhausted by now" from elapsed sleep time.
   let observed = process.new_subject()
   let counter_attachment =
-    sinal.observe(observation.acknowledged(), fn(_, _) {
+    sinal.observe(telemetry.acknowledged(), fn(_, _) {
       process.send(observed, Nil)
     })
   use <- exception.defer(fn() { detach(counter_attachment) })
@@ -360,7 +360,7 @@ fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
     )
   let assert Ok(definition) =
     worker.define(
-      "observation.dup.sequential",
+      "telemetry.dup.sequential",
       "v1",
       input_codec,
       output_codec,
@@ -381,7 +381,7 @@ fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
       attempt_owner,
       30_000,
     )
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
 
   let signal = process.new_subject()
   let attachment =
@@ -400,8 +400,8 @@ fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
   |> should.equal(Ok(True))
   let assert Ok(AcknowledgedSignal(_, first_metadata)) =
     process.receive(signal, within: 5000)
-  first_metadata.confirmation |> should.equal(observation.Replied)
-  first_metadata.committed_state |> should.equal(job.Succeeded)
+  first_metadata.confirmation |> should.equal(telemetry.Replied)
+  first_metadata.committed_state |> should.equal(public_job.Succeeded)
 
   // The exact same claim/execution, acknowledged a second time: this is the
   // early receipt-match site, reached with no concurrency at all.
@@ -415,8 +415,8 @@ fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
   |> should.equal(Ok(True))
   let assert Ok(AcknowledgedSignal(_, second_metadata)) =
     process.receive(signal, within: 5000)
-  second_metadata.confirmation |> should.equal(observation.Reconciled)
-  second_metadata.committed_state |> should.equal(job.Succeeded)
+  second_metadata.confirmation |> should.equal(telemetry.Reconciled)
+  second_metadata.committed_state |> should.equal(public_job.Succeeded)
   second_metadata.command_id |> should.equal(first_metadata.command_id)
 
   // Exactly two events, deterministically: a sentinel claim/ack through the
@@ -431,7 +431,7 @@ fn run_acknowledged_observation_reconciled_sequential_duplicate_test(
       attempt_owner,
       30_000,
     )
-  let sentinel_execution = attempt.execute_claim(sentinel_claimed)
+  let sentinel_execution = attempt.execute_claim_inline(sentinel_claimed)
   let #(sentinel_job_id, _, _) = attempt.claim_identity(sentinel_claimed)
   attempt.acknowledge(
     database,
@@ -514,7 +514,7 @@ fn run_acknowledged_observation_reconciled_concurrent_duplicate_test(
     postgres.submit(database_a, test_queue, definition, 8)
   let assert Ok(Some(claimed)) =
     attempt.claim_one(database_a, test_queue, workers, attempt_owner, 30_000)
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
   let #(job_id, _, _) = attempt.claim_identity(claimed)
 
   let signal = process.new_subject()
@@ -618,7 +618,7 @@ fn run_acknowledged_observation_reconciled_concurrent_duplicate_test(
     postgres.submit(database_a, test_queue, sentinel_worker, 11)
   let assert Ok(Some(sentinel_claimed)) =
     attempt.claim_one(database_a, test_queue, workers, attempt_owner, 30_000)
-  let sentinel_execution = attempt.execute_claim(sentinel_claimed)
+  let sentinel_execution = attempt.execute_claim_inline(sentinel_claimed)
   let #(sentinel_job_id, _, _) = attempt.claim_identity(sentinel_claimed)
   attempt.acknowledge(
     database_a,
@@ -631,11 +631,11 @@ fn run_acknowledged_observation_reconciled_concurrent_duplicate_test(
   assert_next_observation_is_sentinel(signal, sentinel_job_id)
 
   let confirmations = [event_1.confirmation, event_2.confirmation]
-  list.contains(confirmations, observation.Replied) |> should.equal(True)
-  list.contains(confirmations, observation.Reconciled) |> should.equal(True)
+  list.contains(confirmations, telemetry.Replied) |> should.equal(True)
+  list.contains(confirmations, telemetry.Reconciled) |> should.equal(True)
   event_1.command_id |> should.equal(event_2.command_id)
-  event_1.committed_state |> should.equal(job.Succeeded)
-  event_2.committed_state |> should.equal(job.Succeeded)
+  event_1.committed_state |> should.equal(public_job.Succeeded)
+  event_2.committed_state |> should.equal(public_job.Succeeded)
   mark_database_test_executed(
     "acknowledged-observation-reconciled-on-concurrent-duplicate-passed",
   )

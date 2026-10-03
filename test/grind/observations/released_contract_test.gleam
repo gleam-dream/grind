@@ -8,13 +8,14 @@ import gleeunit/should
 import grind/internal/attempt
 import grind/internal/consumer as queue
 import grind/internal/job
-import grind/internal/observation
 import grind/internal/postgres
 import grind/internal/registry
 import grind/internal/worker
+import grind/job as public_job
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/observers.{detach}
+import grind/telemetry
 import pog
 import sinal
 
@@ -61,7 +62,7 @@ fn run_released_observation_emission_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.released(), fn(measurements, metadata) {
+    sinal.observe(telemetry.released(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -85,13 +86,13 @@ fn run_released_observation_emission_test(database_url: String) -> Nil {
 
   let assert Ok(#(measurements, metadata)) =
     process.receive(signal, within: 5000)
-  measurements |> should.equal(observation.ReleasedMeasurements(count: 1))
+  measurements.count |> should.equal(1)
   metadata.ref.job_id |> should.equal(claimed_id)
   metadata.ref.job_id |> should.equal(job.id_value(handle))
   metadata.attempt.attempt_id |> should.equal(attempt_id)
   metadata.attempt.epoch |> should.equal(epoch)
   metadata.attempt.attempt |> should.equal(1)
-  metadata.restored_state |> should.equal(job.Queued)
+  metadata.restored_state |> should.equal(public_job.Queued)
   postgres.state(database, handle) |> should.equal(Ok(job.Queued))
   mark_database_test_executed("released-observation-emission-passed")
 }
@@ -135,7 +136,7 @@ fn run_released_observation_absent_test(database_url: String) -> Nil {
 
   let signal = process.new_subject()
   let attachment =
-    sinal.observe(observation.released(), fn(measurements, metadata) {
+    sinal.observe(telemetry.released(), fn(measurements, metadata) {
       process.send(signal, #(measurements, metadata))
     })
   use <- exception.defer(fn() { detach(attachment) })
@@ -148,7 +149,7 @@ fn run_released_observation_absent_test(database_url: String) -> Nil {
       "released-absent-owner",
       30_000,
     )
-  let execution = attempt.execute_claim(claimed)
+  let execution = attempt.execute_claim_inline(claimed)
   attempt.acknowledge(
     database,
     "released-absent",
@@ -244,7 +245,7 @@ fn run_contract_mismatch_observation_emission_test(
   let signal = process.new_subject()
   let attachment =
     sinal.observe(
-      observation.contract_mismatch_recorded(),
+      telemetry.contract_mismatch_recorded(),
       fn(measurements, metadata) {
         process.send(signal, #(measurements, metadata))
       },
@@ -268,12 +269,13 @@ fn run_contract_mismatch_observation_emission_test(
   let assert Ok(#(measurements, metadata)) =
     process.receive(signal, within: 5000)
   measurements
-  |> should.equal(observation.ContractMismatchMeasurements(count: 1))
+  |> fn(m: telemetry.JobMeasurements) { m.count }
+  |> should.equal(1)
   metadata.ref.job_id |> should.equal(job.id_value(handle))
   metadata.ref.queue |> should.equal("contract-mismatch-emission")
   metadata.ref.worker_id |> should.equal("contract.mismatch.emission")
   metadata.attempt.attempt |> should.equal(1)
-  metadata.kind |> should.equal(worker.OutputCodec)
+  metadata.kind |> should.equal(public_job.OutputCodec)
   metadata.expected_version |> should.equal("contract-mismatch-output-v2")
   metadata.actual_version |> should.equal("contract-mismatch-output-v1")
   mark_database_test_executed("contract-mismatch-observation-emission-passed")
@@ -333,7 +335,7 @@ fn run_contract_mismatch_observation_absent_test(database_url: String) -> Nil {
   let signal = process.new_subject()
   let attachment =
     sinal.observe(
-      observation.contract_mismatch_recorded(),
+      telemetry.contract_mismatch_recorded(),
       fn(measurements, metadata) {
         process.send(signal, #(measurements, metadata))
       },

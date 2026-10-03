@@ -35,8 +35,9 @@ import gleam/erlang/process
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
-import grind/internal/observation
+import gleam/result
 import grind/internal/postgres.{type Database}
+import grind/telemetry
 import pog
 import sinal/forwarder.{type Forwarder}
 
@@ -268,6 +269,23 @@ pub fn supervised(
   })
 }
 
+/// A pruner child that reads its `Database` each time it starts, so a
+/// restarted pruner uses its runtime's current one.
+pub fn supervised_from(
+  database: fn() -> Result(Database, String),
+  policy: ValidatedPrunerPolicy,
+  name: process.Name(Message),
+) -> supervision.ChildSpecification(Nil) {
+  supervision.worker(fn() {
+    case database() {
+      Error(reason) -> Error(actor.InitFailed(reason))
+      Ok(database) ->
+        actor.start(builder(database, policy, name))
+        |> result.map(fn(started) { actor.Started(started.pid, Nil) })
+    }
+  })
+}
+
 fn handle_message(
   state: PrunerState,
   message: Message,
@@ -290,13 +308,13 @@ fn handle_message(
 }
 
 /// Classifies a `postgres.PruneError` into the coarse
-/// `observation.PruneFailureKind` `[grind, prune, failed]` reports — see
+/// `telemetry.PruneFailureKind` `[grind, prune, failed]` reports — see
 /// that type's own doc comment for what each variant means and, in
 /// particular, which ones leave "did this actually delete anything"
 /// genuinely unknown rather than "no".
 fn prune_failure_kind(
   error: postgres.PruneError,
-) -> observation.PruneFailureKind {
+) -> telemetry.PruneFailureKind {
   case error {
     postgres.PruneQueryFailed(pog_error) -> query_failure_kind(pog_error)
     postgres.NonPositiveRetention
@@ -309,19 +327,19 @@ fn prune_failure_kind(
       // bounds. Mapped rather than asserted away, since a `PruneError` from
       // a future, differently-validated call site should still report
       // *something* sensible instead of crashing the pruner actor.
-      observation.PruneNotAttempted
+      telemetry.PruneNotAttempted
   }
 }
 
-fn query_failure_kind(error: pog.QueryError) -> observation.PruneFailureKind {
+fn query_failure_kind(error: pog.QueryError) -> telemetry.PruneFailureKind {
   case error {
-    pog.QueryTimeout -> observation.PruneReplyLost
-    pog.UnexpectedResultType(_) -> observation.PruneResultUndecodable
+    pog.QueryTimeout -> telemetry.PruneReplyLost
+    pog.UnexpectedResultType(_) -> telemetry.PruneResultUndecodable
     pog.ConstraintViolated(_, _, _) | pog.PostgresqlError(_, _, _) ->
-      observation.PruneRejected
+      telemetry.PruneRejected
     pog.ConnectionUnavailable
     | pog.UnexpectedArgumentCount(_, _)
-    | pog.UnexpectedArgumentType(_, _) -> observation.PruneNotAttempted
+    | pog.UnexpectedArgumentType(_, _) -> telemetry.PruneNotAttempted
   }
 }
 
@@ -334,9 +352,9 @@ fn emit_prune_failed(
   let _ =
     forwarder.emit(
       fwd,
-      observation.prune_failed(),
-      observation.PruneFailedMeasurements(count: 1),
-      observation.PruneFailedMetadata(
+      telemetry.prune_failed(),
+      telemetry.PruneFailedMeasurements(count: 1),
+      telemetry.PruneFailedMetadata(
         older_than_ms: max_age_ms,
         limit:,
         kind: prune_failure_kind(error),

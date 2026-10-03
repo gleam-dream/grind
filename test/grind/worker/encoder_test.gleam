@@ -56,8 +56,14 @@ fn definition(
   definition
 }
 
-fn context(current_attempt: Int, max_attempts: Int) -> worker.RetryContext {
-  worker.RetryContext(current_attempt:, max_attempts:, snooze_count: 0)
+fn context(current_attempt: Int, max_attempts: Int) -> worker.Context {
+  worker.synthetic_context(
+    job_id: 1,
+    attempt: current_attempt,
+    max_attempts:,
+    snooze_count: 0,
+    queue: "default",
+  )
 }
 
 pub fn infallible_adapts_a_total_encoder_test() {
@@ -73,13 +79,13 @@ pub fn encode_input_reports_the_codec_reason_test() {
 
 pub fn accepted_output_is_proposed_as_success_test() {
   definition(fn(_) { Ok("fine") })
-  |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3))
+  |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3), 1_048_576)
   |> should.equal(worker.ExecutedSuccess("encoder-output-v1", "\"fine\""))
 }
 
 pub fn rejected_output_is_proposed_as_unencodable_test() {
   definition(fn(_) { Ok("too long") })
-  |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3))
+  |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3), 1_048_576)
   |> should.equal(worker.ExecutedUnencodable(
     worker.OutputCodec,
     "longer than 4 bytes",
@@ -88,7 +94,7 @@ pub fn rejected_output_is_proposed_as_unencodable_test() {
 
 pub fn rejected_error_with_retries_left_is_not_retried_test() {
   definition(fn(_) { Error(AccountMissing(-5)) })
-  |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3))
+  |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3), 1_048_576)
   |> should.equal(worker.ExecutedUnencodable(
     worker.ErrorCodec,
     "account id must be at least 0",
@@ -97,7 +103,7 @@ pub fn rejected_error_with_retries_left_is_not_retried_test() {
 
 pub fn rejected_error_on_the_last_attempt_is_unencodable_test() {
   definition(fn(_) { Error(AccountMissing(-5)) })
-  |> worker.execute_encoded("encoder-input-v1", "1", context(3, 3))
+  |> worker.execute_encoded("encoder-input-v1", "1", context(3, 3), 1_048_576)
   |> should.equal(worker.ExecutedUnencodable(
     worker.ErrorCodec,
     "account id must be at least 0",
@@ -112,7 +118,7 @@ pub fn accepted_error_keeps_the_retry_disposition_test() {
     _delay,
   ) =
     definition(fn(_) { Error(AccountMissing(5)) })
-    |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3))
+    |> worker.execute_encoded("encoder-input-v1", "1", context(1, 3), 1_048_576)
   error_version |> should.be_some
   encoded_error |> should.be_some
 }

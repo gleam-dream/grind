@@ -10,6 +10,7 @@ import gleam/list
 import gleam/result
 import gleam/string
 import grind/internal/consumer as queue
+import grind_bench/harness_db
 import grind_bench/load/context
 import grind_bench/load/runtime
 import grind_bench/load/workload
@@ -289,7 +290,7 @@ fn completion_snapshot(
       use value <- decode.field(1, decode.int)
       decode.success(#(name, json.int(value)))
     })
-  pog.execute(query, connection)
+  harness_db.execute(query, connection)
   |> result.map(fn(returned) { json.object(returned.rows) })
   |> result.map_error(string.inspect)
 }

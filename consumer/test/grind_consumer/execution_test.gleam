@@ -1,116 +1,116 @@
-import exception
-import gleam/erlang/process
-import gleeunit/should
-import grind/internal/consumer as queue
-import grind/internal/job
-import grind/internal/postgres
-import grind/internal/registry
-import grind/internal/worker
-import grind_consumer.{PaymentRejected, PaymentRequest}
-import grind_consumer/support/env
-import grind_consumer/support/wait
-import grind_consumer/support/workers
+//// The common task from outside the package: one runtime with two
+//// differently typed workers, one submit each, `await`.
 
-pub fn public_consumer_executes_typed_workers_test() {
+import gleam/erlang/process
+import gleam/option
+import gleam/time/duration
+import gleeunit/should
+import grind
+import grind/job
+import grind/queue
+import grind/worker
+import grind_consumer.{
+  type PaymentError, type PaymentRequest, PaymentRejected, PaymentRequest,
+}
+import grind_consumer/support/env
+
+fn charge_worker() -> worker.Worker(PaymentRequest, String, PaymentError) {
+  worker.new(
+    env.unique("payments.charge"),
+    input: grind_consumer.payment_request_codec(),
+    output: grind_consumer.text_codec(),
+    perform: fn(request) {
+      case request {
+        PaymentRequest("missing/99", _) -> Error(PaymentRejected("missing/99"))
+        PaymentRequest(key, amount) -> {
+          let #(receipt, _) = env.apply_synthetic_effect(key, amount)
+          Ok(receipt)
+        }
+      }
+    },
+  )
+  |> worker.with_queue(env.unique("payments"))
+  |> worker.with_error_codec(grind_consumer.payment_error_codec())
+  |> worker.with_max_attempts(1)
+}
+
+fn report_worker() -> worker.Worker(Int, Int, Nil) {
+  worker.new(
+    env.unique("reports.double"),
+    input: grind_consumer.amount_codec(),
+    output: grind_consumer.amount_codec(),
+    perform: fn(amount) { Ok(amount * 2) },
+  )
+  |> worker.with_queue(env.unique("reports"))
+}
+
+pub fn two_typed_workers_run_from_one_runtime_test() {
   case env.database_url() {
     Error(Nil) -> Nil
-    Ok(url) -> run_public_consumer_test(url)
+    Ok(url) -> {
+      env.reset_effects()
+      let charge = charge_worker()
+      let report = report_worker()
+      use jobs <- env.with_grind(url, fn(config) {
+        config
+        |> grind.with_worker(charge)
+        |> grind.with_worker(report)
+        |> grind.with_queue(
+          queue.new(charge.queue)
+          |> queue.with_concurrency(4)
+          |> queue.with_poll_interval(duration.milliseconds(50)),
+        )
+      })
+      let assert Ok(grind.Inserted(paid)) =
+        grind.submit(jobs, job.new(charge, PaymentRequest("order/1", 12)))
+      let assert Ok(grind.Inserted(rejected)) =
+        grind.submit(jobs, job.new(charge, PaymentRequest("missing/99", 1)))
+      let assert Ok(grind.Inserted(doubled)) =
+        grind.submit(jobs, job.new(report, 21))
+      let within = duration.seconds(10)
+      let assert Ok(grind.Succeeded(_receipt)) =
+        grind.await(jobs, paid, within:)
+      grind.await(jobs, rejected, within:)
+      |> should.equal(
+        Ok(grind.Failed(
+          grind.Business(PaymentRejected("missing/99")),
+          option.Some(job.BudgetExhausted),
+          "worker returned an application error",
+        )),
+      )
+      grind.await(jobs, doubled, within:)
+      |> should.equal(Ok(grind.Succeeded(42)))
+      env.synthetic_effect_count("order/1") |> should.equal(1)
+      env.mark("two-worker-consumer-passed")
+    }
   }
 }
 
-fn run_public_consumer_test(url: String) -> Nil {
-  let assert Ok(policy) =
-    queue.default_policy()
-    |> queue.with_poll_interval(60_000)
-    |> queue.validate_policy
-  let assert Ok(settings) =
-    postgres.settings(url)
-    |> postgres.validate
-  let assert Ok(database) = postgres.start(settings)
-  use <- exception.defer(fn() { postgres.close(database) })
-  let assert Ok(Nil) = postgres.migrate(database)
-  env.reset_effects()
-
-  let payment_probe = process.new_subject()
-  let report_probe = process.new_subject()
-  let payment_worker = workers.payment_worker(payment_probe)
-  let report_worker = workers.report_worker(report_probe)
-  let assert Ok(workers) = registry.new("external-consumer")
-  let assert Ok(workers) = registry.register(workers, payment_worker)
-  let assert Ok(workers) = registry.register(workers, report_worker)
-
-  let assert Ok(payment_handle) =
-    postgres.submit(
-      database,
-      "external-consumer",
-      payment_worker,
-      PaymentRequest("payment/42", 500),
-    )
-  // A second, independently admitted job reuses the same application
-  // idempotency key as `payment_handle`. Nothing is preseeded: this is what
-  // actually exercises the app's own dedup table, because the worker's own
-  // effect application for this second job is the one that must observe the
-  // key already taken by the first job's own execution.
-  let assert Ok(dedup_handle) =
-    postgres.submit(
-      database,
-      "external-consumer",
-      payment_worker,
-      PaymentRequest("payment/42", 500),
-    )
-  let assert Ok(report_handle) =
-    postgres.submit(database, "external-consumer", report_worker, 8)
-  let assert Ok(failure_handle) =
-    postgres.submit(
-      database,
-      "external-consumer",
-      payment_worker,
-      PaymentRequest("missing/99", 0),
-    )
-
-  let assert Ok(consumer) = queue.start(database, workers, policy)
-  use <- exception.defer(fn() { queue.stop(consumer) })
-
-  process.receive(payment_probe, within: 5000)
-  |> should.equal(Ok(workers.ChargeInvoked))
-  process.receive(payment_probe, within: 5000)
-  |> should.equal(Ok(workers.ChargeInvoked))
-  process.receive(report_probe, within: 5000)
-  |> should.equal(Ok(workers.ReportInvoked))
-  process.receive(payment_probe, within: 5000)
-  |> should.equal(Ok(workers.ChargeInvoked))
-
-  // Handler probes arrive before their database acknowledgements. Wait for the
-  // committed job states themselves before reading typed outcomes.
-  wait.await_state(database, payment_handle, job.Succeeded, 250)
-  |> should.equal(True)
-  wait.await_state(database, dedup_handle, job.Succeeded, 250)
-  |> should.equal(True)
-  wait.await_state(database, report_handle, job.Succeeded, 250)
-  |> should.equal(True)
-  wait.await_state(database, failure_handle, job.BusinessFailed, 250)
-  |> should.equal(True)
-  // Both payment jobs called into the same synthetic effect for the same
-  // key, yet the key was only ever actually applied once.
-  env.synthetic_effect_count("payment/42") |> should.equal(1)
-  // The receipt carries a unique token minted only inside the app's own
-  // table (consumer_effect.erl), so reading it back here and asserting both
-  // jobs' committed outcomes equal it proves the outcome's value actually
-  // came from that table -- not merely a value this test could have
-  // predicted as a pure function of the key.
-  let assert Ok(payment_receipt) = env.synthetic_effect_receipt("payment/42")
-  postgres.outcome(database, payment_handle)
-  |> should.equal(Ok(job.SucceededWith(payment_receipt)))
-  postgres.outcome(database, dedup_handle)
-  |> should.equal(Ok(job.SucceededWith(payment_receipt)))
-  postgres.outcome(database, report_handle)
-  |> should.equal(Ok(job.SucceededWith(16)))
-  postgres.outcome(database, failure_handle)
-  |> should.equal(
-    Ok(job.BusinessFailedWithCause(
-      PaymentRejected("missing/99"),
-      worker.BudgetExhausted,
-    )),
-  )
-  env.mark("two-worker-consumer-passed")
+pub fn a_handler_reads_its_job_context_test() {
+  case env.database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let seen = process.new_subject()
+      let probe =
+        worker.responding(
+          env.unique("context.probe"),
+          input: grind_consumer.amount_codec(),
+          output: grind_consumer.amount_codec(),
+          handle: fn(context, amount) {
+            process.send(seen, #(
+              worker.job_id(context),
+              worker.attempt(context),
+            ))
+            worker.Succeeded(amount)
+          },
+        )
+        |> worker.with_queue(env.unique("context"))
+      use jobs <- env.with_grind(url, grind.with_worker(_, probe))
+      let assert Ok(grind.Inserted(handle)) =
+        grind.submit(jobs, job.new(probe, 1))
+      process.receive(seen, within: 10_000)
+      |> should.equal(Ok(#(job.id(handle), 1)))
+      env.mark("consumer-observes-context-passed")
+    }
+  }
 }
