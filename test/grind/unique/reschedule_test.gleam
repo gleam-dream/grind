@@ -4,11 +4,12 @@ import gleam/int
 import gleam/list
 import gleam/option.{Some}
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/submission
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/submission
+import grind/internal/unique
 import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt, spawn_lock_holder,
   spawn_submit, unique_test_lock_key,
@@ -28,7 +29,6 @@ import grind/support/unique_rows.{
   force_available_at_due, force_job_state, future_available_at,
   job_available_at_ms, submit_reschedule, unique_receipt_reschedule_fields,
 }
-import grind/unique
 import pog
 
 // -- Increment 10: rescheduling ---------------------------------------------

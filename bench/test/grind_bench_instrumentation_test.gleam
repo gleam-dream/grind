@@ -16,10 +16,10 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
 import grind_bench
 import grind_bench/instrumentation
 import grind_bench/worker as bench_worker

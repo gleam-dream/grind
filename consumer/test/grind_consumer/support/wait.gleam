@@ -1,7 +1,7 @@
 import gleam/erlang/process
-import grind/job
-import grind/postgres
-import grind/queue
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
 
 pub fn await_state(
   database: postgres.Database,

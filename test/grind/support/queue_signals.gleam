@@ -1,5 +1,5 @@
 import gleam/erlang/process
-import grind/queue
+import grind/internal/consumer as queue
 import grind/support/concurrency.{type LeaseCommand}
 
 pub type WorkerProbe {

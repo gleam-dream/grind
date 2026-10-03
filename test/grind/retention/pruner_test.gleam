@@ -1,13 +1,13 @@
 import exception
 import gleam/erlang/process
 import gleeunit/should
-import grind/observation
-import grind/postgres
-import grind/pruner
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/pruner
+import grind/internal/worker
 import grind/support/env.{mark_database_test_executed, monotonic_ms, prune_url}
 import grind/support/observers.{detach}
 import grind/support/retention_rows.{job_row_exists, seed_terminal_job}
-import grind/worker
 import pog
 import sinal
 

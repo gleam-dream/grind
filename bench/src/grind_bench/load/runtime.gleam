@@ -3,7 +3,7 @@ import gleam/int
 import gleam/list
 import gleam/result
 import gleam/string
-import grind/worker
+import grind/internal/worker
 import grind_bench/worker as bench_worker
 
 pub type BenchWorker =

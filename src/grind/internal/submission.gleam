@@ -14,8 +14,8 @@
 //// module, not a second, translating layer.
 
 import gleam/option.{type Option, None, Some}
-import grind/job
-import grind/worker.{type Worker}
+import grind/internal/job
+import grind/internal/worker.{type Worker}
 import pog
 
 /// A stable identity for one admission command, independent of any
@@ -52,7 +52,6 @@ pub type Availability {
 
 /// The submission's own availability, as a millisecond value (`None` for
 /// `Immediately`).
-@internal
 pub fn availability_ms(availability: Availability) -> Option(Int) {
   case availability {
     Immediately -> None
@@ -96,7 +95,6 @@ pub fn conflict_state(conflict: Conflict) -> job.State {
   state
 }
 
-@internal
 pub fn new_conflict(
   job_id: Int,
   queue: String,
@@ -133,7 +131,6 @@ pub fn pending_submission_id(
   submission_id
 }
 
-@internal
 pub fn new_pending_submission(
   installation: job.Installation,
   submission_id: SubmissionId,
@@ -143,7 +140,6 @@ pub fn new_pending_submission(
   PendingSubmission(installation:, submission_id:, worker:, request_sha256:)
 }
 
-@internal
 pub fn pending_submission_installation(
   pending: PendingSubmission(input, output, error),
 ) -> job.Installation {
@@ -151,7 +147,6 @@ pub fn pending_submission_installation(
   installation
 }
 
-@internal
 pub fn pending_submission_worker(
   pending: PendingSubmission(input, output, error),
 ) -> Worker(input, output, error) {
@@ -159,7 +154,6 @@ pub fn pending_submission_worker(
   worker
 }
 
-@internal
 pub fn pending_submission_request_sha256(
   pending: PendingSubmission(input, output, error),
 ) -> BitArray {

@@ -6,7 +6,7 @@ import gleam/list
 import gleam/option.{Some}
 import gleam/result
 import gleam/string
-import grind/postgres
+import grind/internal/postgres
 import grind_bench/audit
 import grind_bench/load/context
 import grind_bench/load/runtime

@@ -3,9 +3,11 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/submission
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/env.{
   database_url, mark_database_test_executed, owner_a_url, unique_test_run_id,
   user_schema_fallback_url,
@@ -13,8 +15,6 @@ import grind/support/env.{
 import grind/support/schema_roles.{
   create_isolated_schema_role, drop_isolated_schema_role, role_scoped_url,
 }
-import grind/unique
-import grind/worker
 import pog
 
 pub fn postgres_two_schemas_share_a_database_but_stay_isolated_test() {

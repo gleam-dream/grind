@@ -1,15 +1,15 @@
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
-import grind/submission
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/env.{database_url, mark_database_test_executed}
 import grind/support/submissions.{submit_keep_existing}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{
   type RawInput, RawInput, encode_raw_input, raw_input_decoder,
 }
-import grind/unique
-import grind/worker
 
 // -- Uniqueness increment 12 (selected keys) ---------------------------------
 //

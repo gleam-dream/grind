@@ -1,9 +1,10 @@
 import exception
 import gleam/erlang/process
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/submission
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/submission
+import grind/internal/unique
 import grind/support/ack_queries.{wait_for_commit_trigger_backend}
 import grind/support/concurrency.{spawn_submit}
 import grind/support/env.{database_url, mark_database_test_executed}
@@ -21,7 +22,6 @@ import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{
   future_available_at, job_available_at_ms, submit_reschedule,
 }
-import grind/unique
 import pog
 
 // -- Increment 11: uncertain admission commits -------------------------------

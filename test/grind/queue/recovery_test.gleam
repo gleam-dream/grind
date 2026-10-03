@@ -5,10 +5,11 @@ import gleam/int
 import gleam/json
 import gleam/result
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/concurrency.{LongHandlerStarted, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
@@ -22,7 +23,6 @@ import grind/support/queue_signals.{
 }
 import grind/support/queue_timing.{await_new_coordinator_pid, database_time_ms}
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 import pog
 
 pub fn postgres_stopped_consumer_handle_does_not_retarget_after_restart_test() {

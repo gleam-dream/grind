@@ -2,8 +2,9 @@ import exception
 import gleam/erlang/process
 import gleam/list
 import gleeunit/should
-import grind/job
-import grind/submission
+import grind/internal/job
+import grind/internal/submission
+import grind/internal/unique
 import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt,
   install_unique_insert_barrier, spawn_lock_holder, spawn_submit,
@@ -16,7 +17,6 @@ import grind/support/lock_wait.{
 }
 import grind/support/submissions.{submit_keep_existing, unique_test_worker}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_databases}
-import grind/unique
 import pog
 
 // -- Increment 8: concurrent admission under a forced barrier --------------

@@ -1,6 +1,6 @@
 import exception
 import gleeunit/should
-import grind/postgres
+import grind/internal/postgres
 import grind_consumer/support/env
 
 pub fn storage_start_failure_is_reported_test() {

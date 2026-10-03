@@ -1,13 +1,13 @@
 import gleam/dynamic/decode
 import gleeunit/should
+import grind/internal/job
+import grind/internal/submission
+import grind/internal/unique
 import grind/internal/unique_admission
-import grind/job
-import grind/submission
 import grind/support/env.{database_url, mark_database_test_executed}
 import grind/support/submissions.{submit_keep_existing, unique_test_worker}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{force_job_timestamp}
-import grind/unique
 import pog
 
 /// Increment 6(a): the shared `@internal` period predicate at an exact

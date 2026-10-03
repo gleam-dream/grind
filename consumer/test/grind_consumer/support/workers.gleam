@@ -2,7 +2,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/json
-import grind/worker
+import grind/internal/worker
 import grind_consumer.{
   type PaymentError, type PaymentRequest, PaymentRejected, PaymentRequest,
 }

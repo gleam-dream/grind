@@ -25,8 +25,8 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import grind/postgres
-import grind/worker
+import grind/internal/postgres
+import grind/internal/worker
 import pog
 
 /// One job to preload. `available_at_ms: None` means immediately available

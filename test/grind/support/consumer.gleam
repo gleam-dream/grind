@@ -1,4 +1,4 @@
-import grind/queue
+import grind/internal/consumer as queue
 
 /// The manually-polled `ValidatedPolicy` almost every test in this suite
 /// starts a consumer under: no `Poll` timer of its own, so `process_one`/

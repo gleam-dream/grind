@@ -5,13 +5,13 @@ import gleam/int
 import gleam/json
 import gleam/option.{None}
 import gleeunit/should
-import grind/diagnostic
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/worker
+import grind/internal/consumer as queue
+import grind/internal/diagnostic
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind_consumer/support/env
 import sinal
 

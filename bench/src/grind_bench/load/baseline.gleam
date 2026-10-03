@@ -6,9 +6,9 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/postgres
+import grind/internal/registry
 import grind_bench
 import grind_bench/load/context
 import grind_bench/load/drain as drain_measurement

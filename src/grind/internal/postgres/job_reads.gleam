@@ -3,10 +3,10 @@
 
 import gleam/option.{type Option, None, Some, unwrap}
 import gleam/result
+import grind/internal/job.{type JobHandle, type State, Queued, Scheduled}
 import grind/internal/sql
 import grind/internal/store
-import grind/job.{type JobHandle, type State, Queued, Scheduled}
-import grind/worker.{type Worker}
+import grind/internal/worker.{type Worker}
 import pog
 
 /// Internal mirror; `grind/postgres` owns the documented public errors.

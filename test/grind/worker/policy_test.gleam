@@ -4,12 +4,12 @@ import gleam/int
 import gleam/json
 import gleam/result
 import gleeunit/should
-import grind/queue
+import grind/internal/consumer as queue
+import grind/internal/worker
 import grind/support/queue_signals.{
   type RetryPolicyProbe, RetryPolicyInvoked, WorkerInvoked,
 }
 import grind/support/worker_failure.{type LookupFailure, AccountMissing}
-import grind/worker
 
 pub fn invocation_preserves_the_application_error_test() {
   let assert Ok(input_codec) =

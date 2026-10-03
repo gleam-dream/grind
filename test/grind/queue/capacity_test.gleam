@@ -5,11 +5,12 @@ import gleam/int
 import gleam/json
 import gleam/result
 import gleeunit/should
-import grind/diagnostic
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/diagnostic
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/concurrency.{ReleaseAttempt}
 import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
@@ -18,7 +19,6 @@ import grind/support/observers.{detach}
 import grind/support/queue_signals.{CapacityWorkerStarted}
 import grind/support/queue_timing.{database_time_ms}
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 import pog
 
 pub fn postgres_consumer_enforces_configured_capacity_test() {

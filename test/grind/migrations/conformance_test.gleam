@@ -11,16 +11,16 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleeunit/should
+import grind/internal/consumer as queue
+import grind/internal/job
 import grind/internal/migrations
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/concurrency.{spawn_submit}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed}
 import grind/support/migration_fixtures.{grind_catalog_digest}
-import grind/worker
 import pog
 import simplifile
 

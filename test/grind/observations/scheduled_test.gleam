@@ -4,11 +4,12 @@ import gleam/erlang/process
 import gleam/json
 import gleam/option.{None, Some}
 import gleeunit/should
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/concurrency.{LongHandlerStarted, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
@@ -18,7 +19,6 @@ import grind/support/observation_fixtures.{
 import grind/support/observers.{detach}
 import grind/support/queue_timing.{database_time_milliseconds}
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 
 pub fn postgres_acknowledged_observation_available_at_for_committed_retry_test() {
   case queue_database_url() {

@@ -4,15 +4,15 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/job_state.{wait_for_job_state}
 import grind/support/queue_signals.{LaterWorkerInvoked, WorkerInvoked}
-import grind/worker
 import pog
 
 pub fn postgres_automatic_queue_skips_incompatible_job_test() {

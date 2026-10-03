@@ -1,6 +1,6 @@
-import grind/postgres
-import grind/submission
-import grind/worker
+import grind/internal/postgres
+import grind/internal/submission
+import grind/internal/worker
 
 // -- Decision B (2026-09-25): retry-safe plain submit (`submit_with_id`) ----
 //

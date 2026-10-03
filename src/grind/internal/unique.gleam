@@ -13,8 +13,8 @@
 //// `submit_at` too, which never touch a uniqueness policy at all.
 
 import gleam/option.{type Option, None, Some}
-import grind/job
-import grind/worker.{type Codec}
+import grind/internal/job
+import grind/internal/worker.{type Codec}
 
 /// Whether a uniqueness key is scoped to the submitting queue or shared by
 /// every queue in the same schema.
@@ -150,7 +150,6 @@ pub fn policy(
 /// encoded text (reused for `FullInput` rather than re-encoding). `Error`
 /// carries a `selected` key codec's rejection reason, prefixed with the key
 /// name.
-@internal
 pub fn key_material(
   key: Key(input),
   input: input,
@@ -168,13 +167,11 @@ pub fn key_material(
   }
 }
 
-@internal
 pub type PeriodSpec {
   FinitePeriod(milliseconds: Int, from: UniqueTimestamp)
   Unbounded
 }
 
-@internal
 pub fn period_spec(period: Period) -> PeriodSpec {
   case period {
     For(milliseconds, from) -> FinitePeriod(milliseconds, from)
@@ -182,7 +179,6 @@ pub fn period_spec(period: Period) -> PeriodSpec {
   }
 }
 
-@internal
 pub type PolicyFields(input) {
   PolicyFields(
     key: Key(input),
@@ -192,7 +188,6 @@ pub type PolicyFields(input) {
   )
 }
 
-@internal
 pub fn policy_fields(policy: Policy(input)) -> PolicyFields(input) {
   let Policy(key:, scope:, period:, states:) = policy
   PolicyFields(key:, scope:, period:, states:)
@@ -200,7 +195,6 @@ pub fn policy_fields(policy: Policy(input)) -> PolicyFields(input) {
 
 /// The persisted state strings a policy's `States` group admits, in Grind's
 /// own vocabulary (`grind/job.State`, lower-cased).
-@internal
 pub fn eligible_states(states: States) -> List(String) {
   case states {
     Incomplete -> ["queued", "scheduled", "retryable", "executing", "uncertain"]
@@ -223,7 +217,6 @@ pub fn eligible_states(states: States) -> List(String) {
 // `SubmissionId` with a changed scope/period/states/action is detected as a
 // conflicting request rather than silently replayed.
 
-@internal
 pub fn scope_label(scope: QueueScope) -> String {
   case scope {
     WithinQueue -> "within_queue"
@@ -231,7 +224,6 @@ pub fn scope_label(scope: QueueScope) -> String {
   }
 }
 
-@internal
 pub fn states_label(states: States) -> String {
   case states {
     Incomplete -> "incomplete"
@@ -241,7 +233,6 @@ pub fn states_label(states: States) -> String {
   }
 }
 
-@internal
 pub fn action_label(action: ConflictAction) -> String {
   case action {
     KeepExisting -> "keep_existing"
@@ -249,7 +240,6 @@ pub fn action_label(action: ConflictAction) -> String {
   }
 }
 
-@internal
 pub fn period_origin_label(from: UniqueTimestamp) -> String {
   case from {
     FromInsertion -> "from_insertion"
@@ -258,7 +248,6 @@ pub fn period_origin_label(from: UniqueTimestamp) -> String {
 }
 
 /// The persisted-column name a finite period's origin measures from.
-@internal
 pub fn period_column(from: UniqueTimestamp) -> String {
   case from {
     FromInsertion -> "inserted_at"
@@ -267,7 +256,6 @@ pub fn period_column(from: UniqueTimestamp) -> String {
 }
 
 /// The reschedule target's millisecond value, or `None` for `KeepExisting`.
-@internal
 pub fn reschedule_target_ms(action: ConflictAction) -> Option(Int) {
   case action {
     KeepExisting -> None

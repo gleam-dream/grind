@@ -4,11 +4,12 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/ack_queries.{wait_for_commit_trigger_backend}
 import grind/support/concurrency.{LongHandlerStarted, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
@@ -19,7 +20,6 @@ import grind/support/observers.{detach}
 import grind/support/syncrep.{terminate_backend}
 import grind/support/unique_fixture.{unique_test_suffix}
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 import pog
 import sinal
 

@@ -7,8 +7,8 @@
 import gleam/dynamic/decode
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import grind/internal/observation
 import grind/internal/store
-import grind/observation
 import pog
 import sinal/forwarder.{type Forwarder}
 

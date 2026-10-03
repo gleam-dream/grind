@@ -5,10 +5,12 @@ import gleam/int
 import gleam/json
 import gleam/option.{None, Some}
 import gleeunit/should
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/submission
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/concurrency.{spawn_submit}
 import grind/support/env.{
   database_url, mark_database_test_executed, queue_database_url,
@@ -22,8 +24,6 @@ import grind/support/syncrep.{
   wait_for_syncrep_trigger_backend,
 }
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
-import grind/unique
-import grind/worker
 import pog
 import sinal
 

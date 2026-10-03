@@ -6,9 +6,10 @@ import gleam/json
 import gleam/option.{None, Some}
 import gleam/string
 import gleeunit/should
+import grind/internal/job
+import grind/internal/postgres
 import grind/internal/store
-import grind/job
-import grind/postgres
+import grind/internal/worker
 import grind/support/env.{
   database_url, mark_database_test_executed, owner_a_url, postgres_log_path,
   queue_database_url, unique_test_run_id,
@@ -17,7 +18,6 @@ import grind/support/schema_roles.{
   create_isolated_schema_role, drop_isolated_schema_role, role_scoped_url,
 }
 import grind/support/submissions.{unique_test_worker}
-import grind/worker
 import pog
 import simplifile
 

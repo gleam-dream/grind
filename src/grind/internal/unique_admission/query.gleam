@@ -2,8 +2,8 @@
 
 import gleam/dynamic/decode
 import gleam/int
+import grind/internal/unique
 import grind/internal/unique_admission/request.{type PolicyPart}
-import grind/unique
 import pog
 
 pub fn lock_key_sql(first_parameter: Int) -> String {

@@ -1,7 +1,7 @@
 //// Shared Sinal wire primitives for Grind observations.
 //// Public event records and their domain projections remain in observation.
 
-import grind/job
+import grind/internal/job
 import sinal/fields
 
 /// A single-field `Fields(Int)` for the `count` measurement every

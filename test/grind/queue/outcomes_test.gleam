@@ -5,17 +5,17 @@ import gleam/int
 import gleam/json
 import gleam/option.{None, Some}
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/queue_signals.{RetryPolicyInvoked, WorkerInvoked}
 import grind/support/worker_failure.{
   AccountMissing, decode_lookup_failure, encode_lookup_failure,
 }
-import grind/worker
 import pog
 
 pub fn postgres_queue_commits_typed_worker_success_test() {

@@ -4,11 +4,11 @@ import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleeunit/should
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/env.{mark_database_test_executed, queue_database_url}
-import grind/worker
 
 pub fn postgres_consumer_stop_cleans_only_its_own_normal_exit_test() {
   case queue_database_url() {

@@ -8,8 +8,8 @@ import gleam/otp/static_supervisor
 import gleam/otp/supervision
 import gleeunit/should
 import grind/internal/pool
+import grind/internal/postgres
 import grind/internal/store
-import grind/postgres
 import grind/support/env.{database_url, mark_database_test_executed}
 import pog
 

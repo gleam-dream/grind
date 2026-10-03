@@ -3,10 +3,10 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/job
-import grind/postgres
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/worker
 import grind/support/env.{database_url, mark_database_test_executed}
-import grind/worker
 import pog
 
 pub fn postgres_admission_round_trips_typed_arguments_test() {

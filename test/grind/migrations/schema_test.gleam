@@ -4,7 +4,7 @@ import gleam/list
 import gleam/string
 import gleeunit/should
 import grind/internal/migrations
-import grind/postgres
+import grind/internal/postgres
 import grind/support/env.{
   mark_database_test_executed, migration_collision_resolutions_url,
   migration_collision_submissions_url, schema_atomic_url, schema_bad_url,

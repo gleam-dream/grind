@@ -10,11 +10,13 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/submission
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{
   mark_database_test_executed, queue_database_url, unique_test_run_id,
@@ -24,8 +26,6 @@ import grind/support/worker_failure.{
   type LookupFailure, AccountMissing, decode_lookup_failure,
   encode_lookup_failure,
 }
-import grind/unique
-import grind/worker
 import pog
 
 pub fn postgres_rejected_input_writes_nothing_on_every_submit_path_test() {

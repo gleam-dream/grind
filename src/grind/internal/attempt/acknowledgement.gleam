@@ -5,13 +5,13 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
-import grind/diagnostic
+import grind/internal/diagnostic
 import grind/internal/diagnostics
+import grind/internal/job
 import grind/internal/lease
+import grind/internal/postgres
 import grind/internal/store
-import grind/job
-import grind/postgres
-import grind/worker
+import grind/internal/worker
 import pog
 import sinal/forwarder.{type Forwarder}
 

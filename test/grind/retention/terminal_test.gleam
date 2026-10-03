@@ -6,11 +6,12 @@ import gleam/json
 import gleam/list
 import gleam/string
 import gleeunit/should
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
 import grind/internal/terminal
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/worker
 import grind/support/concurrency.{
   type LongHandlerSignal, LongHandlerStarted, ReleaseAttempt,
 }
@@ -19,7 +20,6 @@ import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/worker_failure.{
   AccountMissing, decode_lookup_failure, encode_lookup_failure,
 }
-import grind/worker
 import pog
 
 /// Whether a `job.State` is one of the six terminal states

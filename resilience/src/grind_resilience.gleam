@@ -5,11 +5,11 @@ import gleam/io
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/worker
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 
 type Mode {
   Normal

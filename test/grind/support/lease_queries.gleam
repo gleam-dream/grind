@@ -2,7 +2,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{Some}
 import gleam/result
-import grind/queue
+import grind/internal/consumer as queue
 import pog
 
 pub fn attempt_count_for(

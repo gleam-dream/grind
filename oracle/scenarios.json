@@ -452,7 +452,7 @@
       "classification": "intentional-grind-semantics",
       "reason": "Grind has durable caller reconciliation identities absent from Oban Basic; dedicated Grind fault tests remain authoritative.",
       "sources": [
-        "src/grind/submission.gleam",
+        "src/grind/internal/submission.gleam",
         "test/grind/queue/ack_failure_test.gleam"
       ]
     },
@@ -470,7 +470,7 @@
       "classification": "intentional-grind-semantics",
       "reason": "Grind exponential backoff differs from Oban polynomial jitter; paired retry cases explicitly configure equal delays.",
       "sources": [
-        "src/grind/worker.gleam",
+        "src/grind/internal/worker.gleam",
         "oracle/deps/oban/lib/oban/worker.ex"
       ]
     },
@@ -478,14 +478,17 @@
       "id": "priority-and-queue-controls",
       "classification": "missing-accidental-divergence",
       "reason": "Priorities and pause/scale are Oban capabilities with no equivalent Grind surface. No passing scenario is claimed.",
-      "sources": ["src/grind/queue.gleam", "oracle/deps/oban/lib/oban.ex"]
+      "sources": [
+        "src/grind/internal/consumer.gleam",
+        "oracle/deps/oban/lib/oban.ex"
+      ]
     },
     {
       "id": "transaction-enqueue-and-testing-helpers",
       "classification": "deferred",
       "reason": "Approved before-1.0 API work, not an initial-release parity prerequisite.",
       "sources": [
-        "src/grind/postgres.gleam",
+        "src/grind/internal/postgres.gleam",
         "oracle/deps/oban/lib/oban/testing.ex"
       ]
     },

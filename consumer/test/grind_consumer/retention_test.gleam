@@ -1,10 +1,10 @@
 import exception
 import gleam/erlang/process
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
 import grind_consumer/support/env
 import grind_consumer/support/wait
 import grind_consumer/support/workers

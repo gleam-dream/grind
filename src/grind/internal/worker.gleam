@@ -318,7 +318,6 @@ pub type BusinessFailureCause {
 /// place this mapping is written. `business_failure_cause_from_string` is
 /// its inverse. Internal: only Grind's own storage/observation code needs
 /// this mapping; a caller holds a typed `BusinessFailureCause` already.
-@internal
 pub fn business_failure_cause_to_string(cause: BusinessFailureCause) -> String {
   case cause {
     BudgetExhausted -> "budget_exhausted"
@@ -326,7 +325,6 @@ pub fn business_failure_cause_to_string(cause: BusinessFailureCause) -> String {
   }
 }
 
-@internal
 pub fn business_failure_cause_from_string(
   raw: String,
 ) -> Result(BusinessFailureCause, Nil) {
@@ -337,7 +335,6 @@ pub fn business_failure_cause_from_string(
   }
 }
 
-@internal
 pub type ResolvedResponse(output, error) {
   ResolvedSucceeded(output)
   ResolvedRetryable(error, RetryDelay)
@@ -351,7 +348,6 @@ pub type ResolvedResponse(output, error) {
 /// The pure policy resolver used by both queue execution and transition tests.
 /// It proposes a disposition; only the fenced PostgreSQL acknowledgement can
 /// establish the committed job outcome.
-@internal
 pub fn resolve_response(
   worker: Worker(input, output, error),
   response: WorkerResponse(output, error),
@@ -395,7 +391,6 @@ pub type CodecKind {
 }
 
 /// The persistence metadata bound to a worker definition.
-@internal
 pub type Metadata {
   Metadata(
     id: String,
@@ -408,7 +403,6 @@ pub type Metadata {
 }
 
 /// Internal persistence view; callers should define a worker once and submit it.
-@internal
 pub fn metadata(worker: Worker(input, output, error)) -> Metadata {
   let Worker(
     id:,
@@ -435,7 +429,6 @@ pub fn metadata(worker: Worker(input, output, error)) -> Metadata {
 
 /// Internal JSON encoding used at admission. `Error` carries the input
 /// codec's own rejection reason.
-@internal
 pub fn encode_input(
   worker: Worker(input, output, error),
   input: input,
@@ -445,14 +438,12 @@ pub fn encode_input(
 }
 
 /// Internal codec result used by typed job retrieval.
-@internal
 pub fn input_codec(worker: Worker(input, output, error)) -> Codec(input) {
   let Worker(input:, ..) = worker
   input
 }
 
 /// Internal JSON decoding that rejects stored data from another codec version.
-@internal
 pub fn decode_codec(
   codec: Codec(value),
   stored_version: String,
@@ -467,7 +458,6 @@ pub fn decode_codec(
 
 /// Internal version and JSON encoding view used by audited typed outcomes
 /// and unique keys. `Error` carries the codec's own rejection reason.
-@internal
 pub fn encode_value(
   codec: Codec(value),
   value: value,
@@ -477,7 +467,6 @@ pub fn encode_value(
   |> result.map(fn(encoded) { #(version, json.to_string(encoded)) })
 }
 
-@internal
 pub fn codec_version(codec: Codec(value)) -> String {
   let Codec(version:, ..) = codec
   version
@@ -516,7 +505,6 @@ pub type Execution {
 }
 
 /// Internal erased invocation. The closure remains bound to this worker's types.
-@internal
 pub fn execute_encoded(
   worker: Worker(input, output, error),
   input_version: String,
@@ -584,7 +572,6 @@ fn encode_error(
 }
 
 /// The stored failure description for an `ExecutedUnencodable` proposal.
-@internal
 pub fn unencodable_description(codec: CodecKind, reason: String) -> String {
   case codec {
     OutputCodec -> "output codec rejected the handler's output: " <> reason
@@ -621,7 +608,6 @@ fn default_retry_delay_loop(exponent: Int, current_ms: Int) -> Int {
 }
 
 /// Internal typed fields retained by admitted job handles.
-@internal
 pub fn handle_data(
   worker: Worker(input, output, error),
 ) -> #(Metadata, Codec(input), Codec(output), Option(Codec(error))) {

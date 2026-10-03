@@ -5,10 +5,10 @@ import gleam/io
 import gleam/list
 import gleam/result
 import gleam/string
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
 import grind_bench
 import grind_bench/instrumentation
 import grind_bench/latency

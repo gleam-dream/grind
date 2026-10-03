@@ -2,8 +2,8 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{type Option}
 import gleam/result
-import grind/job
-import grind/postgres
+import grind/internal/job
+import grind/internal/postgres
 import pog
 
 pub fn wait_for_succeeded(

@@ -3,8 +3,8 @@ import gleam/int
 import gleam/io
 import gleam/option.{type Option, None, Some}
 import gleam/string
-import grind/job
-import grind/postgres
+import grind/internal/job
+import grind/internal/postgres
 import grind_bench
 import grind_bench/load/runtime
 import grind_bench/preload

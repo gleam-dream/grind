@@ -8,7 +8,7 @@
 //// Unix-millisecond time for `postgres.submit_at`.
 
 import gleam/option.{type Option, None, Some}
-import grind/worker.{type BusinessFailureCause, type Codec, type Worker}
+import grind/internal/worker.{type BusinessFailureCause, type Codec, type Worker}
 
 /// A cheap, in-memory-only, never-persisted identity for one `Database`
 /// value's own installation: the physical database (by OID, not by
@@ -54,7 +54,6 @@ pub opaque type Installation {
   )
 }
 
-@internal
 pub fn new_installation(
   database_oid: Int,
   schema: String,
@@ -63,7 +62,6 @@ pub fn new_installation(
   Installation(database_oid:, schema:, cluster_identifier:)
 }
 
-@internal
 pub fn installation_schema(installation: Installation) -> String {
   let Installation(schema:, ..) = installation
   schema
@@ -85,7 +83,6 @@ pub fn installation_schema(installation: Installation) -> String {
 /// token of the single `Database` that minted it, so this function is only
 /// ever called pairwise against that one minting `Database`, never chained
 /// across independently-minted tokens.
-@internal
 pub fn same_installation(a: Installation, b: Installation) -> Bool {
   let Installation(
     database_oid: oid_a,
@@ -140,7 +137,6 @@ pub fn available_at(
   }
 }
 
-@internal
 pub fn available_at_unix_milliseconds(available_at: AvailableAt) -> Int {
   let AvailableAt(unix_milliseconds) = available_at
   unix_milliseconds
@@ -164,7 +160,6 @@ pub type State {
 /// `grind_unique_submissions.observed_state`) to its typed `State`. Shared
 /// by `postgres.state` and the uniqueness admission path so the mapping is
 /// defined once.
-@internal
 pub fn state_of_stored(text: String) -> Result(State, Nil) {
   case text {
     "queued" -> Ok(Queued)
@@ -189,7 +184,6 @@ pub fn state_of_stored(text: String) -> Result(State, Nil) {
 /// Shared the same way, so `grind/observation` and `grind/postgres` encode a
 /// `State` through this one definition rather than each keeping its own
 /// copy.
-@internal
 pub fn state_to_stored(state: State) -> String {
   case state {
     Queued -> "queued"
@@ -240,7 +234,6 @@ pub fn queue(handle: JobHandle(input, output, error)) -> String {
 }
 
 /// Internal: bind the submitting worker's typed codecs to a returned row.
-@internal
 pub fn new_handle(
   id: Int,
   installation: Installation,
@@ -263,7 +256,6 @@ pub fn new_handle(
 }
 
 /// Internal persistence fields. These do not form a caller-managed workflow.
-@internal
 pub fn storage_fields(
   handle: JobHandle(input, output, error),
 ) -> #(Int, Installation, String, String, String, Codec(input)) {
@@ -279,7 +271,6 @@ pub fn storage_fields(
   #(id, installation, queue, worker_id, worker_version, input)
 }
 
-@internal
 pub fn result_fields(
   handle: JobHandle(input, output, error),
 ) -> #(
@@ -306,7 +297,6 @@ pub fn result_fields(
 
 /// Internal identity and persisted codec contract used to resolve an
 /// uncertain attempt without repeating worker metadata at the call site.
-@internal
 pub fn reconciliation_fields(
   handle: JobHandle(input, output, error),
 ) -> #(Int, Installation, String, String, String, String, Option(String)) {
@@ -337,7 +327,6 @@ pub fn reconciliation_fields(
 
 /// Encodes a caller-confirmed output using the admitted job's bound codec.
 /// `Error` carries the codec's rejection reason.
-@internal
 pub fn encode_reconciled_success(
   handle: JobHandle(input, output, error),
   value: output,
@@ -348,7 +337,6 @@ pub fn encode_reconciled_success(
 
 /// Encodes a caller-confirmed business error when the worker retained a
 /// codec. `Error` carries the codec's rejection reason.
-@internal
 pub fn encode_reconciled_error(
   handle: JobHandle(input, output, error),
   value: error,

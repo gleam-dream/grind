@@ -14,7 +14,7 @@ import gleam/list
 import gleam/otp/actor
 import gleam/result
 import gleam/string
-import grind/postgres
+import grind/internal/postgres
 import pog
 import simplifile
 

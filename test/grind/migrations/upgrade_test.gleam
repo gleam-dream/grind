@@ -8,12 +8,14 @@ import gleam/list
 import gleam/option.{None}
 import gleam/result
 import gleeunit/should
+import grind/internal/consumer as queue
+import grind/internal/job
 import grind/internal/migrations
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/submission
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/concurrency.{spawn_submit}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{
@@ -30,8 +32,6 @@ import grind/support/syncrep.{
   terminate_backend, wait_for_backend_gone, wait_for_syncrep_trigger_backend,
 }
 import grind/support/worker_failure.{type LookupFailure}
-import grind/unique
-import grind/worker
 import pog
 
 /// A synthetic `v13` (one past the real, current latest `v12`) used only by

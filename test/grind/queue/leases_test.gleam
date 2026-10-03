@@ -6,11 +6,12 @@ import gleam/json
 import gleam/option.{None, Some}
 import gleam/result
 import gleeunit/should
-import grind/diagnostic
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/diagnostic
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/concurrency.{ReleaseAttempt}
 import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
@@ -20,7 +21,6 @@ import grind/support/lease_queries.{
 import grind/support/observers.{detach}
 import grind/support/queue_signals.{FirstAttemptStarted}
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 import pog
 
 pub fn postgres_queue_renews_running_attempt_before_ack_test() {

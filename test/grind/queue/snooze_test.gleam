@@ -6,17 +6,17 @@ import gleam/json
 import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/attempt
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/concurrency.{LongHandlerStarted, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/queue_signals.{LaterWorkerInvoked, WorkerInvoked}
 import grind/support/queue_timing.{database_time_milliseconds}
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 import pog
 
 pub fn postgres_worker_snooze_commits_scheduled_state_test() {

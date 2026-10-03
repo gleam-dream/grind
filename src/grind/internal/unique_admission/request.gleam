@@ -5,10 +5,10 @@ import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
-import grind/job
-import grind/submission
-import grind/unique
-import grind/worker.{type Worker}
+import grind/internal/job
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker.{type Worker}
 
 /// The request fingerprint's hash; see `docs/UNIQUENESS-CONTRACT.md`, Decision 9.
 @external(erlang, "grind_unique_ffi", "sha256")

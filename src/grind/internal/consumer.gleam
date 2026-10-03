@@ -22,18 +22,18 @@ import gleam/otp/static_supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
-import grind/diagnostic
 import grind/internal/attempt
 import grind/internal/consumer_hooks.{type Hooks}
+import grind/internal/diagnostic
 import grind/internal/diagnostics
 import grind/internal/pool
+import grind/internal/postgres.{type Database}
 import grind/internal/queue/active.{type ActiveAttempt, ActiveAttempt} as queue_active
 import grind/internal/queue/handoff as queue_handoff
 import grind/internal/queue/renewer as queue_renewer
 import grind/internal/queue/timing as queue_timing
 import grind/internal/queue/worker as queue_worker
-import grind/postgres.{type Database}
-import grind/registry.{type Registry}
+import grind/internal/registry.{type Registry}
 import pog
 import sinal/forwarder
 
@@ -108,7 +108,6 @@ pub fn default_policy_validated() -> ValidatedPolicy {
 }
 
 /// Reports whether a renewal timer still belongs to the active attempt.
-@internal
 pub fn renewal_is_current(
   active_attempt_id: Int,
   active_epoch: Int,
@@ -125,7 +124,6 @@ pub fn renewal_is_current(
 
 /// Starts one shutdown grace period, or keeps its generation when another
 /// caller joins the already pending drain.
-@internal
 pub fn next_shutdown_generation(
   current_generation: Int,
   shutdown_already_pending: Bool,
@@ -267,7 +265,6 @@ pub type StartError {
 
 /// The lease-rule minimum for storage deadline D. The concurrency argument
 /// is retained for existing internal callers; the rule is independent of it.
-@internal
 pub fn minimum_lease_for_deadline(
   maximum_concurrency: Int,
   statement_deadline_ms: Int,
@@ -333,7 +330,6 @@ pub type ProcessError {
   QueueActorExited
 }
 
-@internal
 pub type RenewalStatus {
   LeaseRenewalConfirmed
   LeaseRenewalUnknown
@@ -362,7 +358,6 @@ type Message {
 /// Exposed `@internal` only so `begin_shutdown_for_test` can hand its reply
 /// subject's type to a caller outside this module; not part of the stable
 /// public API.
-@internal
 pub type ShutdownReply {
   ShutdownDrained
   ShutdownForced(Int)
@@ -470,7 +465,6 @@ pub fn start(
 /// worker-start sequence — see `consumer_hooks.Hooks`'s doc comment. Not
 /// part of the public API: every publicly-started consumer runs under
 /// `consumer_hooks.none()`.
-@internal
 pub fn start_with_hooks(
   database: Database,
   workers: Registry,
@@ -896,7 +890,6 @@ fn request_shutdown(
 /// through "draining with active work" (and therefore through scheduling its
 /// grace timer) from any process, independent of the one owner process that
 /// may legitimately call the public, blocking `stop`.
-@internal
 pub fn begin_shutdown_for_test(
   consumer: Consumer,
   reply: process.Subject(ShutdownReply),
@@ -909,12 +902,10 @@ pub fn begin_shutdown_for_test(
 
 /// Reports whether the coordinator has begun its shutdown transition.
 /// This internal observation supports deterministic lifecycle synchronization.
-@internal
 pub fn shutdown_state(consumer: Consumer) -> Result(Bool, ProcessError) {
   call_coordinator(consumer, ReadShutdownState)
 }
 
-@internal
 pub fn renewal_status(
   consumer: Consumer,
 ) -> Result(Option(RenewalStatus), ProcessError) {
@@ -922,14 +913,12 @@ pub fn renewal_status(
 }
 
 /// Returns the coordinator incarnation owned by this consumer handle.
-@internal
 pub fn coordinator_pid(consumer: Consumer) -> Result(process.Pid, Nil) {
   let Consumer(subject:, ..) = consumer
   process.subject_owner(subject)
 }
 
 /// Returns the OTP supervisor process owned by this consumer handle.
-@internal
 pub fn supervisor_pid(consumer: Consumer) -> process.Pid {
   let Consumer(supervisor_pid:, ..) = consumer
   supervisor_pid
@@ -1233,7 +1222,6 @@ fn release_dead_worker_before_activation(
 /// is spent. Exposed only so a test's own `Hooks.after_worker_start` can
 /// wait out a worker it just killed before this coordinator's own
 /// `process.monitor` call — see `consumer_hooks.Hooks`.
-@internal
 pub fn wait_for_worker_exit(pid: process.Pid, checks_remaining: Int) -> Nil {
   case process.is_alive(pid), checks_remaining > 0 {
     False, _ -> Nil

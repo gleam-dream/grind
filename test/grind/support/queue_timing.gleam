@@ -1,7 +1,7 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/result
-import grind/queue
+import grind/internal/consumer as queue
 import grind/support/concurrency.{type LeaseCommand, ReleaseAttempt}
 import pog
 

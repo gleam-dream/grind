@@ -6,7 +6,7 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
-import grind/worker.{type Worker}
+import grind/internal/worker.{type Worker}
 import pog
 
 /// `bench_index`: this run's own submission sequence number (assigned by the

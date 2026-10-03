@@ -5,11 +5,11 @@ import gleam/io
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
-import grind/observation
-import grind/postgres
-import grind/pruner
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/pruner
+import grind/internal/registry
 import grind_bench
 import grind_bench/audit
 import grind_bench/instrumentation

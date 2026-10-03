@@ -53,9 +53,9 @@
 //// housekeeping, not a compatibility break.
 
 import gleam/option.{type Option}
+import grind/internal/job
 import grind/internal/observation/wire as observation_wire
-import grind/job
-import grind/worker
+import grind/internal/worker
 import sinal.{type Event}
 import sinal/fields
 

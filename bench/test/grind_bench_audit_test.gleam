@@ -21,10 +21,10 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleeunit/should
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/worker
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/worker
 import grind_bench
 import grind_bench/audit
 import grind_bench/load

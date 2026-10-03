@@ -6,11 +6,11 @@
 import gleam/dynamic/decode
 import gleam/json
 import gleeunit/should
+import grind/internal/worker
 import grind/support/worker_failure.{
   type LookupFailure, AccountMissing, decode_lookup_failure,
   encode_lookup_failure,
 }
-import grind/worker
 
 /// Accepts only non-negative integers, like a json_blueprint codec with an
 /// `integer_between` refinement.

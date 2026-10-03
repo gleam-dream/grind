@@ -1,12 +1,12 @@
 import gleam/dynamic/decode
 import gleam/json
 import gleam/option.{type Option}
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/submission
 import grind/internal/terminal
-import grind/job
-import grind/postgres
-import grind/submission
-import grind/unique
-import grind/worker
+import grind/internal/unique
+import grind/internal/worker
 import pog
 
 pub type RawInput {

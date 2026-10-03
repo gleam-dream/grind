@@ -16,17 +16,17 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
-import grind/diagnostic
 import grind/internal/attempt/acknowledgement.{type Claim, AckProposal, Claim} as attempt_acknowledgement
+import grind/internal/diagnostic
 import grind/internal/diagnostics
+import grind/internal/job.{type State}
 import grind/internal/lease
+import grind/internal/observation
+import grind/internal/postgres.{type Database}
+import grind/internal/registry.{type Registry}
 import grind/internal/sql
 import grind/internal/store
-import grind/job.{type State}
-import grind/observation
-import grind/postgres.{type Database}
-import grind/registry.{type Registry}
-import grind/worker
+import grind/internal/worker
 import pog
 import sinal/forwarder.{type Forwarder}
 

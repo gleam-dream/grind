@@ -4,12 +4,12 @@
 import gleam/erlang/process
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import grind/diagnostic
 import grind/internal/attempt
+import grind/internal/diagnostic
 import grind/internal/diagnostics
+import grind/internal/postgres
 import grind/internal/queue/renewer
-import grind/postgres
-import grind/worker
+import grind/internal/worker
 import sinal/forwarder
 
 pub type WorkerMessage {

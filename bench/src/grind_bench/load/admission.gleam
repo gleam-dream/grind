@@ -6,12 +6,12 @@ import gleam/io
 import gleam/json
 import gleam/list
 import gleam/string
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/submission
-import grind/unique
-import grind/worker
+import grind/internal/consumer as queue
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind_bench/audit
 import grind_bench/load/context
 import grind_bench/load/observers

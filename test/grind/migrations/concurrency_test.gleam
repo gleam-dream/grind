@@ -6,7 +6,7 @@ import gleam/list
 import gleam/result
 import gleeunit/should
 import grind/internal/migrations
-import grind/postgres
+import grind/internal/postgres
 import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt, spawn_lock_holder,
   spawn_submit,

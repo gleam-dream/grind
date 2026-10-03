@@ -1,10 +1,10 @@
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
-import grind/postgres
-import grind/submission
-import grind/unique
-import grind/worker
+import grind/internal/postgres
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import pog
 
 /// The `Int` input / `String` output (`int.to_string`) worker shape most

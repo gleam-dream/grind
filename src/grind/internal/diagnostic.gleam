@@ -19,8 +19,8 @@
 //// is `checkout_wait_us`. Closed enum wire strings are listed on each type.
 
 import gleam/option.{type Option}
+import grind/internal/observation
 import grind/internal/observation/wire
-import grind/observation
 import sinal.{type Event}
 import sinal/fields
 

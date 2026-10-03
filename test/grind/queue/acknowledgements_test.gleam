@@ -6,10 +6,11 @@ import gleam/json
 import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/attempt
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/ack_queries.{count_acknowledgements_for_job}
 import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt, spawn_lock_holder,
@@ -27,7 +28,6 @@ import grind/support/syncrep.{
 }
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_databases}
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 import pog
 
 pub fn postgres_acknowledgement_persists_a_receipt_test() {

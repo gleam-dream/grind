@@ -10,16 +10,16 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import grind/internal/job
 import grind/internal/sql
 import grind/internal/store
+import grind/internal/submission
+import grind/internal/unique
 import grind/internal/unique_admission/query as unique_admission_query
 import grind/internal/unique_admission/request.{
   type PolicyPart, type Request, PolicyPart,
 } as unique_admission_request
-import grind/job
-import grind/submission
-import grind/unique
-import grind/worker.{type Worker}
+import grind/internal/worker.{type Worker}
 import pog
 
 /// The proven-committed outcome of one `submit` call. Mirrors

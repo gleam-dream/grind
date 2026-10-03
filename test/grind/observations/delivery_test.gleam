@@ -6,13 +6,14 @@ import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
-import grind/diagnostic
 import grind/internal/attempt
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/diagnostic
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/ack_queries.{count_acknowledgements_for_job}
 import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt, spawn_lock_holder,
@@ -30,7 +31,6 @@ import grind/support/observation_fixtures.{
 }
 import grind/support/observers.{detach}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_databases}
-import grind/worker
 import pog
 import sinal
 

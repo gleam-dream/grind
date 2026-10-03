@@ -5,11 +5,12 @@ import gleam/json
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleeunit/should
+import grind/internal/consumer as queue
 import grind/internal/consumer_hooks
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/queue_signals.{RetryPolicyInvoked}
@@ -17,7 +18,6 @@ import grind/support/queue_timing.{database_time_milliseconds}
 import grind/support/worker_failure.{
   AccountMissing, decode_lookup_failure, encode_lookup_failure,
 }
-import grind/worker
 import one_shot
 import pog
 

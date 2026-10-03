@@ -3,12 +3,12 @@
 
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import grind/internal/job.{type JobHandle, type State, Queued, Scheduled}
+import grind/internal/observation
 import grind/internal/postgres/resolution_queries.{
   type ResolutionCommand, ResolutionCommand,
 } as postgres_resolution_queries
 import grind/internal/store
-import grind/job.{type JobHandle, type State, Queued, Scheduled}
-import grind/observation
 import pog
 import sinal/forwarder.{type Forwarder}
 

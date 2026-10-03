@@ -9,7 +9,7 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleam/string
-import grind/queue
+import grind/internal/consumer as queue
 import grind_bench/load/context
 import grind_bench/load/runtime
 import grind_bench/load/workload

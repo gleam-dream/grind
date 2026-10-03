@@ -1,11 +1,11 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/result
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/unique
 import grind/internal/unique_admission
-import grind/job
-import grind/postgres
-import grind/unique
-import grind/worker
+import grind/internal/worker
 import pog
 
 pub fn await_claim_waiting_on_advisory(

@@ -1,6 +1,6 @@
 //// Payload-free projections and bounded forwarding for queue diagnostics.
 
-import grind/diagnostic
+import grind/internal/diagnostic
 import grind/internal/store
 import pog
 import sinal/forwarder.{type Forwarder}

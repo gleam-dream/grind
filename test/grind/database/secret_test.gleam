@@ -5,7 +5,7 @@
 import exception
 import gleam/string
 import gleeunit/should
-import grind/postgres
+import grind/internal/postgres
 import grind/support/env.{database_url, mark_database_test_executed}
 
 const password = "grind-secret-password"

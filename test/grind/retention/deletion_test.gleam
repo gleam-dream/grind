@@ -6,10 +6,12 @@ import gleam/json
 import gleam/list
 import gleam/result
 import gleeunit/should
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/submission
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/concurrency.{
   ClaimGateAcquired, ClaimGateReleased, ReleaseAttempt, spawn_lock_holder,
   spawn_submit, unique_test_lock_key,
@@ -23,8 +25,6 @@ import grind/support/retention_rows.{
   seed_resolution_receipt, seed_terminal_job, seed_unique_submission_receipt,
 }
 import grind/support/submissions.{submit_keep_existing, unique_test_worker}
-import grind/unique
-import grind/worker
 import pog
 import sinal
 

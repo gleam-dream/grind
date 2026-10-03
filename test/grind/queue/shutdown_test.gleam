@@ -4,10 +4,11 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/concurrency.{type LeaseCommand, ReleaseAttempt}
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{
@@ -22,7 +23,6 @@ import grind/support/queue_timing.{
   await_new_coordinator_pid, wait_for_shutdown_state,
 }
 import grind/support/worker_failure.{AccountMissing}
-import grind/worker
 import pog
 
 pub fn postgres_repeated_stop_after_coordinator_gone_reports_without_drain_test() {

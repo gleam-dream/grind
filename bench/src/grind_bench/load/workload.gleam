@@ -4,8 +4,8 @@ import gleam/io
 import gleam/list
 import gleam/result
 import gleam/string
-import grind/postgres
-import grind/worker
+import grind/internal/postgres
+import grind/internal/worker
 import grind_bench/audit
 import grind_bench/load/runtime
 import grind_bench/preload

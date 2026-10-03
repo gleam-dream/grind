@@ -5,8 +5,8 @@ import gleam/erlang/process
 import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
-import grind/diagnostic
-import grind/observation
+import grind/internal/diagnostic
+import grind/internal/observation
 import sinal
 
 @external(erlang, "grind_diagnostic_wire_probe", "attach")

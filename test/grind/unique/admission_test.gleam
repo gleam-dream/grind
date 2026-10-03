@@ -2,15 +2,15 @@ import gleam/dynamic/decode
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/submission
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/env.{database_url, mark_database_test_executed}
 import grind/support/submissions.{submit_keep_existing, unique_test_worker}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{RawInput, encode_raw_input, raw_input_decoder}
-import grind/unique
-import grind/worker
 
 pub fn unique_period_validation_test() {
   unique.within_milliseconds(0, unique.FromInsertion)

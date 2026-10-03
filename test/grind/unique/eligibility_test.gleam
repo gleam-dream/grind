@@ -3,18 +3,18 @@ import gleam/dynamic/decode
 import gleam/json
 import gleam/list
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/submission
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{database_url, mark_database_test_executed}
 import grind/support/submissions.{submit_keep_existing, unique_test_worker}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{force_job_state}
-import grind/unique
-import grind/worker
 
 /// Increment 4: `WithinQueue` admits the same key independently in two
 /// queues; `AcrossQueues` then conflicts with the earlier of the two rows

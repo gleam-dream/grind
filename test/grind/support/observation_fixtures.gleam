@@ -3,10 +3,10 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleeunit/should
-import grind/observation
-import grind/registry
+import grind/internal/observation
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/worker_failure.{type LookupFailure}
-import grind/worker
 import sinal
 import sinal/forwarder
 

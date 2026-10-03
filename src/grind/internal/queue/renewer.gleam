@@ -5,8 +5,8 @@ import gleam/erlang/process
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
-import grind/diagnostic
 import grind/internal/attempt
+import grind/internal/diagnostic
 import grind/internal/diagnostics
 import pog
 import sinal/forwarder.{type Forwarder}

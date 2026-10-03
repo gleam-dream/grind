@@ -83,7 +83,6 @@ pub fn advisory_lock_statement() -> String {
 ///
 /// `@internal`: exposed only for `postgres.migrate_with` and the test suite,
 /// never part of the public API.
-@internal
 pub fn migrations() -> List(Migration) {
   [
     Migration(11, v11_statements(), v11_shape(), [], []),

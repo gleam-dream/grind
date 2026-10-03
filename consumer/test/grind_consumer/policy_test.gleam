@@ -1,5 +1,5 @@
 import gleeunit/should
-import grind/queue
+import grind/internal/consumer as queue
 
 pub fn queue_policy_is_checked_before_start_test() {
   queue.default_policy()

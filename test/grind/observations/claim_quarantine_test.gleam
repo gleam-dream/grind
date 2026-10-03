@@ -7,11 +7,12 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/attempt
-import grind/job
-import grind/observation
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/observation
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/consumer.{manual_policy}
 import grind/support/env.{
   database_url, mark_database_test_executed, quarantine_url, queue_database_url,
@@ -21,7 +22,6 @@ import grind/support/submissions.{
   unique_test_worker, unique_test_worker_versioned,
 }
 import grind/support/unique_fixture.{unique_test_suffix}
-import grind/worker
 import pog
 import sinal
 

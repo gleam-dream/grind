@@ -6,17 +6,17 @@ import gleam/json
 import gleam/list
 import gleam/string
 import gleeunit/should
-import grind/diagnostic
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
+import grind/internal/consumer as queue
+import grind/internal/diagnostic
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import grind/support/diagnostics
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/support/job_state.{wait_for_succeeded}
 import grind/support/lease_queries.{lease_expiration}
 import grind/support/observers.{detach}
-import grind/worker
 import pog
 
 pub fn postgres_first_ack_rollback_retries_proposal_without_rerun_test() {

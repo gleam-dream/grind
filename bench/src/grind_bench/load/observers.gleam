@@ -1,4 +1,4 @@
-import grind/observation
+import grind/internal/observation
 import grind_bench/load/runtime
 import sinal
 import sinal/forwarder

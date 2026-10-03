@@ -12,9 +12,9 @@
 import exception
 import gleam/dynamic/decode
 import gleeunit/should
-import grind/job
-import grind/postgres
-import grind/worker
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/worker
 import grind_bench
 import grind_bench/preload
 import grind_bench/worker as bench_worker

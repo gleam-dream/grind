@@ -35,8 +35,8 @@ import gleam/erlang/process
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
-import grind/observation
-import grind/postgres.{type Database}
+import grind/internal/observation
+import grind/internal/postgres.{type Database}
 import pog
 import sinal/forwarder.{type Forwarder}
 
@@ -139,7 +139,6 @@ pub fn supervisor_pid(pruner: Pruner) -> process.Pid {
 /// `@internal`: exposed only so the test suite can kill a live incarnation
 /// to prove the supervisor restarts it cleanly, with no duplicated or
 /// leaked tick.
-@internal
 pub fn actor_pid(pruner: Pruner) -> Result(process.Pid, Nil) {
   let Pruner(subject:, ..) = pruner
   process.subject_owner(subject)

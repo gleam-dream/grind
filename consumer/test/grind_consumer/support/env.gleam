@@ -1,5 +1,5 @@
 import gleam/time/timestamp
-import grind/queue
+import grind/internal/consumer as queue
 
 pub fn now_unix_ms() -> Int {
   let #(seconds, nanoseconds) =

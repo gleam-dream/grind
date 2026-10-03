@@ -9,14 +9,14 @@ import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/string
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/submission
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker
 import grind/support/consumer
-import grind/unique
-import grind/worker
 import pog
 import simplifile
 

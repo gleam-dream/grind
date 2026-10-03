@@ -4,12 +4,12 @@ import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
-import grind/postgres
+import grind/internal/postgres
+import grind/internal/worker
 import grind/support/concurrency.{ReleaseAttempt}
 import grind/support/env.{unique_test_run_id}
 import grind/support/queue_signals.{type LeaseSignal, FirstAttemptStarted}
 import grind/support/worker_failure.{type LookupFailure, AccountMissing}
-import grind/worker
 import pog
 
 // -- Uniqueness (grind/unique, submit_unique/reconcile_unique) --------------

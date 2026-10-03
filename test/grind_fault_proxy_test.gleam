@@ -34,11 +34,11 @@ import gleam/option.{Some}
 import gleam/string
 import gleeunit/should
 import grind/internal/attempt
-import grind/job
-import grind/postgres
-import grind/queue
-import grind/registry
-import grind/worker
+import grind/internal/consumer as queue
+import grind/internal/job
+import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/worker
 import pog
 
 @external(erlang, "grind_test_env", "fault_proxy_url")

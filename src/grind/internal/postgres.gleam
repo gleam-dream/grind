@@ -21,20 +21,20 @@ import gleam/otp/static_supervisor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import grind/internal/job.{type JobHandle, type State}
 import grind/internal/lease
 import grind/internal/migrations
+import grind/internal/observation
 import grind/internal/pool
 import grind/internal/postgres/job_reads as postgres_job_reads
 import grind/internal/postgres/migration as postgres_migration
 import grind/internal/postgres/resolution as postgres_resolution
 import grind/internal/sql
 import grind/internal/store
+import grind/internal/submission
+import grind/internal/unique
 import grind/internal/unique_admission
-import grind/job.{type JobHandle, type State}
-import grind/observation
-import grind/submission
-import grind/unique
-import grind/worker.{type Worker}
+import grind/internal/worker.{type Worker}
 import pog
 import sinal/forwarder.{type Forwarder}
 
@@ -426,7 +426,6 @@ pub opaque type Database {
 /// would (`unique_domain_lock_query` in `test/grind/support/lock_wait.gleam`,
 /// exercised by `test/grind/unique/lock_contention_test.gleam`); never part
 /// of the public API.
-@internal
 pub fn installation(database: Database) -> job.Installation {
   let Database(installation:, ..) = database
   installation
@@ -697,7 +696,6 @@ pub fn close(database: Database) -> Result(Nil, CloseError) {
 
 /// A consumer's dedicated renewal pool shares the database connection
 /// settings but has its own registered name and reserved connection.
-@internal
 pub fn renewal_pool_config(
   database: Database,
   pool_name: process.Name(pog.Message),
@@ -929,7 +927,6 @@ pub fn migrate(database: Database) -> Result(Nil, StorageError) {
 /// `@internal`: exposed only for the test suite (concurrent migrators,
 /// injected partial failures, and the upgrade harness), never part of the
 /// public API.
-@internal
 pub fn migrate_with(
   database: Database,
   steps: List(migrations.Migration),
@@ -1561,7 +1558,6 @@ pub type AcknowledgementReceipt {
 /// Exposed only so `grind/internal/attempt` can read a connection out of an
 /// opaque `Database` — that module cannot pattern-match `Database`'s own
 /// constructor, which stays private to this module.
-@internal
 pub fn connection(database: Database) -> pog.Connection {
   let Database(connection:, ..) = database
   connection
@@ -1569,7 +1565,6 @@ pub fn connection(database: Database) -> pog.Connection {
 
 /// Exposed only so `grind/internal/attempt` can read a forwarder out of an
 /// opaque `Database`; see `connection`.
-@internal
 pub fn forwarder(database: Database) -> Forwarder {
   let Database(forwarder:, ..) = database
   forwarder
@@ -1734,7 +1729,6 @@ pub fn prune_finished(
 /// out so `grind/pruner.validate_policy` can enforce the identical bounds
 /// on its own `max_age_ms` field without a second, independently
 /// maintained copy of them.
-@internal
 pub fn validate_retention_ms(older_than_ms: Int) -> Result(Nil, PruneError) {
   case older_than_ms <= 0 {
     True -> Error(NonPositiveRetention)
@@ -1749,7 +1743,6 @@ pub fn validate_retention_ms(older_than_ms: Int) -> Result(Nil, PruneError) {
 /// The `limit` half of `prune_finished`'s own validation — see
 /// `validate_retention_ms`'s own doc comment for why this is `@internal`
 /// and shared with `grind/pruner`.
-@internal
 pub fn validate_prune_limit(limit: Int) -> Result(Nil, PruneError) {
   case limit <= 0 {
     True -> Error(NonPositivePruneLimit)

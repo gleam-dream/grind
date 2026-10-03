@@ -8,7 +8,7 @@
 
 import gleam/list
 import gleam/option.{type Option}
-import grind/worker.{type Worker}
+import grind/internal/worker.{type Worker}
 
 /// Immutable worker selections for one queue name.
 pub opaque type Registry {
@@ -90,7 +90,6 @@ pub fn queue(registry: Registry) -> String {
   queue
 }
 
-@internal
 pub fn identities(registry: Registry) -> List(#(String, String)) {
   let Registry(workers:, ..) = registry
   list.map(workers, fn(selection) {
@@ -99,14 +98,12 @@ pub fn identities(registry: Registry) -> List(#(String, String)) {
   })
 }
 
-@internal
 pub type SelectionError {
   WrongQueue(expected: String, actual: String)
   WorkerNotRegistered(id: String, version: String)
 }
 
 /// Internal exact selection; no worker-version fallback is permitted.
-@internal
 pub fn select(
   registry: Registry,
   queue: String,
