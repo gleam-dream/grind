@@ -38,7 +38,8 @@ pub fn fast(config: grind.Config) -> grind.Config {
   |> grind.with_unique_lock_wait(duration.milliseconds(400))
 }
 
-/// Starts a runtime, migrates it, runs `body`, then stops it.
+/// Starts a runtime that migrates its schema first, runs `body`, then
+/// stops it.
 pub fn with_runtime(
   url: String,
   configure: fn(grind.Config) -> grind.Config,
@@ -46,8 +47,10 @@ pub fn with_runtime(
 ) -> a {
   let name = process.new_name("facade_grind")
   let assert Ok(jobs) =
-    grind.start(configure(grind.new(pool_config(url))), name)
+    grind.start(
+      configure(grind.new(pool_config(url))) |> grind.with_startup_migration,
+      name,
+    )
   use <- exception.defer(fn() { grind.stop(jobs) })
-  let assert Ok(Nil) = grind.migrate(jobs)
   body(jobs)
 }

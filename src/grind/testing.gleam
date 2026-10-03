@@ -28,6 +28,7 @@ import grind/internal/consumer
 import grind/internal/runtime
 import grind/internal/worker as definition
 import grind/worker.{type Context, type Response, type Worker}
+import pog
 
 /// Why `perform` could not run the handler, or could not encode its
 /// result.
@@ -42,8 +43,9 @@ pub type Error {
   ErrorRejected(reason: String)
 }
 
-/// A context for job 1, attempt 1 of 20, no snoozes, queue `"default"`,
-/// whose cancellation never fires.
+/// A context for the given job and attempt, of 20, with no snoozes, queue
+/// `"default"`, a cancellation that never fires, and a connection to no
+/// pool: set one with `with_connection` for a handler that queries.
 pub fn context(job_id job_id: Int, attempt attempt: Int) -> Context {
   definition.synthetic_context(
     job_id:,
@@ -64,6 +66,15 @@ pub fn with_snooze_count(context: Context, snooze_count: Int) -> Context {
 
 pub fn with_queue(context: Context, queue: String) -> Context {
   definition.Context(..context, queue:)
+}
+
+/// The connection `worker.connection` returns, such as
+/// `grind.connection(jobs)` or a test's own pool.
+pub fn with_connection(
+  context: Context,
+  connection: pog.Connection,
+) -> Context {
+  definition.Context(..context, connection:)
 }
 
 /// A context whose cancellation has already fired, for the process that

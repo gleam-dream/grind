@@ -30,6 +30,7 @@ import grind/internal/pool
 import grind/internal/postgres/job_reads as postgres_job_reads
 import grind/internal/postgres/migration as postgres_migration
 import grind/internal/postgres/resolution as postgres_resolution
+import grind/internal/postgres/schema_probe
 import grind/internal/sql
 import grind/internal/store
 import grind/internal/submission
@@ -201,8 +202,10 @@ pub fn with_observation_capacity(
   Settings(..settings, observation_capacity: capacity)
 }
 
-/// Sets the PostgreSQL schema every pooled connection's `search_path` is
-/// pinned to exactly (`validate`, via a `pog.connection_parameter`) — the one
+/// Sets the PostgreSQL schema every Grind storage call's `search_path` is
+/// set to exactly (`validate`: a connection parameter on a pool Grind owns
+/// alone; on a pool shared with the application, set for each call and
+/// restored before the connection returns to the pool) — the one
 /// schema this `Database` reads and writes, and the schema `migrate`/
 /// `migrate_with` creates if it does not yet exist. Defaults to `"public"`.
 /// See `README.md`, "Isolation": the schema, not any value derived from the
@@ -210,7 +213,7 @@ pub fn with_observation_capacity(
 /// distinct Grind installations sharing one PostgreSQL cluster. Validated
 /// non-empty by `validate`; never SQL-injected — every use of `schema` is
 /// either a properly quoted identifier (`CREATE SCHEMA IF NOT EXISTS`, the
-/// `search_path` connection parameter) or an ordinary bound query parameter
+/// bound `search_path` value) or an ordinary bound query parameter
 /// (the uniqueness admission lock key, see
 /// `grind/internal/unique_admission/query.lock_key_sql`), never spliced as
 /// unescaped text.
@@ -281,6 +284,11 @@ pub opaque type ValidatedSettings {
     schema: String,
     max_payload_bytes: Int,
     connect_timeout_ms: Int,
+    /// The `search_path` each managed checkout sets and then restores:
+    /// `Some` for a pool built from the application's `pog.Config` and
+    /// shared with it, `None` for a pool Grind owns alone, whose sessions
+    /// are pinned to the schema by a connection parameter instead.
+    scoped_search_path: Option(String),
   )
 }
 
@@ -429,20 +437,33 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
               name: "idle_in_transaction_session_timeout",
               value: int.to_string(2 * settings.statement_deadline_ms),
             )
-            // Pins every pooled connection's `search_path` to exactly this
-            // one configured schema — see `with_schema`'s own doc comment
-            // and `docs/RISKS.md` #7. This is what makes the advisory lock
-            // key's bound `schema` parameter (see
-            // `grind/internal/unique_admission/query.lock_key_sql`) and every
-            // `current_schema()`-based query elsewhere in this module
-            // (`read_schema_generation` and friends) agree by
-            // construction.
-            |> pog.connection_parameter(
-              name: "search_path",
-              value: quote_ident(settings.schema),
+          // A pool Grind owns alone (a URL source) pins every session's
+          // `search_path` to exactly the schema. A pool built from the
+          // application's `pog.Config` is shared with the application,
+          // whose unqualified tables must keep resolving through its own
+          // `search_path`: Grind's statements run under its schema one
+          // managed checkout at a time instead (`pool_child`,
+          // `grind_postgres_ffi:enter_search_path`). Either way the
+          // advisory lock key's bound `schema` parameter (see
+          // `grind/internal/unique_admission/query.lock_key_sql`) and every
+          // `current_schema()`-based read (`read_schema_generation` and
+          // friends) agree by construction. See `with_schema` and
+          // `docs/RISKS.md` #7.
+          let search_path = quote_ident(settings.schema)
+          let #(config, scoped_search_path) = case settings.source {
+            FromUrl(..) -> #(
+              pog.connection_parameter(
+                config,
+                name: "search_path",
+                value: search_path,
+              ),
+              None,
             )
+            FromConfig(..) -> #(config, Some(search_path))
+          }
           Ok(ValidatedSettings(
             fn() { config },
+            scoped_search_path:,
             forwarder: validated_forwarder(settings.observation_capacity),
             unique_lock_wait_ms: settings.unique_lock_wait_ms,
             statement_deadline_ms: settings.statement_deadline_ms,
@@ -610,8 +631,17 @@ pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
 pub fn pool_child(
   settings: ValidatedSettings,
 ) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
-  let ValidatedSettings(reveal_config, statement_deadline_ms:, ..) = settings
-  pool.supervised(reveal_config(), statement_deadline_ms)
+  let ValidatedSettings(
+    reveal_config,
+    statement_deadline_ms:,
+    scoped_search_path:,
+    ..,
+  ) = settings
+  pool.supervised_with_search_path(
+    reveal_config(),
+    statement_deadline_ms,
+    scoped_search_path,
+  )
 }
 
 /// The observation forwarder under its own temporary supervisor; see
@@ -650,6 +680,7 @@ pub fn attach(
     schema:,
     max_payload_bytes:,
     connect_timeout_ms:,
+    ..,
   ) = settings
   let pog.Config(pool_name:, ..) = reveal_config()
   let connection = pog.named_connection(pool_name)
@@ -846,8 +877,18 @@ pub fn renewal_pool_config(
   database: Database,
   pool_name: process.Name(pog.Message),
 ) -> pog.Config {
-  let Database(config:, ..) = database
-  pog.Config(..config(), pool_name:, pool_size: 1)
+  let Database(config:, schema:, ..) = database
+  let config = config()
+  // The renewal pool is Grind's alone, so its sessions are pinned to the
+  // schema outright, replacing any `search_path` the application gave.
+  let parameters =
+    list.filter(config.connection_parameters, fn(parameter) {
+      parameter.0 != "search_path"
+    })
+  pog.Config(..config, pool_name:, pool_size: 1, connection_parameters: [
+    #("search_path", quote_ident(schema)),
+    ..parameters
+  ])
 }
 
 pub type StorageError {
@@ -1089,6 +1130,33 @@ pub fn migrate_with(
     steps,
   )
   |> result.map_error(migration_error)
+}
+
+/// The newest schema version `migrate` reaches.
+pub fn latest_schema_version() -> Int {
+  list.fold(migrations.migrations(), 0, fn(highest, step) {
+    int.max(highest, step.version)
+  })
+}
+
+/// The schema's applied version from its migration markers alone: `None`
+/// when Grind's marker table is absent or empty. `start` reads it to refuse
+/// consumers on a schema `migrate` has not brought up to date; `migrate`
+/// itself checks the full shape.
+pub fn schema_version(
+  database: Database,
+) -> Result(Option(Int), pog.QueryError) {
+  let Database(connection:, ..) = database
+  case schema_probe.schema_migrations_table_exists(connection) {
+    Error(schema_probe.ProbeQueryFailed(error)) -> Error(error)
+    Error(schema_probe.ProbeMalformed) | Ok(False) -> Ok(None)
+    Ok(True) ->
+      case schema_probe.read_schema_marker(connection) {
+        Error(schema_probe.ProbeQueryFailed(error)) -> Error(error)
+        Error(schema_probe.ProbeMalformed) | Ok(#(0, _, _)) -> Ok(None)
+        Ok(#(_, _, maximum)) -> Ok(Some(maximum))
+      }
+  }
 }
 
 fn migration_error(error: postgres_migration.RunnerError) -> StorageError {

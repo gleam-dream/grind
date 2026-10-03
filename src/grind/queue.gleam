@@ -24,6 +24,15 @@
 //// queue stops claiming and waits up to its grace for running jobs.
 //// `grind.start` and `grind.supervised` check these values and report a
 //// `grind.InvalidQueue` error.
+////
+//// Every bound in Grind is a `gleam/time/duration.Duration`, not a bare
+//// `Int`: the queue's settings, the worker's timeout and retry delays, the
+//// facade's deadlines and `grind.await(within:)`. One type keeps the unit
+//// in the call (`duration.milliseconds(250)`, `duration.seconds(30)`), so a
+//// lease in seconds cannot be passed where milliseconds are read; the
+//// lease rule above compares two of them. An application holding
+//// milliseconds converts once with `duration.milliseconds(ms)`, which needs
+//// `gleam_time` as a direct dependency.
 
 import gleam/time/duration.{type Duration}
 import grind/internal/queue_config

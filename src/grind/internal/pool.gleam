@@ -3,6 +3,7 @@
 
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process
+import gleam/option.{type Option, None}
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
@@ -12,13 +13,25 @@ pub fn supervised(
   config: pog.Config,
   deadline_ms: Int,
 ) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
+  supervised_with_search_path(config, deadline_ms, None)
+}
+
+/// A pool whose managed checkouts each run under `search_path` (an already
+/// quoted value) and restore the session's own value before the connection
+/// returns to the pool, so a pool shared with the application keeps the
+/// application's `search_path`. `None` leaves sessions untouched.
+pub fn supervised_with_search_path(
+  config: pog.Config,
+  deadline_ms: Int,
+  search_path: Option(String),
+) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
   static_supervisor.new(static_supervisor.OneForAll)
   |> static_supervisor.add(
     // This lifecycle owner must outlive every admitted application caller and
     // pgo descendant. A public bounded close may report StopTimedOut while it
     // continues draining; the parent must not force-kill it after five seconds.
     supervision.supervisor(fn() {
-      case start_deadline_owner(config.pool_name, deadline_ms) {
+      case start_deadline_owner(config.pool_name, deadline_ms, search_path) {
         Ok(pid) -> Ok(actor.Started(pid, Nil))
         Error(reason) -> Error(actor.InitExited(process.Abnormal(reason)))
       }
@@ -36,6 +49,7 @@ pub fn supervised(
 fn start_deadline_owner(
   name: process.Name(pog.Message),
   deadline_ms: Int,
+  search_path: Option(String),
 ) -> Result(process.Pid, Dynamic)
 
 /// A public Database owns an unlinked root. Isolate failed OTP start links too:

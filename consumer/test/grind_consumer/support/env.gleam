@@ -54,8 +54,8 @@ pub fn pool(url: String) -> pog.Config {
   config |> pog.pool_size(4)
 }
 
-/// Starts a runtime over the consumer database, migrates it, runs `body`,
-/// and stops it.
+/// Starts a runtime over the consumer database that migrates its schema
+/// first, runs `body`, and stops it.
 pub fn with_grind(
   url: String,
   configure: fn(grind.Config) -> grind.Config,
@@ -63,10 +63,9 @@ pub fn with_grind(
 ) -> a {
   let assert Ok(jobs) =
     grind.start(
-      configure(grind.new(pool(url))),
+      configure(grind.new(pool(url))) |> grind.with_startup_migration,
       process.new_name("consumer_grind"),
     )
   use <- exception.defer(fn() { grind.stop(jobs) })
-  let assert Ok(Nil) = grind.migrate(jobs)
   body(jobs)
 }

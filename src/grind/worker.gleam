@@ -28,7 +28,8 @@
 ////
 //// A handler built with `new` returns `Result(output, error)`. One built
 //// with `responding` receives the job's `Context` (job id, attempt, snooze
-//// count, correlation, cancellation and deadline) and returns a `Response`
+//// count, correlation, cancellation, deadline and the runtime's database
+//// connection) and returns a `Response`
 //// that may also snooze, discard, cancel or report an uncertain effect.
 ////
 //// | Policy             | Default                                   | Setter                      |
@@ -49,6 +50,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
 import grind/internal/worker as definition
+import pog
 import sinal/correlation.{type Correlation}
 
 /// A typed worker definition. Build it with `new` or `responding`.
@@ -61,8 +63,8 @@ pub type Codec(value) =
 
 /// What a running handler knows about its job. Read it with `job_id`,
 /// `attempt`, `max_attempts`, `snooze_count`, `queue`, `correlation`,
-/// `cancellation` and `deadline`. `grind/testing.context` builds one for a
-/// test.
+/// `cancellation`, `deadline` and `connection`. `grind/testing.context`
+/// builds one for a test.
 pub type Context =
   definition.Context
 
@@ -411,4 +413,14 @@ pub fn cancellation(context: Context) -> process.Selector(Nil) {
 /// When the handler will be stopped, if the worker has a timeout.
 pub fn deadline(context: Context) -> Option(Timestamp) {
   context.deadline
+}
+
+/// The runtime's pool, the one `grind.connection` returns, for the
+/// handler's own queries. A worker is defined before the runtime starts, so
+/// this is how its handler reaches the shared pool. Queries on it run
+/// under the application's `search_path`. It is not the attempt's
+/// acknowledgement: a write commits on its own, so a handler that may run
+/// twice writes idempotently.
+pub fn connection(context: Context) -> pog.Connection {
+  context.connection
 }

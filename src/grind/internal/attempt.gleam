@@ -43,6 +43,7 @@ pub opaque type ClaimedJob {
     run: fn(worker.Context) -> worker.Execution,
     timeout_ms: Option(Int),
     abandonment: worker.Abandonment,
+    connection: pog.Connection,
   )
 }
 
@@ -138,6 +139,7 @@ pub fn claim_context(
     correlation: stored_correlation(id, correlation),
     cancellation:,
     deadline:,
+    connection: claimed.connection,
   )
 }
 
@@ -751,6 +753,7 @@ fn claim_registered_job(
                       },
                       timeout_ms:,
                       abandonment:,
+                      connection: postgres.connection(database),
                     )),
                   )
                 }

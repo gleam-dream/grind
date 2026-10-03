@@ -8,26 +8,31 @@
 //// import grind/job
 ////
 //// pub fn children(pool: pog.Config, name: process.Name(grind.Message)) {
-////   let config = grind.new(pool) |> grind.with_worker(mailer())
+////   let config =
+////     grind.new(pool)
+////     |> grind.with_worker(mailer())
+////     |> grind.with_startup_migration
 ////   supervisor.new(supervisor.OneForOne)
 ////   |> supervisor.add(grind.supervised(config, name))
 //// }
 ////
 //// pub fn send(name: process.Name(grind.Message), email: Email) {
 ////   let jobs = grind.named(name)
-////   let assert Ok(grind.Inserted(handle)) =
-////     grind.submit(jobs, job.new(mailer(), email))
-////   grind.await(jobs, handle, within: duration.seconds(5))
+////   let assert Ok(admission) = grind.submit(jobs, job.new(mailer(), email))
+////   grind.await(jobs, grind.handle(admission), within: duration.seconds(5))
 //// }
 //// ```
 ////
 //// One child runs everything a node needs: the PostgreSQL pool built from
 //// the application's `pog.Config`, an observation forwarder, one consumer
-//// per queue its workers use, and the pruner. `grind.connection` returns
-//// that pool, so the application, Grind and other libraries share it;
-//// `submit_in` enqueues inside the application's own transaction. Run the
-//// schema's migrations once with `migrate`, or apply `priv/migrations`
-//// through cigogne.
+//// per queue its workers use, and the pruner. `grind.connection` (and
+//// `worker.connection` inside a handler) returns that pool, so the
+//// application, Grind and other libraries share it; `submit_in` enqueues
+//// inside the application's own transaction. A runtime that runs
+//// consumers starts only on a current schema: `with_startup_migration`
+//// applies the migrations first, or migrate at deploy time with `migrate`
+//// from a runtime `without_consumers`, or apply `priv/migrations` through
+//// cigogne.
 ////
 //// | Operation                      | Default                        | Setter                          |
 //// | ------------------------------ | ------------------------------ | ------------------------------- |
@@ -96,6 +101,7 @@ pub opaque type Config {
     observation_capacity: Int,
     pruner: Option(Int),
     consumers: Bool,
+    startup_migration: Bool,
   )
 }
 
@@ -114,11 +120,14 @@ type Registration {
 const default_max_age_ms = 604_800_000
 
 /// A configuration that builds Grind's pool from the application's
-/// `pog.Config`, keeping its pool name and size. Grind adds three
-/// connection parameters: `search_path` set to Grind's schema (`public` by
-/// default), `READ COMMITTED` isolation, and an idle-in-transaction timeout
-/// of twice the statement deadline. The configuration is held in a
-/// closure, so its password does not print.
+/// `pog.Config`, keeping its pool name, size and `search_path`. Grind adds
+/// two connection parameters: `READ COMMITTED` isolation, and an
+/// idle-in-transaction timeout of twice the statement deadline. Grind's own
+/// statements run under its schema (`with_schema`), set for each storage
+/// call and restored before the connection returns to the pool, so the
+/// application's unqualified tables keep resolving through its own
+/// `search_path`. The configuration is held in a closure, so its password
+/// does not print.
 pub fn new(pool: pog.Config) -> Config {
   Config(
     pool: fn() { pool },
@@ -133,6 +142,7 @@ pub fn new(pool: pog.Config) -> Config {
     observation_capacity: 1024,
     pruner: Some(default_max_age_ms),
     consumers: True,
+    startup_migration: False,
   )
 }
 
@@ -159,7 +169,8 @@ pub fn with_queue(config: Config, queue: Queue) -> Config {
 
 /// The PostgreSQL schema Grind reads and writes, `public` by default. The
 /// schema is the unit of isolation between Grind installations in one
-/// database.
+/// database. It scopes only Grind's own statements: queries the
+/// application runs on `connection` keep the application's `search_path`.
 pub fn with_schema(config: Config, schema: String) -> Config {
   Config(..config, schema:)
 }
@@ -216,6 +227,16 @@ pub fn without_pruner(config: Config) -> Config {
 /// Oban's `queues: false`.
 pub fn without_consumers(config: Config) -> Config {
   Config(..config, consumers: False)
+}
+
+/// Applies missing schema migrations when the runtime starts, before any
+/// consumer polls, exactly as `migrate` does; a failure fails the start
+/// with `StartupMigrationFailed`. Without it, a runtime that would start
+/// consumers refuses a schema behind this Grind's with `SchemaNotMigrated`.
+/// Leave it off when the runtime's role may not run DDL, and migrate at
+/// deploy time instead.
+pub fn with_startup_migration(config: Config) -> Config {
+  Config(..config, startup_migration: True)
 }
 
 /// A configuration value `start` or `supervised` rejected.
@@ -455,6 +476,13 @@ pub type StartError {
   /// No connection could be made within the connect timeout, or the first
   /// query failed.
   Unavailable(pog.QueryError)
+  /// The runtime would start consumers, but the schema is at `found`
+  /// (`None`: not installed), below the `required` version. Configure
+  /// `with_startup_migration`, or run `migrate` from a runtime started
+  /// `without_consumers` (or apply `priv/migrations`) first.
+  SchemaNotMigrated(found: Option(Int), required: Int)
+  /// `with_startup_migration` was set and the migration failed.
+  StartupMigrationFailed(MigrateError)
   /// The runtime's processes could not start, for example because another
   /// runtime already uses this name or pool name. The description never
   /// includes an exit reason, which could carry the pool configuration.
@@ -491,16 +519,21 @@ pub fn start(
     Ok(_) -> Ok(runtime.Grind(name))
     Error(error) ->
       case process.receive(failures, within: 0) {
-        Ok(failure) -> Error(Unavailable(failure))
+        Ok(runtime.DatabaseUnavailable(failure)) -> Error(Unavailable(failure))
+        Ok(runtime.SchemaBehind(found:, required:)) ->
+          Error(SchemaNotMigrated(found:, required:))
+        Ok(runtime.StartupMigrationFailed(failure)) ->
+          Error(StartupMigrationFailed(migrate_error(failure)))
         Error(Nil) -> Error(StartFailed(start_failure(error)))
       }
   }
 }
 
 /// The runtime as one child of the application's supervision tree,
-/// registered under `name`. A configuration error or an unreachable
-/// database fails the child's start with a description; call `check` first
-/// for a typed configuration error. On shutdown each queue stops claiming
+/// registered under `name`. A configuration error, an unreachable
+/// database, or a schema behind this Grind's when the node runs consumers
+/// (see `with_startup_migration`) fails the child's start with a
+/// description; call `check` first for a typed configuration error. On shutdown each queue stops claiming
 /// and waits up to its grace for running jobs.
 pub fn supervised(
   config: Config,
@@ -546,12 +579,17 @@ fn root_supervisor(
   plans: List(runtime.QueuePlan),
   name: process.Name(Message),
   is_supervised: Bool,
-  failures: Option(process.Subject(pog.QueryError)),
+  failures: Option(process.Subject(runtime.Failure)),
 ) -> static_supervisor.Builder {
   let queues = case config.consumers {
     True ->
       list.map(plans, fn(plan) { #(plan, process.new_name("grind_consumer")) })
     False -> []
+  }
+  let startup = case config.startup_migration, queues {
+    True, _ -> runtime.MigrateFirst
+    False, [] -> runtime.SkipSchemaCheck
+    False, _ -> runtime.RequireCurrentSchema
   }
   let database = fn() {
     runtime.database(runtime.Grind(name))
@@ -569,6 +607,8 @@ fn root_supervisor(
       plans,
       failures,
       config.connect_timeout_ms,
+      startup,
+      config.migration_deadline_ms,
     ))
   let root =
     list.fold(queues, root, fn(root, entry) {
@@ -605,8 +645,11 @@ fn root_supervisor(
 }
 
 /// The runtime's pool, shared with the application: run your own queries
-/// on it, or open the transaction that `submit_in` enqueues inside. Its
-/// `search_path` is Grind's schema. Panics when no runtime was configured
+/// on it, or open the transaction that `submit_in` enqueues inside. It is
+/// `pog.named_connection` of the configuration's pool name, and its
+/// `search_path` is the application's: Grind sets its own schema for its
+/// own statements only. A handler reaches the same pool with
+/// `worker.connection(context)`. Panics when no runtime was configured
 /// under this name on this node with `start` or `supervised`.
 pub fn connection(grind: Grind) -> pog.Connection {
   case runtime.recorded_pool(grind.name) {
@@ -692,46 +735,72 @@ pub type MigrateError {
 
 /// Applies every missing schema migration, each in its own transaction
 /// under an advisory lock. Running it again, or on many nodes at once, is
-/// safe.
+/// safe. A runtime that runs consumers needs a current schema to start, so
+/// call this from a runtime started `without_consumers` (a deploy step), or
+/// configure `with_startup_migration` instead.
 pub fn migrate(grind: Grind) -> Result(Nil, MigrateError) {
   case runtime.database(grind) {
     Error(Nil) -> Error(MigrateNotRunning)
     Ok(database) ->
-      postgres.migrate(database)
-      |> result.map_error(fn(error) {
-        case error {
-          postgres.MigrationQueryFailed(reason) -> MigrationUnavailable(reason)
-          postgres.SchemaCreationFailed(reason) -> MigrationUnavailable(reason)
-          postgres.IncompatibleSchema -> IncompatibleSchema
-          postgres.UnsupportedSchemaVersion(version) ->
-            UnsupportedSchemaVersion(version)
-          postgres.MigrationStepFailed(version, reason) ->
-            MigrationStepFailed(version, reason)
-          postgres.MigrationLockUnavailable(version) ->
-            MigrationLockUnavailable(version)
-          postgres.MigrationCommitUnknown(version) ->
-            MigrationCommitUnknown(version)
-        }
-      })
+      postgres.migrate(database) |> result.map_error(migrate_error)
+  }
+}
+
+fn migrate_error(error: postgres.StorageError) -> MigrateError {
+  case error {
+    postgres.MigrationQueryFailed(reason) -> MigrationUnavailable(reason)
+    postgres.SchemaCreationFailed(reason) -> MigrationUnavailable(reason)
+    postgres.IncompatibleSchema -> IncompatibleSchema
+    postgres.UnsupportedSchemaVersion(version) ->
+      UnsupportedSchemaVersion(version)
+    postgres.MigrationStepFailed(version, reason) ->
+      MigrationStepFailed(version, reason)
+    postgres.MigrationLockUnavailable(version) ->
+      MigrationLockUnavailable(version)
+    postgres.MigrationCommitUnknown(version) -> MigrationCommitUnknown(version)
   }
 }
 
 // -- Submission ---------------------------------------------------------------
 
-/// What a submit admitted.
+/// What a submit admitted. A job without `job.unique` is always
+/// `Inserted`; `handle` returns the job either way, so a plain submit needs
+/// no `case`:
+///
+/// ```gleam
+/// use admission <- result.try(grind.submit(jobs, job.new(mailer(), email)))
+/// grind.await(jobs, grind.handle(admission), within: duration.seconds(5))
+/// ```
 pub type Admission(input, output, error) {
   /// A new job.
   Inserted(JobHandle(input, output, error))
   /// A job already occupies the uniqueness key; nothing was inserted.
-  Existing(Conflict)
+  Existing(Conflict(input, output, error))
   /// The occupying scheduled job was moved to the policy's time.
-  Rescheduled(Conflict)
+  Rescheduled(Conflict(input, output, error))
 }
 
-/// The stored job a uniqueness conflict found. Rebind it with `bind` to
-/// read its typed outcome. `state` is its state when the decision was made.
-pub type Conflict {
-  Conflict(job_id: Int, queue: String, state: State)
+/// The stored job a uniqueness conflict found. `state` is its state when
+/// the decision was made. `handle` reads it with the submitted worker's
+/// codecs: the occupying job has the same worker id and version, and a
+/// read still checks its stored codec versions.
+pub type Conflict(input, output, error) {
+  Conflict(
+    job_id: Int,
+    queue: String,
+    state: State,
+    handle: JobHandle(input, output, error),
+  )
+}
+
+/// The admitted job: the new one, or the one occupying the uniqueness key.
+pub fn handle(
+  admission: Admission(input, output, error),
+) -> JobHandle(input, output, error) {
+  case admission {
+    Inserted(handle) -> handle
+    Existing(conflict) | Rescheduled(conflict) -> conflict.handle
+  }
 }
 
 /// A submit whose commit could not be confirmed. Pass it to
@@ -781,17 +850,16 @@ pub fn submit(
   )
   use spec <- result.try(spec_for(job))
   postgres.admit(database, spec)
-  |> result.map(admission_of)
+  |> result.map(admission_of(_, postgres.installation(database), spec.worker))
   |> result.map_error(submit_error)
 }
 
 /// Admits a job inside the application's open transaction `tx`, so it
 /// commits or rolls back with the application's own writes. Grind sends no
-/// `BEGIN` or `COMMIT` and emits no `admitted` event: the commit is yours.
-/// The transaction must be `READ COMMITTED` and on Grind's database; Grind
-/// sets `search_path` and `lock_timeout` for its own statements, then
-/// restores yours. When your commit's outcome is unknown, resubmit the same
-/// job under the same id (`job.with_id`).
+/// `BEGIN` or `COMMIT`. The transaction must be `READ COMMITTED` and on
+/// Grind's database; Grind sets `search_path` and `lock_timeout` for its
+/// own statements, then restores yours. When your commit's outcome is
+/// unknown, resubmit the same job under the same id (`job.with_id`).
 ///
 /// ```gleam
 /// pog.transaction(grind.connection(jobs), fn(tx) {
@@ -800,6 +868,13 @@ pub fn submit(
 ///   |> result.map_error(ReceiptNotQueued)
 /// })
 /// ```
+///
+/// Grind emits no `[grind, job, admitted]` event here, because it cannot
+/// see whether your commit succeeded; the job's first event is `claimed`.
+/// To trace the admission, record it yourself once `pog.transaction`
+/// returns `Ok`: the admission's `job.id(grind.handle(admission))`, and
+/// the correlation you gave the job with `job.with_correlation`, join it to
+/// the job's later events.
 pub fn submit_in(
   grind: Grind,
   tx: pog.Connection,
@@ -810,7 +885,7 @@ pub fn submit_in(
   )
   use spec <- result.try(spec_for(job))
   postgres.admit_in(database, tx, spec)
-  |> result.map(admission_of)
+  |> result.map(admission_of(_, postgres.installation(database), spec.worker))
   |> result.map_error(submit_error)
 }
 
@@ -825,7 +900,11 @@ pub fn reconcile_submission(
     runtime.database(grind) |> result.replace_error(SubmitNotRunning),
   )
   postgres.reconcile_unique(database, pending)
-  |> result.map(admission_of)
+  |> result.map(admission_of(
+    _,
+    submission.pending_submission_installation(pending),
+    submission.pending_submission_worker(pending),
+  ))
   |> result.map_error(submit_error)
 }
 
@@ -879,19 +958,39 @@ fn spec_for(
 
 fn admission_of(
   admission: submission.Admission(input, output, error),
+  installation: internal_job.Installation,
+  worker: Worker(input, output, error),
 ) -> Admission(input, output, error) {
   case admission {
     submission.Inserted(handle) -> Inserted(handle)
-    submission.Existing(conflict) -> Existing(conflict_of(conflict))
-    submission.Rescheduled(conflict) -> Rescheduled(conflict_of(conflict))
+    submission.Existing(conflict) ->
+      Existing(conflict_of(conflict, installation, worker))
+    submission.Rescheduled(conflict) ->
+      Rescheduled(conflict_of(conflict, installation, worker))
   }
 }
 
-fn conflict_of(conflict: submission.Conflict) -> Conflict {
+fn conflict_of(
+  conflict: submission.Conflict,
+  installation: internal_job.Installation,
+  worker: Worker(input, output, error),
+) -> Conflict(input, output, error) {
+  let job_id = submission.conflict_job_id(conflict)
+  let queue = submission.conflict_queue(conflict)
   Conflict(
-    job_id: submission.conflict_job_id(conflict),
-    queue: submission.conflict_queue(conflict),
+    job_id:,
+    queue:,
     state: convert.state(submission.conflict_state(conflict)),
+    handle: internal_job.JobHandle(
+      id: job_id,
+      installation:,
+      queue:,
+      worker_id: worker.id,
+      worker_version: worker.version,
+      input: worker.input,
+      output: worker.output,
+      error: worker.error,
+    ),
   )
 }
 
@@ -1321,6 +1420,10 @@ pub fn describe_start_error(error: StartError) -> String {
     InvalidConfig(error) -> describe_config_error(error)
     Unavailable(reason) ->
       "grind: the database is unavailable: " <> string.inspect(reason)
+    SchemaNotMigrated(found:, required:) ->
+      runtime.describe_schema_behind(found, required)
+    StartupMigrationFailed(error) ->
+      "grind: the startup migration failed: " <> string.inspect(error)
     StartFailed(description:) ->
       "grind: the runtime did not start: " <> description
   }

@@ -13,6 +13,7 @@ import grind/job
 import grind/testing
 import grind/unique
 import grind/worker
+import pog
 
 fn int_codec() -> worker.Codec(Int) {
   worker.codec(worker.infallible(json.int), decode.int)
@@ -152,6 +153,12 @@ pub fn perform_with_passes_the_context_test() {
     0,
   )
   |> should.equal(Ok(worker.Cancelled("cancelled")))
+  // A test chooses the connection a handler's queries use.
+  let db = pog.named_connection(process.new_name("definition_test_pool"))
+  testing.context(job_id: 7, attempt: 1)
+  |> testing.with_connection(db)
+  |> worker.connection
+  |> should.equal(db)
 }
 
 pub fn state_names_and_terminal_states_test() {

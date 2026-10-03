@@ -1,5 +1,5 @@
 -module(grind_runtime_ffi).
--export([parent_pid/0, put_pool/2, get_pool/1, exit_shutdown/0]).
+-export([parent_pid/0, put_pool/2, get_pool/1, exit_shutdown/0, no_pool/0]).
 
 %% The calling process's supervisor: the first entry of `$ancestors`, which
 %% proc_lib sets for every process a supervisor starts.
@@ -25,3 +25,8 @@ get_pool(Name) ->
 
 exit_shutdown() ->
     erlang:exit(shutdown).
+
+%% The pool name of a synthetic handler context (`grind/testing`): a fixed
+%% name no pool is ever started under, so a query on it fails at once.
+no_pool() ->
+    grind_testing_no_pool.

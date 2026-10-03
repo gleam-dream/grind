@@ -81,13 +81,13 @@ with_deadline_ms(PoolName, Deadline, Fun, OnCheckoutFailure) ->
 
 with_deadline_ms_timing(PoolName, Deadline, Fun, OnCheckoutFailure) ->
     case grind_pool_ffi:acquire(PoolName) of
-        {ok, Owner, Token, ConfiguredDeadlineMs} ->
+        {ok, Owner, Token, ConfiguredDeadlineMs, SearchPath} ->
             DeadlineMs = case Deadline of
                 configured -> ConfiguredDeadlineMs;
                 ExplicitDeadlineMs -> ExplicitDeadlineMs
             end,
             ExpiresAt = erlang:monotonic_time(millisecond) + DeadlineMs,
-            try checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure, 0, 0)
+            try checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, 0, 0)
             after grind_pool_ffi:release(Owner, Token)
             end;
         {error, closed} -> checkout_unavailable(OnCheckoutFailure, 0, 0)
@@ -97,13 +97,13 @@ with_deadline_ms_timing(PoolName, Deadline, Fun, OnCheckoutFailure) ->
 %% Checking it back in recycles that dead socket forever. Retire unusable
 %% candidates before sending any SQL, sharing one absolute deadline across
 %% all candidates. This retries admission only: Fun is never retried here.
-checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
+checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
     case erlang:monotonic_time(millisecond) < ExpiresAt of
         false -> checkout_unavailable(OnCheckoutFailure, WaitUs, Candidates);
-        true -> checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates)
+        true -> checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates)
     end.
 
-checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
+checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
     %% Time only the real checkout call. Probes, stale-holder retirement,
     %% callback execution and cleanup do not masquerade as pool waiting.
     %% Pinned pgo has no receive timeout while queued: this interval may exceed
@@ -112,19 +112,28 @@ checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidat
     try pgo:checkout(PoolName, [{timeout, infinity}, {deadline, ExpiresAt}]) of
         {ok, Ref, Conn} ->
             CheckedOutWaitUs = WaitUs + erlang:monotonic_time(microsecond) - StartedUs,
-            case connection_usable(Conn, ExpiresAt) andalso
+            Entered = case connection_usable(Conn, ExpiresAt) andalso
                  erlang:monotonic_time(millisecond) < ExpiresAt of
-                true ->
+                true -> enter_search_path(Conn, SearchPath);
+                false -> error
+            end,
+            case Entered of
+                {ok, Restore} ->
                     Value = try Fun({single_connection, Conn}, Conn)
                     after
                         %% Cleanup cannot change a result or prove whether an
                         %% earlier command committed. Ambiguity stays ambiguous.
-                        catch return_connection(Ref, Conn, ExpiresAt)
+                        %% A connection whose search_path could not be
+                        %% restored never returns to the shared pool.
+                        case catch leave_search_path(Conn, Restore) of
+                            ok -> catch return_connection(Ref, Conn, ExpiresAt);
+                            _ -> retire_connection(Ref, Conn)
+                        end
                     end,
                     {Value, {checkout_timing, CheckedOutWaitUs, Candidates + 1, checked_out}};
-                false ->
+                error ->
                     retire_connection(Ref, Conn),
-                    checkout_before(PoolName, ExpiresAt, Fun, OnCheckoutFailure,
+                    checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure,
                                     CheckedOutWaitUs, Candidates + 1)
             end;
         {error, _Reason} ->
@@ -149,6 +158,38 @@ checkout_candidate(PoolName, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidat
                                  WaitUs + erlang:monotonic_time(microsecond) - StartedUs,
                                  Candidates + 1)
     end.
+
+%% The pool is shared with the application, so Grind never pins the
+%% session's `search_path` for the connection's life. Each managed checkout
+%% sets it to Grind's schema, saving the session's value first, and puts
+%% that value back before the connection returns to the pool. Both
+%% statements are session-level (`set_config(.., false)`), so a rollback
+%% inside `Fun` neither undoes the first nor is undone by the second. A
+%% connection the first statement fails on is retired before any of the
+%% caller's SQL is sent; one the restore fails on is retired instead of
+%% being checked in. `none` (a pool Grind owns alone, or a test pool)
+%% leaves the session untouched.
+enter_search_path(_Conn, none) -> {ok, none};
+enter_search_path(Conn, {some, SearchPath}) ->
+    Sql = <<"WITH previous AS MATERIALIZED (SELECT current_setting('search_path') AS value) "
+            "SELECT previous.value, set_config('search_path', $1, false) FROM previous">>,
+    case catch pgo_handler:extended_query(Conn, Sql, [SearchPath], #{queue_time => undefined}) of
+        #{rows := [Row]} -> {ok, {some, row_first(Row)}};
+        _ -> error
+    end.
+
+leave_search_path(_Conn, none) -> ok;
+leave_search_path(Conn, {some, Previous}) ->
+    Sql = <<"SELECT set_config('search_path', $1, false)">>,
+    case pgo_handler:extended_query(Conn, Sql, [Previous], #{queue_time => undefined}) of
+        #{rows := [_]} -> ok;
+        _ -> error
+    end.
+
+row_first(Row) when is_tuple(Row) -> element(1, Row);
+row_first([Value | _]) -> Value;
+row_first(#{<<"value">> := Value}) -> Value;
+row_first(#{value := Value}) -> Value.
 
 checkout_unavailable(OnCheckoutFailure, WaitUs, Candidates) ->
     {OnCheckoutFailure(), {checkout_timing, WaitUs, Candidates, checkout_unavailable}}.

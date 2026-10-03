@@ -15,6 +15,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/time/timestamp.{type Timestamp}
+import pog
 import sinal/correlation.{type Correlation}
 
 /// A versioned JSON boundary for one caller-owned value type.
@@ -166,11 +167,14 @@ pub type Context {
     correlation: Correlation,
     cancellation: process.Selector(Nil),
     deadline: Option(Timestamp),
+    /// The runtime's pool, shared with the application.
+    connection: pog.Connection,
   )
 }
 
 /// A context for running a handler outside a consumer, as `grind/testing`
-/// and the unit tests do. Its cancellation selector never fires.
+/// and the unit tests do. Its cancellation selector never fires, and its
+/// connection names a pool that is never started.
 pub fn synthetic_context(
   job_id job_id: Int,
   attempt attempt: Int,
@@ -187,8 +191,12 @@ pub fn synthetic_context(
     correlation: correlation.from_key("grind-job-" <> int.to_string(job_id)),
     cancellation: process.new_selector(),
     deadline: None,
+    connection: pog.named_connection(no_pool()),
   )
 }
+
+@external(erlang, "grind_runtime_ffi", "no_pool")
+fn no_pool() -> process.Name(pog.Message)
 
 /// The default handler timeout: 15 minutes.
 pub const default_timeout_ms = 900_000

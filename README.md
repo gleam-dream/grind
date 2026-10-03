@@ -34,10 +34,13 @@ pub fn mailer() -> worker.Worker(Email, String, Nil) {
   |> worker.with_queue("mailers")
 }
 
-/// One child in the application's supervision tree runs the pool, one
-/// consumer per queue and the pruner.
+/// One child in the application's supervision tree migrates the schema,
+/// then runs the pool, one consumer per queue and the pruner.
 pub fn children(pool: pog.Config, name: process.Name(grind.Message)) {
-  let config = grind.new(pool) |> grind.with_worker(mailer())
+  let config =
+    grind.new(pool)
+    |> grind.with_worker(mailer())
+    |> grind.with_startup_migration
   supervisor.new(supervisor.OneForOne)
   |> supervisor.add(grind.supervised(config, name))
 }
@@ -45,15 +48,20 @@ pub fn children(pool: pog.Config, name: process.Name(grind.Message)) {
 /// Anywhere in the application: a handle found by name.
 pub fn send(name: process.Name(grind.Message), email: Email) {
   let jobs = grind.named(name)
-  let assert Ok(grind.Inserted(handle)) =
-    grind.submit(jobs, job.new(mailer(), email))
-  grind.await(jobs, handle, within: duration.seconds(5))
+  let assert Ok(admission) = grind.submit(jobs, job.new(mailer(), email))
+  grind.await(jobs, grind.handle(admission), within: duration.seconds(5))
   // Ok(grind.Succeeded("msg:a@b.c"))
 }
 ```
 
-Run `grind.migrate(jobs)` once at deploy time, or apply
+A runtime that runs consumers starts only on a current schema, so no
+consumer polls before Grind's tables exist. `grind.with_startup_migration`
+applies the missing migrations before the consumers start. Without it,
+`start` fails with `SchemaNotMigrated(found:, required:)` (and `supervised`
+fails its child's start) until the schema is migrated at deploy time:
+`grind.migrate(jobs)` from a runtime started `without_consumers`, or
 [`priv/migrations`](priv/migrations) through cigogne (see "Migrations").
+Leave startup migration off when the runtime's role may not run DDL.
 `test/grind/facade/readme_test.gleam` compiles and runs this program.
 
 ## Defaults
@@ -158,14 +166,22 @@ line.
 
 Grind builds its pool from the application's `pog.Config` and keeps its
 pool name. `grind.connection(jobs)` returns that pool, so the application,
-Grind and other libraries (a saga store, for example) share one pool. The
-pool's `search_path` is Grind's schema (`public` by default) and its
-isolation is `READ COMMITTED`; qualify tables in other schemas.
+Grind and other libraries (a saga store, for example) share one pool; a
+handler reaches it with `worker.connection(context)`, since a worker is
+defined before the runtime exists. The pool's isolation is
+`READ COMMITTED`. Its `search_path` stays the application's: Grind sets
+its own schema (`grind.with_schema`, `public` by default) for each of its
+storage calls and restores the session's value before the connection
+returns to the pool, so an application can keep Grind in its own schema
+and still query its tables unqualified.
 
 `grind.submit_in(jobs, tx, job)` admits a job inside the application's
 open transaction: the job, its receipt and any uniqueness decision commit or
 roll back with the application's own writes. Grind sends no `BEGIN` or
-`COMMIT` and emits no `admitted` event. The transaction must be
+`COMMIT` and emits no `admitted` event, because it cannot see your commit;
+record the admission yourself after `pog.transaction` returns `Ok`, keyed
+by `job.id(grind.handle(admission))` and the job's correlation. The
+transaction must be
 `READ COMMITTED` on Grind's database; Grind sets `search_path` and
 `lock_timeout` for its own statements and restores yours.
 
@@ -193,8 +209,8 @@ submit-only node. `start` and `supervised` validate the configuration;
 ## Handler context, cancellation and abandoned attempts
 
 A `responding` handler receives a `worker.Context`: `job_id`, `attempt`,
-`max_attempts`, `snooze_count`, `queue`, `correlation`, `deadline` and
-`cancellation`. `grind.cancel` of a running job commits a cancellation
+`max_attempts`, `snooze_count`, `queue`, `correlation`, `deadline`,
+`cancellation` and `connection` (the runtime's pool). `grind.cancel` of a running job commits a cancellation
 request; the attempt's next lease renewal (within a third of the lease)
 delivers it to the handler's `cancellation` selector, and a handler that
 stops early returns `Cancelled`.
@@ -205,7 +221,9 @@ follows: `HoldUncertain`, the default, holds the job `uncertain` until an
 operator resolves it with `admin.resolve_uncertain`; it never runs twice
 without a decision. `ReplayAfterLeaseExpiry(max_replays:)` requeues it after
 its lease expires, at most that many times; choose it for handlers that are
-idempotent by construction. `admin.list(jobs, admin.query(limit: 100) |>
+idempotent by construction. A replay redelivers the same business attempt,
+so it does not count against `max_attempts`, and `[grind, job, quarantined]`
+reports it with `replayed: True`. `admin.list(jobs, admin.query(limit: 100) |>
 admin.in_state(job.Uncertain))` finds the jobs that wait for an operator.
 
 A snooze reschedules the job without using an attempt. After
@@ -229,10 +247,12 @@ whatever `grind_jobs` and its sibling tables hold in one PostgreSQL schema —
 there is no separate owner column scoping rows within one shared schema.
 Which schema is **explicit configuration, not inferred**: `grind.new`
 defaults the schema to `"public"`; `grind.with_schema(config,
-"myschema")` overrides it. `grind.start` and `grind.supervised` pin every pooled
-connection's own `search_path` to exactly that one configured schema (a
-`search_path` connection parameter, quoted safely), so it is never left to
-whatever the connecting role or database would otherwise default to. Two
+"myschema")` overrides it. Every Grind storage call runs with `search_path`
+set to exactly that one configured schema (quoted safely, set when the call
+checks out its connection and restored before the connection returns to the
+pool), so it is never left to whatever the connecting role or database
+would otherwise default to, and the application's own queries on the shared
+pool keep the application's `search_path`. Two
 pools configured with the same schema (through any connection string that
 reaches the same physical database) share the identical installation and
 see each other's jobs; two pools configured with different schemas — in the
@@ -287,7 +307,11 @@ PostgreSQL must be configured to preserve `search_path`** — PgBouncer's
 transaction pooling mode in particular can hand a physical server
 connection to a client without applying that client's own startup
 parameters, silently pointing an installation at the wrong schema with no
-error at all; see [docs/RISKS.md](docs/RISKS.md) risk 18.
+error at all; see [docs/RISKS.md](docs/RISKS.md) risk 18. On a pool built
+from the application's `pog.Config`, Grind sets `search_path` per storage
+call with a session-level `set_config` and restores it afterwards, so the
+pooler must also keep one server session for the whole checkout (session
+pooling).
 
 ## Observations
 
@@ -713,11 +737,14 @@ Cigogne keeps its own migration-tracking table (`priv/cigogne.toml`'s
 `grind_schema_migrations`: cigogne's own `applied`/`unapplied` computation
 never reads Grind's marker table, only its own. An application that also
 uses `grind.with_schema` to put Grind's own tables in a non-`public`
-schema gets that placement automatically for cigogne's _DDL_ too — the
-shared connection's `search_path`, which Grind's own `grind.start`
-pins to exactly the configured schema, is what every unqualified
-`CREATE TABLE`/`ALTER TABLE` in `priv/migrations/*.sql` resolves against —
-but cigogne's own _tracking table_ location is a separate decision the
+schema must point cigogne's connection at that schema itself: every
+unqualified `CREATE TABLE`/`ALTER TABLE` in `priv/migrations/*.sql`
+resolves against the connection's own `search_path`, and the pool
+`grind.connection` returns keeps the application's (Grind sets its schema
+only for its own storage calls). Give cigogne a connection whose
+`search_path` is that schema (a `pog.connection_parameter` on a separate
+migration pool), or migrate with `grind.migrate`/`with_startup_migration`,
+which always target the configured schema. Cigogne's own _tracking table_ location is a separate decision the
 application must make explicitly (`priv/cigogne.toml`'s
 `[migration-table] schema = "..."`, or the equivalent
 `config.MigrationTableConfig` override): left at the default, every Grind

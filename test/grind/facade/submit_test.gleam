@@ -152,6 +152,8 @@ pub fn facade_handler_context_carries_job_identity_test() {
       worker.queue(context) |> should.equal(job.queue(handle))
       worker.correlation(context) |> should.equal(order)
       worker.deadline(context) |> option.is_some |> should.be_true
+      // The context carries the runtime's pool.
+      worker.connection(context) |> should.equal(grind.connection(jobs))
       // The correlation is stored with the job.
       let assert Ok([summary]) =
         admin.list(
@@ -258,10 +260,14 @@ pub fn facade_unique_policy_returns_existing_test() {
       let policy = unique_policy()
       let assert Ok(grind.Inserted(first)) =
         grind.submit(jobs, job.new(echo_worker, 3) |> job.unique(policy))
-      let assert Ok(grind.Existing(conflict)) =
+      let assert Ok(grind.Existing(conflict) as admission) =
         grind.submit(jobs, job.new(echo_worker, 3) |> job.unique(policy))
       conflict.job_id |> should.equal(job.id(first))
       conflict.state |> should.equal(job.Queued)
+      // `handle` returns the occupying job, readable without `bind`.
+      grind.handle(admission) |> should.equal(first)
+      grind.state(jobs, conflict.handle) |> should.equal(Ok(job.Queued))
+      grind.handle(grind.Inserted(first)) |> should.equal(first)
       mark_database_test_executed("facade-unique-existing-passed")
     }
   }

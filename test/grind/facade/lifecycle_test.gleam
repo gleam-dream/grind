@@ -34,13 +34,15 @@ pub fn facade_supervised_handle_survives_a_restart_test() {
       // A handle exists before its runtime starts.
       grind.submit(jobs, job.new(echo_worker, 1))
       |> should.equal(Error(grind.SubmitNotRunning))
-      let config = grind.new(pool_config(url)) |> grind.with_worker(echo_worker)
+      let config =
+        grind.new(pool_config(url))
+        |> grind.with_worker(echo_worker)
+        |> grind.with_startup_migration
       let assert Ok(started) =
         supervisor.new(supervisor.OneForOne)
         |> supervisor.add(grind.supervised(config, name))
         |> supervisor.start
       use <- exception.defer(fn() { stop_tree(started.pid) })
-      let assert Ok(Nil) = grind.migrate(jobs)
       let assert Ok(grind.Inserted(first)) =
         grind.submit(jobs, job.new(echo_worker, 1))
       grind.await(jobs, first, within: duration.seconds(10))
@@ -106,10 +108,11 @@ pub fn facade_stop_from_another_process_drains_test() {
       let name = process.new_name("lifecycle_stop")
       let assert Ok(jobs) =
         grind.start(
-          grind.new(pool_config(url)) |> grind.with_worker(slow),
+          grind.new(pool_config(url))
+            |> grind.with_worker(slow)
+            |> grind.with_startup_migration,
           name,
         )
-      let assert Ok(Nil) = grind.migrate(jobs)
       let assert Ok(grind.Inserted(handle)) =
         grind.submit(jobs, job.new(slow, 9))
       let assert Ok(Nil) = process.receive(started_handler, within: 10_000)
@@ -152,13 +155,15 @@ pub fn facade_supervisor_shutdown_drains_running_jobs_test() {
         )
         |> worker.with_queue(unique("lifecycle-drain"))
       let name = process.new_name("lifecycle_drain")
-      let config = grind.new(pool_config(url)) |> grind.with_worker(slow)
+      let config =
+        grind.new(pool_config(url))
+        |> grind.with_worker(slow)
+        |> grind.with_startup_migration
       let assert Ok(started) =
         supervisor.new(supervisor.OneForOne)
         |> supervisor.add(grind.supervised(config, name))
         |> supervisor.start
       let jobs = grind.named(name)
-      let assert Ok(Nil) = grind.migrate(jobs)
       let assert Ok(grind.Inserted(handle)) =
         grind.submit(jobs, job.new(slow, 3))
       let assert Ok(Nil) = process.receive(started_handler, within: 10_000)

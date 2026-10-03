@@ -1,22 +1,28 @@
 -module(grind_pool_ffi).
 -behaviour(gen_server).
 
--export([start_deadline_owner/2, managed_start/2, acquire/1, release/2,
+-export([start_deadline_owner/2, start_deadline_owner/3, managed_start/2, acquire/1, release/2,
          start_unlinked/1, abort_start/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
--record(owner, {name, deadline, pool = undefined, pool_monitor = undefined, pool_stopped = false,
+-record(owner, {name, deadline, search_path = none, pool = undefined, pool_monitor = undefined, pool_stopped = false,
                 subtree = unattached, calls = #{}}).
 
 %% One stable registration per pool protects the live incarnation's deadline.
 start_deadline_owner(PoolName, DeadlineMs) ->
-    OwnerName = list_to_atom(atom_to_list(PoolName) ++ "_deadline_owner"),
-    gen_server:start_link({local, OwnerName}, ?MODULE, {PoolName, DeadlineMs}, []).
+    start_deadline_owner(PoolName, DeadlineMs, none).
 
-init({PoolName, DeadlineMs}) ->
+%% `SearchPath` is `none` or `{some, Value}`: the `search_path` every managed
+%% checkout from this pool runs under, restored before the connection
+%% returns to the pool (`grind_postgres_ffi`, `scoped/3`).
+start_deadline_owner(PoolName, DeadlineMs, SearchPath) ->
+    OwnerName = list_to_atom(atom_to_list(PoolName) ++ "_deadline_owner"),
+    gen_server:start_link({local, OwnerName}, ?MODULE, {PoolName, DeadlineMs, SearchPath}, []).
+
+init({PoolName, DeadlineMs, SearchPath}) ->
     process_flag(trap_exit, true),
     persistent_term:put({grind_pg_deadline, PoolName}, {self(), DeadlineMs}),
-    {ok, #owner{name = PoolName, deadline = DeadlineMs}}.
+    {ok, #owner{name = PoolName, deadline = DeadlineMs, search_path = SearchPath}}.
 
 %% Register the exact pgo subtree before a managed pool start can succeed. The
 %% pinned pgo_pool starts an internal supervisor, but its own death does not
@@ -108,11 +114,12 @@ handle_call({attach, PoolPid, Tree}, _From,
     end;
 handle_call({acquire, Caller}, _From,
             State = #owner{name = Name, pool = Pool, subtree = {_, _},
-                           deadline = Deadline, calls = Calls}) ->
+                           deadline = Deadline, search_path = SearchPath,
+                           calls = Calls}) ->
     case whereis(Name) =:= Pool andalso is_process_alive(Pool) of
         true ->
             Token = monitor(process, Caller),
-            {reply, {ok, self(), Token, Deadline},
+            {reply, {ok, self(), Token, Deadline, SearchPath},
              State#owner{calls = Calls#{Token => Caller}}};
         false -> {reply, {error, closed}, State}
     end;

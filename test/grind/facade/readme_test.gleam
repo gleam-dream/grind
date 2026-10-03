@@ -42,16 +42,18 @@ pub fn mailer() -> worker.Worker(Email, String, Nil) {
 }
 
 pub fn children(pool: pog.Config, name: process.Name(grind.Message)) {
-  let config = grind.new(pool) |> grind.with_worker(mailer())
+  let config =
+    grind.new(pool)
+    |> grind.with_worker(mailer())
+    |> grind.with_startup_migration
   supervisor.new(supervisor.OneForOne)
   |> supervisor.add(grind.supervised(config, name))
 }
 
 pub fn send(name: process.Name(grind.Message), email: Email) {
   let jobs = grind.named(name)
-  let assert Ok(grind.Inserted(handle)) =
-    grind.submit(jobs, job.new(mailer(), email))
-  grind.await(jobs, handle, within: duration.seconds(5))
+  let assert Ok(admission) = grind.submit(jobs, job.new(mailer(), email))
+  grind.await(jobs, grind.handle(admission), within: duration.seconds(5))
 }
 
 pub fn readme_quick_start_test() {
@@ -62,7 +64,6 @@ pub fn readme_quick_start_test() {
       let assert Ok(started) =
         children(pool_config(url), name) |> supervisor.start
       use <- exception.defer(fn() { stop_supervisor(started.pid) })
-      let assert Ok(Nil) = grind.migrate(grind.named(name))
       send(name, Email("a@b.c", "hi"))
       |> should.equal(Ok(grind.Succeeded("msg:a@b.c")))
       mark_database_test_executed("facade-readme-quick-start-passed")

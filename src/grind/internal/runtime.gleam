@@ -3,6 +3,7 @@
 
 import exception
 import gleam/erlang/process
+import gleam/int
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
@@ -45,42 +46,80 @@ pub type Runtime {
   )
 }
 
+/// What the runtime does about the schema before its consumers start.
+pub type Startup {
+  /// Apply missing migrations first (`grind.with_startup_migration`).
+  MigrateFirst
+  /// Refuse to start consumers on a schema behind this Grind's migrations.
+  RequireCurrentSchema
+  /// No consumer starts on this node, so nothing polls the schema early.
+  SkipSchemaCheck
+}
+
+/// Why the runtime did not start, for `grind.start`'s typed error.
+pub type Failure {
+  DatabaseUnavailable(pog.QueryError)
+  /// The schema's applied version is `found` (`None`: not installed), below
+  /// the `required` version this Grind's consumers run against.
+  SchemaBehind(found: Option(Int), required: Int)
+  StartupMigrationFailed(postgres.StorageError)
+}
+
 /// The runtime as a supervised child registered under `name`. It reads the
 /// installation identity over the already-running pool, waiting up to the
-/// connect timeout, and sends a failure to `failures` when given one.
+/// connect timeout, then settles the schema as `startup` says, before any
+/// consumer (a later child) starts. It sends a failure to `failures` when
+/// given one.
 pub fn child(
   validated: postgres.ValidatedSettings,
   name: process.Name(Message),
   supervised: Bool,
   queues: List(#(QueuePlan, process.Name(consumer.Message))),
   plans: List(QueuePlan),
-  failures: Option(process.Subject(pog.QueryError)),
+  failures: Option(process.Subject(Failure)),
   connect_timeout_ms: Int,
+  startup: Startup,
+  migration_deadline_ms: Int,
 ) -> supervision.ChildSpecification(Nil) {
+  let init_timeout_ms = case startup {
+    MigrateFirst ->
+      // One bounded transaction per version, plus the schema creation.
+      connect_timeout_ms
+      + 5000
+      + migration_deadline_ms
+      * { postgres.latest_schema_version() + 1 }
+    RequireCurrentSchema | SkipSchemaCheck -> connect_timeout_ms + 5000
+  }
+  let fail = fn(failure: Failure) {
+    case failures {
+      Some(failures) -> process.send(failures, failure)
+      None -> Nil
+    }
+    Error(describe_failure(failure))
+  }
   supervision.worker(fn() {
-    actor.new_with_initialiser(connect_timeout_ms + 5000, fn(subject) {
+    actor.new_with_initialiser(init_timeout_ms, fn(subject) {
       let root = parent_pid()
       case postgres.attach(validated, root) {
-        Error(postgres.InstallationQueryFailed(error)) -> {
-          case failures {
-            Some(failures) -> process.send(failures, error)
-            None -> Nil
-          }
-          Error("grind: the database is unavailable: " <> string.inspect(error))
-        }
+        Error(postgres.InstallationQueryFailed(error)) ->
+          fail(DatabaseUnavailable(error))
         Error(postgres.PoolStartFailed(_)) ->
           Error("grind: the database pool did not start")
         Ok(database) ->
-          Ok(
-            actor.initialised(Runtime(
-              database:,
-              root:,
-              supervised:,
-              queues:,
-              plans:,
-            ))
-            |> actor.returning(subject),
-          )
+          case settle_schema(database, startup) {
+            Error(failure) -> fail(failure)
+            Ok(Nil) ->
+              Ok(
+                actor.initialised(Runtime(
+                  database:,
+                  root:,
+                  supervised:,
+                  queues:,
+                  plans:,
+                ))
+                |> actor.returning(subject),
+              )
+          }
       }
     })
     |> actor.named(name)
@@ -95,6 +134,49 @@ pub fn child(
     |> actor.start
     |> result.map(fn(started) { actor.Started(started.pid, Nil) })
   })
+}
+
+fn settle_schema(
+  database: postgres.Database,
+  startup: Startup,
+) -> Result(Nil, Failure) {
+  case startup {
+    SkipSchemaCheck -> Ok(Nil)
+    MigrateFirst ->
+      postgres.migrate(database) |> result.map_error(StartupMigrationFailed)
+    RequireCurrentSchema -> {
+      let required = postgres.latest_schema_version()
+      case postgres.schema_version(database) {
+        Error(error) -> Error(DatabaseUnavailable(error))
+        // A newer Grind may have migrated first in a rolling deploy.
+        Ok(Some(found)) if found >= required -> Ok(Nil)
+        Ok(found) -> Error(SchemaBehind(found:, required:))
+      }
+    }
+  }
+}
+
+/// The failure as the child's start error, which a supervisor reports.
+pub fn describe_failure(failure: Failure) -> String {
+  case failure {
+    DatabaseUnavailable(error) ->
+      "grind: the database is unavailable: " <> string.inspect(error)
+    SchemaBehind(found:, required:) -> describe_schema_behind(found, required)
+    StartupMigrationFailed(error) ->
+      "grind: the startup migration failed: " <> string.inspect(error)
+  }
+}
+
+pub fn describe_schema_behind(found: Option(Int), required: Int) -> String {
+  let found = case found {
+    None -> "not installed"
+    Some(version) -> "at version " <> int.to_string(version)
+  }
+  "grind: the schema is "
+  <> found
+  <> ", but this node's consumers need version "
+  <> int.to_string(required)
+  <> "; configure grind.with_startup_migration, or run grind.migrate from a runtime without consumers (or apply priv/migrations) before starting this one"
 }
 
 /// The running runtime's state, or `Error(Nil)` when none is registered
