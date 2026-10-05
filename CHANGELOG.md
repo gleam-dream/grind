@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+- Round 9: make the PostgreSQL test and benchmark clusters use their own temporary socket directories.
+
 The first release. Wave 3 of the release plan replaced the engine-shaped
 public modules with one `grind` facade; see
 [docs/migration-wave-3.md](docs/migration-wave-3.md) for every changed item.

@@ -450,3 +450,7 @@ The apps' remaining findings for Grind are unchanged here: the handler's
 cancellation was requested (research_agent), `worker.deadline` stays an
 absolute `Timestamp` (checkout, research_agent), and a result write inside
 the acknowledgement transaction (extractor, EXT-9) is not offered.
+
+## Round 9: validation maintenance
+
+Keep the test and benchmark PostgreSQL Unix sockets inside their temporary cluster directories (`pg_ctl -k "$root"`) rather than relying on a system socket directory. This is test portability only; job, workflow, lease, storage and application APIs are unchanged. No dependent source migration is required.
