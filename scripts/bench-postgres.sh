@@ -54,7 +54,7 @@ if pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
 fi
 
 initdb -D "$cluster" --username=grind --auth-local=trust --auth-host=trust >/dev/null
-pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port \
+pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port -k $root \
   -c shared_preload_libraries=pg_stat_statements \
   -c log_lock_waits=on \
   -c deadlock_timeout=100 \

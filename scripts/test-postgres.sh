@@ -52,7 +52,7 @@ initdb -D "$cluster" --username=grind --auth-local=trust --auth-host=trust >/dev
 # stay local and fast; a test that raises its own transaction's synchronous_commit
 # back to "on" (see the Increment 2 lost-reply tests) will park in SyncRep until
 # something terminates that backend — raising it anywhere else would hang forever.
-pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port -c synchronous_standby_names=grind_never_standby -c synchronous_commit=local" -l "$root/postgres.log" start >/dev/null
+pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port -k $root -c synchronous_standby_names=grind_never_standby -c synchronous_commit=local" -l "$root/postgres.log" start >/dev/null
 started=1
 createdb -h 127.0.0.1 -p "$port" -U grind grind_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_queue_test
