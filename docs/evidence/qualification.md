@@ -55,11 +55,9 @@ requires full validation and the design gate. Sinal's own test suite remains
 required. Weekly qualification has a separate final status. No commercial
 provider or existing database is used.
 
-Private Sinal checkout uses the immutable `sibling-revisions.txt` pin and either
-`SIBLINGS_APP_CLIENT_ID` plus `SIBLINGS_APP_PRIVATE_KEY`, or `SIBLINGS_READ_TOKEN` with
-read access to Sinal. Checkout does not persist credentials. Fork pull requests
-fail before private credentials are acquired; run their reviewed changes on a
-trusted branch. Missing credentials fail explicitly.
+Sinal checkout uses the immutable `sibling-revisions.txt` pin and the default
+GitHub Actions token to read its public repository. Checkout does not persist
+credentials. Fork pull requests run the same required checks.
 
 The native script check compiles top-level Elixir modules and wraps remaining
 script expressions in a function without executing database/process actions.

@@ -20,14 +20,6 @@ jobs:
         with:
           path: grind
           persist-credentials: false
-      - name: Require trusted private dependency access
-        env:
-          FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
-        run: |
-          if [[ "$FORK" == true ]]; then
-            echo '::error::Fork PRs cannot access the private Sinal dependency; run this gate in a trusted branch.'
-            exit 1
-          fi
       - name: Read immutable sibling revision
         id: revisions
         working-directory: grind
@@ -35,27 +27,11 @@ jobs:
           sinal="$(sed -n 's/^sinal=//p' sibling-revisions.txt)"
           [[ "$sinal" =~ ^[0-9a-f]{40}$ ]] || { echo 'Invalid Sinal revision' >&2; exit 1; }
           echo "sinal=$sinal" >> "$GITHUB_OUTPUT"
-      - name: Read private Sinal through GitHub App
-        if: vars.SIBLINGS_APP_CLIENT_ID != ''
-        id: sibling-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
-        with:
-          client-id: ${{ vars.SIBLINGS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.SIBLINGS_APP_PRIVATE_KEY }}
-          owner: gleam-dream
-          repositories: sinal
-          permission-contents: read
-      - name: Require private checkout credential
-        env:
-          SIBLING_TOKEN: ${{ steps.sibling-token.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
-        run: |
-          [[ -n "$SIBLING_TOKEN" ]] || { echo '::error::Configure the Sinal read-only GitHub App or SIBLINGS_READ_TOKEN.'; exit 1; }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: gleam-dream/sinal
           ref: ${{ steps.revisions.outputs.sinal }}
           path: sinal
-          token: ${{ steps.sibling-token.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
           persist-credentials: false
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
       - name: Canonical formatting
