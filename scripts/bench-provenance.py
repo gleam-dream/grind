@@ -18,6 +18,8 @@ def source_digest() -> str:
     names = git("ls-files", "--cached", "--others", "--exclude-standard").splitlines()
     digest = hashlib.sha256()
     for name in sorted(set(names)):
+        if any(part.startswith(".env") or part in {".aws", ".codex"} for part in Path(name).parts):
+            continue
         if name.startswith(("bench/results/", ".git/")):
             continue
         path = root / name
@@ -27,6 +29,8 @@ def source_digest() -> str:
     sibling = root.parent / "sinal"
     sibling_inputs = list((sibling / "src").rglob("*")) + [sibling / "gleam.toml", sibling / "manifest.toml"]
     for path in sorted(sibling_inputs):
+        if any(part.startswith(".env") or part in {".aws", ".codex"} for part in path.relative_to(sibling).parts):
+            continue
         if path.is_file():
             digest.update(str(path.relative_to(sibling)).encode() + b"\0" + path.read_bytes())
     return digest.hexdigest()

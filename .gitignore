@@ -6,3 +6,4 @@ oracle/_build/
 oracle/deps/
 .render/
 **/.render/
+.ci-results/

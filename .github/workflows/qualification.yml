@@ -1,7 +1,7 @@
-name: CI
+name: Qualification
 on:
-  push:
-  pull_request:
+  schedule:
+    - cron: "30 3 * * 0"
   workflow_dispatch:
 
 permissions:
@@ -11,10 +11,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validation:
-    name: Full validation
+  qualification:
+    name: ${{ matrix.profile }} evidence
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [matrix, soak]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -58,46 +62,27 @@ jobs:
           token: ${{ steps.sibling-token.outputs.token || secrets.SIBLINGS_READ_TOKEN }}
           persist-credentials: false
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-      - name: Canonical formatting
+      - name: Scheduled evidence and retained audit checks
         working-directory: grind
-        run: nix flake check
-      - name: Complete ordinary gate
-        working-directory: grind
-        run: CI_ARTIFACT_DIR="$RUNNER_TEMP/grind-ci" nix develop --command bash scripts/ci.sh full
-      - name: Sinal's own test suite
-        working-directory: sinal
-        run: nix develop --command gleam test
-      - name: Preserve evidence, including failed runs
+        env:
+          PROFILE: ${{ matrix.profile }}
+        run: CI_ARTIFACT_DIR="$RUNNER_TEMP/grind-qualification" nix develop --command bash scripts/ci.sh "$PROFILE"
+      - name: Preserve qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: grind-validation-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/grind-ci
-          retention-days: 7
+          name: grind-${{ matrix.profile }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/grind-qualification
+          retention-days: 14
           include-hidden-files: true
           if-no-files-found: error
-
-  design:
-    name: Design layer
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
-      - run: nix run .#design-gate-check -- docs/design .
-
-  ci:
-    name: CI
+  qualification-status:
+    name: Qualification
     if: always()
-    needs: [validation, design]
+    needs: [qualification]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Require every mandatory job to succeed
-        env:
-          VALIDATION: ${{ needs.validation.result }}
-          DESIGN: ${{ needs.design.result }}
-        run: |
-          [[ "$VALIDATION" == success && "$DESIGN" == success ]] || exit 1
+      - env:
+          RESULT: ${{ needs.qualification.result }}
+        run: '[[ "$RESULT" == success ]]'

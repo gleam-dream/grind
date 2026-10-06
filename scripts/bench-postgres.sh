@@ -33,20 +33,26 @@ cluster="$root/data"
 started=0
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 bench_root="$repo_root/bench"
-python3 -B -m unittest discover -s "$bench_root/test" -p 'test_*.py'
+results_dir="${GRIND_BENCH_RESULTS_DIR:-$repo_root/.ci-results/bench-smoke-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+mkdir -p "$(dirname "$results_dir")"
+mkdir "$results_dir"
 
 cleanup() {
+  local status=$?
+  if [[ -f "$root/postgres.log" ]]; then cp "$root/postgres.log" "$results_dir/postgres.log" || status=1; fi
   if [[ "${BENCH_KEEP:-0}" == "1" ]]; then
     echo "BENCH_KEEP=1: leaving cluster running at 127.0.0.1:$port (data dir: $cluster)"
     echo "  stop it later with: pg_ctl -D '$cluster' -m immediate stop"
-    return
+    return "$status"
   fi
   if [[ "$started" == 1 ]]; then
-    pg_ctl -D "$cluster" -m immediate stop >/dev/null
+    pg_ctl -D "$cluster" -m immediate stop >/dev/null || status=1
   fi
   rm -rf "$root"
+  return "$status"
 }
 trap cleanup EXIT
+python3 -B -m unittest discover -s "$bench_root/test" -p 'test_*.py'
 
 if pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
   echo "port $port is already in use; refusing to use a non-disposable database" >&2
@@ -134,12 +140,12 @@ done
 
 echo "bench: audit checker and preload guard mutation tests passed"
 
-results_dir="${GRIND_BENCH_RESULTS_DIR:-$root/results}"
-mkdir -p "$results_dir"
-export GRIND_BENCH_COMMIT="$(git -C "$repo_root" rev-parse HEAD)"
+GRIND_BENCH_COMMIT="$(git -C "$repo_root" rev-parse HEAD)"
+export GRIND_BENCH_COMMIT
 export GRIND_BENCH_DIRTY=0
 [[ -z "$(git -C "$repo_root" status --porcelain)" ]] || export GRIND_BENCH_DIRTY=1
-export GRIND_BENCH_SOURCE_SHA256="$(python3 "$repo_root/scripts/bench-provenance.py" --digest)"
+GRIND_BENCH_SOURCE_SHA256="$(python3 "$repo_root/scripts/bench-provenance.py" --digest)"
+export GRIND_BENCH_SOURCE_SHA256
 python3 "$repo_root/scripts/bench-provenance.py" "$results_dir/provenance.json" "$@"
 (
   cd "$bench_root"
@@ -156,6 +162,7 @@ echo "bench: smoke (1000 jobs) passed"
 # Exercise repaired plan/arrival/pruning paths in the gate as well as their
 # instrumentation units. These are activation checks, not a performance matrix.
 for scenario in "l2 1 250 0 500" "l3 50 1000" "l5 0 3000" "l5 1 3000" "l7 40 1 4 1" "profile 40 1 4"; do
+  read -r -a scenario_args <<< "$scenario"
   activation_log="$root/activation-${scenario// /-}.log"
   (
     cd "$bench_root"
@@ -164,7 +171,7 @@ for scenario in "l2 1 250 0 500" "l3 50 1000" "l5 0 3000" "l5 1 3000" "l7 40 1 4
     GRIND_BENCH_RESULTS_DIR="$results_dir" \
     GRIND_BENCH_POSTGRES_LOG="$root/postgres.log" \
     GRIND_BENCH_PG_DATA_DIR="$cluster" \
-      gleam run -m grind_bench/load -- $scenario
+      gleam run -m grind_bench/load -- "${scenario_args[@]}"
   ) | tee "$activation_log"
   if [[ "$scenario" != l2* ]]; then
     grep -Eq '^completion_observer_stop_ack polls=([2-9]|[1-9][0-9]+) harness_pool_restart_retries=[0-9]+$' "$activation_log" || {

@@ -163,6 +163,8 @@ class Runner:
         assert not dependency_dirty, "modified Oban source cannot validate the pinned oracle"
         digest = hashlib.sha256()
         for name in sorted(git("ls-files", "--cached", "--others", "--exclude-standard").splitlines()):
+            if any(part.startswith(".env") or part in {".aws", ".codex"} for part in Path(name).parts):
+                continue
             path = ROOT / name
             if path.is_file() and not path.is_relative_to(self.output) and not name.startswith(
                     ("oracle/results/", "resilience/results/", "bench/results/")):

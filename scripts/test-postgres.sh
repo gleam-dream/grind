@@ -7,14 +7,21 @@ cluster="$root/data"
 started=0
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 oracle_results=${GRIND_ORACLE_RESULTS_ROOT:-"$repo_root/oracle/results/core-$(date -u +%Y%m%dT%H%M%SZ)-$$"}
+log_dir=${GRIND_TEST_LOG_DIR:-"$repo_root/.ci-results/postgres-$(date -u +%Y%m%dT%H%M%SZ)-$$"}
+mkdir -p "$log_dir"
 cleanup() {
+  local status=$?
+  if [[ -f "$root/postgres.log" ]]; then
+    cp "$root/postgres.log" "$log_dir/postgres.log" || status=1
+  fi
   if [[ "$started" == 1 ]]; then
-    pg_ctl -D "$cluster" -m immediate stop >/dev/null
+    pg_ctl -D "$cluster" -m immediate stop >/dev/null || status=1
   fi
   if [[ -d "$oracle_results" && -f "$root/postgres.log" ]]; then
-    cp "$root/postgres.log" "$oracle_results/postgres.log"
+    cp "$root/postgres.log" "$oracle_results/postgres.log" || status=1
   fi
   rm -rf "$root"
+  return "$status"
 }
 trap cleanup EXIT
 
@@ -215,6 +222,7 @@ for contract in admission-read-passed two-schemas-share-database-isolated two-ur
   MIX_REBAR3="$(command -v rebar3)"
   mix local.hex --force --if-missing
   mix deps.get --check-locked
+  mix compile --force --warnings-as-errors
   GRIND_OBAN_TEST_DATABASE_URL="postgres://grind@127.0.0.1:$port/oban_test?sslmode=disable" \
   GRIND_ORACLE_MARKER="$root/oracle-test-ran" \
     mix run run.exs

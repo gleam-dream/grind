@@ -81,6 +81,9 @@
             postgresql_16
             python3
             rebar3
+            actionlint
+            shellcheck
+            ruff
           ];
         };
 

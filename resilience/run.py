@@ -178,11 +178,15 @@ class Runner:
         names = set(git("ls-files", "--cached", "--others", "--exclude-standard").splitlines())
         digest = hashlib.sha256()
         for name in sorted(names):
+            if any(part.startswith(".env") or part in {".aws", ".codex"} for part in Path(name).parts):
+                continue
             path = ROOT / name
             if path.is_file() and not path.is_relative_to(self.output) and not name.startswith(("bench/results/", "resilience/results/")):
                 digest.update(name.encode() + b"\0" + path.read_bytes())
         sibling = ROOT.parent / "sinal"
         for path in sorted((sibling / "src").rglob("*")):
+            if any(part.startswith(".env") or part in {".aws", ".codex"} for part in path.relative_to(sibling).parts):
+                continue
             if path.is_file():
                 digest.update(str(path.relative_to(sibling)).encode() + b"\0" + path.read_bytes())
         dirty = bool(git("status", "--porcelain").strip())
@@ -511,7 +515,7 @@ class Runner:
         subprocess.run(["pg_ctl", "-D", str(data), "-m", "immediate", "stop"], check=True, capture_output=True, timeout=15)
         self.record("postgres_stopped", data_directory=str(data))
         time.sleep(0.75)
-        subprocess.run(["pg_ctl", "-D", str(data), "-o", f"-h 127.0.0.1 -p {urlsplit(self.url).port}",
+        subprocess.run(["pg_ctl", "-D", str(data), "-o", f"-h 127.0.0.1 -p {urlsplit(self.url).port} -k {data.parent}",
                         "-l", str(data.parent / "postgres.log"), "start"], check=True, capture_output=True, timeout=15)
         self.record("postgres_restarted", outage_seconds=time.monotonic() - start)
 

@@ -29,6 +29,8 @@ def source_digest() -> str:
     paths += [("sinal/" + name, sibling / name) for name in ("gleam.toml", "manifest.toml")]
     digest = hashlib.sha256()
     for name, path in paths:
+        if any(part.startswith(".env") or part in {".aws", ".codex"} for part in Path(name).parts):
+            continue
         if path.is_file() and not name.startswith(("oracle/results/", "bench/results/", "resilience/results/")):
             digest.update(name.encode() + b"\0" + path.read_bytes() + b"\0")
     return digest.hexdigest()

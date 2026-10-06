@@ -103,7 +103,8 @@ if [[ "$GRIND_BENCH_NETWORK_DELAY_MS" != "0" ]]; then
 fi
 export GRIND_BENCH_POSTGRES_LOG="$root/postgres.log"
 export GRIND_BENCH_PG_DATA_DIR="$cluster"
-export GRIND_BENCH_COMMIT="$(cd "$repo_root" && git rev-parse --short HEAD)"
+GRIND_BENCH_COMMIT="$(cd "$repo_root" && git rev-parse --short HEAD)"
+export GRIND_BENCH_COMMIT
 if [[ -n "$(cd "$repo_root" && git status --porcelain)" ]]; then
   export GRIND_BENCH_DIRTY=1
 else
@@ -117,7 +118,8 @@ python3 "$repo_root/scripts/bench-provenance.py" --reserve-dir "$results_dir"
 results_reserved=1
 mkdir -p "$warmup_dir"
 
-export GRIND_BENCH_SOURCE_SHA256="$(python3 "$repo_root/scripts/bench-provenance.py" --digest)"
+GRIND_BENCH_SOURCE_SHA256="$(python3 "$repo_root/scripts/bench-provenance.py" --digest)"
+export GRIND_BENCH_SOURCE_SHA256
 python3 "$repo_root/scripts/bench-provenance.py" "$results_dir/provenance.json" "$@"
 echo "commit=$GRIND_BENCH_COMMIT dirty=$GRIND_BENCH_DIRTY results_dir=$results_dir"
 
@@ -224,6 +226,20 @@ if [[ -n "${GRIND_BENCH_T2_PROFILES:-}" ]]; then
   done < "$results_dir/t2-profiles.txt"
   [[ "${#l6t2_points[@]}" -gt 0 ]] || { echo "empty T2 profile file" >&2; exit 1; }
 fi
+
+# Preserve the actual selected workload shapes so evidence validation does not
+# maintain a second matrix configuration.
+{
+  printf 'suite=%s\nrepeats=%s\n' "$what" "$repeats"
+  printf 'l1 %s\n' "${l1_points[@]}"
+  printf 'l2 %s\n' "${l2_points[@]}"
+  printf 'l3 %s\n' "${l3_points[@]}"
+  printf 'l4 %s\n' "${l4_points[@]}"
+  printf 'l5 %s\n' "${l5_points[@]}"
+  printf 'l6_t1 %s\n' "${l6t1_points[@]}"
+  printf 'l6_t2 %s\n' "${l6t2_points[@]}"
+  printf 'l7 %s\n' "${l7_points[@]}"
+} > "$results_dir/matrix-points.txt"
 
 run_l1_point() {
   local consumers=$1 concurrency=$2 queues=$3 cost_ms=$4 job_count=$5
@@ -340,13 +356,15 @@ run_l6t2_point() {
 
 if [[ "$what" == "l1" || "$what" == "all" ]]; then
   for point in "${l1_points[@]}"; do
-    run_l1_point $point
+    read -r -a point_args <<< "$point"
+    run_l1_point "${point_args[@]}"
   done
 fi
 
 if [[ "$what" == "l7" || "$what" == "all" ]]; then
   for point in "${l7_points[@]}"; do
-    run_l7_point $point
+    read -r -a point_args <<< "$point"
+    run_l7_point "${point_args[@]}"
   done
   echo "== profile 1x50 (coordinator profiling, item 11) =="
   (cd "$bench_root" && gleam run -m grind_bench/load -- profile 9000 1 50)
@@ -356,36 +374,42 @@ fi
 
 if [[ "$what" == "l2" || "$what" == "all" ]]; then
   for point in "${l2_points[@]}"; do
-    run_l2_point $point
+    read -r -a point_args <<< "$point"
+    run_l2_point "${point_args[@]}"
   done
 fi
 
 if [[ "$what" == "l3" || "$what" == "all" ]]; then
   for point in "${l3_points[@]}"; do
-    run_l3_point $point
+    read -r -a point_args <<< "$point"
+    run_l3_point "${point_args[@]}"
   done
 fi
 
 if [[ "$what" == "l4" || "$what" == "all" ]]; then
   for point in "${l4_points[@]}"; do
-    run_l4_point $point
+    read -r -a point_args <<< "$point"
+    run_l4_point "${point_args[@]}"
   done
 fi
 
 if [[ "$what" == "l5" || "$what" == "all" ]]; then
   for point in "${l5_points[@]}"; do
-    run_l5_point $point
+    read -r -a point_args <<< "$point"
+    run_l5_point "${point_args[@]}"
   done
 fi
 
 if [[ "$what" == "l6" || "$what" == "l6t1" || "$what" == "all" ]]; then
   for point in "${l6t1_points[@]}"; do
-    run_l6t1_point $point
+    read -r -a point_args <<< "$point"
+    run_l6t1_point "${point_args[@]}"
   done
 fi
 if [[ "$what" == "l6" || "$what" == "l6t2" || "$what" == "all" ]]; then
   for point in "${l6t2_points[@]}"; do
-    run_l6t2_point $point
+    read -r -a point_args <<< "$point"
+    run_l6t2_point "${point_args[@]}"
   done
 fi
 
