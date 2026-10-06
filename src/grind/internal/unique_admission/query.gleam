@@ -20,15 +20,9 @@ pub fn lock_key_sql(first_parameter: Int) -> String {
   <> ", 'hex'))::text, 0)"
 }
 
-/// The domain-wide advisory lock query itself — SQL text, parameter
-/// binding, and the `Bool` decoder together — built once here so
-/// `acquire_lock` and any test that needs to hold this exact same lock (the
-/// forced-overlap and contention tests under `test/grind/unique/`) never
-/// re-encode it by hand; `pg_advisory_xact_lock` itself returns `void`,
-/// which `pg_types` cannot decode (see `docs/UNIQUENESS-CONTRACT.md`'s
-/// PostgreSQL driver note), hence the `SELECT true FROM (...)` wrapping.
-/// `schema` is the configured schema (see `lock_key_sql`'s own doc comment
-/// for why it is bound here rather than resolved server-side).
+/// Builds the same domain-wide lock query for admission and contention tests.
+/// The configured schema is bound explicitly. `pg_advisory_xact_lock` returns
+/// `void`, which the driver cannot decode, so the query returns `true` instead.
 pub fn lock_query(
   schema: String,
   worker_id: String,
@@ -56,17 +50,16 @@ fn sql_parameter(index: Int, cast: String) -> String {
   "$" <> int.to_string(index) <> "::" <> cast
 }
 
-/// The uniqueness key digest; see `docs/UNIQUENESS-CONTRACT.md`, Decision 1.
+/// Hashes PostgreSQL's jsonb text representation of the uniqueness key.
+/// See docs/adr/0003-separate-command-receipts-from-uniqueness.md.
 pub fn key_digest_sql(key_json_parameter: Int) -> String {
   "sha256(convert_to(("
   <> sql_parameter(key_json_parameter, "jsonb")
   <> ")::text, 'UTF8'))"
 }
 
-/// Converts a bound millisecond (`divisor` `1000.0`) or microsecond
-/// (`1000000.0`) integer into `timestamptz` (also correct for a bound
-/// `NULL`). See `docs/UNIQUENESS-CONTRACT.md`'s PostgreSQL driver note for
-/// why time round-trips through a bound integer instead of a decoded value.
+/// Converts a bound millisecond (`1000.0`) or microsecond (`1000000.0`) integer
+/// to timestamptz. A bound NULL remains NULL; no timestamp decoder is needed.
 pub fn to_timestamptz_sql(param_index: Int, divisor: String) -> String {
   "to_timestamp("
   <> sql_parameter(param_index, "double precision")
@@ -75,9 +68,8 @@ pub fn to_timestamptz_sql(param_index: Int, divisor: String) -> String {
   <> ")"
 }
 
-/// The uniqueness period predicate; see `docs/UNIQUENESS-CONTRACT.md`,
-/// admission transaction step 6. `column` and `now_expression` are trusted
-/// SQL fragments spliced verbatim, never caller input.
+/// Includes rows whose selected time is on or after the occupancy cutoff.
+/// `column` and `now_expression` are trusted SQL fragments, never caller input.
 pub fn period_predicate(
   column: String,
   now_expression: String,
@@ -98,43 +90,18 @@ pub fn is_reschedule(action: unique.ConflictAction) -> Bool {
   }
 }
 
-/// Every candidate this admission transaction reads is locked, never merely
-/// read: a `RescheduleScheduledTo` action needs `FOR UPDATE` (it is about to
-/// write `available_at`), and every other action still needs `FOR KEY
-/// SHARE` — the weakest lock mode that still conflicts with a `DELETE`
-/// (`postgres.prune_finished` locks its own candidates at `FOR UPDATE`
-/// strength). `prune_finished` itself never blocks on this: its own scan is
-/// `FOR UPDATE SKIP LOCKED`, so a row this transaction already holds is
-/// simply skipped, never waited on. The direction that *can* block is this
-/// transaction's own read, when `prune_finished` instead reaches and locks
-/// this row first — held for as long as that one `DELETE` statement, batch
-/// and all, takes to run — this read then waits behind it, and reports
-/// `AdmissionContended` if that wait exceeds this transaction's own
-/// `lock_timeout`: a correct outcome, bounded to however long that single
-/// prune batch holds the row, not a bug. `FOR KEY SHARE` deliberately does
-/// *not* conflict with `FOR NO KEY UPDATE`: `attempt.claim_registered_job`,
-/// `postgres.cancel_lock`, `lease`'s own quarantine scan, and
-/// `postgres.apply_uncertain_resolution`'s own row lock all lock this same
-/// table at that weaker strength precisely so an unrelated claim, cancel,
-/// quarantine sweep, or resolution racing a `KeepExisting` read of the
-/// identical row never spuriously contends (`AdmissionContended`) for a
-/// reason that was never actually a write conflict — see
-/// `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" step 6, for the
-/// full contention picture.
+/// Locks the earliest matching candidate. Rescheduling needs FOR UPDATE;
+/// KeepExisting uses FOR KEY SHARE to block deletion while allowing ordinary
+/// claim, cancellation, quarantine and resolution updates using FOR NO KEY UPDATE.
 ///
-/// The window this lock actually closes: this transaction committing (its
-/// own `INSERT` and receipt) *after* `prune_finished`'s `DELETE` statement
-/// already took its snapshot but *before* that statement's own scan reaches
-/// and locks this exact row — without this lock, `prune_finished`'s `SKIP
-/// LOCKED` search would find the row still unlocked at that point and
-/// delete it out from under the read this transaction just performed.
-/// `grind_v12`'s own `ON DELETE CASCADE` foreign keys are the second,
-/// independent backstop for the one narrower window this lock alone cannot
-/// close (a prune statement that already locked this row, under its own
-/// fixed snapshot, strictly before this admission's own commit becomes
-/// visible to it) — see `docs/RECOVERY-EVIDENCE.md`, Increment 24, for why
-/// a receipt referencing an already-deleted job can still never become a
-/// permanent orphan either way.
+/// Pruning uses FOR UPDATE SKIP LOCKED and skips candidates admission holds.
+/// If pruning locks first, admission waits under its lock_timeout and can report
+/// AdmissionContended. Without admission's row lock, pruning could take a snapshot
+/// before the receipt committed and delete its job afterward.
+///
+/// The ON DELETE CASCADE foreign keys independently prevent permanent receipt
+/// orphans when a pruning statement locked the job before admission became visible.
+/// See docs/adr/0007-validate-forward-migrations-and-bound-recovery-retention.md.
 pub fn candidate_sql(
   scope: unique.QueueScope,
   period: unique.PeriodSpec,

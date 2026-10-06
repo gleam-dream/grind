@@ -578,7 +578,7 @@ fn await_admission_blocked_on_receipt_insert(
 /// `prune_finished` is called from — proving `FOR UPDATE SKIP LOCKED` skips
 /// this row (rather than deleting out from under a still-open admission)
 /// and the row and its receipt both survive together. See
-/// `docs/RECOVERY-EVIDENCE.md` for the mutation (`FOR KEY SHARE` removed)
+/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` for the mutation (`FOR KEY SHARE` removed)
 /// that reproduces the opposite: the row deleted while admission's own
 /// still-open transaction goes on to commit a receipt that names it,
 /// leaving `grind_unique_submissions` an orphaned row pointing at nothing.

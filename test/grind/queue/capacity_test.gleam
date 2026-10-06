@@ -322,7 +322,7 @@ pub fn postgres_automatic_consumer_drains_backlog_without_per_interval_ceiling_t
 /// slot keeps refilling as soon as a claim succeeds instead of waiting for
 /// the next `Poll` timer, so the whole backlog drains in a small, bounded
 /// number of intervals rather than one claim per interval regardless of
-/// concurrency (the ceiling `docs/RISKS.md` risk 6 used to document: with
+/// concurrency (the ceiling `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RISKS.md` risk 6 used to document: with
 /// the old per-poll claim budget, 50 jobs at a 1000ms interval took roughly
 /// 50 intervals — about 50 seconds — to drain no matter how high
 /// `maximum_concurrency` was set). Bounded by the database's own clock, not
@@ -577,7 +577,7 @@ pub fn postgres_automatic_fill_does_not_hot_loop_on_claim_error_test() {
 }
 
 /// Regression coverage for the `FillSlots`-message refactor
-/// (`fill_automatic_slots`/`request_fill`, `docs/RISKS.md` risks 4 and 5): a
+/// (`fill_automatic_slots`/`request_fill`, `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RISKS.md` risks 4 and 5): a
 /// claim that fails outright (not merely "found nothing") must still yield
 /// to the next `Poll` timer rather than being retried immediately from
 /// inside the same message handler — `start_attempt`'s `Error` branch always

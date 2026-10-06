@@ -4,3 +4,5 @@ erl_crash.dump
 .direnv/
 oracle/_build/
 oracle/deps/
+.render/
+**/.render/

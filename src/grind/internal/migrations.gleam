@@ -214,7 +214,7 @@ fn v11_shape() -> List(ExpectedRelation) {
 /// `ADD CONSTRAINT` itself fail with `23503 foreign_key_violation` on a
 /// database that has been running a while, since `ALTER TABLE ... ADD
 /// CONSTRAINT` validates every existing row by default. See
-/// `docs/RECOVERY-EVIDENCE.md`, Increment 25, for the red-first proof (a
+/// `test/grind/migrations/upgrade_test.gleam` for the seeded-orphan proof (a
 /// seeded orphan in the frozen v11 upgrade fixture makes this migration
 /// fail with `23503` without these three `DELETE`s, and succeed with the
 /// orphan gone once they run).
@@ -222,7 +222,7 @@ fn v11_shape() -> List(ExpectedRelation) {
 /// **Dropping `storage_owner`.** Isolation between logically distinct Grind
 /// installations is now the PostgreSQL schema (`search_path`) alone, not a
 /// `storage_owner` value scoping rows within one shared schema — see
-/// `docs/UNIQUENESS-CONTRACT.md` and `README.md`, "Isolation". `v11`
+/// `docs/adr/0003-separate-command-receipts-from-uniqueness.md` and `docs/USAGE.md`, "Isolation". `v11`
 /// (frozen, already released — its own statements cannot change) created
 /// `storage_owner` on `grind_jobs` and every receipt/resolution table, plus
 /// every composite key or index that included it; `v12`, still unreleased
@@ -258,7 +258,7 @@ fn v11_shape() -> List(ExpectedRelation) {
 /// install, which only ever had one implicit `storage_owner` value per
 /// schema to begin with under the derived, non-override resolution) passes
 /// through with no observable effect beyond the schema change itself. See
-/// `docs/RECOVERY-EVIDENCE.md` for the frozen-fixture proof of both the
+/// `docs/adr/0011-retain-rewritten-history-as-source-provenance.md` for the frozen-fixture proof of both the
 /// ordinary (no-collision) upgrade and the collision-fails-closed case.
 ///
 /// **The down direction is lossy.** `priv/migrations/*.sql`'s own `v12`
@@ -325,7 +325,7 @@ fn v12_statements() -> List(String) {
 /// would only get in the way. `postgres.prune_finished` deletes only from
 /// `grind_jobs`; every receipt row cascades, by the database itself, rather
 /// than by a second explicit `DELETE` this module used to also generate —
-/// see `docs/RECOVERY-EVIDENCE.md`, Increment 24, for why an explicit,
+/// see `test/grind/retention/deletion_test.gleam` for why an explicit,
 /// same-statement receipt `DELETE` was not enough on its own. Confirmed
 /// empirically the same way `v11_shape`'s own doc comment describes, against
 /// a real freshly `migrate`d v12 schema.
@@ -358,7 +358,7 @@ fn v12_shape() -> List(ExpectedRelation) {
 
 /// `grind_v12`'s own cumulative foreign-key set: the three `ON DELETE
 /// CASCADE` constraints backstopping `postgres.prune_finished` against the
-/// snapshot-timing race `docs/RECOVERY-EVIDENCE.md` Increment 24 describes.
+/// snapshot-timing race covered by `test/grind/retention/deletion_test.gleam`.
 /// Checked by name against `pg_constraint`, independently of `v12_shape`'s
 /// own `pg_class` relation check, since a plain foreign key (no backing
 /// index of its own beyond whatever `v12_shape` already lists) never

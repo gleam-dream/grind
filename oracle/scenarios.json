@@ -461,7 +461,7 @@
       "classification": "intentional-grind-semantics",
       "reason": "Grind exact encoded key equality and opt-in participation differ from Oban JSON containment and visibility of ordinary jobs.",
       "sources": [
-        "docs/UNIQUENESS-CONTRACT.md",
+        "docs/adr/0003-separate-command-receipts-from-uniqueness.md",
         "oracle/deps/oban/lib/oban/engines/basic.ex"
       ]
     },
@@ -508,7 +508,7 @@
       "id": "multi-node-faults-and-throughput",
       "classification": "missing-accidental-divergence",
       "reason": "This deterministic behavior adapter does not measure node/connection loss, slow commit, pool starvation, or throughput. Dedicated resilience and benchmark suites must supply those release proofs.",
-      "sources": ["docs/RELEASE-READINESS.md", "scripts/bench-matrix.sh"]
+      "sources": ["docs/evidence/qualification.md", "scripts/bench-matrix.sh"]
     }
   ]
 }

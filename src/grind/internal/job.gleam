@@ -36,14 +36,14 @@ import grind/internal/worker.{type BusinessFailureCause, type Codec, type Worker
 /// comparing only the database OID and schema, exactly as before this
 /// field existed: two different physical clusters that collide on OID and
 /// schema can still be indistinguishable to this client-side check when
-/// the cluster identifier could not be read on either side — a residual,
-/// documented gap, not a regression (see `docs/RISKS.md` risk 7). Stamped
+/// the cluster identifier could not be read on either side. This gap is recorded
+/// in docs/adr/0008-state-driver-deadline-and-installation-limits.md. Stamped
 /// onto a `JobHandle`/`PendingSubmission` at mint/bind time so a value
 /// minted against one `Database` can be caught, with a typed error, if it
 /// is later used against a different one — see
 /// `postgres.HandleFromAnotherInstallation` and friends. This is a
 /// client-side sanity check only: the real isolation boundary is the
-/// PostgreSQL schema itself (see README, "Isolation"), which this token
+/// PostgreSQL schema itself (see docs/USAGE.md, "Isolation"), which this token
 /// never influences and nothing here is ever written to a row or compared
 /// against one.
 pub type Installation {

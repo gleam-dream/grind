@@ -4,8 +4,8 @@ import grind/internal/worker
 
 // -- Decision B (2026-09-25): retry-safe plain submit (`submit_with_id`) ----
 //
-// `docs/RELEASE-READINESS.md`, "Retry-safe plain submit", and
-// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts". Plain `submit`/
+// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md`, "Retry-safe plain submit", and
+// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission receipts". Plain `submit`/
 // `submit_at` have no request identity, so a caller that retries after
 // `SubmitQueryFailed` (which may itself have committed) risks a duplicate
 // row. `submit_with_id` reuses `submit_unique`'s own admission receipt,

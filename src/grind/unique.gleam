@@ -16,7 +16,7 @@
 //// returns `grind.Existing` (or `grind.Rescheduled` with `reschedule_to`)
 //// with the occupying job. The policy is checked under an advisory lock in
 //// the admission transaction, so two concurrent submissions never both
-//// insert. See `docs/UNIQUENESS-CONTRACT.md`.
+//// insert. See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`.
 ////
 //// The defaults are: scope `WithinQueue`, states `Incomplete`, and a
 //// duplicate leaves the existing job unchanged.

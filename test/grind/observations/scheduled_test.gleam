@@ -182,7 +182,7 @@ pub fn postgres_acknowledged_observation_available_at_none_when_cancel_overrides
 /// is left at its unrelated pre-ack value — this must never be surfaced as
 /// `Some`. Named mutation: gating on `proposed_state` instead of
 /// `committed_state` (the exact bug this test was written to catch) makes
-/// this test fail — see `docs/RECOVERY-EVIDENCE.md`, "Acknowledged
+/// this test fail — see `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, "Acknowledged
 /// observation".
 fn run_acknowledged_observation_available_at_cancel_overrides_retry_test(
   database_url: String,

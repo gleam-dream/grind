@@ -11,7 +11,7 @@ import grind/internal/submission
 import grind/internal/unique
 import grind/internal/worker.{type Worker}
 
-/// The request fingerprint's hash; see `docs/UNIQUENESS-CONTRACT.md`, Decision 9.
+/// SHA-256 for the exact prepared request envelope.
 @external(erlang, "grind_unique_ffi", "sha256")
 fn sha256(data: BitArray) -> BitArray
 
@@ -127,17 +127,11 @@ pub fn build_request(
   Ok(Request(..request, request_sha256: fingerprint(request)))
 }
 
-/// The request fingerprint envelope; see `docs/UNIQUENESS-CONTRACT.md`,
-/// Decision 9, and "Admission receipts". Tagged `"grind-unique-request-v1"`
-/// when `policy` is `Some` and `"grind-plain-request-v1"` when it is
-/// `None` — deliberately different magic strings, so a `SubmissionId`
-/// reused between `submit_unique` and `submit_with_id` (or between two
-/// calls whose only difference is the presence of a policy) always
-/// fingerprint-mismatches and reports `SubmissionConflict`, never a
-/// silently-replayed decision from the wrong kind of admission. The
-/// policy-specific fields (key, scope, period, states, action) are present
-/// in the envelope only when `policy` is `Some`, in the same field order
-/// this envelope has always used.
+/// Plain and unique admissions use different envelope tags. Reusing a
+/// SubmissionId across those command kinds must return SubmissionConflict.
+/// Policy fields are included only when present; field order and encoding
+/// remain stable so retries reproduce the original fingerprint.
+/// See docs/adr/0003-separate-command-receipts-from-uniqueness.md.
 fn fingerprint(request: Request(input, output, error)) -> BitArray {
   let tag = case request.policy {
     Some(_) -> "grind-unique-request-v1"

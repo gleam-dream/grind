@@ -26,7 +26,7 @@ import pog
 
 // -- Increment 11: uncertain admission commits -------------------------------
 //
-// Full contract: `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" (the
+// Full contract: `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" (the
 // `pog.TransactionQueryError` classification and `CommitUnknown`/
 // `reconcile_unique`). `install_syncrep_reply_trigger` above is generalized
 // (table + predicate) so the same mechanism Increment 2 proved for the
@@ -43,7 +43,7 @@ import pog
 /// reported directly as `NotCommitted(ConnectionUnavailable)`, with no
 /// `PendingSubmission` constructed and no receipt lookup attempted — this is
 /// knowably not-committed, not merely uncertain. See
-/// `docs/RECOVERY-EVIDENCE.md`, Increment 11, for why this needed its own
+/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, Increment 11, for why this needed its own
 /// FFI wrapper distinguishing a checkout failure from `run`'s other,
 /// genuinely uncertain `pog.TransactionQueryError` case (case (d) below).
 /// Reopening the same pool name and retrying the identical `SubmissionId` —
@@ -225,7 +225,7 @@ fn run_unique_aborted_commit_test(database_url: String) -> Nil {
   // of that connection is a real, transient recovery window (not a
   // steady-state failure), matching every other terminate-then-retry test
   // in this file — `run_ack_commit_connection_loss_test`'s own
-  // `retry_transient_query` (documented `docs/RECOVERY-EVIDENCE.md`,
+  // `retry_transient_query` (documented `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`,
   // "Acknowledgement deadline") is the pattern this test was previously
   // missing, which is exactly why it flaked under load: a plain,
   // unretried call here could observe `QueryTimeout`/`ConnectionUnavailable`
@@ -356,7 +356,7 @@ fn run_unique_committed_reply_lost_test(database_url: String) -> Nil {
 /// loss produces — R1 alone would have made every checkout failure
 /// (including (a) above) report `CommitUnknown` too, imprecisely; R2
 /// restores (a)'s precise `NotCommitted`. See
-/// `docs/RECOVERY-EVIDENCE.md` for the red-before-fix output and the R1
+/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` for the red-before-fix output and the R1
 /// mutation that reverts to the bug.
 ///
 /// With the fix: `submit_unique` reports `CommitUnknown(pending)`.

@@ -490,7 +490,7 @@ fn run_batch_partial_error_test(database_url: String) -> Nil {
 /// `UPDATE` no longer matches (the row is no longer `executing`), so B
 /// falls through to `acknowledge_transaction`'s own re-read of the
 /// acknowledgement receipt and must return `Ok(True)`, exactly as A did —
-/// not a query failure. See `docs/RECOVERY-EVIDENCE.md`, "Isolation-level
+/// not a query failure. See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, "Isolation-level
 /// pinning", for the genuine red this test produced before
 /// `postgres.validate` pinned every pooled connection's own
 /// `default_transaction_isolation` to `read committed`.

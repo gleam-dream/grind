@@ -37,7 +37,7 @@ import pog
 /// A synthetic `v13` (one past the real, current latest `v12`) used only by
 /// the upgrade harness below: adds a nullable column and an index on it to
 /// `grind_jobs`, the shape of change the design calls out
-/// (`docs/RELEASE-READINESS.md`, "Migration mechanism") as the one most
+/// (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md`, "Migration mechanism") as the one most
 /// likely to interact badly with rows a previous release already wrote —
 /// layered on top of the real `v12` (`finished_at`) this harness now also
 /// exercises for real, rather than only against a synthetic stand-in.
@@ -581,7 +581,7 @@ fn job_id_for_queue(
   })
 }
 
-/// The genuine lost-reply gap named in `docs/RELEASE-READINESS.md`
+/// The genuine lost-reply gap named in `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md`
 /// ("Migration gaps"): every other `reconcile_unique` lost-reply test in
 /// this file proves the mechanism against a stable, already-latest schema.
 /// This one proves it survives a real schema upgrade landing *between* the
@@ -613,7 +613,7 @@ fn job_id_for_queue(
 /// document their own non-determinism (sometimes a transparent recovery,
 /// sometimes `QueueAckUnknown`) rather than a guaranteed commit either.
 /// Documented here rather than silently worked around, matching this
-/// codebase's own practice (see `docs/RECOVERY-EVIDENCE.md`, Increment 33,
+/// codebase's own practice (see `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, Increment 33,
 /// "two findings ... rest on premises that did not hold empirically").
 ///
 /// (b) Genuinely never reaches PostgreSQL — the real TCP fault proxy

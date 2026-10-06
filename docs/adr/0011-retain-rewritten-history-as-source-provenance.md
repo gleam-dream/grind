@@ -1,16 +1,20 @@
-# History
+# Retain rewritten history as source provenance
 
-On 2026-09-27, an 89-commit development history was squashed into the 12 milestone commits M1–M12 on `master`. Each milestone commit's tree is byte-identical to the tree of a gated commit from the original history: the squash grouped commits together but did not rewrite or reorder any tree.
+<a id="adr-0011"></a>
 
-The original history was removed on 2026-10-02 and is no longer available in this repository.
+- **Decision.** Keep the original-to-milestone commit mapping as this ADR provenance appendix. Material design decisions live in the other ADRs; the standing design does not use implementation-wave numbers.
 
-## Commit hashes in evidence documents
+- **Rationale.** The old implementation history was deliberately collapsed into milestones. Recovery experiments and source attribution can refer to original hashes that are no longer normal current ancestry. The mapping permits a reader to identify the retained commit that represents each original source, including commits whose original objects remain retained.
 
-`docs/RECOVERY-EVIDENCE.md`, `docs/PERFORMANCE-EVIDENCE.md`, `docs/RELEASE-READINESS.md`, `oracle/ORACLE-LEDGER.md` and the benchmark results in Git history cite commits from the original history. Those hashes record what was measured at the time and were not rewritten. They no longer resolve in this repository; use the mapping below to find the milestone commit on `master` that contains each one.
+- **Alternatives.** Discarding the table would lose attribution. Keeping a separate HISTORY or an increment-by-increment narrative would create a competing status corpus. This appendix preserves the evidence mapping without converting every experimental log into design rationale.
 
-## Mapping: original commit to milestone
+- **Evidence and history.** Local docs/HISTORY.md records 89 rows; 861a735eb35368bb1960e7bfcfc3c383db0d3306 recorded mappings; 4b117d710062b9e605eb1fa2a96c3d5b21955427 removed original history references. A mapping is attribution, not proof that every old experiment passes now. Original author conversations are not reconstructed.
 
-The table lists all 89 original commits in order, with the milestone commit that contains each one. "Boundary" means the original commit was the last one in its milestone, so the milestone commit's tree is byte-identical to the original commit's tree. For every other row, later commits in the same milestone changed the tree further.
+- **Source revisions.** [861a735e](https://github.com/gleam-dream/grind/commit/861a735eb35368bb1960e7bfcfc3c383db0d3306), [4b117d71](https://github.com/gleam-dream/grind/commit/4b117d710062b9e605eb1fa2a96c3d5b21955427).
+
+## Provenance appendix
+
+The following original source attribution rows are preserved verbatim. Milestone names here identify historical commits only; they do not define current architecture.
 
 | Original  | Original subject                                                                                                               | Milestone | Milestone commit | Milestone subject                                                                                      | Boundary |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------ | --------- | ---------------- | ------------------------------------------------------------------------------------------------------ | -------- |
@@ -104,11 +108,7 @@ The table lists all 89 original commits in order, with the milestone commit that
 | `eb41667` | docs(bench): record L2-L6 evidence and T1/T2 verdicts at 548c31e                                                               | M12       | `af63ee6`        | feat(bench): L2-L6 scenarios and evidence; track T2 renewal starvation                                 | no       |
 | `c0fad12` | docs: track renewal starvation (T2), bench harness defects, and post-readiness benchmark review                                | M12       | `af63ee6`        | feat(bench): L2-L6 scenarios and evidence; track T2 renewal starvation                                 | yes      |
 
-## Known blemishes carried through
+## References from source comments
 
-The squash groups commits; it does not clean up defects already present in the original history. Four are worth calling out explicitly so they are not mistaken for something the squash introduced:
-
-- **`bce4cc4`'s mislabelled CI changes.** `bce4cc4` (`chore(bench): grind_a/grind_ctl roles, log/data-dir env, bench-matrix.sh (items 8, 10, 13)`, squashed into M10) actually carried CI, `scripts/test-postgres.sh`, and `RELEASE-READINESS.md` changes that came from a concurrent agent, on top of its own stated bench-role and bench-matrix work. M10's message notes this; the content itself is unchanged.
-- **`c950fcf`, wip commit.** The very first commit of the original history, `wip(grind): preserve unaccepted cancellation slice`, was a work-in-progress checkpoint rather than a finished unit. It is folded into M1 rather than dropped, since M1's tree (byte-identical to `1a96627`) already reflects whatever of that slice survived review.
-- **`5701ede`, pog fork commit.** `refactor(postgres): use pog's public timeout API from the fork` depended on an interim `lostbean/pog` git fork whose branches no longer exist. It is squashed into M6, which ends (at `7529d45`) with that fork already dropped in favor of a Grind-owned checkout deadline on vanilla, Hex-sourced `pog`; M6's message notes this explicitly.
-- **`fc9454e`, storage-owner commit.** `feat(postgres)!: storage owner identifies the database, not the URL` introduced a `storage_owner` concept that was itself removed two commits later in the same range (`5c88aa5`, `refactor!: remove storage_owner; one Grind installation per schema`). Both are squashed into M8, whose tree (at `6842d39`) reflects only the surviving one-installation-per-schema design.
+- Comments that name a historical report's numbered step, defect, risk or measured red/green result link to that report at the captured repository revision. A mechanical replacement with a new ADR filename would invent section-level evidence that the ADR does not contain.
+- Current architecture and behavior have their owner in the native design. These immutable comment references preserve the provenance of an existing explanation; no report remains as a competing working-tree document.

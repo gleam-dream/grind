@@ -1,4 +1,4 @@
-//// Item 9: `pg_stat_statements` total_exec_time/calls, bucketed by which
+//// `pg_stat_statements` total_exec_time/calls, bucketed by which
 //// part of Grind (or the bench harness's own ledger) a statement belongs
 //// to -- claim, quarantine, ack, or ledger -- diffed before/after a run so
 //// the harness's own statements (the `ledger` bucket) can be subtracted
@@ -6,7 +6,7 @@
 //// classified by a `CASE` over `query` text rather than per-`queryid`
 //// bookkeeping (`grind_bench/sampler_db`'s own per-tick sampler already
 //// does that finer-grained job for the raw JSONL evidence; this module is
-//// the coarser before/after rollup item 9 asks for).
+//// the coarser before/after rollup).
 ////
 //// Classification is necessarily heuristic (SQL text substring matching,
 //// not a query planner): a statement touching

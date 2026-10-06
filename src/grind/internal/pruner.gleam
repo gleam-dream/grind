@@ -1,35 +1,12 @@
-//// A supervised background process that periodically calls
-//// `postgres.prune_finished` against one `Database`, so an application does
-//// not have to build its own timer loop around that call (see README,
-//// "Retention", for the manual-timer alternative this replaces). Defaults
-//// mirror Oban's own pruner: `interval_ms` 30_000, `limit` 10_000,
-//// `max_age_ms` 60_000 — see README, "Retention", for how this differs from
-//// Oban's own leader-elected pruner (this one is safe to run
-//// unsupervised-by-leadership on every node at once, since
-//// `prune_finished` itself is `FOR UPDATE SKIP LOCKED`-safe against
-//// concurrent callers).
+//// Periodically prunes finished jobs from one Database. Each tick runs one
+//// bounded batch; a full batch waits until the next scheduled tick.
+//// Concurrent callers are safe because candidate deletion uses SKIP LOCKED.
 ////
-//// Each tick calls `prune_finished(database, older_than_ms: max_age_ms,
-//// limit:)` exactly once — matching Oban's own pruner, which never drains
-//// a backlog within one tick either. A batch that comes back exactly
-//// `limit` rows (more may still be due) is picked up again on the next
-//// scheduled tick, not immediately; tune `limit` down (and `interval_ms`
-//// down to match) rather than up if a backlog needs to drain faster than
-//// one `limit`-sized batch per `interval_ms` — a single `prune_finished`
-//// call is one statement under the pool's own `statement_deadline_ms`, so
-//// too large a `limit` risks that one call timing out instead of
-//// committing, on a large enough backlog. Measured, not assumed: the
-//// default `limit` (10,000, matching Oban's own pruner) against 10,000
-//// finished jobs each carrying all three receipt kinds (the worst case
-//// every deleted job cascades into an acknowledgement, a uniqueness
-//// submission, and a resolution row — 30,000 cascaded deletes total) ran
-//// in ~66ms on ordinary hardware, about 1.7% of the pool's own default
-//// 4000ms `statement_deadline_ms` — see `docs/RECOVERY-EVIDENCE.md`,
-//// Increment 25, for the full measurement and its caveats (a much larger
-//// fan-out per job, slower disks, or a `limit` raised past
-//// `postgres.prune_limit_maximum` could still change this). A failed call
-//// emits `[grind, prune, failed]` (see `grind/observation`) instead of
-//// retrying immediately; the next scheduled tick tries again regardless.
+//// The internal policy defaults to a thirty-second interval, 10,000 jobs and
+//// a sixty-second age. The public Grind runtime overrides the age to seven
+//// days. A large batch can exceed the storage deadline; tune against the
+//// deployed workload. Failure emits [grind, prune, failed] through telemetry
+//// and retries on the next tick. See docs/USAGE.md, "Retention".
 
 import gleam/erlang/process
 import gleam/otp/actor

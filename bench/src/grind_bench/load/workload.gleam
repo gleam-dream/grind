@@ -17,10 +17,8 @@ fn worker_versions(worker_def: runtime.BenchWorker) -> worker.Metadata {
   worker.metadata(worker_def)
 }
 
-/// Preloads `job_count` jobs, round-robin distributed across `queues`, and
-/// records `bench_submissions` for every preloaded row -- item 2, bullet 1:
-/// any `record_submissions` insert failure now fails the whole run (via
-/// `let assert`) rather than being swallowed.
+/// Preloads job_count jobs round-robin across queues and records every row
+/// in bench_submissions. A failed preload or ledger insert fails the run.
 pub fn preload_and_track(
   database: postgres.Database,
   ledger: pog.Connection,
@@ -76,9 +74,8 @@ pub fn preload_varying_cost(
   })
 }
 
-/// Item 2, bullet 1: propagates the first insert failure instead of
-/// swallowing it (`list.try_each`, not `list.each` with a discarded
-/// result).
+/// Propagates the first ledger insert failure; dropping it would make the
+/// audit account for fewer jobs than the benchmark actually preloaded.
 pub fn record_submissions(
   ledger: pog.Connection,
   pairs: List(#(Int, Int)),
@@ -97,7 +94,7 @@ pub fn record_submissions(
   })
 }
 
-/// Item 2, bullet 2: fails the run immediately (before any consumer ever
+/// Fails the run immediately (before any consumer ever
 /// starts) if the ledger's own submission count does not equal `job_count`.
 pub fn assert_submission_count(ledger: pog.Connection, job_count: Int) -> Nil {
   case audit.check_submission_count(ledger, job_count) {
@@ -112,7 +109,7 @@ pub fn assert_submission_count(ledger: pog.Connection, job_count: Int) -> Nil {
   }
 }
 
-/// Item 7: `ANALYZE` (fresh planner stats) and `CHECKPOINT` (flush preload's
+/// `ANALYZE` (fresh planner stats) and `CHECKPOINT` (flush preload's
 /// own dirty buffers) after preload, before `t0` -- so neither shows up as
 /// noise inside the measured window. Runs against Grind's own connection
 /// (`ANALYZE`, schema-scoped) and the ctl/ledger connection (`CHECKPOINT`,
@@ -184,13 +181,8 @@ fn poll_drain(
           poll_drain(drain, grind_schema, deadline)
         }
       }
-    // A real query failure (item 3, bullet 4's own "fail loud" rule applies
-    // here too): silently retrying this the way an ordinary "not yet
-    // drained" result is retried would misreport a genuine harness/DB
-    // problem as an ordinary timeout -- exactly the bug a missing
-    // `search_path` on the drain connection produced the first time this
-    // ran for real (500 jobs finished in under a second; the poll spun
-    // silently for the full 30s timeout because every query it ran failed).
+    // A query failure is a harness/database error, not unfinished work.
+    // Retrying it until timeout would conceal the cause of an invalid run.
     Error(query_error) ->
       panic as {
         "grind_bench/load: drain poll query failed: "
@@ -198,12 +190,3 @@ fn poll_drain(
       }
   }
 }
-/// Item 7: `t0` is the first bench job's own handler dispatch
-/// (`bench_effects.started_at`, the closest DB timestamp to "first claim"
-/// the public/ledger schema offers -- see this module's own top-level doc
-/// comment on why this, not consumer-startup wall-clock, is `t0`), and
-/// `t_end` is the last job's own `grind_jobs.finished_at`. Both come from
-/// the database, not this process's own wall clock, so N consumers' own
-/// staggered startup calls (`list.map` over `queue.start`) can never give
-/// an early one a head start inside the measured window, and the drain
-/// poll's own interval never inflates the tail.

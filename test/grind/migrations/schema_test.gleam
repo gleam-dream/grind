@@ -352,7 +352,7 @@ fn run_missing_schema_artifact_test(
 /// database missing one of `grind_v12`'s three `ON DELETE CASCADE`
 /// constraints (dropped by hand, here) must fail closed exactly like a
 /// missing relation does, not silently pass as though the receipt-orphan
-/// backstop `docs/RECOVERY-EVIDENCE.md` Increment 24 describes were still
+/// backstop `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` Increment 24 describes were still
 /// in place.
 pub fn postgres_migration_missing_foreign_key_shape_detected_test() {
   case schema_missing_fk_url() {
@@ -705,7 +705,7 @@ fn run_missing_relation_shape_test(database_url: String) -> Nil {
 /// `MigrationStepFailed(12, _)` message, and the schema marker stays at 11
 /// (this step's own transaction rolled back cleanly, never partially
 /// applied) — see `v12_statements`'s own doc comment, "Dropping
-/// `storage_owner`", and `docs/RECOVERY-EVIDENCE.md`.
+/// `storage_owner`", and `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`.
 pub fn postgres_migration_submission_collision_detected_test() {
   case migration_collision_submissions_url() {
     Error(Nil) -> Nil

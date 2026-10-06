@@ -1,23 +1,10 @@
-//// Bulk job preload: batched multi-row `INSERT ... VALUES`, built from
-//// exactly the same column list and per-row expressions as
-//// `grind/postgres.submit_with_availability`'s own single-row `INSERT`
-//// (`src/grind/postgres.gleam`, the plain `submit`/`submit_at` path -- not
-//// `grind/internal/unique_admission`'s richer insert, which also writes a
-//// `grind_unique_submissions` receipt and is not what a plain preloaded job
-//// needs). Grind itself has no bulk-submit API (see `docs/RISKS.md`,
-//// finding 5 in the bench planning notes), so a load scenario that needs
-//// many thousands of pre-existing rows goes around `postgres.submit`
-//// entirely -- through this bench-owned statement instead, batched for
-//// throughput, one call per batch rather than one call per row.
+//// Preloads benchmark jobs with batched INSERTs. This bypasses ordinary
+//// admission and creates no submission receipts, so it measures processing
+//// of existing work rather than submission throughput.
 ////
-//// **Column drift guard.** `check_schema_matches` (exercised by
-//// `bench/test/grind_bench_preload_test.gleam`) queries
-//// `information_schema.columns` for the live `grind_jobs` table and fails
-//// if either (a) a column this preload's own `INSERT` references no longer
-//// exists, or (b) some *other* column is `NOT NULL` with no default (so any
-//// `INSERT` must supply it) and is not in this preload's own column list --
-//// case (b) is exactly what would happen if a future Grind migration added
-//// a new required column this preload was never updated for.
+//// Rows use the supplied worker metadata and input encoder. The schema guard
+//// checks every mirrored column and rejects any required column without a
+//// default that the preload does not supply.
 
 import gleam/dynamic/decode
 import gleam/int
@@ -41,11 +28,8 @@ pub fn immediate(bench_index: Int, cost_ms: Int) -> PreloadJob {
   PreloadJob(bench_index:, cost_ms:, available_at_ms: None)
 }
 
-/// The exact column list `postgres.submit_with_availability`'s own `INSERT`
-/// supplies -- see that function's own SQL text
-/// (`src/grind/postgres.gleam`). Kept as a literal, not read from source, so
-/// `check_schema_matches` has a concrete list to check against the live
-/// database rather than parsing Gleam source.
+/// The preload's literal INSERT column list. The schema guard compares this
+/// list with live columns rather than parsing production Gleam source.
 pub fn mirrored_columns() -> List(String) {
   [
     "queue", "worker_id", "worker_version", "input_version", "input",
@@ -123,19 +107,11 @@ fn required_columns_without_default(
   |> result.map(fn(returned) { returned.rows })
 }
 
-/// Preloads `jobs` under `queue` and `meta` (a real `worker.Metadata`,
-/// `worker.metadata(worker_def)` -- item 12: `meta.max_attempts` replaces a
-/// hardcoded `20`, so this preload never silently drifts from whatever
-/// `with_max_attempts` the caller's own worker definition actually set),
-/// batched `batch_size` rows per statement. `encode_input` builds each row's
-/// `input` JSON text through the worker's own public codec (item 12:
-/// `worker.encode_input(worker_def, ...)` -- never a hand-rolled JSON
-/// string), so a preloaded row's `input` column is byte-for-byte what
-/// `postgres.submit` would have written for the same value. Returns
-/// `#(bench_index, job_id)` pairs for every preloaded row, correlated via
-/// `input->>'bench_index'` in the `RETURNING` clause rather than row order
-/// (a multi-row `INSERT ... RETURNING`'s row order is not part of any
-/// documented PostgreSQL guarantee).
+/// Preloads jobs using the supplied worker metadata and input encoder, with
+/// batch_size rows per statement. Configured attempt limits and input encoding
+/// therefore match the worker definition rather than benchmark constants.
+/// Returns #(bench_index, job_id) pairs, correlated by the stored bench_index;
+/// INSERT RETURNING row order is not a PostgreSQL guarantee.
 pub fn preload(
   database: postgres.Database,
   queue: String,

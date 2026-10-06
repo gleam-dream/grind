@@ -21,7 +21,7 @@ import pog
 
 // -- Increment 8: concurrent admission under a forced barrier --------------
 //
-// See `docs/RECOVERY-EVIDENCE.md`, Increment 8, for the mutation evidence
+// See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, Increment 8, for the mutation evidence
 // (a genuine red run with the domain lock skipped, and one with the lock
 // key widened to include the queue) these tests were checked against.
 
@@ -179,7 +179,7 @@ fn run_unique_concurrent_overlap_test(database_url: String) -> Nil {
 }
 
 /// The uniqueness domain lock key deliberately excludes queue
-/// (`docs/UNIQUENESS-CONTRACT.md`, admission transaction step 3), so a
+/// (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, admission transaction step 3), so a
 /// `WithinQueue` submission in one queue and an `AcrossQueues` submission in
 /// another, on the same key, still serialize against each other: one row,
 /// not two.
@@ -277,7 +277,7 @@ fn run_unique_concurrent_mixed_scope_test(database_url: String) -> Nil {
   // fixes the order without weakening the concurrency being proved: B still
   // arrives while A's insert transaction is genuinely open and still needs
   // the same domain lock A holds, which is exactly what the lock key
-  // excluding queue (`docs/UNIQUENESS-CONTRACT.md`, admission transaction
+  // excluding queue (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, admission transaction
   // step 2) is being proved to guarantee.
   await_overlap_shape(
     barrier_connection,

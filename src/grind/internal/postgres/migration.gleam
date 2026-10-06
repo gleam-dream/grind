@@ -113,7 +113,7 @@ fn ensure_schema_exists(
 /// and only ever attempting `CREATE SCHEMA` for a genuinely absent schema
 /// keeps the "migrate creates the schema if absent" contract while never
 /// demanding a privilege an already-provisioned installation has no reason
-/// to hold. See `docs/RECOVERY-EVIDENCE.md` for the real failure this fixes.
+/// to hold. See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` for the real failure this fixes.
 fn schema_exists(
   connection: pog.Connection,
   schema: String,

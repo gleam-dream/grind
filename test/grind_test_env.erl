@@ -32,7 +32,7 @@ migration_deadline_url() -> env("GRIND_TEST_MIGRATION_DEADLINE_URL").
 migration_lock_url() -> env("GRIND_TEST_MIGRATION_LOCK_URL").
 prune_url() -> env("GRIND_TEST_PRUNE_URL").
 prune_owner_b_url() -> env("GRIND_TEST_PRUNE_OWNER_B_URL").
-%% docs/RELEASE-READINESS.md, "Migration gaps".
+%% https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md, "Migration gaps".
 cigogne_e2e_url() -> env("GRIND_TEST_CIGOGNE_E2E_URL").
 cigogne_e2e_fresh_url() -> env("GRIND_TEST_CIGOGNE_E2E_FRESH_URL").
 cigogne_concurrent_url() -> env("GRIND_TEST_CIGOGNE_CONCURRENT_URL").

@@ -164,8 +164,8 @@ fn relation_has_columns(
 /// itself), so it would otherwise never be checked at all — a database
 /// missing one of `grind_v12`'s three `ON DELETE CASCADE` constraints (say,
 /// dropped by hand) must fail closed exactly like a missing relation or
-/// column does, not silently pass as if the receipt-orphan backstop
-/// `docs/RECOVERY-EVIDENCE.md` Increment 24 describes were still in place.
+/// column does. Otherwise pruning could leave receipt orphans even though
+/// the schema marker claimed cascading deletion was installed.
 pub fn relation_foreign_keys_match(
   connection: pog.Connection,
   foreign_keys: List(String),

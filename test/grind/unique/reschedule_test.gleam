@@ -33,7 +33,7 @@ import pog
 
 // -- Increment 10: rescheduling ---------------------------------------------
 //
-// Full contract: `docs/UNIQUENESS-CONTRACT.md`, `ConflictAction`,
+// Full contract: `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, `ConflictAction`,
 // `RescheduleScheduledTo`, and admission transaction steps 5-6.
 // `postgres_submit_unique_reschedule_row_lock_contention_test` above already
 // proves lock contention on the reschedule candidate's row; the tests below
@@ -271,7 +271,7 @@ fn run_unique_reschedule_claimable_test(database_url: String) -> Nil {
 /// The live race between a manual consumer's claim (which locks the
 /// scheduled row as part of its own claim `UPDATE`) and a concurrent
 /// `RescheduleScheduledTo` submission for the same key (whose candidate
-/// selection also locks that row, per `docs/UNIQUENESS-CONTRACT.md`'s
+/// selection also locks that row, per `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`'s
 /// admission transaction step 5). The claim is blocked mid-`UPDATE` — after
 /// it has already locked the row via its own `FOR UPDATE SKIP LOCKED`
 /// candidate CTE, before it commits — by a `BEFORE UPDATE` trigger scoped to

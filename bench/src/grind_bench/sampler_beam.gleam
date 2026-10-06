@@ -1,20 +1,9 @@
-//// A 1-second BEAM introspection sampler: appends one JSON line per tick to
-//// a caller-chosen path (raw evidence -- gitignored under
-//// `bench/results/`, never committed; see `grind_bench/summarize` for
-//// the generated percentile/CSV rollup this feeds).
-////
-//// Runs synchronously on whatever process calls `run` -- a load scenario
-//// spawns it on its own unlinked process (`process.spawn_unlinked`) and
-//// stops it with `process.kill` once the scenario's own run finishes
-//// (a `gleam_erlang` `Subject` can only be received from by the process
-//// that created it, so a "stop" message from the spawning process cannot
-//// be received here -- see `docs/RECOVERY-EVIDENCE.md`-style note in
-//// `grind_bench/load`'s own doc comment on this exact trap). There is no
-//// supervision here: a sampler dying mid-run should not affect the load
-//// run itself, and the run is always bounded (a fixed job count or
-//// wall-clock budget), never a long-lived service. `max_ticks` is this
-//// module's own hard backstop against a caller that forgets to kill the
-//// sampler process at all.
+//// Appends BEAM snapshots at the requested interval to a caller-chosen path.
+//// Runs synchronously in its caller; load scenarios use an unlinked process
+//// and kill it when the run ends. A Subject belongs to the process that
+//// creates it, so a parent-created Subject cannot receive a stop here.
+//// Sampler failure does not stop the workload; required sample coverage is
+//// checked separately. max_ticks bounds a sampler the caller forgets to kill.
 
 import gleam/erlang/process
 import gleam/json

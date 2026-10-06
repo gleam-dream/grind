@@ -47,7 +47,7 @@ pub fn current_function_and_reductions(
 /// Ledger `bench_index`es -1/-2/-3 are never real bench jobs (every real
 /// index is `>= 0`) -- reused as bench-run-scoped counters via the same ETS
 /// table `grind_bench/worker`'s own delivery counters already live in.
-/// `pub`: item 4's mutation tests exercise these through the real
+/// Mutation tests exercise these through the real
 /// `attach_audit_observers` wiring from `bench/test/`, a different module in
 /// this same package.
 pub const ledger_error_counter = -1
@@ -108,7 +108,7 @@ pub fn database_url() -> String {
   }
 }
 
-/// Item 10: the harness's own ledger/drain-poll/samplers role. Defaults to
+/// The harness's ledger, drain-poll and sampler role. Defaults to
 /// `database_url()` (same role as Grind) when the disposable cluster was
 /// started without a separate `grind_ctl` role.
 pub fn ctl_database_url() -> String {

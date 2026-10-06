@@ -3,7 +3,7 @@
 //// serve both, keyed on whether `Request.policy` is `Some` or `None`.
 //// Request fingerprints and dynamic query construction live in the
 //// `grind/internal/unique_admission` submodules. See
-//// `docs/UNIQUENESS-CONTRACT.md` for the full contract.
+//// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md` for the full contract.
 
 import gleam/dynamic/decode
 import gleam/int
@@ -236,7 +236,7 @@ pub fn reconcile(
 
 /// Runs the admission transaction and classifies its result. Shared by
 /// `submit` (`policy: Some`) and `submit_plain` (`policy: None`); see
-/// "Out of scope" in `docs/UNIQUENESS-CONTRACT.md` for why the
+/// "Out of scope" in `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md` for why the
 /// `TransactionRolledBack(SubmissionConflict)` arm below matters for
 /// `Some` too.
 fn run(
@@ -261,7 +261,7 @@ fn run(
     Ok(Ok(commit)) -> Ok(commit)
     // Both leave a receipt that may now be visible; re-reading it resolves
     // the genuine outcome. See "Admission transaction" in
-    // `docs/UNIQUENESS-CONTRACT.md`.
+    // `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`.
     Ok(Error(pog.TransactionRolledBack(submission.SubmissionConflict)))
     | Ok(Error(pog.TransactionQueryError(_))) ->
       case
@@ -379,7 +379,7 @@ fn single_row(rows: List(a)) -> a {
 
 /// The domain-wide advisory lock (`acquire_lock`) and candidate selection
 /// only ever run when `request.policy` is `Some`. See
-/// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts", for why the `None`
+/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission receipts", for why the `None`
 /// case needs no other lock.
 fn admission_transaction(
   connection: pog.Connection,
@@ -436,7 +436,7 @@ fn transaction_body(
 
 /// Pins this transaction to `READ COMMITTED`, as the **literal first
 /// statement** — must run before any other query, or PostgreSQL rejects it.
-/// See `docs/UNIQUENESS-CONTRACT.md`, "Admission transaction", step 1.
+/// See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission transaction", step 1.
 fn pin_read_committed(
   connection: pog.Connection,
 ) -> Result(Nil, submission.SubmitError(input, output, error)) {
@@ -462,7 +462,7 @@ fn set_lock_timeout(
   Ok(Nil)
 }
 
-/// The domain-wide advisory lock key; see `docs/UNIQUENESS-CONTRACT.md`,
+/// The domain-wide advisory lock key; see `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`,
 /// admission transaction step 3. The configured schema (`postgres.Settings.schema`,
 /// see `postgres.with_schema`) is bound as an ordinary parameter — never
 /// `current_schema()` spliced into the SQL text — so two schemas, now the

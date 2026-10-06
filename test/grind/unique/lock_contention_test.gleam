@@ -33,7 +33,7 @@ import pog
 
 // -- Increment 9: contention -------------------------------------------------
 //
-// See `docs/RECOVERY-EVIDENCE.md`, Increment 9, for this section's evidence.
+// See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, Increment 9, for this section's evidence.
 
 /// The test itself holds the real domain lock (via `unique_domain_lock_query`,
 /// built from the same `@internal lock_key_sql` production code uses) in its
@@ -128,12 +128,12 @@ fn run_unique_contended_lock_wait_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-contended-lock-wait-passed")
 }
 
-/// DEFECT 1 (docs/RELEASE-READINESS.md, "Defects found while designing the
+/// DEFECT 1 (https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md, "Defects found while designing the
 /// deadline"): the same contention as above, but with *default*
 /// `postgres.settings` on the submitter — no `unique_lock_wait` override.
 /// Before the fix, the default `unique_lock_wait_ms` (5000) was equal to
 /// pgo's own hardcoded pool checkout deadline (also ~5000 ms — see
-/// `docs/RECOVERY-EVIDENCE.md`, "Acknowledgement deadline"), so contention
+/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, "Acknowledgement deadline"), so contention
 /// could surface as the checkout being force-closed
 /// (`NotCommitted(pog.QueryTimeout)`/`CommitUnknown`) instead of the
 /// clean, typed `AdmissionContended` a caller can actually branch on — a
@@ -233,7 +233,7 @@ fn run_unique_contended_lock_wait_default_settings_test(
 /// by the test through an open `SELECT ... FOR UPDATE` transaction, not the
 /// domain lock) blocks a `RescheduleScheduledTo` submission's candidate
 /// selection (which takes that same row lock, per
-/// `docs/UNIQUENESS-CONTRACT.md`'s admission transaction step 6) until its
+/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`'s admission transaction step 6) until its
 /// 200ms `unique_lock_wait` elapses; the row is left completely unchanged.
 /// Once released, the same reschedule request succeeds.
 pub fn postgres_submit_unique_reschedule_row_lock_contention_test() {
@@ -465,7 +465,7 @@ fn run_unique_lock_timeout_no_leak_test(database_url: String) -> Nil {
 
 // -- Isolation-level pinning (R1) --------------------------------------------
 //
-// See `docs/RECOVERY-EVIDENCE.md`, "Isolation-level pinning", for the red
+// See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, "Isolation-level pinning", for the red
 // evidence this test was checked against.
 
 /// The admission transaction's correctness (a waiter's plain reads after the

@@ -1,5 +1,4 @@
-//// Grind runs typed background jobs on PostgreSQL and Erlang/OTP: a
-//// strongly-typed Oban.
+//// Grind runs typed background jobs on PostgreSQL and Erlang/OTP.
 ////
 //// ```gleam
 //// import gleam/otp/static_supervisor as supervisor
@@ -36,7 +35,7 @@
 ////
 //// | Operation                      | Default                        | Setter                          |
 //// | ------------------------------ | ------------------------------ | ------------------------------- |
-//// | storage call, including checkout | 4 s                          | `with_statement_deadline`       |
+//// | storage call                   | 4 s; queued checkout may exceed it | `with_statement_deadline`    |
 //// | initial connect at start       | 15 s                           | `with_connect_timeout`          |
 //// | uniqueness lock wait           | 2 s                            | `with_unique_lock_wait`         |
 //// | migration step                 | 30 s                           | `with_migration_deadline`       |
@@ -175,8 +174,9 @@ pub fn with_schema(config: Config, schema: String) -> Config {
   Config(..config, schema:)
 }
 
-/// Bounds every storage call, from waiting for a connection through its
-/// last statement. A connection obtained after the deadline sends nothing.
+/// Sets the absolute storage deadline before checkout. A connection obtained
+/// after expiry sends nothing; the pinned pool can wait past it while queued.
+/// See docs/adr/0008-state-driver-deadline-and-installation-limits.md.
 pub fn with_statement_deadline(config: Config, deadline: Duration) -> Config {
   Config(..config, statement_deadline_ms: duration.to_milliseconds(deadline))
 }
@@ -839,8 +839,9 @@ pub type SubmitError(input, output, error) {
 }
 
 /// Admits a job in its own transaction. Every admission records a receipt,
-/// under the job's id or one Grind generates, so `CommitUnknown` is always
-/// reconcilable. Emits `[grind, job, admitted]` once the commit is proven.
+/// under the caller's submission key or a generated key. Retain the pending
+/// command after `CommitUnknown`; reconciliation depends on receipt retention.
+/// Emits `[grind, job, admitted]` once the commit is proven.
 pub fn submit(
   grind: Grind,
   job: job.Job(input, output, error),
@@ -1115,7 +1116,8 @@ pub fn outcome(
 
 /// Waits up to `within` for the job to leave the pending states, and
 /// returns its outcome then: the finished result, `Uncertain`, or
-/// `Pending(state)` when the time ran out.
+/// `Pending(state)` when the time ran out. The budget is checked after each
+/// storage read, so the last read can finish after `within`.
 pub fn await(
   grind: Grind,
   handle: JobHandle(input, output, error),

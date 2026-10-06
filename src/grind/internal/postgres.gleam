@@ -97,8 +97,8 @@ pub fn database_url(settings: Settings) -> Result(String, Nil) {
 /// `validate`'s own margin against it, and so `queue.start`'s lease rule
 /// (`4 * statement_deadline_ms`, independently of concurrency) stays
 /// comfortably under `queue.default_policy`'s 30 000 ms lease without
-/// having to raise that default. See docs/RELEASE-READINESS.md,
-/// "Acknowledgement deadline".
+/// having to raise that default.
+/// See docs/adr/0008-state-driver-deadline-and-installation-limits.md.
 pub fn settings(database_url: String) -> Settings {
   Settings(
     source: FromUrl(fn() { database_url }),
@@ -144,7 +144,7 @@ pub fn with_pool_size(settings: Settings, pool_size: Int) -> Settings {
 /// on the `grind_unique_submissions` primary key when a concurrent same-id
 /// writer's insert is still uncommitted — `submit_with_id` has no
 /// domain-wide advisory lock of its own (see
-/// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts"), so this same
+/// `docs/adr/0003-separate-command-receipts-from-uniqueness.md`), so this same
 /// setting is what keeps that wait bounded too. Validated positive by
 /// `validate`, before any pool starts.
 pub fn with_unique_lock_wait(
@@ -154,19 +154,14 @@ pub fn with_unique_lock_wait(
   Settings(..settings, unique_lock_wait_ms: milliseconds)
 }
 
-/// Sets the Grind-owned checkout deadline, in milliseconds, that bounds
-/// every Grind storage call against this pool — inline SQL, every
-/// Squirrel-generated call, and a whole `pog.transaction` including its own
-/// `BEGIN`/`COMMIT` (`src/grind_postgres_ffi.erl`). A lost reply on a
-/// half-open socket (`docs/RECOVERY-EVIDENCE.md`, "Acknowledgement
-/// deadline") surfaces as `QueueAckUnknown`/`pog.QueryTimeout` within
-/// roughly this bound instead of hanging indefinitely. Validated positive,
-/// and against `unique_lock_wait_ms`, by `validate`. Also sets the pooled
-/// connection's own `idle_in_transaction_session_timeout` startup parameter
-/// to twice this value, so a request whose *reply* is lost but which never
-/// even reached PostgreSQL (the request itself dropped) does not leave a
-/// real server session idle in transaction, holding row locks, forever —
-/// see DEFECT 3 in docs/RELEASE-READINESS.md.
+/// Sets the absolute storage deadline before checkout, in milliseconds.
+/// Queued pool checkout can exceed this deadline; an expired connection sends
+/// nothing. Once transferred, the deadline closes a connection still held by
+/// a blocked statement or transaction, including BEGIN/COMMIT.
+/// Idle-in-transaction timeout is twice this value so a lost request does not
+/// leave a server session holding locks indefinitely. Validation requires a
+/// positive deadline and room for the uniqueness lock wait.
+/// See docs/adr/0008-state-driver-deadline-and-installation-limits.md.
 pub fn with_statement_deadline(
   settings: Settings,
   milliseconds: Int,
@@ -208,7 +203,7 @@ pub fn with_observation_capacity(
 /// restored before the connection returns to the pool) — the one
 /// schema this `Database` reads and writes, and the schema `migrate`/
 /// `migrate_with` creates if it does not yet exist. Defaults to `"public"`.
-/// See `README.md`, "Isolation": the schema, not any value derived from the
+/// See `docs/USAGE.md`, "Isolation": the schema, not any value derived from the
 /// database URL or role, is the whole unit of isolation between logically
 /// distinct Grind installations sharing one PostgreSQL cluster. Validated
 /// non-empty by `validate`; never SQL-injected — every use of `schema` is
@@ -244,15 +239,15 @@ pub type ConfigError {
   /// advisory lock key derivation for such a name can end up `NULL` in
   /// edge cases — configuring it at all is never something a caller
   /// actually means, only ever a copy-paste of the *unquoted* convention
-  /// documented in risk 7), or starts with the reserved `pg_` prefix
+  /// documented in the installation limits ADR), or starts with the reserved `pg_` prefix
   /// (PostgreSQL reserves every `pg_`-prefixed schema name for its own
   /// system and temporary schemas; `CREATE SCHEMA` refuses one outright,
   /// so accepting it here would only defer that same rejection to
   /// `migrate`, with a less specific error). See `with_schema` and
-  /// `docs/RISKS.md` risk 7.
+  /// `docs/adr/0008-state-driver-deadline-and-installation-limits.md`.
   InvalidSchema
   /// `unique_lock_wait_ms` is within roughly one second of
-  /// `statement_deadline_ms` (DEFECT 1, docs/RELEASE-READINESS.md): default
+  /// `statement_deadline_ms` (see docs/adr/0008-state-driver-deadline-and-installation-limits.md): default
   /// PostgreSQL's own `55P03 lock_not_available` (raised once
   /// `unique_lock_wait_ms` elapses, mapped to `submission.AdmissionContended`)
   /// would otherwise race the checkout deadline itself force-closing the
@@ -302,7 +297,7 @@ fn quote_ident(name: String) -> String {
 }
 
 /// The margin `validate` requires between `unique_lock_wait_ms` and
-/// `statement_deadline_ms` (DEFECT 1). Not itself configurable: it exists so
+/// `statement_deadline_ms`. Not itself configurable: it exists so
 /// PostgreSQL's own lock-wait error has time to actually surface and be
 /// mapped to `submission.AdmissionContended` before the checkout deadline would
 /// otherwise force-close the connection first.
@@ -369,9 +364,9 @@ const migration_lock_timeout_margin_ms = 1000
 /// handling (`40001 serialization_failure`) in place of the idempotent
 /// result that retry is supposed to get (the acknowledgement path) — and
 /// neither depends on a caller never configuring their role or database
-/// with a non-default isolation level. See `docs/UNIQUENESS-CONTRACT.md`,
-/// "Admission transaction" step 1, and `docs/RECOVERY-EVIDENCE.md`,
-/// "Isolation-level pinning", for the full rationale and mutation evidence.
+/// with a non-default isolation level. See `docs/adr/0003-separate-command-receipts-from-uniqueness.md`,
+/// and `docs/adr/0011-retain-rewritten-history-as-source-provenance.md`
+/// for the rationale and historical mutation evidence.
 /// `grind/internal/unique_admission`'s own `pin_read_committed` (`SET
 /// TRANSACTION ISOLATION LEVEL READ COMMITTED` as that transaction's own
 /// first statement) is kept as defense in depth on top of this — a
@@ -448,7 +443,7 @@ pub fn validate(settings: Settings) -> Result(ValidatedSettings, ConfigError) {
           // `grind/internal/unique_admission/query.lock_key_sql`) and every
           // `current_schema()`-based read (`read_schema_generation` and
           // friends) agree by construction. See `with_schema` and
-          // `docs/RISKS.md` #7.
+          // `docs/adr/0008-state-driver-deadline-and-installation-limits.md`.
           let search_path = quote_ident(settings.schema)
           let #(config, scoped_search_path) = case settings.source {
             FromUrl(..) -> #(
@@ -575,7 +570,7 @@ pub type StartError {
 ///
 /// Isolation between logically distinct Grind installations sharing one
 /// PostgreSQL cluster is the schema this pool's `search_path` resolves to —
-/// see `README.md`, "Isolation" — not a value this call derives or accepts;
+/// see `docs/USAGE.md`, "Isolation" — not a value this call derives or accepts;
 /// every job row, quarantine scan, uniqueness domain, and retention sweep
 /// this `Database` performs is simply whatever `grind_jobs` and its sibling
 /// tables in that one schema hold. Also starts this `Database`'s own
@@ -607,8 +602,7 @@ pub type StartError {
 /// jobs keep being admitted, claimed, and acknowledged normally. See
 /// `postgres_forwarder_crash_loop_does_not_stop_the_pool_test`
 /// (`test/grind/observations/delivery_test.gleam`) and
-/// `docs/RECOVERY-EVIDENCE.md`, "Acknowledged
-/// observation".
+/// `docs/adr/0011-retain-rewritten-history-as-source-provenance.md`.
 pub fn start(settings: ValidatedSettings) -> Result(Database, StartError) {
   let supervisor =
     static_supervisor.new(static_supervisor.OneForOne)
@@ -784,7 +778,7 @@ fn read_database_oid(
 /// pg_control_system`, and PostgreSQL still logs it server-side, even
 /// though the branch calling it would never have been taken (confirmed
 /// empirically against a role with the privilege explicitly revoked; see
-/// `docs/RECOVERY-EVIDENCE.md`). Never sending the restricted call's own
+/// `docs/adr/0011-retain-rewritten-history-as-source-provenance.md`). Never sending the restricted call's own
 /// query text at all, once the separate privilege check reports `False`,
 /// is what actually avoids both the client-visible error (already
 /// swallowed into `None` either way) and the server-side log line — the
@@ -1320,11 +1314,9 @@ pub fn admit_in(
   |> result.map(fn(commit) { commit.outcome })
 }
 
-/// Builds and forwards `[grind, job, admitted]`, shared by a plain
-/// `submit`/`submit_at` admission and every `submit_unique` decision.
-/// `submission_id`/`confirmation` are `None`/always `Replied` for a plain
-/// submission (there is no receipt concept there — every plain submission is
-/// its own fresh commit); see `AdmittedMetadata` for the unique case.
+/// Builds and forwards `[grind, job, admitted]` after admission commits.
+/// Every admission carries its submission key. A matched receipt uses
+/// `Reconciled`; a new admission uses `Replied`.
 fn emit_admitted(
   fwd: Forwarder,
   correlation: Correlation,
@@ -1418,7 +1410,7 @@ pub type JobReadError {
   /// installation tokens — see `grind/job`'s `Installation` type doc comment
   /// for what this client-side check does and, more importantly, does not
   /// guarantee (the real isolation boundary is the PostgreSQL schema itself,
-  /// see `README.md`, "Isolation"). Reachable from every `JobReadError`-
+  /// see `docs/USAGE.md`, "Isolation"). Reachable from every `JobReadError`-
   /// returning function except `bind_handle`, which mints a fresh handle
   /// against the `Database` it is called on rather than checking one handed
   /// in.
@@ -1459,7 +1451,7 @@ fn job_read_error(error: postgres_job_reads.JobReadError) -> JobReadError {
 
 /// Reconstructs a typed handle from durable identity after an application
 /// restart, scoped to whatever schema this `Database`'s pool connects to —
-/// see `README.md`, "Isolation". The current worker definition must exactly
+/// see `docs/USAGE.md`, "Isolation". The current worker definition must exactly
 /// match the stored worker and codec contract. May return
 /// `JobReadQueryFailed`, `JobNotFound`, `WorkerContractMismatch`, or
 /// `CodecContractMismatch`; never `QueueRouteMismatch`, `CodecFailed`,
@@ -1822,7 +1814,7 @@ pub type QuarantineError {
 
 /// Quarantines up to `limit` expired `executing` rows across every queue in
 /// this schema — not only the queues some running consumer happens to poll
-/// (see `README.md`, "Isolation"). Intended for queues no consumer currently
+/// (see `docs/USAGE.md`, "Isolation"). Intended for queues no consumer currently
 /// polls (an idle queue, a worker retired without a replacement consumer,
 /// or an operational sweep run outside any consumer's own poll loop); a
 /// polled queue's own consumer already quarantines its expired rows as part
@@ -1892,7 +1884,7 @@ pub type PruneReport {
 pub type PruneError {
   /// `older_than_ms` was not positive; nothing was touched. There is no
   /// minimum retention floor beyond this (matching Oban's own `max_age`,
-  /// which is likewise only required to be positive) — see README,
+  /// which is likewise only required to be positive) — see docs/USAGE.md,
   /// "Retention", for what a very short retention window can do to a late
   /// commit-unknown reconciliation.
   NonPositiveRetention
@@ -1908,7 +1900,7 @@ pub type PruneError {
   PruneQueryFailed(pog.QueryError)
 }
 
-/// Deletes up to `limit` rows in this schema (see `README.md`, "Isolation")
+/// Deletes up to `limit` rows in this schema (see `docs/USAGE.md`, "Isolation")
 /// that finished (reached one of the six terminal states — see
 /// `grind/internal/terminal`) more than `older_than_ms` milliseconds ago.
 /// Each deleted job's own acknowledgement, uniqueness-submission, and
@@ -1958,7 +1950,7 @@ pub type PruneError {
 /// never resolve, and an automatic acknowledgement retry that reaches the
 /// server after its job was pruned reports `QueueAckStale(AckRecordMissing)`
 /// — the same shape an ordinary lost/reassigned row already produces, not a
-/// new failure mode. See README, "Retention", for the full list.
+/// new failure mode. See docs/USAGE.md, "Retention", for the full list.
 pub fn prune_finished(
   database: Database,
   older_than_ms older_than_ms: Int,
@@ -2125,18 +2117,13 @@ pub fn reconcile_acknowledgement(
 // instead). That module returns `grind/unique`'s public
 // `Admission`/`Conflict`/`SubmitError`/`PendingSubmission` types
 // directly, so `submit_unique`/`reconcile_unique` below are thin entry
-// points, not a second translating layer. See `docs/UNIQUENESS-CONTRACT.md`
-// for the full contract.
-
-/// Admits one job under a uniqueness policy. Rejects an empty queue name
-/// before acquiring any resource. See `docs/UNIQUENESS-CONTRACT.md` for the
-/// full admission transaction. May return `submission.EmptyQueueName`,
-/// `submission.InvalidInput` (the input codec or a `unique.selected` key
-/// codec rejected the value, before any storage call),
-/// `submission.AdmissionContended`, `submission.SubmissionConflict`,
-/// `submission.NotCommitted`, or `submission.CommitUnknown`; never
-/// `submission.CommitUnknownWithoutId`, which is reserved for `submit`/
-/// `submit_at`'s own no-identity uncertain case.
+// points, not a second translating layer. See `docs/adr/0003-separate-command-receipts-from-uniqueness.md`
+// for the admission decision and rationale.
+/// Admits one job under a uniqueness policy. Rejects an empty queue or an
+/// invalid input/key before storage. Lock contention, conflicting submission
+/// keys and unknown commits are typed failures. Retain an unknown command
+/// for reconciliation while its receipt remains retained.
+/// See docs/adr/0003-separate-command-receipts-from-uniqueness.md.
 pub fn submit_unique(
   database: Database,
   queue: String,
@@ -2164,29 +2151,13 @@ pub fn submit_unique(
   )
 }
 
-/// Persists a job (immediately, or at an absolute availability time — see
-/// `availability`) with a caller-supplied `SubmissionId`, no uniqueness
-/// policy. Unlike `submit`/`submit_at`, a retry of this exact call (same id,
-/// same request) converges on the original commit instead of risking a
-/// duplicate row: it reuses `submit_unique`'s own admission receipt, request
-/// fingerprint, and reconciliation machinery — the same unified admission
-/// transaction in `grind/internal/unique_admission`, taken with no policy
-/// (`Request.policy: None`), not a second implementation — see
-/// `docs/UNIQUENESS-CONTRACT.md`, "Admission receipts", for the full
-/// contract, including what lock (if any) protects a concurrent same-id
-/// retry with no uniqueness key to serialize on. Returns `submission.Inserted`
-/// on this call's own first commit, or on a matching replay;
-/// `submit_unique`'s `Existing`/`Rescheduled` variants never occur here —
-/// there is no policy to conflict against, so every resolved call is
-/// `Inserted`. May return `submission.EmptyQueueName`,
-/// `submission.InvalidInput` (before any storage call),
-/// `submission.AdmissionContended`, `submission.SubmissionConflict`,
-/// `submission.NotCommitted`, or `submission.CommitUnknown` (recoverable with
-/// `reconcile_unique`, or a plain retry of the same `SubmissionId`); never
-/// `submission.CommitUnknownWithoutId`, which is reserved for `submit`/
-/// `submit_at`'s own no-identity uncertain case — use this function (or
-/// `submit_unique`) instead of `submit`/`submit_at` for a job that might
-/// need to be resubmitted safely.
+/// Admits a job with a caller-supplied SubmissionId and no uniqueness policy.
+/// An exact retry returns the original Inserted decision; the same key with
+/// a different request returns SubmissionConflict. This uses the same receipt
+/// and fingerprint transaction as submit_unique, with no policy to return
+/// Existing or Rescheduled. CommitUnknown is recoverable by reconcile_unique
+/// or an exact retry while the receipt is retained.
+/// See docs/adr/0003-separate-command-receipts-from-uniqueness.md.
 pub fn submit_with_id(
   database: Database,
   queue: String,

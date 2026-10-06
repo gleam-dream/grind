@@ -1,4 +1,4 @@
-//// Fault-proxy tests (docs/RELEASE-READINESS.md, "Acknowledgement deadline").
+//// Fault-proxy tests (https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md, "Acknowledgement deadline").
 ////
 //// These sit a real TCP relay (`grind_fault_proxy.erl`, bound through
 //// `fault_proxy.gleam`) between a Grind `Database` and the disposable test
@@ -13,14 +13,14 @@
 //// before any test relies on it to prove something about Grind.
 ////
 //// T1/T2/T4/T5 print how long the affected call actually took, in
-//// milliseconds, so `docs/RECOVERY-EVIDENCE.md` can quote real numbers, and
+//// milliseconds, so `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` can quote real numbers, and
 //// also assert `elapsed < 2 * postgres.statement_deadline_ms(database)` —
 //// tight enough to fail if the fix regressed to an unbounded wait, loose
 //// enough to tolerate ordinary scheduling/GC jitter around one deadline
 //// window, and derived from the pool's own configured deadline rather than
 //// a hardcoded constant so it tracks a caller-chosen `statement_deadline`
 //// instead of silently passing regardless of it (see the mutation evidence
-//// in `docs/RECOVERY-EVIDENCE.md`).
+//// in `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`).
 
 import exception
 import fault_proxy
@@ -359,7 +359,7 @@ fn run_t1(base_url: String) -> Nil {
   // Bounded by roughly `deadline_ms` (the checkout deadline armed at the
   // ack's own `BEGIN`), not by this call's own generous outer wait: assert
   // `elapsed < 2 * deadline_ms`, not merely "returned at all before 20000ms"
-  // — see the mutation evidence in docs/RECOVERY-EVIDENCE.md proving this
+  // — see the mutation evidence in https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md proving this
   // bound is not vacuous (a deliberately widened `statement_deadline`
   // widens the observed `elapsed` proportionally, and a hardcoded bound
   // that failed to track it would go red).
@@ -714,7 +714,7 @@ fn run_t5(base_url: String) -> Nil {
   // receipt and the job left `Executing`, never `QueueAckFailed` (pog does
   // not expose which statement inside the transaction actually failed, so
   // Grind conservatively treats every `TransactionQueryError` alike — see
-  // `docs/RECOVERY-EVIDENCE.md`).
+  // `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`).
   case process.receive(reply, within: 20_000) {
     Ok(Error(postgres.QueueAckUnknown(returned_command_id, _))) -> {
       let elapsed = monotonic_ms() - start_ms
@@ -956,7 +956,7 @@ fn run_t3(base_url: String) -> Nil {
 /// none of them went down abnormally — not merely printing "CONFIRMED" and
 /// letting the test pass regardless either way — a live regression guard in
 /// case some future call path ever bypasses Grind's own checkout and lets
-/// pog re-checkout with its own default (`docs/RECOVERY-EVIDENCE.md`,
+/// pog re-checkout with its own default (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`,
 /// "DEFECT 2 probe").
 pub fn fault_proxy_defect2_queue_deadline_test() {
   case fault_proxy_url() {

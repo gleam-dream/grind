@@ -50,10 +50,9 @@ pub fn transaction_measured(
 // owned by `grind/internal/pool`, and run against the pog `Connection` shape
 // `{single_connection, Conn}` rather than letting pog re-checkout with its
 // own unconfigurable, hardcoded default — see `src/grind_postgres_ffi.erl`'s
-// own module documentation for the full mechanism and why it also fixes
-// DEFECT 2 (a `pog_ffi:convert_error` checkout-error shape with no matching
-// clause, which could otherwise crash the caller with `error:function_clause`
-// instead of a typed error).
+// module documentation for the mechanism. It also converts unsupported
+// checkout-error shapes to typed errors rather than letting
+// `pog_ffi:convert_error` crash the caller.
 @external(erlang, "grind_postgres_ffi", "execute_safely")
 pub fn execute_safely(
   query: pog.Query(a),
@@ -88,19 +87,11 @@ pub fn migration_transaction_safely(
   callback: fn(pog.Connection) -> Result(a, b),
 ) -> Result(a, pog.TransactionError(b))
 
-/// Distinguishes a checkout failure (definitely not committed) from a
-/// genuinely uncertain post-checkout outcome (checked out fine, then lost
-/// the connection during the callback or its own `COMMIT`; might have
-/// committed). `Error(Nil)` means checkout itself failed — nothing was ever
-/// sent; `Ok(Result)` means the transaction actually ran to completion
-/// (successfully, rolled back, or with its own `TransactionError`), and
-/// `Result` is exactly what it returned. `grind/internal/unique_admission`'s
-/// own `run` is the only caller that needs this distinction today; other
-/// `transaction_safely` callers (acknowledgement, audited resolution)
-/// conservatively still report their own "unknown" outcome for a checkout
-/// failure too (`docs/IMPLEMENTATION-SCOPE.md` backlog) — safe, only less
-/// precise. See "Admission transaction" in `docs/UNIQUENESS-CONTRACT.md` for
-/// the full rationale.
+/// Separates a failed checkout from a transaction that ran and returned an
+/// outcome. `Error(Nil)` means nothing was sent; `Ok(Result)` retains the
+/// transaction's result, including an unknown commit. Admission uses this
+/// distinction. Acknowledgement and resolution wrappers conservatively report
+/// unknown outcomes for checkout failures too.
 @external(erlang, "grind_postgres_ffi", "transaction_or_checkout_failure")
 pub fn transaction_or_checkout_failure(
   connection: pog.Connection,

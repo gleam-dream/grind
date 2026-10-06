@@ -3,7 +3,7 @@
 %% closes a socket on its own initiative (a genuine half-open network fault,
 %% unlike `pg_terminate_backend`, which closes the *server* side and lets the
 %% client observe a fast, clean close). Loopback only; no TLS; a connect hang
-%% (upstream never accepting) is not covered — see docs/RECOVERY-EVIDENCE.md.
+%% (upstream never accepting) is not covered — see https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md.
 %%
 %% One controller process per `start/2` call owns the listen socket, the
 %% current one-shot fault arming (`arm/3`), and the list of live per-connection

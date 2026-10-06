@@ -242,7 +242,7 @@ fn run_submit_unique_json_equality_test(database_url: String) -> Nil {
 
   // 1 and 1.0 are distinct scalars under PostgreSQL's own jsonb::text
   // rendering: a deliberate departure from a cross-language canonical JSON
-  // equality (see docs/UNIQUENESS-CONTRACT.md).
+  // equality (see https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md).
   let assert Ok(submission.Inserted(_)) = admit("numeric-int", json.int(1))
   let assert Ok(submission.Inserted(_)) =
     admit("numeric-float", json.float(1.0))

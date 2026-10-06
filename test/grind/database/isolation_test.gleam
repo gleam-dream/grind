@@ -32,7 +32,7 @@ pub fn postgres_two_schemas_share_a_database_but_stay_isolated_test() {
 /// each role its own private namespace, and `postgres.with_schema` pins
 /// each pool's `search_path` to exactly that one schema — deliberately
 /// explicit, not inferred from the role or the URL (see `with_schema`'s own
-/// doc comment and `docs/RISKS.md` #7 for why relying on PostgreSQL's own
+/// doc comment and `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RISKS.md` #7 for why relying on PostgreSQL's own
 /// `"$user", public` `search_path` fallback instead is the fragile shape
 /// this package no longer recommends: see
 /// `postgres_user_schema_fallback_shares_one_installation_test` for exactly

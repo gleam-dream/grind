@@ -90,7 +90,7 @@ createdb -h 127.0.0.1 -p "$port" -U grind grind_migration_lock
 createdb -h 127.0.0.1 -p "$port" -U grind grind_prune_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_prune_owner_b
 createdb -h 127.0.0.1 -p "$port" -U grind grind_squirrel_check
-# Increment 26 (docs/RELEASE-READINESS.md, "Migration gaps"): cigogne
+# Increment 26 (https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md, "Migration gaps"): cigogne
 # end-to-end (a fresh install cigogne itself applies, and its own
 # concurrent-with-`migrate` serialization) plus the upgrade-harness genuine
 # lost-reply `reconcile_unique` scenario.

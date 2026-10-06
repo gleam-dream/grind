@@ -13,7 +13,7 @@
 -- returned), written once at submission/preload time. `bench_effects` is one
 -- row per actual handler invocation, keyed by `bench_index` alone (a worker's
 -- `perform` callback never receives Grind's own job id — see
--- `docs/IMPLEMENTATION-SCOPE.md`, "Job lifecycle and attempt history" — so
+-- `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/IMPLEMENTATION-SCOPE.md`, "Job lifecycle and attempt history" — so
 -- the ledger has to use the identity the application itself controls). The
 -- audit checker (`grind_bench/audit`) joins these two tables, plus Grind's
 -- own `grind_jobs`/`grind_job_acknowledgements`/`grind_job_resolutions` in

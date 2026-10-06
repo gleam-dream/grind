@@ -12,31 +12,5 @@ pre-commit:
       # the staged files in {staged_files}.
       run: nix fmt -- {staged_files}
       stage_fixed: true
-    # When this repo grows a design layer under docs/design/ (via the
-    # design-layer flake input), uncomment the gate job so every commit
-    # checks it. The gate is NOT stored in this repo — it is a pinned Nix
-    # flake input, called as a bundle. One call runs the whole composite:
-    #   1. render freshness — the layer renders as ONE document, so this is one
-    #      seat, not one per design.typ (regenerate-and-compare against the
-    #      committed docs/design/design-layer.pdf). A standalone document kept
-    #      outside the aggregate gets its own seat:
-    #      `nix run github:lostbean/design-layer#render -- <doc> --check`;
-    #   2. token-coverage — every referenced semantic token is defined;
-    #   3. link integrity — cross-links intact.
-    # Exit: 0 clean, 1 violation, 2 error. It fails closed on a violation, so a
-    # design that does not render clean does not promote. A bare `typst compile`
-    # is NOT the gate — it renders the document without asserting the
-    # document-level contracts the projected library cannot express.
-    #
-    # Call it through THIS repo's own flake (`.#design-gate-check`, which
-    # forwards github:lostbean/design-layer#check). That is what keeps the hook
-    # offline and reproducible: it resolves the revision flake.lock names
-    # instead of re-fetching the input on every commit. A repo that has not
-    # forwarded the app can call the input URL directly instead, at the cost of
-    # a network resolve. No dev shell is needed either way — `nix run` brings
-    # the renderer with it.
-    #
-    # Whole-repo rather than staged-only, because a staged change can break the
-    # layer without touching it.
-    # design-gate:
-    #   run: nix run "$PWD#design-gate-check" -- docs/design .
+    design-gate:
+      run: nix run .#design-gate-check -- docs/design .

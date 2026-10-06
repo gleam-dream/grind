@@ -252,7 +252,7 @@ fn reconcile_transaction(
 /// retry as stale" pattern the acknowledgement path already uses
 /// (`acknowledge_transaction`'s re-read of `matching_acknowledgement` after
 /// a 0-row fenced `UPDATE`), applied here to `resolve_uncertain`'s
-/// analogous race — see `docs/RECOVERY-EVIDENCE.md`, "Concurrent audited
+/// analogous race — see `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, "Concurrent audited
 /// resolution".
 fn resolution_receipt_outcome(
   connection: pog.Connection,
@@ -389,7 +389,7 @@ fn apply_uncertain_resolution(
   // otherwise make an audited resolution spuriously contend
   // (`AdmissionContended`) with an unrelated admission reading the exact
   // same row for a reason that was never actually incompatible with this
-  // resolution's own write. See `docs/UNIQUENESS-CONTRACT.md`, "Admission
+  // resolution's own write. See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission
   // transaction" step 6, for the full contention picture across claim,
   // cancel, quarantine, and now resolution.
   let select = postgres_resolution_queries.lock_uncertain_query(id)

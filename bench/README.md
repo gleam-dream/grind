@@ -2,9 +2,8 @@
 
 This unpublished Gleam project measures Grind against disposable PostgreSQL
 clusters. Use it to check workload correctness, renewal safety, latency and
-throughput on the machine where you intend to run Grind. Historical results
-below describe specific development snapshots; they do not qualify today's code
-for release. See [release readiness](../docs/RELEASE-READINESS.md) for that decision.
+throughput on the machine where you intend to run Grind. Qualification requires
+fresh reviewed results for the chosen source and dependencies. See [qualification evidence](../docs/evidence/qualification.md) for that decision.
 
 ## Run
 
@@ -60,27 +59,7 @@ the individual-run CLI is documented in [load.gleam](src/grind_bench/load.gleam)
 
 ## Harness pools
 
-The harness's own bookkeeping queries (ledger writes, drain polling, the
-completion observer and the audits) go through
-[`harness_db.execute`](src/grind_bench/harness_db.gleam), not through
-Grind. The L3 open-loop scenario once crashed with `noproc` on its drain
-pool while nine package gates ran in parallel, and passed when run alone.
-The drain pool then had one connection, shared by the 10 ms completion
-observer and the drain poller, and every query ran with pog's 5 s default
-timeout. pgo arms that deadline at checkout and cancels it asynchronously
-at checkin; under heavy machine load a query can run close to it, and a
-deadline message that arrives after its connection was checked in or
-replaced can crash pgo's pool process. While the pool restarts its name is
-unregistered, so a concurrent query exits with `noproc`. The race is in the
-harness's plain pog usage under load, not in Grind's storage calls, which
-check out through Grind's bounded FFI.
-
-The observer now has its own pool, bookkeeping queries run with a 60 s
-timeout so no deadline fires near a slow query's completion, and a query
-that exits with `noproc` is retried for up to 5 s. The observer's stop line
-reports `harness_pool_restart_retries`; a nonzero count means a pool
-restarted during the run and the run should be repeated before its numbers
-are used as evidence.
+Bookkeeping queries use harness_db.execute rather than Grind. The completion observer has its own pool. Bookkeeping uses a sixty-second timeout and retries noproc for up to five seconds. A nonzero harness_pool_restart_retries count requires repeating the run before its measurements are used. [ADR-0009](../docs/adr/0009-separate-observations-from-qualification-evidence.md) records the failure that motivated this isolation.
 
 ## Comparability and validity
 
@@ -134,52 +113,50 @@ Each `.jsonl.drain.json` records the actual interval, final completion counts an
 sampler coverage, including first/last samples, count and maximum gap. Timeout
 still fails; final diagnostics do not start another drain or turn failure into success.
 
-## Historical results: 2026-09-28
+## Historical measurements
 
-These are laptop measurements from dirty exploratory trees based on `8431b61`,
-with Sinal `c8868251a69ecf4fafdba7a7a8f1b419c71c1dfe`. The source SHA-256 values identify
-historical inputs; the removed generated snapshots cannot be reconstructed from
-these hashes alone:
+These measurements belong to the dirty exploratory build tested on 2026-09-28.
+[ADR-0009](../docs/adr/0009-separate-observations-from-qualification-evidence.md#bounded-measured-conclusions-and-provenance)
+records the accepted findings and failed-run limits. The
+[original benchmark summary](https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/bench/README.md#historical-results-2026-09-28)
+preserves the tables and workload counts. They have not been rerun for this
+checkout; the deleted raw outputs cannot be re-audited from these summaries.
 
-- Baseline and delayed L3/T2: `4b0c3e229246b329a45ab4b52353954d25d577e72833b3f0fdef8013c0df4cf9`.
-- Fresh matched L7 pair: `c48eda5d5034c5d62979463f3f030316b9f7af146650db0823c116831139dddc`.
+L7 used one queue, fifty worker slots, a main pool of fifty, one-millisecond
+handlers and a 600-second drain budget. Each value below is the median of three
+measured repeats after warm-up. Additional harness pools are excluded from the
+Grind connection counts.
 
-Environment: Darwin 25.5.0 arm64, 12 logical CPUs, Gleam 1.18.1,
-OTP 28.5.0.6 / ERTS 16.4.0.6, PostgreSQL 16.15 on the same host, with
-`synchronous_commit=local`. Each main point had three measured repeats after
-warm-up. Operating-system and storage differences limit cross-host comparisons.
+| Consumers × slots | Jobs per repeat | Grind connections | Throughput, no injected delay (jobs/s) | Throughput, 5 ms delay (jobs/s) |
+| ----------------- | --------------: | ----------------: | -------------------------------------: | ------------------------------: |
+| 1 × 50            |           9,000 |                51 |                               1,651.07 |                           41.74 |
+| 5 × 10            |          33,000 |                55 |                               3,872.33 |                          207.81 |
+| 10 × 5            |          46,000 |                60 |                               4,329.82 |                          414.29 |
 
-L7 medians used one queue, 50 total worker slots, main pool 50, 1ms handlers and
-a 600-second drain budget. The job counts were 9,000 / 33,000 / 46,000 respectively.
-Harness connections are additional to the Grind totals below.
+L3 used four C10 consumers at 1,000 arrivals/s. Both arrival generators passed
+the recorded validity checks. The median of the three per-repeat durable-ACK
+p99 measurements was 253.647 ms without injected delay and 25,644.262 ms with
+delay. Durable completion includes the observer's nominal ten-millisecond
+polling interval. The retained summary does not record L3's per-repeat job
+count, arrival-window duration or handler cost.
 
-| Shape | Total Grind connections | Jobs/s, no injected delay | Jobs/s, 5ms per direction/chunk |
-| ----- | ----------------------: | ------------------------: | ------------------------------: |
-| 1×C50 |                      51 |                  1,651.07 |                           41.74 |
-| 5×C10 |                      55 |                  3,872.33 |                          207.81 |
-| 10×C5 |                      60 |                  4,329.82 |                          414.29 |
+The delay setting adds five milliseconds to each received TCP chunk in each
+direction on Grind's database path. The shapes have different job and connection
+counts, so these numbers do not establish a controlled runtime speedup. The
+coordinator threshold T3 remained triggered. The earlier delayed L7 run failed
+its sixty-second budget; the fresh matched pair does not erase that failure.
 
-The 1×C50 / 5×C10 ratios were 42.64% and 20.09%; median PostgreSQL CPU at 1×C50
-was 14.78% and 3.44% of the machine respectively. T3 remained triggered. These
-are topology comparisons with different total connection budgets, not a
-controlled speedup over an older runtime. Batch claiming remains deferred.
+Recorded environment: Darwin 25.5.0 arm64, twelve logical CPUs, Gleam 1.18.1,
+OTP 28.5.0.6 / ERTS 16.4.0.6, and same-host PostgreSQL 16.15 with
+`synchronous_commit=local`. The retained summary does not identify the CPU model,
+memory or storage hardware. The dirty Grind trees were based on `8431b61`, with
+Sinal `c8868251a69ecf4fafdba7a7a8f1b419c71c1dfe`:
 
-| Other accepted scope  | Recorded result                                                                                                                                                                                        |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| L3 at 1000 arrivals/s | Median observed durable-ACK p99: 253.647ms without injected delay; 25,644.262ms with 5ms delay. Both generators passed validity checks.                                                                |
-| T1, 9 measured rows   | 192 attempts; worst renewal lag 15.371ms against a 5,000ms threshold; minimum sampled headroom 19,984.037ms. No T1 trigger.                                                                            |
-| T2, 111 measured rows | 1,830 classified jobs; all 1,254 healthy siblings succeeded, with minimum headroom 10,638.835ms and no quarantine. All 576 targets activated: 288 succeeded and 288 became uncertain without receipts. |
+- Baseline and delayed L3/T2 source SHA-256: `4b0c3e229246b329a45ab4b52353954d25d577e72833b3f0fdef8013c0df4cf9`.
+- Fresh matched L7 source SHA-256: `c48eda5d5034c5d62979463f3f030316b9f7af146650db0823c116831139dddc`.
 
-The accepted composite contained 240 main rows: the original baseline, delayed
-L3/T2 subsets and the fresh L7 pair. Its numeric, raw and provenance audit passed
-at the time. Three exact L2 autovacuum-related waits were adjudicated as setup or
-cleanup outside measurement; this did not create a general log-error exception.
-The original delayed L7 run failed its 60-second drain budget and remains a failed
-historical attempt; the fresh pair supplied the matched comparison. Earlier
-L2–L6 measurements had harness defects and are not release evidence. The repaired
-harness gate passed 38 tests and its audited smoke; a deliberate 1ms drain timeout
-also verified failure diagnostics. None of these historical passes qualifies
-subsequent source changes.
+These hashes cannot reconstruct the removed source snapshots. Use the L3 and L7
+[run commands](#run) with new provenance to measure the chosen build.
 
 ## Outputs and release use
 
@@ -190,10 +167,8 @@ include earlier successful warm-ups. Review failures before recording a summary.
 
 Record results with the exact source/dependency versions, environment, shapes,
 repeat counts, validity checks and limitations. Routine generated output is
-ignored and disposable after that review; keep concise summaries in this file,
-not source archives or run-directory histories in Git. The historical raw files
-summarized above were removed during repository cleanup and are no longer
-available here for re-audit.
+ignored and disposable after that review; record concise accepted findings with source provenance in the ADR evidence appendix,
+not source archives or run-directory histories in Git.
 
 Release qualification needs fresh gates and relevant benchmark runs on fixed
 source and dependencies. Set `GRIND_BENCH_RELEASE_EVIDENCE=1` to reject a dirty

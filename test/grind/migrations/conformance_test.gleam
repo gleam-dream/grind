@@ -150,7 +150,7 @@ fn marker_insert_version(statement: String) -> Option(Int) {
   }
 }
 
-// -- Cigogne end-to-end (docs/RELEASE-READINESS.md, "Migration gaps") ------
+// -- Cigogne end-to-end (https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md, "Migration gaps") ------
 //
 // Grind ships `priv/migrations/*.sql` (cigogne format) as a mirror for an
 // application that wants to apply Grind's schema through cigogne instead of

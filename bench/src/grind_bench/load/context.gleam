@@ -11,9 +11,8 @@ import grind_bench/load/runtime
 import grind_bench/preload
 import pog
 
-/// Shared setup every scenario needs: a fresh, migrated Grind installation
-/// (item 1: its own run-scoped schema) plus a reset ledger and a dedicated
-/// drain-polling connection (item 6).
+/// Shared scenario resources: a fresh migrated installation in a run-owned
+/// schema, a reset ledger and a dedicated drain-polling connection.
 pub type Harness {
   Harness(
     database: postgres.Database,
@@ -88,12 +87,8 @@ pub fn setup_with_deadline(
   ledger_pool_size: Int,
   deadline_ms: Int,
 ) -> Harness {
-  // `postgres.validate` requires `unique_lock_wait_ms + 1000 <
-  // statement_deadline_ms` (`docs/RISKS.md`-documented margin) -- the
-  // default `unique_lock_wait_ms` (2000) only clears the real default
-  // deadline (4000). A scaled-down `deadline_ms` (L6T2's own reduced `D`)
-  // needs a proportionally scaled-down lock wait too, or `setup` itself
-  // fails closed before this scenario ever starts.
+  // Validation requires unique_lock_wait_ms + 1000 < statement_deadline_ms.
+  // Scale the lock wait with reduced fault deadlines so setup remains valid.
   let lock_wait_ms = case deadline_ms >= 4000 {
     True -> 2000
     False -> int.max(1, deadline_ms / 4)
@@ -122,7 +117,7 @@ fn setup_with_settings(
     |> grind_bench.with_grind_pool_size(pool_size)
     |> grind_bench.with_ledger_pool_size(ledger_pool_size)
   let assert Ok(ledger) = grind_bench.start_ledger_pool(config)
-  // Item 1: drop any schema orphaned by a run that never reached its own
+  // Drop any schema orphaned by a run that never reached its own
   // end-of-run cleanup (a crash, or an interrupted BENCH_KEEP run), before
   // this run creates its own fresh one.
   let assert Ok(Nil) = grind_bench.drop_stale_bench_schemas(ledger)
@@ -171,7 +166,7 @@ pub fn schema_of(database: postgres.Database) -> String {
   job.installation_schema(postgres.installation(database))
 }
 
-/// Item 1: drops this run's own fresh schema unless `BENCH_KEEP=1`, so
+/// Drops this run's own fresh schema unless `BENCH_KEEP=1`, so
 /// schemas never accumulate across ordinary runs (see `setup`'s own
 /// `drop_stale_bench_schemas` for the backstop on a run that skips this).
 pub fn cleanup_schema(ledger: pog.Connection, grind_schema: String) -> Nil {

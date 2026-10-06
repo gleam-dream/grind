@@ -67,11 +67,7 @@ pub type QueuePolicy {
     /// which always tries to claim into every free slot up to
     /// `maximum_concurrency` and backs off to `polling`'s interval only once
     /// a claim finds nothing (see `grind/queue`'s module-level automatic
-    /// polling behavior); before this field was narrowed to this single
-    /// meaning it also throttled automatic polling to at most this many
-    /// claims per `Poll` timer tick, which is what produced the low default
-    /// throughput ceiling documented as risk 6 in `docs/RISKS.md`. **Default:
-    /// 1** (see `default_policy`) — plainly, this means `process_available`
+    /// polling behavior). The default is 1, so `process_available`
     /// handles exactly one job per call unless raised with
     /// `with_maximum_batch_jobs`; a caller relying on `process_available` to
     /// drain a manual-mode backlog rather than calling `process_one` in its
@@ -1514,33 +1510,14 @@ fn finish_completion(
   }
 }
 
-/// Claims into one free slot, if any is free and this consumer is not
-/// shutting down — Oban-like: there is no separate per-poll claim budget, so
-/// a backlog drains as fast as capacity allows instead of at most one claim
-/// (or `maximum_jobs_per_poll`, before this change) per `Poll` timer tick.
-/// Filling *more* than one slot in a row is not done by recursing here
-/// directly: a successful automatic claim that leaves free capacity behind
-/// asks `continue_after_start` to send this coordinator's own incarnation a
-/// `FillSlots` message instead (`request_fill`), so this function itself
-/// only ever performs at most one claim per call. That message goes to the
-/// back of the same mailbox `RenewalObserved`, `AttemptFinished`, and `BeginShutdown`
-/// also arrive on, so a burst that fills many slots interleaves with those
-/// messages one claim at a time — each one gets to run between successive
-/// claims, rather than waiting out an entire burst of up to
-/// `maximum_concurrency` claims before this coordinator's message loop comes
-/// up for air again. (An earlier version of this function recursed directly
-/// into `start_attempt`/`continue_after_start` from inside one message
-/// handler, so a burst that filled every free slot could stall a pending
-/// lease renewal or a shutdown request behind all of it. Renewal storage work
-/// now runs independently; only its status arrives here.) `attempt.claim_one`'s
-/// own claim-time quarantine scan (see
-/// its doc comment) still runs on every one of these calls; that stays
-/// bounded by real progress, not by wall-clock time, because every call here
-/// either starts a genuine attempt (shrinking the free-slot count by one) or
-/// finds no job and stops immediately via `continue_if_idle` — never
-/// spinning and finding nothing on the same call, so this can never become a
-/// hot loop (see `docs/RISKS.md` risk 6 for the fixed per-claim cost that
-/// remains).
+/// Claims into one free slot unless shutdown has started. Each successful
+/// automatic claim queues FillSlots at the back of this incarnation's mailbox,
+/// so completion, renewal status and shutdown messages can run between claims.
+/// Renewal storage work runs in an independent actor and reserved pool.
+///
+/// Every claim performs its bounded quarantine scan. A successful claim consumes
+/// one free slot; an empty or failed claim waits for the polling interval.
+/// This avoids a hot loop while draining a backlog at available capacity.
 fn fill_automatic_slots(
   state: ConsumerState,
 ) -> actor.Next(ConsumerState, Message) {
@@ -1578,26 +1555,11 @@ fn continue_after_start(
   }
 }
 
-/// Called at the end of every poll round (a claim just found nothing or
-/// failed, or an active attempt just finished). Arms the next `Poll` timer
-/// whenever this consumer is not shutting down, `auto_poll` is on, no timer
-/// is already outstanding, and free capacity remains (`active` below
-/// `maximum_concurrency`) — not only when `active` is fully empty. A
-/// `maximum_concurrency` above 1 otherwise leaves spare slots idle for as
-/// long as one attempt keeps running: with an empty-only check, a newly due
-/// job (or the claim-time expired-lease quarantine scan, which piggybacks on
-/// the same claim query) had to wait for every currently active attempt to
-/// finish before the next poll was even scheduled, no matter how much
-/// capacity was actually free in the meantime. Reaching this function at all
-/// already means the immediately preceding claim (if any) found nothing to
-/// claim right now — a slot freeing up later calls `fill_automatic_slots`
-/// directly instead, so a fresh claim attempt is never delayed behind this
-/// timer while capacity is genuinely free. `poll_scheduled` is the
-/// single-outstanding-timer guard this relies on: an active attempt
-/// finishing while a timer from an earlier round is already pending must
-/// not arm a second, overlapping one (see the field's doc comment).
-/// Shutdown draining is unaffected — a consumer already shutting down never
-/// re-arms a poll regardless of capacity.
+/// Arms one Poll timer when automatic polling is enabled, capacity remains,
+/// no timer is outstanding, and shutdown has not started. Existing active jobs
+/// do not prevent polling into free slots. A newly freed slot tries to fill
+/// immediately; an empty or failed claim waits for the polling interval.
+/// During shutdown, notify waiters after the active ledger drains.
 fn continue_if_idle(
   state: ConsumerState,
 ) -> actor.Next(ConsumerState, Message) {

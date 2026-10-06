@@ -16,6 +16,9 @@ import grind_bench/summarize
 import pog
 import simplifile
 
+/// Measures from the first handler dispatch to the last independently
+/// observed durable completion, using database timestamps. Observer polling
+/// delay is included in this window; consumer startup time is excluded.
 pub fn timestamps_ms(
   ledger: pog.Connection,
   _grind_schema: String,
@@ -43,7 +46,7 @@ fn unix_ms_query(sql: String, ledger: pog.Connection) -> Result(Int, Nil) {
   }
 }
 
-/// Item 6/I6: `GRIND_BENCH_POSTGRES_LOG`'s own line count right now --
+/// I6: `GRIND_BENCH_POSTGRES_LOG`'s own line count right now --
 /// captured before a run starts so `postgres_log_window` can slice off
 /// exactly the lines written during the run, with no `log_line_prefix`
 /// timestamp parsing required. `0` if the env var is unset. An explicitly
@@ -80,8 +83,8 @@ pub fn postgres_log_window(lines_before: Int) -> Result(List(String), Nil) {
   }
 }
 
-/// Item 9: postmaster + descendants' own cumulative CPU time (`ps` cputime),
-/// `None` if `GRIND_BENCH_PG_DATA_DIR` is unset or unreadable -- best-effort,
+/// postmaster + descendants' own cumulative CPU time (`ps` cputime),
+/// `Error(Nil)` if `GRIND_BENCH_PG_DATA_DIR` is unset or unreadable -- best-effort,
 /// never fatal.
 pub fn cpu_ms_now() -> Result(Int, Nil) {
   case runtime.getenv("GRIND_BENCH_PG_DATA_DIR") {
@@ -90,8 +93,8 @@ pub fn cpu_ms_now() -> Result(Int, Nil) {
   }
 }
 
-/// Item 9: `#(cpu_ms_delta, cpu_percent_of_one_core)` from a before/after
-/// `ps` cputime pair and the run's own wall-clock `elapsed_ms`. `None` if
+/// `#(cpu_ms_delta, cpu_percent_of_one_core)` from a before/after
+/// `ps` cputime pair and the run's own wall-clock `elapsed_ms`. `Error(Nil)` if
 /// either sample was unavailable.
 pub fn cpu_delta(
   before: Result(Int, Nil),
@@ -276,19 +279,10 @@ fn insert_filler_batch(connection: pog.Connection, count: Int) -> Nil {
   Nil
 }
 
-/// A reduced audit for a scenario that submits no bench-tracked jobs at all
-/// (L2's idle-polling probe) or that legitimately prunes rows mid-run
-/// (L5 with the pruner on): I1 (missing/extra job rows), I2 (effect
-/// counts), and I5 (acknowledgement correlation) all assume nothing is
-/// deleted and every ledger row still has a matching `grind_jobs` row --
-/// see `grind_bench/audit`'s own doc comment, "pruning is expected to be
-/// off for every scenario this checker runs against." This checks only
-/// I3's `[grind, job, quarantined]` counter would already have measured
-/// deliberately (skipped here -- the caller reports it, since L5's own
-/// pruner-on run and L2's idle probe both expect zero quarantines and
-/// L6 does not use this helper at all), I4 (no job left `executing`), I6
-/// (ledger-write errors and PostgreSQL log anomalies), and I7 (forwarder
-/// drops).
+/// Audits idle probes and runs that prune rows. Full row/effect/receipt
+/// correlation assumes retained rows, so I1/I2/I5 do not apply here.
+/// Requires no quarantines, executing jobs, ledger errors or forwarder drops,
+/// and no anomalies in a configured PostgreSQL log. L6 uses its own audit.
 pub fn reduced_audit_and_report(
   ledger: pog.Connection,
   database: postgres.Database,

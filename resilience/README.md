@@ -51,15 +51,14 @@ five minutes.
 | M5   | v1 work remains active while a v2 worker/codec VM joins.                                                                              | v2 work completes with its own node; killing v1 leaves an old-version row that v2's quarantine scan still sees; no implicit replay.                                                                                            |
 | M6   | Two VMs prune concurrently while another connection holds a terminal row lock.                                                        | Both prune calls finish, their total is the unlocked candidate count, the locked row remains, and a later sweep removes it and its receipt.                                                                                    |
 | M7   | Graceful drain, grace-expired shutdown, then replacement with more capacity.                                                          | Clean drain finishes durably; forced shutdown reports active work; replacement quarantines the abandoned attempt; audited replay is explicit.                                                                                  |
-| F1   | A real PostgreSQL trigger delays ACK updates while a long sibling needs renewal; 5 ms per-direction TCP delay also applies.           | `pg_stat_activity` witnesses `PgSleep`; proxy witnesses delayed bytes; all jobs reach durable success. This is a resilience probe, not the complete B10 parameter matrix.                                                      |
+| F1   | A real PostgreSQL trigger delays ACK updates while a long sibling needs renewal; 5 ms per-direction TCP delay also applies.           | `pg_stat_activity` witnesses `PgSleep`; proxy witnesses delayed bytes; all jobs reach durable success. This is a resilience probe; load and latency qualification needs a separate parameter matrix.                           |
 | F2   | Close the proxied connections and terminate real PostgreSQL backends.                                                                 | Connection cuts and successful backend termination are recorded; the long job survives reconnect across a lease interval without another effect.                                                                               |
 | F3   | Kill the application worker process inside a live VM after its effect.                                                                | The same quarantine and audited-replay assertions as M2 hold.                                                                                                                                                                  |
 | F4   | Stop the disposable PostgreSQL server immediately, then restart it during a live attempt.                                             | Stop/start commands succeed; measured downtime is recorded; the job completes once after reconnect.                                                                                                                            |
 | F5   | Ten consumer start/stop cycles while a sibling VM remains live.                                                                       | Exact deadline/type/query cache counts return to baseline, the owner mailbox stays empty, and sibling jobs continue completing.                                                                                                |
 | Soak | Repeated normal/retry/snooze batches, queued and running cancellation, lifecycle churn, pruning and all nine destructive fault types. | Exact attempt/effect/receipt accounting; every fault runs at least twice; a long primary job survives each fault without duplicate effects; every round passes the resource bounds below.                                      |
 
-M1–M7 are the concrete scenario slots proposed in the review. M6 covers
-Grind's concurrent maintenance design; Grind has no leader election. Compare
+M6 covers concurrent maintenance; Grind has no leader election. Compare
 fresh M2/M6 results with the pinned Oban run using
 [oracle/fault_compare.py](../oracle/fault_compare.py), as described in the
 [oracle guide](../oracle/README.md). These scenarios classify audited replay
@@ -120,37 +119,8 @@ A short rehearsal cannot qualify the two-hour requirement. TLS and pooler
 coverage remain separate. The harness never claims exactly-once effects after
 an operator explicitly authorizes replay.
 
-## Historical result: 2026-09-28
+Historical measured conclusions and attributed source/dependency limits are recorded in [ADR-0009](../docs/adr/0009-separate-observations-from-qualification-evidence.md#bounded-measured-conclusions-and-provenance). A new build requires fresh reviewed evidence.
 
-The two-hour run passed 7,202.060719 mixed-fault seconds after warm-up, fourteen
-standalone cases and 266 mixed rounds. Each of nine fault types ran 29–30 times.
-Independent review checked source/runtime identity, 7,182 primary jobs, 11,172
-receipts, 6,993 effects including warm-up, resource bounds and final cleanup.
-Peak sampled database sessions were eight; retained primary storage peaked at
-245,760 bytes. Worker atoms grew by 1,596 across 532 consumer starts, within the
-explicit allowance but not a claim of bounded atoms under indefinite churn.
+Future run artifacts are ignored working files. Retain them through investigation and review, record exact source/dependencies, environment, validity and failed-run classifications, then delete temporary output after acceptance. Use [qualification instructions](../docs/evidence/qualification.md).
 
-These results came from dirty development snapshots before `1e87d2c`; diagnostics
-and later Sinal changes were not covered. The final audit used causal barriers
-and controller monotonic order rather than comparing independent VM wall clocks.
-The paired M2/M6 comparison passed within its deliberate semantic differences.
-The earlier 24-hour attempt failed after a 275-second host sleep; none of its
-elapsed time counted toward this run. Day-long endurance remains unverified.
-
-The historical raw directories and one-off auditors were removed during the
-2026-10-01 cleanup after recording these findings. They cannot be re-audited here.
-The old independent auditor was tied to snapshot hashes and temporary driver
-paths; it is not a portable qualification command. Review fresh source, duration,
-fault/accounting/resource results and process cleanup independently before
-recording a new release summary. The maintained harness assertions remain.
-
-Future run artifacts are ignored working files. Keep them through investigation
-and review, record a concise result with exact source/dependencies and environment,
-then delete them. See [release readiness](../docs/RELEASE-READINESS.md).
-
-Partition modes preserve the reliable byte stream: each direction retains at most
-one 64 KiB read and stops reading until recovery, allowing socket backpressure.
-Healing forwards those bytes before any later bytes. Only the explicit M4 COMMIT
-reply-loss fault blackholes bytes. The earlier byte-discard partition model left
-pgo waiting forever for a discarded ReadyForQuery and was rejected after the
-stronger M3 drain assertion exposed it; the historical failure is recorded in [recovery evidence](../docs/RECOVERY-EVIDENCE.md).
+Partition modes preserve the reliable byte stream: each direction retains at most one 64 KiB read and stops reading until recovery. Healing forwards retained bytes before later bytes. Only the explicit M4 COMMIT reply-loss fault blackholes bytes.

@@ -15,7 +15,7 @@
 ]).
 
 %% Grind's own checkout deadline (`postgres.Settings.statement_deadline_ms`;
-%% docs/RELEASE-READINESS.md, "Acknowledgement deadline"). Vanilla pog never
+%% docs/adr/0008-state-driver-deadline-and-installation-limits.md). Vanilla pog never
 %% lets a caller configure the connection-hold deadline for a transaction or
 %% a squirrel-generated call: `pog_ffi:checkout/1` always calls
 %% `pgo:checkout/1` with pgo's own hardcoded 5000 ms (`pgo_pool.erl`'s
@@ -32,7 +32,7 @@
 %% statement is in flight. That is what actually bounds a stuck
 %% `BEGIN`/`COMMIT`/renewal `UPDATE` on a half-open socket — proven
 %% empirically against a real TCP fault proxy; see
-%% docs/RECOVERY-EVIDENCE.md, "Acknowledgement deadline". Then it runs the
+%% docs/adr/0011-retain-rewritten-history-as-source-provenance.md. Then it runs the
 %% caller's work against the pog `Connection` shape `{single_connection,
 %% Conn}` (`pog.gleam`'s compiled representation — confirmed against
 %% build/packages/pog/src/pog.erl and pog_ffi.erl), so `pog:execute/2` and
@@ -142,7 +142,7 @@ checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Wait
             %% clause (a plain string, "connection not available because
             %% deadline reached while in queue" — `pgo_pool.erl`,
             %% `checkout_info/2`) that can otherwise crash the caller with
-            %% `error:function_clause` instead of a typed error (DEFECT 2).
+            %% `error:function_clause` instead of a typed error.
             %% Never reached through `pog_ffi:checkout/1` or `pgo:query/3`
             %% any more, because this module always checks out itself first.
             %% Correctly `connection_unavailable`, not `query_timeout`: the
@@ -262,7 +262,7 @@ socket_options_available(GetOptions) ->
     catch _:_ -> false
     end.
 
-%% Defends the *post-checkout* half of DEFECT 2: `pgo_handler:extended_query/4`
+%% Handles unsupported post-checkout errors: `pgo_handler:extended_query/4`
 %% can still return an error shape `pog_ffi:convert_error/1` has no clause
 %% for (for example `econnreset`/`etimedout` on a genuinely lost socket,
 %% distinct from the `closed` shape it does handle), raising
@@ -388,7 +388,7 @@ transaction_measured(Connection, Callback) ->
 %% needs this distinction today; other `transaction_safely/2` callers
 %% (acknowledgement, audited resolution) conservatively still report their
 %% own "unknown" outcome for a checkout failure too
-%% (`docs/IMPLEMENTATION-SCOPE.md` backlog) — safe, only less precise.
+%% (see docs/adr/0008-state-driver-deadline-and-installation-limits.md).
 transaction_or_checkout_failure(Connection, Callback) ->
     with_deadline(
         Connection,
