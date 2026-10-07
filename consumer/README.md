@@ -35,3 +35,9 @@ Run it through the repository's database gate,
 `nix develop --command bash scripts/test-postgres.sh`, which sets
 `GRIND_CONSUMER_DATABASE_URL` and checks that every test's contract marker
 was written. Without the variable, database tests return early.
+
+## Transactional resolution
+
+- `resolution_transaction_test` uses only public Grind APIs and application-native values. It commits queue resolution and application acknowledgment in one borrowed transaction, then tests rollback, process death, lost commit reply and pruning.
+- It also exercises configured schemas, stricter caller timeouts, exact-command conflicts, cancellation and same-job contention while unrelated work proceeds. The application still owns the outer transaction lifetime.
+- `fault_proxy.gleam` and `grind_fault_proxy.erl` link the package's existing test-only TCP proxy. They share fault-injection machinery, not internal Grind APIs. The COMMIT reply-loss test kills the caller after independent commit readback; it does not assert an automatic driver retry result.

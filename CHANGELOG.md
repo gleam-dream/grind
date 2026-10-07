@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `admin.resolve_uncertain_in` for atomic queue resolution and application acknowledgment in a caller-owned READ COMMITTED transaction. `Staged` does not establish commit. The API preserves stricter caller statement/lock limits and emits no committed-resolution event. No migration or new retention lifetime is introduced.
+
 - Preserve explicit uncertainty and cancellation intent in either ordering. Pending cancellation blocks replay while attributed terminal confirmation remains available. No migration is required; previously erased evidence still requires application reconciliation.
 
 - Typed, versioned workers and fallible input/output/error JSON codecs behind the grind facade.

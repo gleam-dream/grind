@@ -244,7 +244,7 @@ consumer_bad_url="postgres://grind@127.0.0.1:$port/grind_database_missing?sslmod
   GRIND_CONSUMER_TEST_MARKER="$root/consumer-test-ran" \
     gleam test
 )
-for contract in consumer-observes-capacity-passed two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed consumer-cancellation-preserves-uncertainty-passed consumer-unique-admission-existing-conflict-retry-passed consumer-unique-reschedule-across-queues-passed consumer-observes-acknowledged-passed consumer-observes-claimed-passed consumer-submit-with-id-retry-passed consumer-prune-finished-passed consumer-validating-codec-passed consumer-submit-in-passed consumer-observes-context-passed consumer-testing-support-passed consumer-shared-pool-passed consumer-schema-not-migrated-passed; do
+for contract in consumer-resolution-transaction-passed consumer-observes-capacity-passed two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed consumer-cancellation-preserves-uncertainty-passed consumer-unique-admission-existing-conflict-retry-passed consumer-unique-reschedule-across-queues-passed consumer-observes-acknowledged-passed consumer-observes-claimed-passed consumer-submit-with-id-retry-passed consumer-prune-finished-passed consumer-validating-codec-passed consumer-submit-in-passed consumer-observes-context-passed consumer-testing-support-passed consumer-shared-pool-passed consumer-schema-not-migrated-passed; do
   if ! grep -q "$contract" "$root/consumer-test-ran"; then
     echo "external-consumer integration contract did not execute: $contract" >&2
     exit 1

@@ -103,9 +103,13 @@ pub type Error {
   /// The resolution may or may not have committed; repeat it with the same
   /// id.
   ResolutionCommitUnknown(resolution_id: String)
+  /// Borrowed resolution requires the connection passed to a pog.transaction callback.
+  NotInTransaction
+  /// Borrowed resolution requires READ COMMITTED; isolation is never changed.
+  TransactionIsolationUnsupported(String)
   JobNotFound
   ReceiptNotFound
-  /// The handle belongs to another database or schema.
+  /// The handle belongs to another installation, or the transaction uses another database.
   WrongDatabase
   Unavailable(pog.QueryError)
   /// No runtime is running under this name on this node.
@@ -138,10 +142,14 @@ pub fn describe_error(error: Error) -> String {
       "grind/admin: resolution "
       <> resolution_id
       <> " may have committed; repeat it with the same id"
+    NotInTransaction ->
+      "grind/admin: resolution requires a caller-owned transaction"
+    TransactionIsolationUnsupported(level) ->
+      "grind/admin: unsupported transaction isolation: " <> level
     JobNotFound -> "grind/admin: no such job"
     ReceiptNotFound -> "grind/admin: no such acknowledgement receipt"
     WrongDatabase ->
-      "grind/admin: the handle belongs to another database or schema"
+      "grind/admin: the handle or transaction belongs to another database or schema"
     Unavailable(reason) ->
       "grind/admin: the database is unavailable: " <> string.inspect(reason)
     NotRunning -> "grind/admin: no runtime is running under this name"
@@ -154,7 +162,9 @@ pub fn error_kind(error: Error) -> grind.ErrorKind {
     | InvalidRetention(_)
     | EmptyResolutionField(_)
     | ResolutionNeedsErrorCodec
-    | ResolutionValueRejected(_) -> grind.Invalid
+    | ResolutionValueRejected(_)
+    | NotInTransaction
+    | TransactionIsolationUnsupported(_) -> grind.Invalid
     JobNotFound | ReceiptNotFound | NotUncertain -> grind.NotFound
     ResolutionConflict | RecordMismatch | WrongDatabase | CancellationPending ->
       grind.Mismatch
@@ -325,22 +335,70 @@ pub fn resolve_uncertain(
   resolution: Resolution(output, error),
 ) -> Result(Resolved, Error) {
   use database <- result.try(database(grind))
+  postgres.resolve_uncertain(database, handle, resolution_request(resolution))
+  |> resolution_result
+}
+
+/// The result of resolution statements inside a caller-owned transaction.
+/// Even AlreadyApplied does not prove that the surrounding application writes committed.
+pub type StagedResolution {
+  Staged(Resolved)
+}
+
+/// Resolves an uncertain job together with application writes in the caller's
+/// open READ COMMITTED transaction on the same PostgreSQL database.
+/// Pass the connection received by a pog.transaction callback, not a pool.
+/// The caller owns commit, rollback, checkout and the outer transaction lifetime.
+///
+/// Grind scopes search_path to its schema and bounds lock_timeout and
+/// statement_timeout by with_statement_deadline, preserving stricter caller
+/// limits. Successful statements restore these settings before returning.
+/// A database statement error may abort the transaction; propagate every error
+/// to its owner so all staged writes roll back. There is no nested transaction.
+///
+/// Keep investigation and external calls outside the transaction: row locks
+/// remain held until the caller finishes it. No committed resolved event is
+/// emitted. If the outer commit reply is lost, read the application's durable
+/// acknowledgment; a staged result is not commit evidence. Exact-command retry
+/// remains valid while the job and its receipt are retained.
+pub fn resolve_uncertain_in(
+  grind: Grind,
+  transaction: pog.Connection,
+  handle: JobHandle(input, output, error),
+  resolution: Resolution(output, error),
+) -> Result(StagedResolution, Error) {
+  use database <- result.try(database(grind))
+  postgres.resolve_uncertain_in(
+    database,
+    transaction,
+    handle,
+    resolution_request(resolution),
+  )
+  |> resolution_result
+  |> result.map(Staged)
+}
+
+fn resolution_request(
+  resolution: Resolution(output, error),
+) -> postgres.ResolutionRequest(output, error) {
   let Resolution(decision:, id:, by:, details:) = resolution
   let decision = case decision {
     ConfirmSuccess(output) -> postgres.ConfirmSuccess(output)
     ConfirmFailure(error) -> postgres.ConfirmBusinessFailure(error)
     AuthorizeReplay -> postgres.AuthorizeReplay
   }
-  postgres.resolve_uncertain(
-    database,
-    handle,
-    postgres.ResolutionRequest(
-      resolution_id: id,
-      resolved_by: by,
-      details:,
-      decision:,
-    ),
+  postgres.ResolutionRequest(
+    resolution_id: id,
+    resolved_by: by,
+    details:,
+    decision:,
   )
+}
+
+fn resolution_result(
+  outcome: Result(postgres.ResolutionResult, postgres.ResolutionError),
+) -> Result(Resolved, Error) {
+  outcome
   |> result.map(fn(result) {
     case result {
       postgres.ResolutionApplied(state) -> Applied(convert.state(state))
@@ -350,6 +408,9 @@ pub fn resolve_uncertain(
   })
   |> result.map_error(fn(error) {
     case error {
+      postgres.ResolutionNotInTransaction -> NotInTransaction
+      postgres.ResolutionIsolationUnsupported(level) ->
+        TransactionIsolationUnsupported(level)
       postgres.EmptyResolutionId -> EmptyResolutionField("id")
       postgres.EmptyResolver -> EmptyResolutionField("by")
       postgres.EmptyResolutionDetails -> EmptyResolutionField("details")

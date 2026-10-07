@@ -140,6 +140,24 @@ recovery and submission deduplication end when the job is pruned. See
 
 ## Business transactions
 
+`admin.resolve_uncertain_in(jobs, tx, handle, resolution)` stages the same
+attributed resolution inside an application's open READ COMMITTED transaction.
+Use it when queue resolution and an application acknowledgment must commit
+together. It returns `Staged(Applied(state))` or `Staged(AlreadyApplied(state))`;
+the caller still owns commit, rollback and recovery if the commit reply is lost.
+
+Keep provider investigation outside that transaction. Resolution caps PostgreSQL
+lock and statement timeouts by `with_statement_deadline`, preserves stricter
+caller settings, and restores the caller's settings after successful statements.
+Locks remain held until the outer transaction ends. A borrowed connection adds
+no checkout or network deadline, and staging emits no committed-resolution event.
+Propagate errors so the transaction owner rolls back all staged writes.
+
+The [separate public consumer](consumer/test/grind_consumer/resolution_transaction_test.gleam)
+demonstrates rollback, exact-command retry, cancellation, concurrent resolution,
+and durable application acknowledgment after lost commit replies and pruning.
+No migration is required. Existing missing history still requires investigation.
+
 `grind.submit_in(jobs, tx, job)` stages admission in the application's open
 READ COMMITTED transaction. The application owns business invariants, account
 locking, commit, and reconciliation after a lost commit reply. Grind rejects

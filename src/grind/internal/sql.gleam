@@ -528,6 +528,108 @@ pub fn reschedule_job(
   |> pog.execute(db)
 }
 
+/// A row you get from running the `resolution_transaction_settings` query
+/// defined in `./src/grind/internal/sql/resolution_transaction_settings.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ResolutionTransactionSettingsRow {
+  ResolutionTransactionSettingsRow(
+    isolation: String,
+    database_oid: Int,
+    search_path: String,
+    lock_timeout: String,
+    statement_timeout: String,
+  )
+}
+
+/// Runs the `resolution_transaction_settings` query
+/// defined in `./src/grind/internal/sql/resolution_transaction_settings.sql`.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn resolution_transaction_settings(
+  db: pog.Connection,
+) -> Result(pog.Returned(ResolutionTransactionSettingsRow), pog.QueryError) {
+  let decoder = {
+    use isolation <- decode.field(0, decode.string)
+    use database_oid <- decode.field(1, decode.int)
+    use search_path <- decode.field(2, decode.string)
+    use lock_timeout <- decode.field(3, decode.string)
+    use statement_timeout <- decode.field(4, decode.string)
+    decode.success(ResolutionTransactionSettingsRow(
+      isolation:,
+      database_oid:,
+      search_path:,
+      lock_timeout:,
+      statement_timeout:,
+    ))
+  }
+
+  "SELECT
+  current_setting('transaction_isolation') AS isolation,
+  (SELECT oid::int4 FROM pg_database WHERE datname = current_database()) AS database_oid,
+  current_setting('search_path') AS search_path,
+  current_setting('lock_timeout') AS lock_timeout,
+  current_setting('statement_timeout') AS statement_timeout;
+"
+  |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `restore_resolution_transaction` query
+/// defined in `./src/grind/internal/sql/restore_resolution_transaction.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type RestoreResolutionTransactionRow {
+  RestoreResolutionTransactionRow(
+    search_path: String,
+    lock_timeout: String,
+    statement_timeout: String,
+  )
+}
+
+/// Runs the `restore_resolution_transaction` query
+/// defined in `./src/grind/internal/sql/restore_resolution_transaction.sql`.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn restore_resolution_transaction(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: String,
+  arg_3: String,
+) -> Result(pog.Returned(RestoreResolutionTransactionRow), pog.QueryError) {
+  let decoder = {
+    use search_path <- decode.field(0, decode.string)
+    use lock_timeout <- decode.field(1, decode.string)
+    use statement_timeout <- decode.field(2, decode.string)
+    decode.success(RestoreResolutionTransactionRow(
+      search_path:,
+      lock_timeout:,
+      statement_timeout:,
+    ))
+  }
+
+  "SELECT
+  set_config('search_path', $1, true) AS search_path,
+  set_config('lock_timeout', $2, true) AS lock_timeout,
+  set_config('statement_timeout', $3, true) AS statement_timeout;
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.text(arg_2))
+  |> pog.parameter(pog.text(arg_3))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `sample_now` query
 /// defined in `./src/grind/internal/sql/sample_now.sql`.
 ///
@@ -555,6 +657,58 @@ pub fn sample_now(
   "SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint
 "
   |> pog.query
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `scope_resolution_transaction` query
+/// defined in `./src/grind/internal/sql/scope_resolution_transaction.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type ScopeResolutionTransactionRow {
+  ScopeResolutionTransactionRow(
+    search_path: String,
+    lock_timeout: String,
+    statement_timeout: String,
+  )
+}
+
+/// Runs the `scope_resolution_transaction` query
+/// defined in `./src/grind/internal/sql/scope_resolution_transaction.sql`.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn scope_resolution_transaction(
+  db: pog.Connection,
+  arg_1: String,
+  arg_2: Int,
+) -> Result(pog.Returned(ScopeResolutionTransactionRow), pog.QueryError) {
+  let decoder = {
+    use search_path <- decode.field(0, decode.string)
+    use lock_timeout <- decode.field(1, decode.string)
+    use statement_timeout <- decode.field(2, decode.string)
+    decode.success(ScopeResolutionTransactionRow(
+      search_path:,
+      lock_timeout:,
+      statement_timeout:,
+    ))
+  }
+
+  "SELECT
+  set_config('search_path', $1, true) AS search_path,
+  set_config('lock_timeout', LEAST(
+    COALESCE(NULLIF(extract(epoch FROM current_setting('lock_timeout')::interval) * 1000, 0), $2::int),
+    $2::int)::int::text, true) AS lock_timeout,
+  set_config('statement_timeout', LEAST(
+    COALESCE(NULLIF(extract(epoch FROM current_setting('statement_timeout')::interval) * 1000, 0), $2::int),
+    $2::int)::int::text, true) AS statement_timeout;
+"
+  |> pog.query
+  |> pog.parameter(pog.text(arg_1))
+  |> pog.parameter(pog.int(arg_2))
   |> pog.returning(decoder)
   |> pog.execute(db)
 }

@@ -9,6 +9,7 @@ import grind/internal/job.{type JobHandle, type State, Queued, Scheduled}
 import grind/internal/postgres/resolution_queries.{
   type ResolutionCommand, ResolutionCommand,
 } as postgres_resolution_queries
+import grind/internal/postgres/resolution_transaction
 import grind/internal/store
 import grind/telemetry
 import pog
@@ -48,6 +49,9 @@ pub type ResolutionError {
   ResolutionAttemptMetadataMissing
   ResolutionWriteRejected
   ResolutionCommitUnknown(resolution_id: String)
+  ResolutionNotInTransaction
+  ResolutionIsolationUnsupported(String)
+  ResolutionFromAnotherDatabase
 }
 
 pub fn resolve_uncertain(
@@ -56,124 +60,50 @@ pub fn resolve_uncertain(
   handle: JobHandle(input, output, error),
   request: Request(output, error),
 ) -> Result(ResolutionResult, ResolutionError) {
-  let Request(resolution_id:, resolved_by:, details:, decision:) = request
-  {
-    let #(_, _, _, _, _, bound_output_version, _) =
-      job.reconciliation_fields(handle)
-    use
-      #(
-        decision,
-        state,
-        output_version,
-        encoded_output,
-        error_version,
-        encoded_error,
-        failure_description,
-      )
-    <- result.try(case decision {
-      ConfirmSuccess(value) -> {
-        use #(version, encoded) <- result.map(
-          job.encode_reconciled_success(handle, value)
-          |> result.map_error(ResolutionInvalidValue),
-        )
-        #(
-          "confirm_success",
-          "succeeded",
-          version,
-          Some(encoded),
-          None,
-          None,
-          None,
-        )
-      }
-      ConfirmBusinessFailure(value) ->
-        case job.encode_reconciled_error(handle, value) {
-          None -> Error(ResolutionRequiresErrorCodec)
-          Some(Error(reason)) -> Error(ResolutionInvalidValue(reason))
-          Some(Ok(#(version, encoded))) ->
-            Ok(#(
-              "confirm_business_failure",
-              "business_failed",
-              bound_output_version,
-              None,
-              Some(version),
-              Some(encoded),
-              Some(details),
-            ))
-        }
-      AuthorizeReplay ->
-        Ok(#(
-          "authorize_replay",
-          "queued",
-          bound_output_version,
-          None,
-          None,
-          None,
-          None,
-        ))
+  use command <- result.try(prepare(handle, request))
+  let ResolutionCommand(
+    decision:,
+    id:,
+    queue:,
+    worker_id:,
+    worker_version:,
+    resolution_id:,
+    resolved_by:,
+    ..,
+  ) = command
+  case
+    store.transaction_safely(connection, fn(transaction) {
+      reconcile_transaction(transaction, command)
     })
-    let #(
-      id,
-      _,
-      queue,
-      worker_id,
-      worker_version,
-      expected_output_version,
-      expected_error_version,
-    ) = job.reconciliation_fields(handle)
-    let command =
-      ResolutionCommand(
-        id:,
-        queue:,
-        worker_id:,
-        worker_version:,
-        expected_output_version:,
-        expected_error_version:,
-        resolution_id:,
-        resolved_by:,
-        details:,
-        decision:,
-        target_state: state,
-        output_version:,
-        encoded_output:,
-        error_version:,
-        encoded_error:,
-        failure_description:,
-      )
-    case
-      store.transaction_safely(connection, fn(transaction) {
-        reconcile_transaction(transaction, command)
-      })
-    {
-      Ok(result) -> {
-        case resolution_decision_of_stored(decision) {
-          Error(Nil) -> Nil
-          Ok(decision) -> {
-            let #(committed_state, confirmation) = case result {
-              ResolutionApplied(state) -> #(state, telemetry.Replied)
-              ResolutionAlreadyApplied(state) -> #(state, telemetry.Reconciled)
-            }
-            emit_resolved(
-              fwd,
-              events.read_correlation(connection, id),
-              queue,
-              id,
-              worker_id,
-              worker_version,
-              decision,
-              committed_state,
-              resolution_id,
-              resolved_by,
-              confirmation,
-            )
+  {
+    Ok(result) -> {
+      case resolution_decision_of_stored(decision) {
+        Error(Nil) -> Nil
+        Ok(decision) -> {
+          let #(committed_state, confirmation) = case result {
+            ResolutionApplied(state) -> #(state, telemetry.Replied)
+            ResolutionAlreadyApplied(state) -> #(state, telemetry.Reconciled)
           }
+          emit_resolved(
+            fwd,
+            events.read_correlation(connection, id),
+            queue,
+            id,
+            worker_id,
+            worker_version,
+            decision,
+            committed_state,
+            resolution_id,
+            resolved_by,
+            confirmation,
+          )
         }
-        Ok(result)
       }
-      Error(pog.TransactionQueryError(_)) ->
-        Error(ResolutionCommitUnknown(resolution_id))
-      Error(pog.TransactionRolledBack(error)) -> Error(error)
+      Ok(result)
     }
+    Error(pog.TransactionQueryError(_)) ->
+      Error(ResolutionCommitUnknown(resolution_id))
+    Error(pog.TransactionRolledBack(error)) -> Error(error)
   }
 }
 
@@ -510,5 +440,128 @@ fn write_resolution(
   case resolution_state(state) {
     Error(error) -> Error(error)
     Ok(state) -> Ok(ResolutionApplied(state))
+  }
+}
+
+fn prepare(
+  handle: JobHandle(input, output, error),
+  request: Request(output, error),
+) -> Result(ResolutionCommand, ResolutionError) {
+  let Request(resolution_id:, resolved_by:, details:, decision:) = request
+  {
+    let #(_, _, _, _, _, bound_output_version, _) =
+      job.reconciliation_fields(handle)
+    use
+      #(
+        decision,
+        state,
+        output_version,
+        encoded_output,
+        error_version,
+        encoded_error,
+        failure_description,
+      )
+    <- result.try(case decision {
+      ConfirmSuccess(value) -> {
+        use #(version, encoded) <- result.map(
+          job.encode_reconciled_success(handle, value)
+          |> result.map_error(ResolutionInvalidValue),
+        )
+        #(
+          "confirm_success",
+          "succeeded",
+          version,
+          Some(encoded),
+          None,
+          None,
+          None,
+        )
+      }
+      ConfirmBusinessFailure(value) ->
+        case job.encode_reconciled_error(handle, value) {
+          None -> Error(ResolutionRequiresErrorCodec)
+          Some(Error(reason)) -> Error(ResolutionInvalidValue(reason))
+          Some(Ok(#(version, encoded))) ->
+            Ok(#(
+              "confirm_business_failure",
+              "business_failed",
+              bound_output_version,
+              None,
+              Some(version),
+              Some(encoded),
+              Some(details),
+            ))
+        }
+      AuthorizeReplay ->
+        Ok(#(
+          "authorize_replay",
+          "queued",
+          bound_output_version,
+          None,
+          None,
+          None,
+          None,
+        ))
+    })
+    let #(
+      id,
+      _,
+      queue,
+      worker_id,
+      worker_version,
+      expected_output_version,
+      expected_error_version,
+    ) = job.reconciliation_fields(handle)
+    let command =
+      ResolutionCommand(
+        id:,
+        queue:,
+        worker_id:,
+        worker_version:,
+        expected_output_version:,
+        expected_error_version:,
+        resolution_id:,
+        resolved_by:,
+        details:,
+        decision:,
+        target_state: state,
+        output_version:,
+        encoded_output:,
+        error_version:,
+        encoded_error:,
+        failure_description:,
+      )
+    Ok(command)
+  }
+}
+
+/// Uses the same command and fenced transition without owning commit or telemetry.
+pub fn resolve_uncertain_in(
+  tx: pog.Connection,
+  installation: job.Installation,
+  statement_deadline_ms: Int,
+  handle: JobHandle(input, output, error),
+  request: Request(output, error),
+) -> Result(ResolutionResult, ResolutionError) {
+  use command <- result.try(prepare(handle, request))
+  use settings <- result.try(
+    resolution_transaction.enter(tx, installation, statement_deadline_ms)
+    |> result.map_error(fn(error) {
+      case error {
+        resolution_transaction.NotInTransaction -> ResolutionNotInTransaction
+        resolution_transaction.IsolationUnsupported(level) ->
+          ResolutionIsolationUnsupported(level)
+        resolution_transaction.WrongDatabase -> ResolutionFromAnotherDatabase
+        resolution_transaction.QueryFailed(error) ->
+          ReconciliationQueryFailed(error)
+      }
+    }),
+  )
+  let outcome = reconcile_transaction(tx, command)
+  let restored = resolution_transaction.restore(tx, settings)
+  case outcome, restored {
+    Error(error), _ -> Error(error)
+    Ok(_), Error(error) -> Error(ReconciliationQueryFailed(error))
+    Ok(value), Ok(Nil) -> Ok(value)
   }
 }

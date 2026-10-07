@@ -961,6 +961,8 @@ pub type ResolutionError {
   /// See `JobReadError`'s `HandleFromAnotherInstallation` — the same
   /// client-side check, for `resolve_uncertain`'s own handle.
   ResolutionFromAnotherInstallation
+  ResolutionNotInTransaction
+  ResolutionIsolationUnsupported(String)
 }
 
 /// One audited operator decision: `resolution_id` identifies this exact
@@ -982,48 +984,76 @@ pub fn resolve_uncertain(
   handle: JobHandle(input, output, error),
   request: ResolutionRequest(output, error),
 ) -> Result(ResolutionResult, ResolutionError) {
+  use request <- result.try(checked_resolution(database, handle, request))
+  postgres_resolution.resolve_uncertain(
+    database.connection,
+    database.forwarder,
+    handle,
+    request,
+  )
+  |> resolution_result
+}
+
+/// Borrowed resolution emits nothing and never commits the caller's writes.
+pub fn resolve_uncertain_in(
+  database: Database,
+  tx: pog.Connection,
+  handle: JobHandle(input, output, error),
+  request: ResolutionRequest(output, error),
+) -> Result(ResolutionResult, ResolutionError) {
+  use request <- result.try(checked_resolution(database, handle, request))
+  postgres_resolution.resolve_uncertain_in(
+    tx,
+    database.installation,
+    database.statement_deadline_ms,
+    handle,
+    request,
+  )
+  |> resolution_result
+}
+
+fn checked_resolution(
+  database: Database,
+  handle: JobHandle(input, output, error),
+  request: ResolutionRequest(output, error),
+) -> Result(postgres_resolution.Request(output, error), ResolutionError) {
   let ResolutionRequest(resolution_id:, resolved_by:, details:, decision:) =
     request
   let #(_, handle_installation, _, _, _, _, _) =
     job.reconciliation_fields(handle)
-  let Database(installation: database_installation, ..) = database
-  case resolution_id, resolved_by, details {
+  use Nil <- result.try(case resolution_id, resolved_by, details {
     "", _, _ -> Error(EmptyResolutionId)
     _, "", _ -> Error(EmptyResolver)
     _, _, "" -> Error(EmptyResolutionDetails)
-    _, _, _ ->
-      case job.same_installation(handle_installation, database_installation) {
-        False -> Error(ResolutionFromAnotherInstallation)
-        True -> resolve_uncertain_checked(database, handle, request, decision)
-      }
-  }
-}
-
-fn resolve_uncertain_checked(
-  database: Database,
-  handle: JobHandle(input, output, error),
-  request: ResolutionRequest(output, error),
-  decision: Resolution(output, error),
-) -> Result(ResolutionResult, ResolutionError) {
-  let ResolutionRequest(resolution_id:, resolved_by:, details:, ..) = request
-  let Database(connection:, forwarder:, ..) = database
+    _, _, _ -> Ok(Nil)
+  })
+  use Nil <- result.try(
+    case job.same_installation(handle_installation, database.installation) {
+      False -> Error(ResolutionFromAnotherInstallation)
+      True -> Ok(Nil)
+    },
+  )
   let decision = case decision {
     ConfirmSuccess(value) -> postgres_resolution.ConfirmSuccess(value)
     ConfirmBusinessFailure(value) ->
       postgres_resolution.ConfirmBusinessFailure(value)
     AuthorizeReplay -> postgres_resolution.AuthorizeReplay
   }
-  postgres_resolution.resolve_uncertain(
-    connection,
-    forwarder,
-    handle,
-    postgres_resolution.Request(
-      resolution_id:,
-      resolved_by:,
-      details:,
-      decision:,
-    ),
-  )
+  Ok(postgres_resolution.Request(
+    resolution_id:,
+    resolved_by:,
+    details:,
+    decision:,
+  ))
+}
+
+fn resolution_result(
+  outcome: Result(
+    postgres_resolution.ResolutionResult,
+    postgres_resolution.ResolutionError,
+  ),
+) -> Result(ResolutionResult, ResolutionError) {
+  outcome
   |> result.map(fn(result) {
     case result {
       postgres_resolution.ResolutionApplied(state) -> ResolutionApplied(state)
@@ -1050,6 +1080,12 @@ fn resolve_uncertain_checked(
       postgres_resolution.ResolutionAttemptMetadataMissing ->
         ResolutionAttemptMetadataMissing
       postgres_resolution.ResolutionWriteRejected -> ResolutionWriteRejected
+      postgres_resolution.ResolutionNotInTransaction ->
+        ResolutionNotInTransaction
+      postgres_resolution.ResolutionIsolationUnsupported(level) ->
+        ResolutionIsolationUnsupported(level)
+      postgres_resolution.ResolutionFromAnotherDatabase ->
+        ResolutionFromAnotherInstallation
       postgres_resolution.ResolutionCommitUnknown(resolution_id) ->
         ResolutionCommitUnknown(resolution_id)
     }
