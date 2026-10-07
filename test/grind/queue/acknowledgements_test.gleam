@@ -48,12 +48,27 @@ pub fn postgres_ack_committed_reply_lost_with_store_unavailable_is_unknown_test(
   case queue_database_url() {
     Error(Nil) -> Nil
     Ok(database_url) ->
-      run_ack_committed_reply_lost_with_store_unavailable_test(database_url)
+      run_ack_committed_reply_lost_with_store_unavailable_test(
+        database_url,
+        False,
+      )
+  }
+}
+
+pub fn postgres_cancelled_uncertain_ack_reply_lost_retains_evidence_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) ->
+      run_ack_committed_reply_lost_with_store_unavailable_test(
+        database_url,
+        True,
+      )
   }
 }
 
 fn run_ack_committed_reply_lost_with_store_unavailable_test(
   database_url: String,
+  uncertain: Bool,
 ) -> Nil {
   let settings = postgres.settings(database_url)
   let assert Ok(validated) = postgres.validate(settings)
@@ -99,6 +114,17 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
         }
       },
     )
+  let definition = case uncertain {
+    False -> definition
+    True ->
+      worker.with_queue_handler(definition, fn(_value) {
+        let release = process.new_subject()
+        process.send(started, FirstAttemptStarted(release))
+        process.send(invoked, WorkerInvoked)
+        let assert Ok(ReleaseAttempt) = process.receive(release, within: 10_000)
+        worker.WorkerUncertain("provider may have executed")
+      })
+  }
   let assert Ok(workers) = registry.new("ack-reply-lost-unavailable")
   let assert Ok(workers) = registry.register(workers, definition)
   let assert Ok(handle) =
@@ -138,6 +164,12 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
     process.receive(started, within: 5000)
   process.receive(invoked, within: 1000) |> should.equal(Ok(WorkerInvoked))
 
+  case uncertain {
+    True ->
+      postgres.cancel(database, handle)
+      |> should.equal(Ok(postgres.CancellationRequested))
+    False -> Nil
+  }
   let job_id = job.id_value(handle)
   use <- exception.defer(install_syncrep_reply_trigger(
     observer_connection,
@@ -154,11 +186,15 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
 
   let assert Ok(#(execution, ack_result)) =
     process.receive(reply, within: 10_000)
-  execution
-  |> should.equal(worker.ExecutedSuccess(
-    "ack-reply-lost-unavailable-output-v1",
-    "\"unavailable-34\"",
-  ))
+  let expected_execution = case uncertain {
+    True -> worker.ExecutedUncertain("provider may have executed")
+    False ->
+      worker.ExecutedSuccess(
+        "ack-reply-lost-unavailable-output-v1",
+        "\"unavailable-34\"",
+      )
+  }
+  execution |> should.equal(expected_execution)
   ack_result
   |> should.equal(Error(postgres.QueueAckUnknown(command_id, execution)))
 
@@ -177,9 +213,18 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
   use <- exception.defer(fn() { postgres.close(reopened) })
   let assert Ok(postgres.AcknowledgementReceipt(committed_state:, ..)) =
     postgres.reconcile_acknowledgement(reopened, handle, command_id)
-  committed_state |> should.equal(job.Succeeded)
+  committed_state
+  |> should.equal(case uncertain {
+    True -> job.Uncertain
+    False -> job.Succeeded
+  })
   postgres.outcome(reopened, handle)
-  |> should.equal(Ok(job.SucceededWith("unavailable-34")))
+  |> should.equal(
+    Ok(case uncertain {
+      True -> job.ReconciliationRequired("provider may have executed")
+      False -> job.SucceededWith("unavailable-34")
+    }),
+  )
 
   // The same command, retried end to end through the reopened store: proves
   // idempotent replay, not just that the receipt can be read back.
@@ -200,9 +245,26 @@ fn run_ack_committed_reply_lost_with_store_unavailable_test(
   })
   queue.process_one(fresh_consumer) |> should.equal(Ok(False))
   process.receive(invoked, within: 0) |> should.equal(Error(Nil))
-  mark_database_test_executed(
-    "ack-committed-reply-lost-store-unavailable-unknown-passed",
-  )
+  case uncertain {
+    True -> {
+      let assert Ok(intent) =
+        pog.query(
+          "SELECT cancel_requested_at IS NOT NULL FROM grind_jobs WHERE id = $1",
+        )
+        |> pog.parameter(pog.int(job.id_value(handle)))
+        |> pog.returning({
+          use requested <- decode.field(0, decode.bool)
+          decode.success(requested)
+        })
+        |> pog.execute(on: postgres.connection(reopened))
+      intent.rows |> should.equal([True])
+      mark_database_test_executed("uncertain-cancel-ack-lost-reply-reconciled")
+    }
+    False ->
+      mark_database_test_executed(
+        "ack-committed-reply-lost-store-unavailable-unknown-passed",
+      )
+  }
 }
 
 fn run_ack_receipt_test(database_url: String) -> Nil {

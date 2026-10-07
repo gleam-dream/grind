@@ -2,6 +2,7 @@
 //// running job, and audited resolution of an uncertain one.
 
 import gleam/erlang/process
+import gleam/option.{None, Some}
 import gleam/time/duration
 import gleeunit/should
 import grind
@@ -156,4 +157,111 @@ pub fn public_consumer_effect_crash_uncertainty_audited_recovery_test() {
       env.mark("consumer-uncertainty-audited-recovery-passed")
     }
   }
+}
+
+/// Cancellation expresses intent to stop; explicit effect evidence remains
+/// available until the application investigates and attributes its resolution.
+pub fn public_consumer_cancellation_preserves_uncertainty_test() {
+  case env.database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      cancellation_and_uncertainty(url, True)
+      cancellation_and_uncertainty(url, False)
+      env.mark("consumer-cancellation-preserves-uncertainty-passed")
+    }
+  }
+}
+
+fn cancellation_and_uncertainty(url: String, cancel_first: Bool) {
+  let started = process.new_subject()
+  let evidence = "provider may have executed payment operation-42"
+  let charge =
+    worker.responding(
+      env.unique("recovery.cancel-uncertain"),
+      input: grind_consumer.amount_codec(),
+      output: grind_consumer.amount_codec(),
+      handle: fn(_context, _amount) {
+        let release = process.new_subject()
+        process.send(started, release)
+        let assert Ok(Nil) = process.receive(release, within: 10_000)
+        worker.Uncertain(evidence)
+      },
+    )
+    |> worker.with_queue(env.unique("cancel-uncertain"))
+    |> worker.with_error_codec(grind_consumer.amount_codec())
+  use jobs <- env.with_grind(url, fn(config) {
+    config |> grind.with_worker(charge) |> grind.without_pruner
+  })
+  let assert Ok(grind.Inserted(handle)) =
+    grind.submit(jobs, job.new(charge, 42))
+  let assert Ok(release) = process.receive(started, within: 10_000)
+  case cancel_first {
+    True ->
+      grind.cancel(jobs, handle)
+      |> should.equal(Ok(grind.CancellationRequested))
+    False -> Nil
+  }
+  process.send(release, Nil)
+  grind.await(jobs, handle, within: duration.seconds(10))
+  |> should.equal(Ok(grind.Uncertain(evidence)))
+  // Repeating intent, including after acknowledgement, preserves evidence.
+  grind.cancel(jobs, handle) |> should.equal(Ok(grind.AlreadyUncertain))
+  grind.cancel(jobs, handle) |> should.equal(Ok(grind.AlreadyUncertain))
+  let assert Ok([summary]) =
+    admin.list(
+      jobs,
+      admin.query(limit: 10)
+        |> admin.in_queue(charge.queue)
+        |> admin.in_state(job.Uncertain),
+    )
+  summary.id |> should.equal(job.id(handle))
+  summary.description |> should.equal(Some(evidence))
+  summary.finished_at |> should.equal(None)
+  process.sleep(20)
+  let assert Ok(_) =
+    admin.prune_finished(
+      jobs,
+      older_than: duration.milliseconds(10),
+      limit: 10_000,
+    )
+  grind.outcome(jobs, handle) |> should.equal(Ok(grind.Uncertain(evidence)))
+  let replay =
+    admin.resolution(
+      admin.AuthorizeReplay,
+      id: env.unique("forbidden-replay"),
+      by: "operator@example.com",
+      details: "cancellation intent forbids a new attempt",
+    )
+  admin.resolve_uncertain(jobs, handle, replay)
+  |> should.equal(Error(admin.CancellationPending))
+  let decision = case cancel_first {
+    True -> admin.ConfirmSuccess(42)
+    False -> admin.ConfirmFailure(42)
+  }
+  let final_state = case cancel_first {
+    True -> job.Succeeded
+    False -> job.BusinessFailed
+  }
+  let confirmed =
+    admin.resolution(
+      decision,
+      id: env.unique("confirmed-payment"),
+      by: "operator@example.com",
+      details: "provider ledger confirms operation-42",
+    )
+  admin.resolve_uncertain(jobs, handle, confirmed)
+  |> should.equal(Ok(admin.Applied(final_state)))
+  admin.resolve_uncertain(jobs, handle, confirmed)
+  |> should.equal(Ok(admin.AlreadyApplied(final_state)))
+  case cancel_first {
+    True -> grind.outcome(jobs, handle) |> should.equal(Ok(grind.Succeeded(42)))
+    False -> {
+      let assert Ok(grind.Failed(grind.Business(42), _, _)) =
+        grind.outcome(jobs, handle)
+      Nil
+    }
+  }
+  grind.cancel(jobs, handle)
+  |> should.equal(Ok(grind.AlreadyFinished(final_state)))
+  process.receive(started, within: 0) |> should.equal(Error(Nil))
 }

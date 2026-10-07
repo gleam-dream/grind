@@ -188,7 +188,7 @@ for contract in admission-read-passed two-schemas-share-database-isolated two-ur
     exit 1
   fi
   done
-  for contract in cancel-running-ack-wins cancel-after-completion-preserved cancel-running-uncertain-compact-receipt cancel-running-worker-cancel-compact-receipt cancel-pending-expiry-quarantined startup-lookup-failure-releases-resources duplicate-start-preserves-live-pool later-start-failure-releases-resources first-ack-rollback-retried-without-rerun slow-acks-independent-healthy-renewal saturated-pool-independent-renewal consumer-stop-normal-exit-cleaned closed-pool-type-cache-owned-cleanup reserved-pool-cache-owned-cleanup close-waits-internal-type-writer close-waits-managed-query-cache-writer close-releases-dead-managed-caller retires-dead-connection-holder retires-closed-socket-holder multiple-stale-holders-callback-once stale-holder-original-deadline; do
+  for contract in cancel-running-ack-wins cancel-after-completion-preserved cancel-running-uncertain-compact-receipt uncertain-cancel-ack-lost-reply-reconciled cancel-running-worker-cancel-compact-receipt cancel-pending-expiry-quarantined startup-lookup-failure-releases-resources duplicate-start-preserves-live-pool later-start-failure-releases-resources first-ack-rollback-retried-without-rerun slow-acks-independent-healthy-renewal saturated-pool-independent-renewal consumer-stop-normal-exit-cleaned closed-pool-type-cache-owned-cleanup reserved-pool-cache-owned-cleanup close-waits-internal-type-writer close-waits-managed-query-cache-writer close-releases-dead-managed-caller retires-dead-connection-holder retires-closed-socket-holder multiple-stale-holders-callback-once stale-holder-original-deadline; do
     if ! grep -q "$contract" "$root/database-test-ran"; then
       echo "PostgreSQL integration contract did not execute: $contract" >&2
       exit 1
@@ -244,7 +244,7 @@ consumer_bad_url="postgres://grind@127.0.0.1:$port/grind_database_missing?sslmod
   GRIND_CONSUMER_TEST_MARKER="$root/consumer-test-ran" \
     gleam test
 )
-for contract in consumer-observes-capacity-passed two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed consumer-unique-admission-existing-conflict-retry-passed consumer-unique-reschedule-across-queues-passed consumer-observes-acknowledged-passed consumer-observes-claimed-passed consumer-submit-with-id-retry-passed consumer-prune-finished-passed consumer-validating-codec-passed consumer-submit-in-passed consumer-observes-context-passed consumer-testing-support-passed consumer-shared-pool-passed consumer-schema-not-migrated-passed; do
+for contract in consumer-observes-capacity-passed two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed consumer-cancellation-preserves-uncertainty-passed consumer-unique-admission-existing-conflict-retry-passed consumer-unique-reschedule-across-queues-passed consumer-observes-acknowledged-passed consumer-observes-claimed-passed consumer-submit-with-id-retry-passed consumer-prune-finished-passed consumer-validating-codec-passed consumer-submit-in-passed consumer-observes-context-passed consumer-testing-support-passed consumer-shared-pool-passed consumer-schema-not-migrated-passed; do
   if ! grep -q "$contract" "$root/consumer-test-ran"; then
     echo "external-consumer integration contract did not execute: $contract" >&2
     exit 1

@@ -98,8 +98,9 @@ pub type AttemptRef {
 /// `proposed` is what the worker's execution proposed; `committed_state` is
 /// what was actually durably committed, read from the acknowledgement's own
 /// `RETURNING`/receipt — never from the proposal. They can differ: a
-/// concurrent cancellation overrides a proposed success (or any other
-/// proposal) with a committed `Cancelled`. Retry-budget exhaustion is
+/// concurrent cancellation overrides a proposed success or another non-uncertain
+/// proposal with a committed `Cancelled`. An explicit `Uncertain` proposal
+/// preserves its evidence and cancellation intent. Retry-budget exhaustion is
 /// decided by the worker's own business retry policy before the
 /// acknowledgement ever runs — an exhausted retry is proposed as a business
 /// failure (`worker.ExecutedBusinessFailure(.., BudgetExhausted)`, so
@@ -220,9 +221,9 @@ pub type ResolvedMetadata {
   )
 }
 
-/// The two `postgres.CancellationResult` variants that are genuine writes;
-/// the read-only variants (`AlreadyCancelled`, `AlreadyUncertain`,
-/// `AlreadyFinished`) never reach this type because they never emit.
+/// Cancellation of queued or executing work. AlreadyUncertain records intent
+/// without changing the disposition and emits no event. AlreadyCancelled and
+/// AlreadyFinished are read-only and also emit no event.
 pub type CancellationOutcome {
   CancellationDecidedBeforeRun
   CancellationDecidedWhileRunning
@@ -755,8 +756,9 @@ pub fn resolved() -> Event(JobMeasurements, ResolvedMetadata) {
 
 /// The `[grind, job, cancellation_decided]` event descriptor: a cancellation request
 /// that changed something durable (`CancellationDecidedBeforeRun` or
-/// `CancellationDecidedWhileRunning`). The three read-only outcomes
-/// (`AlreadyCancelled`, `AlreadyUncertain`, `AlreadyFinished`) never emit —
+/// `CancellationDecidedWhileRunning`). AlreadyUncertain records intent without
+/// a disposition change and emits no event. AlreadyCancelled and AlreadyFinished
+/// are read-only and also emit no event —
 /// see `CancellationMetadata`.
 pub fn cancellation_decided() -> Event(JobMeasurements, CancellationMetadata) {
   sinal.event(

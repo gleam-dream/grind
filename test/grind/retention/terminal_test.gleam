@@ -410,8 +410,7 @@ fn run_finished_at_paths_test(database_url: String) -> Nil {
   finished_at_is_set(connection, job.id_value(snooze_cancelled_handle))
   |> should.equal(True)
 
-  // acknowledge_transaction, "uncertain" branch overridden by a concurrent
-  // cancellation.
+  // acknowledge_transaction, "uncertain" branch retains unresolved evidence despite cancellation.
   let assert Ok(uncertain_cancelled_handle) =
     postgres.submit(database, run_queue, gated_uncertain_worker, 16)
   drive_cancel_while_executing(
@@ -421,9 +420,9 @@ fn run_finished_at_paths_test(database_url: String) -> Nil {
     gated_uncertain_started,
   )
   postgres.state(database, uncertain_cancelled_handle)
-  |> should.equal(Ok(job.Cancelled))
+  |> should.equal(Ok(job.Uncertain))
   finished_at_is_set(connection, job.id_value(uncertain_cancelled_handle))
-  |> should.equal(True)
+  |> should.equal(False)
 
   // acknowledge_transaction, "runtime_failed" branch: input decode fails at
   // claim time even though the input_version still matches the registered

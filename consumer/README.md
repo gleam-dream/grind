@@ -19,7 +19,8 @@ uses it:
 - failure handling: a retry policy, cancellation of a running handler
   through `worker.cancellation`, and a handler that crashes after its effect,
   is held `uncertain` and is resolved by an operator through `grind/admin`
-  (`recovery_test`); an unreachable database failing `start` with a typed
+  (`recovery_test`), including both cancellation/uncertainty orderings, retained
+  evidence, pruning exclusion, replay refusal and attributed terminal resolution; an unreachable database failing `start` with a typed
   error (`storage_test`); pruning (`retention_test`);
 - telemetry: handlers on `grind/telemetry` descriptors see each job's
   correlation and committed state (`observation_test`);

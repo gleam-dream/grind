@@ -859,8 +859,12 @@ pub fn submit(
 /// commits or rolls back with the application's own writes. Grind sends no
 /// `BEGIN` or `COMMIT`. The transaction must be `READ COMMITTED` and on
 /// Grind's database; Grind sets `search_path` and `lock_timeout` for its
-/// own statements, then restores yours. When your commit's outcome is
-/// unknown, resubmit the same job under the same id (`job.with_id`).
+/// own statements, then restores yours. SERIALIZABLE and REPEATABLE READ are
+/// refused; retain the application isolation and use an application outbox
+/// when needed. A lost outer commit reply requires business-command
+/// reconciliation: an older matching admission receipt cannot prove this
+/// transaction's business writes committed. Retry job admission under the same
+/// id (`job.with_id`) only as part of that application recovery protocol.
 ///
 /// ```gleam
 /// pog.transaction(grind.connection(jobs), fn(tx) {
@@ -1254,10 +1258,12 @@ pub type CancelResult {
   CancelledBeforeRun
   /// The job is running. Its handler's `worker.cancellation` fires at the
   /// attempt's next lease renewal, and its outcome becomes `Cancelled`
-  /// unless it finishes first.
+  /// unless it finishes first or reports `Uncertain`. Explicit uncertainty
+  /// retains its evidence and cancellation intent.
   CancellationRequested
   AlreadyCancelled
-  /// The job is uncertain; resolve it with `grind/admin`.
+  /// The job remains uncertain. Cancellation intent is recorded and blocks
+  /// replay; resolve it with an attributed terminal confirmation in `grind/admin`.
   AlreadyUncertain
   AlreadyFinished(State)
 }
@@ -1275,7 +1281,9 @@ pub type CancelError {
 }
 
 /// Cancels a job. A job that has not started is cancelled at once; a
-/// running job's handler is told through `worker.cancellation`.
+/// running job's handler is told through `worker.cancellation`. An uncertain
+/// job retains its evidence and records intent, including on repeated calls.
+/// Cancellation does not prove that an external effect was prevented.
 pub fn cancel(
   grind: Grind,
   handle: JobHandle(input, output, error),

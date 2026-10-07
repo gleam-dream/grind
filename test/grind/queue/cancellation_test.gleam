@@ -341,9 +341,13 @@ fn run_cancel_running_uncertain_test(database_url: String) -> Nil {
   |> should.equal(Ok(postgres.CancellationRequested))
   process.send(release, ReleaseAttempt)
   process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
-  postgres.state(database, handle) |> should.equal(Ok(job.Cancelled))
+  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
   postgres.outcome(database, handle)
-  |> should.equal(Ok(job.CancelledWithReason("cancelled by caller")))
+  |> should.equal(
+    Ok(job.ReconciliationRequired(
+      "effect may have happened before cancellation",
+    )),
+  )
   let assert Ok(evidence) =
     pog.query(
       "SELECT receipt.command_id, receipt.committed_state, receipt.failure_cause, octet_length(receipt.proposal_sha256), job.cancel_requested_at IS NULL, job.uncertain_at IS NULL FROM grind_job_acknowledgements AS receipt JOIN grind_jobs AS job ON job.id = receipt.job_id WHERE receipt.job_id = $1",
@@ -366,14 +370,15 @@ fn run_cancel_running_uncertain_test(database_url: String) -> Nil {
       ))
     })
     |> pog.execute(on: postgres.connection(database))
-  let assert [#(command_id, "cancelled", None, 32, True, True)] = evidence.rows
+  let assert [#(command_id, "uncertain", None, 32, False, False)] =
+    evidence.rows
   let assert Ok(postgres.AcknowledgementReceipt(
     committed_state: receipt_state,
     business_failure_cause: receipt_cause,
     committed_at_unix_ms: _,
     ..,
   )) = postgres.reconcile_acknowledgement(database, handle, command_id)
-  receipt_state |> should.equal(job.Cancelled)
+  receipt_state |> should.equal(job.Uncertain)
   receipt_cause |> should.equal(None)
 
   let assert Ok(worker_cancel_handle) =

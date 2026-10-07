@@ -1566,17 +1566,10 @@ pub fn cancel(
   }
 }
 
-/// Builds and forwards `[grind, job, cancellation_decided]` from a proven-committed
-/// `CancellationResult`. Called only from `cancel`, strictly after
-/// `transaction_safely` has already returned — never from inside a
-/// transaction callback (the same discipline `acknowledge` and
-/// `resolve_uncertain` follow). Only `CancelledBeforeRun` and
-/// `CancellationRequested` are genuine writes; every read-only outcome emits
-/// nothing.
-/// Which `[grind, job, cancellation_decided]` outcome, if any, a `CancellationResult`
-/// reports. Only `CancelledBeforeRun`/`CancellationRequested` are genuine
-/// writes; every read-only outcome (`AlreadyCancelled`, `AlreadyUncertain`,
-/// `AlreadyFinished`) maps to `None` and must never emit.
+/// Maps proven cancellation results to their existing lifecycle observations.
+/// AlreadyUncertain records cancellation intent without a new disposition or
+/// running handler, so it emits no cancellation_decided event. The ACK and
+/// operator listing continue to expose its retained Uncertain disposition.
 fn cancellation_outcome_of(
   result: CancellationResult,
 ) -> Option(telemetry.CancellationOutcome) {
@@ -1685,7 +1678,7 @@ fn cancel_locked_state(
         _ -> Error(CancellationWriteRejected)
       }
     }
-    "executing" -> {
+    "executing" | "uncertain" -> {
       use returned <- result.try(
         case
           store.call_safely(connection, fn(connection) {
@@ -1697,7 +1690,11 @@ fn cancel_locked_state(
         },
       )
       case returned.rows {
-        [_] -> Ok(CancellationRequested)
+        [_] ->
+          Ok(case state {
+            "uncertain" -> AlreadyUncertain
+            _ -> CancellationRequested
+          })
         _ -> Error(CancellationWriteRejected)
       }
     }
@@ -1706,7 +1703,6 @@ fn cancel_locked_state(
     "business_failed" -> Ok(AlreadyFinished(job.BusinessFailed))
     "runtime_failed" -> Ok(AlreadyFinished(job.RuntimeFailed))
     "contract_mismatch" -> Ok(AlreadyFinished(job.ContractMismatch))
-    "uncertain" -> Ok(AlreadyUncertain)
     "discarded" -> Ok(AlreadyFinished(job.Discarded))
     other -> Error(CancellationInvalidStoredState(other))
   }

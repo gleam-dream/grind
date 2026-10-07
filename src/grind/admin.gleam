@@ -97,7 +97,8 @@ pub type Error {
   ResolutionNeedsErrorCodec
   /// The confirmed value was rejected by its codec.
   ResolutionValueRejected(reason: String)
-  /// A cancellation of the job is pending; it settles the job instead.
+  /// Cancellation intent forbids replay. Investigate the effect and use an
+  /// attributed terminal confirmation to settle the job.
   CancellationPending
   /// The resolution may or may not have committed; repeat it with the same
   /// id.

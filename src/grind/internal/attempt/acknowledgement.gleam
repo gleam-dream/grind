@@ -269,7 +269,7 @@ pub fn acknowledge_transaction(
           ],
         )
         "uncertain" -> #(
-          "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'uncertain' END, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, uncertain_at = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE clock_timestamp() END, attempt_owner = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE attempt_owner END, lease_expires_at = CASE WHEN cancel_requested_at IS NOT NULL THEN NULL ELSE lease_expires_at END, cancel_requested_at = NULL, finished_at = CASE WHEN cancel_requested_at IS NOT NULL THEN clock_timestamp() END WHERE id = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
+          "UPDATE grind_jobs SET state = 'uncertain', failure_description = $1, uncertain_at = clock_timestamp(), finished_at = NULL WHERE id = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
             <> lease.live_lease_predicate("clock_timestamp()")
             <> " RETURNING id, state, failure_description, (extract(epoch FROM available_at) * 1000)::bigint",
           [

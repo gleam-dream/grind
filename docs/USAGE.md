@@ -124,7 +124,20 @@ record the admission yourself after `pog.transaction` returns `Ok`, keyed
 by `job.id(grind.handle(admission))` and the job's correlation. The
 transaction must be
 `READ COMMITTED` on Grind's database; Grind sets `search_path` and
-`lock_timeout` for its own statements and restores yours.
+`lock_timeout` for its own statements and restores yours. SERIALIZABLE and
+REPEATABLE READ produce `TransactionIsolationUnsupported`; Grind does not lower
+isolation. Account locking belongs to the application: lock the accounts in a
+consistent order, check the protected invariant, write the financial operation,
+and enqueue in the same transaction only when READ COMMITTED is the chosen
+business contract. This does not substitute for SERIALIZABLE across arbitrary
+predicates or writers.
+
+For applications retaining SERIALIZABLE, commit an application outbox row with
+the business writes and dispatch that row separately using a stable submission
+ID. The application retries serialization failures around the whole business
+transaction. The dispatcher marks progress only after admission or receipt
+reconciliation; receipt retention does not replace durable financial identity.
+See the [executable financial recovery composition](https://github.com/gleam-dream/oversight/tree/master/apps/financial_recovery).
 
 ```gleam
 pog.transaction(grind.connection(jobs), fn(tx) {
@@ -276,11 +289,12 @@ The events currently published, one per durable job-lifecycle transition:
   registers.
 - `[grind, job, resolved]` — an audited operator decision committed against
   an `uncertain` job (`resolve_uncertain`).
-- `[grind, job, cancellation_decided]` — a cancellation request that changed
-  something durable (`CancellationDecidedBeforeRun` or `CancellationDecidedWhileRunning`); the
-  read-only outcomes (`AlreadyCancelled`, `AlreadyUncertain`,
-  `AlreadyFinished`) never emit. `CancellationDecidedWhileRunning` can be delivered
-  again for an idempotent re-request against an already-executing job.
+- `[grind, job, cancellation_decided]` — cancellation of queued or executing
+  work (`CancellationDecidedBeforeRun` or `CancellationDecidedWhileRunning`).
+  `AlreadyUncertain` records cancellation intent without changing disposition
+  and emits no event. `AlreadyCancelled` and `AlreadyFinished` are read-only
+  and emit no event. `CancellationDecidedWhileRunning` can be delivered again
+  for an idempotent request against an executing job.
 - `[grind, job, released]` — a claimed attempt refunded before its worker
   ever ran (the temporary worker child failed to start).
 - `[grind, job, contract_mismatch_recorded]` — a claimed attempt parked in
@@ -341,8 +355,9 @@ acknowledged normally with no observations at all.
   receipt back after a lost reply) — both are genuine proof of a commit,
   never "assumed". A committed value (such as `committed_state`) always comes
   from what was actually committed, never from a worker's proposal — a
-  concurrent cancellation can override any proposal with a committed
-  `Cancelled`. Retry-budget exhaustion is decided by the worker's own
+  concurrent cancellation can override a non-uncertain proposal with a
+  committed `Cancelled`. An explicit `Uncertain` proposal preserves its
+  evidence and cancellation intent. Retry-budget exhaustion is decided by the worker's own
   business retry policy before the acknowledgement ever runs (an exhausted
   retry is proposed as a business failure, not as a retry the acknowledgement
   later reinterprets); the acknowledgement's `attempt_count < max_attempts`
@@ -449,11 +464,14 @@ attempt identity, epoch, owner and live database lease. A handler return is
 not a committed queue outcome. Automatic ACK recovery retains its proposal
 and does not invoke the handler again.
 
-Cancellation is cooperative and cannot retract an effect. Current
-cancellation-first acknowledgement changes even an explicit Uncertain response
-to Cancelled and clears uncertainty evidence. Investigate application effect
-records as well as the uncertain listing. The unresolved policy is recorded in
-[ADR-0006](../docs/adr/0006-keep-cancellation-and-effect-uncertainty-distinct.md).
+Cancellation is cooperative and cannot retract an effect. An explicit
+Uncertain response retains its evidence and cancellation intent in either
+ordering. Repeated cancellation returns AlreadyUncertain and preserves that
+intent. Pending cancellation blocks AuthorizeReplay; an attributed
+ConfirmSuccess or ConfirmFailure settles the job after investigation. Historical
+evidence erased by older cancellation precedence cannot be reconstructed from
+receipt fingerprints. Consult application effect records for those cases.
+[ADR-0012](adr/0012-preserve-uncertainty-through-cancellation.md) records the decision.
 
 ## Deadlines and capacity
 

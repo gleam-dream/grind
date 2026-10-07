@@ -132,10 +132,22 @@ deadline does not hard-bound a queued pool checkout. See the
 
 An abandoned attempt is held `Uncertain` by default. Investigate the external
 effect before confirming an outcome or authorizing replay with `grind/admin`.
-Cancellation is cooperative and cannot retract an effect; the current
-cancellation-first acknowledgement can clear explicit uncertainty. Receipt
+Cancellation is cooperative and cannot retract an effect. Explicit uncertainty
+retains its evidence and cancellation intent in either order. Pending
+cancellation forbids replay but permits attributed terminal confirmation. Receipt
 recovery and submission deduplication end when the job is pruned. See
 [operations](docs/OPERATIONS.md) for these recovery limits.
+
+## Business transactions
+
+`grind.submit_in(jobs, tx, job)` stages admission in the application's open
+READ COMMITTED transaction. The application owns business invariants, account
+locking, commit, and reconciliation after a lost commit reply. Grind rejects
+SERIALIZABLE and REPEATABLE READ transactions; it never lowers their isolation.
+Keep the isolation your application requires. An application outbox can commit
+financial intent and a dispatch record together, then submit with a stable job
+identity in a separate transaction. See [transaction guidance](docs/USAGE.md#one-pool-and-enqueueing-inside-your-transaction)
+and the [financial recovery consumer](https://github.com/gleam-dream/oversight/tree/master/apps/financial_recovery).
 
 ## Migrations
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve explicit uncertainty and cancellation intent in either ordering. Pending cancellation blocks replay while attributed terminal confirmation remains available. No migration is required; previously erased evidence still requires application reconciliation.
+
 - Typed, versioned workers and fallible input/output/error JSON codecs behind the grind facade.
 - Supervised PostgreSQL runtime, shared application pool, caller-owned transaction admission and optional startup migration.
 - Immediate and delayed jobs, durable submission receipts, scoped uniqueness and scheduled-only rescheduling.
