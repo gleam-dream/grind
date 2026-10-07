@@ -89,7 +89,8 @@ pub type Error {
   EmptyResolutionField(field: String)
   /// The job is not uncertain, so there is nothing to resolve.
   NotUncertain
-  /// The resolution id was already used for a different decision.
+  /// The resolution id was already used for another job or a different command
+  /// in this installation (the same PostgreSQL database and Grind schema).
   ResolutionConflict
   /// The stored job does not match the handle's queue, worker or codecs.
   RecordMismatch
@@ -311,6 +312,17 @@ pub opaque type Resolution(output, error) {
 
 /// A decision, identified by `id` so a repeated call after a lost reply
 /// applies it once, and attributed to `by` with `details`.
+///
+/// IDs are unique across one installation (the same PostgreSQL database and
+/// Grind schema), not just within a job, queue or worker. Retain one ID for
+/// one exact command. Retry it with the same job, decision, value, author and
+/// details; another job or changed command returns `ResolutionConflict`.
+/// A later decision needs a new ID. A durable application decision ID, qualified
+/// by the job ID when necessary, can supply this identity. Do not generate a
+/// new ID merely because the original reply was lost.
+///
+/// The receipt is removed when its job is pruned. These IDs and attribution
+/// fields neither authenticate the operator nor replace business idempotency.
 pub fn resolution(
   decision: Decision(output, error),
   id id: String,

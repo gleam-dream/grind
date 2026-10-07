@@ -134,8 +134,10 @@ An abandoned attempt is held `Uncertain` by default. Investigate the external
 effect before confirming an outcome or authorizing replay with `grind/admin`.
 Cancellation is cooperative and cannot retract an effect. Explicit uncertainty
 retains its evidence and cancellation intent in either order. Pending
-cancellation forbids replay but permits attributed terminal confirmation. Receipt
-recovery and submission deduplication end when the job is pruned. See
+cancellation forbids replay but permits attributed terminal confirmation.
+[Resolution IDs](docs/USAGE.md#resolve-an-uncertain-job) identify one exact
+command across the installation; retain the ID and command when retrying.
+Receipt recovery and submission deduplication end when the job is pruned. See
 [operations](docs/OPERATIONS.md) for these recovery limits.
 
 ## Business transactions

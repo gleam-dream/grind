@@ -473,6 +473,43 @@ evidence erased by older cancellation precedence cannot be reconstructed from
 receipt fingerprints. Consult application effect records for those cases.
 [ADR-0012](adr/0012-preserve-uncertainty-through-cancellation.md) records the decision.
 
+### Resolve an uncertain job
+
+- Investigate the effect before choosing `ConfirmSuccess`, `ConfirmFailure` or
+  `AuthorizeReplay`. Cancellation intent permits terminal confirmation but
+  forbids replay. An attribution string does not authenticate the operator.
+- A resolution ID names one exact command across the installation: the same
+  PostgreSQL database and Grind schema. Reusing a constant such as
+  `"lookup-confirmed"` for different jobs returns `ResolutionConflict`.
+- Persist the decision identity and its full command before applying it. If
+  decision IDs are only unique within a job, qualify them with the job ID:
+
+```gleam
+let command = admin.resolution(
+  admin.ConfirmSuccess(receipt),
+  id: "job:" <> int.to_string(job.id(handle)) <> ":decision:" <> decision_id,
+  by: operator,
+  details: evidence,
+)
+admin.resolve_uncertain(jobs, handle, command)
+```
+
+- The snippet uses `gleam/int`, `grind/job` and `grind/admin`. `decision_id`,
+  `operator`, `evidence` and `receipt` come from the application's saved decision.
+  Preserve them on retry; do not regenerate the ID or revise the evidence text
+  merely because the reply was lost.
+- `Applied(state)` reports the applied decision. `AlreadyApplied(state)` reports
+  the original decision's state without applying it again. After
+  `ResolutionCommitUnknown`, repeat the same command for the same job.
+  A genuinely different decision needs another ID, even for that same job.
+- Use `resolve_uncertain_in` when resolution and application acknowledgment
+  must share a transaction. The ID rules are unchanged; `Staged` still requires
+  the caller's commit. Job pruning removes resolution receipts, so application
+  evidence and business idempotency need their own retention.
+- The [public transactional consumer](../consumer/test/grind_consumer/resolution_transaction_test.gleam)
+  exercises exact retries and rejects changed attribution or reuse on another
+  job. No resolution-ID helper or shared domain type is required.
+
 ## Deadlines and capacity
 
 Storage deadline D defaults to four seconds; migration step deadline defaults
