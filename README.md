@@ -177,6 +177,36 @@ Consumers require a current schema. Choose one migration owner for each schema:
 `grind.migrate` or the [Cigogne SQL mirrors](priv/migrations).
 See [migration configuration and upgrade limits](docs/USAGE.md#migrations).
 
+## Queue statistics
+
+Read one queue through the existing administrative boundary:
+
+```gleam
+import grind/admin
+
+let assert Ok(snapshot) = admin.statistics(jobs, queue: "emails")
+// snapshot.sampled_at_ms: the database clock sample in Unix milliseconds.
+// snapshot.states: one StateStatistics for each state, including zero groups.
+```
+
+Each group reports its `state`, `count`, `oldest_job_age_ms`, `due_count` and
+`oldest_due_age_ms`. Ages are optional when their corresponding count is zero;
+`Some(0)` means an observed age of zero. Insertion age measures time since the
+job was inserted, not time in its current state. Due counts Queued, Scheduled
+and Retryable jobs whose availability has arrived. It does not establish worker
+compatibility, remaining retry budget or execution capacity.
+
+One statement reads committed rows in one snapshot with one database clock
+sample. It returns no payloads, identifiers, keys, correlation or failure text,
+and changes no jobs. Combining `admin.list` pages under concurrent transitions
+does not provide the same snapshot. A stopped runtime, unavailable database or
+unknown stored state returns an error rather than a zero count.
+
+The caller owns access, sampling frequency and export. The result has bounded
+cardinality, but query cost grows with retained jobs in the selected queue. The
+ordinary storage deadline and pool-checkout limitations still apply. Sampling
+separate installations or libraries does not give a shared atomic snapshot.
+
 ## More usage
 
 The [usage guide](docs/USAGE.md) keeps the full API guidance and advanced examples:
