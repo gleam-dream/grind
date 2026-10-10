@@ -2253,6 +2253,17 @@ pub fn reconcile_unique(
 /// The largest `list_jobs` page.
 pub const list_limit_maximum = 10_000
 
+/// Aggregate one queue through the ordinary scoped storage boundary.
+pub fn queue_statistics(
+  database: Database,
+  queue: String,
+) -> Result(List(sql.QueueStatisticsRow), pog.QueryError) {
+  store.call_safely(database.connection, fn(connection) {
+    sql.queue_statistics(connection, queue)
+  })
+  |> result.map(fn(returned) { returned.rows })
+}
+
 /// One job row as an operator sees it, without its typed payloads.
 pub type JobRow {
   JobRow(
