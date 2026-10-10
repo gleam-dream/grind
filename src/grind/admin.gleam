@@ -1,4 +1,4 @@
-//// Operator work: listing jobs, resolving uncertain ones, sweeping expired
+//// Operator work: listing and counting jobs, resolving uncertainty, sweeping expired
 //// attempts, pruning, and reading acknowledgement receipts.
 ////
 //// ```gleam
@@ -27,6 +27,7 @@ import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
 import grind.{type Grind}
 import grind/internal/convert
+import grind/internal/job as stored_job
 import grind/internal/postgres
 import grind/internal/runtime
 import grind/job.{type JobHandle, type State}
@@ -176,6 +177,72 @@ pub fn error_kind(error: Error) -> grind.ErrorKind {
 
 fn database(grind: Grind) -> Result(postgres.Database, Error) {
   runtime.database(grind) |> result.replace_error(NotRunning)
+}
+
+/// Committed counts for one queue at one database snapshot. State order is
+/// unspecified; all known states are present, including empty groups.
+pub type Statistics {
+  Statistics(sampled_at_ms: Int, states: List(StateStatistics))
+}
+
+/// Ages are elapsed milliseconds, clamped at zero. An absent age means the
+/// corresponding count is zero. Insertion age is not time in the current state.
+/// Due counts only waiting jobs whose availability has arrived.
+pub type StateStatistics {
+  StateStatistics(
+    state: State,
+    count: Int,
+    oldest_job_age_ms: Option(Int),
+    due_count: Int,
+    oldest_due_age_ms: Option(Int),
+  )
+}
+
+/// Reads content-free statistics for one explicitly selected queue. Uses one
+/// statement and one database clock sample; it does not mutate or claim jobs.
+///
+/// Due means Queued, Scheduled or Retryable with availability reached. It does
+/// not establish worker compatibility, retry budget, capacity or authority to
+/// execute. The caller owns authorization, metric selection and sampling rate.
+///
+/// Storage errors are not empty queues. This uses the existing storage deadline
+/// and its pool-checkout limitations. Result size is bounded by the state set;
+/// read cost grows with retained rows in the selected queue.
+pub fn statistics(
+  grind: Grind,
+  queue queue: String,
+) -> Result(Statistics, Error) {
+  use database <- result.try(database(grind))
+  use rows <- result.try(
+    postgres.queue_statistics(database, queue) |> result.map_error(Unavailable),
+  )
+  use states <- result.try(
+    list.try_map(rows, fn(row) {
+      use state <- result.map(
+        stored_job.state_of_stored(row.state)
+        |> result.replace_error(RecordMismatch),
+      )
+      StateStatistics(
+        state: convert.state(state),
+        count: row.count,
+        // Counts and non-null ages come from the same statement. Empty groups
+        // stay distinct from an observed age of zero without nullable decoding.
+        oldest_job_age_ms: case row.count {
+          0 -> None
+          _ -> Some(row.oldest_job_age_ms)
+        },
+        due_count: row.due_count,
+        oldest_due_age_ms: case row.due_count {
+          0 -> None
+          _ -> Some(row.oldest_due_age_ms)
+        },
+      )
+    }),
+  )
+  case rows {
+    [first, ..] -> Ok(Statistics(first.sampled_at_ms, states))
+    [] -> Error(RecordMismatch)
+  }
 }
 
 /// Lists stored jobs that match `query`. Uncertain jobs are served by an

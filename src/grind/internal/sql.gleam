@@ -402,6 +402,91 @@ pub fn prune_finished(
   |> pog.execute(db)
 }
 
+/// A row you get from running the `queue_statistics` query
+/// defined in `./src/grind/internal/sql/queue_statistics.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type QueueStatisticsRow {
+  QueueStatisticsRow(
+    sampled_at_ms: Int,
+    state: String,
+    count: Int,
+    oldest_job_age_ms: Int,
+    due_count: Int,
+    oldest_due_age_ms: Int,
+  )
+}
+
+/// One queue, one MVCC snapshot and one database clock sample.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn queue_statistics(
+  db: pog.Connection,
+  queue: String,
+) -> Result(pog.Returned(QueueStatisticsRow), pog.QueryError) {
+  let decoder = {
+    use sampled_at_ms <- decode.field(0, decode.int)
+    use state <- decode.field(1, decode.string)
+    use count <- decode.field(2, decode.int)
+    use oldest_job_age_ms <- decode.field(3, decode.int)
+    use due_count <- decode.field(4, decode.int)
+    use oldest_due_age_ms <- decode.field(5, decode.int)
+    decode.success(QueueStatisticsRow(
+      sampled_at_ms:,
+      state:,
+      count:,
+      oldest_job_age_ms:,
+      due_count:,
+      oldest_due_age_ms:,
+    ))
+  }
+
+  "-- One queue, one MVCC snapshot and one database clock sample.
+WITH sample AS MATERIALIZED (
+  SELECT clock_timestamp() AS at
+), counts AS MATERIALIZED (
+  SELECT
+    state,
+    count(*)::bigint AS count,
+    max(greatest(0, floor(extract(epoch FROM (at - inserted_at)) * 1000)))::bigint AS oldest_job_age_ms,
+    count(*) FILTER (
+      WHERE state IN ('queued', 'scheduled', 'retryable') AND available_at <= at
+    )::bigint AS due_count,
+    max(greatest(0, floor(extract(epoch FROM (at - available_at)) * 1000))) FILTER (
+      WHERE state IN ('queued', 'scheduled', 'retryable') AND available_at <= at
+    )::bigint AS oldest_due_age_ms
+  FROM grind_jobs CROSS JOIN sample
+  WHERE queue = $1
+  GROUP BY state
+), state_names AS (
+  SELECT state FROM counts
+  UNION
+  SELECT unnest(ARRAY[
+    'queued', 'scheduled', 'retryable', 'executing', 'succeeded',
+    'business_failed', 'runtime_failed', 'contract_mismatch', 'uncertain',
+    'discarded', 'cancelled'
+  ]::text[])
+)
+SELECT
+  (SELECT floor(extract(epoch FROM at) * 1000)::bigint FROM sample) AS sampled_at_ms,
+  state_names.state,
+  coalesce(counts.count, 0)::bigint AS count,
+  coalesce(counts.oldest_job_age_ms, 0)::bigint AS oldest_job_age_ms,
+  coalesce(counts.due_count, 0)::bigint AS due_count,
+  coalesce(counts.oldest_due_age_ms, 0)::bigint AS oldest_due_age_ms
+FROM state_names LEFT JOIN counts USING (state)
+ORDER BY state_names.state;
+"
+  |> pog.query
+  |> pog.parameter(pog.text(queue))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `reconcile_acknowledgement` query
 /// defined in `./src/grind/internal/sql/reconcile_acknowledgement.sql`.
 ///
