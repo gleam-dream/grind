@@ -50,7 +50,7 @@ the default is an ignored `.ci-results/<run>` directory.
 | Renewal and load audit contracts (bench/README.md, Comparability and validity)                               | `scripts/ci.sh matrix`                                                                                             | Weekly/manual / bounded mechanism       | Warm-up plus three repeats, CSV/raw/drain evidence and provenance; T3 remains a reviewed performance observation  |
 | Two-hour mixed-fault requirement (this document, Qualification commands)                                     | `scripts/ci.sh soak`                                                                                               | Weekly/manual / bounded mechanism       | Complete short suite, resource assertions, all nine fault types twice, elapsed soak and source/runtime provenance |
 
-CI checks push branches, pull requests and manual runs. The final `CI` status
+CI checks pushes to `master`, pull requests and manual runs. The final `CI` status
 requires full validation and the design gate. Sinal's own test suite remains
 required. Weekly qualification has a separate final status. No commercial
 provider or existing database is used.
@@ -66,3 +66,14 @@ It rejects compiler warnings and syntax errors. Source digests exclude credentia
 pinned pgo internal header through the built dependency. Runtime fault logs are
 not classified as compiler warnings. Native gradual Elixir type checking is
 unavailable on the retained Elixir 1.18 toolchain.
+
+CI caches Gleam package archives and compiler-produced path dependency
+fingerprints. PostgreSQL and benchmark gates still discard downloaded sources,
+package inventories and compiled output before rebuilding. Dependency preparation
+retries explicit Hex rate limits at most three times; other dependency failures
+stop the gate. Compiler and test failures are not retried.
+
+`GRIND_CI_CACHE` selects an isolated Mix client and Hex archive cache shared by
+CI gate steps. Local runs keep their disposable Mix directories by default.
+Only Hex package archives and the Mix client's installed archive enter the
+persistent CI cache.
