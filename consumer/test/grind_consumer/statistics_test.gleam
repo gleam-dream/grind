@@ -103,6 +103,7 @@ fn total(snapshot: admin.Statistics) -> Int {
   list.fold(snapshot.states, 0, fn(n, state) { n + state.count })
 }
 
+// Behavior: Statistics isolate the selected queue.
 pub fn empty_queue_and_installation_isolation_test() -> Nil {
   use a <- with_jobs("statistics_a", definition("primary", "1"))
   use b <- with_jobs("statistics_b", definition("primary", "1"))
@@ -127,6 +128,7 @@ pub fn empty_queue_and_installation_isolation_test() -> Nil {
 }
 
 // Negative control: a transition between public list pages overcounts Queued.
+// Behavior: Statistics observe one committed snapshot.
 pub fn paginated_counts_are_not_a_current_snapshot_test() -> Nil {
   let work = definition("primary", "1")
   use jobs <- with_jobs("statistics_pages", work)
@@ -148,6 +150,7 @@ pub fn paginated_counts_are_not_a_current_snapshot_test() -> Nil {
   string.contains(string.inspect(current), "private-input") |> should.be_false
 }
 
+// Behavior: Availability determines due statistics.
 pub fn delayed_work_becomes_due_without_changing_stored_state_test() -> Nil {
   let work = definition("primary", "1")
   use jobs <- with_jobs("statistics_due", work)
@@ -174,6 +177,7 @@ pub fn delayed_work_becomes_due_without_changing_stored_state_test() -> Nil {
   should.be_true(age >= overdue)
 }
 
+// Behavior: Statistics preserve outcome distinctions.
 pub fn retained_outcomes_and_contract_refusal_remain_distinct_test() -> Nil {
   let work = definition("primary", "1")
   use jobs <- with_jobs("statistics_outcomes", work)
@@ -228,6 +232,7 @@ pub fn retained_outcomes_and_contract_refusal_remain_distinct_test() -> Nil {
   group(snapshot(jobs, "primary"), job.Uncertain).count |> should.equal(1)
 }
 
+// Behavior: Executing jobs are counted without becoming due.
 pub fn executing_is_durable_but_not_due_test() -> Nil {
   let entered = process.new_subject()
   let finished = process.new_subject()
@@ -264,6 +269,7 @@ pub fn executing_is_durable_but_not_due_test() -> Nil {
   group(snapshot(jobs, "primary"), job.Succeeded).count |> should.equal(1)
 }
 
+// Behavior: Statistics exclude staged admission.
 pub fn staged_admission_is_invisible_and_rollback_stays_empty_test() -> Nil {
   let work = definition("primary", "1")
   use jobs <- with_jobs("statistics_transaction", work)
@@ -279,6 +285,7 @@ pub fn staged_admission_is_invisible_and_rollback_stays_empty_test() -> Nil {
   total(snapshot(jobs, "primary")) |> should.equal(1)
 }
 
+// Behavior: Statistics refuse unavailable storage or runtime.
 pub fn database_refusal_and_stopped_runtime_never_report_zero_test() -> Nil {
   use jobs <- with_jobs("statistics_locked", definition("primary", "1"))
   let entered = process.new_subject()
@@ -312,6 +319,7 @@ pub fn database_refusal_and_stopped_runtime_never_report_zero_test() -> Nil {
 }
 
 // Simulate a clock moving behind an already persisted insertion timestamp.
+// Behavior: A present age can be zero.
 pub fn a_nonempty_group_can_have_an_age_of_zero_test() -> Nil {
   let work = definition("primary", "1")
   use jobs <- with_jobs("statistics_clock", work)
@@ -328,6 +336,7 @@ pub fn a_nonempty_group_can_have_an_age_of_zero_test() -> Nil {
 
 // Fault injection only: an unsupported persisted state must not disappear from
 // a snapshot that otherwise looks complete. The database is disposable.
+// Behavior: Statistics reject an unknown retained state.
 pub fn an_unknown_stored_state_refuses_the_whole_snapshot_test() -> Nil {
   let work = definition("primary", "1")
   use jobs <- with_jobs("statistics_unknown", work)
