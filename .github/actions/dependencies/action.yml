@@ -1,0 +1,35 @@
+name: Prepare dependencies
+description: Cache package archives and configuration hashes without retaining compiled output.
+inputs:
+  projects:
+    description: Newline-separated project directories relative to the repository.
+    required: true
+  scope:
+    description: Cache writer identity for parallel jobs.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Cache verified Gleam archives
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        # The parent Hex directory can contain credentials; cache only packages.
+        path: ~/.cache/gleam/hex/hexpm/packages
+        key: gleam-archives-v1-${{ runner.os }}-${{ inputs.scope }}-${{ hashFiles('**/manifest.toml', '!**/build/**') }}
+        restore-keys: |
+          gleam-archives-v1-${{ runner.os }}-${{ inputs.scope }}-
+          gleam-archives-v1-${{ runner.os }}-
+    - name: Cache path dependency fingerprints
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: "**/build/packages/*.config_fingerprint"
+        # No fallback: hashes belong to these exact configs, locks and compiler.
+        key: gleam-fingerprints-v1-${{ runner.os }}-${{ inputs.scope }}-${{ hashFiles('**/gleam.toml', '**/manifest.toml', '**/flake.lock', '**/sibling-revisions.txt', '!**/build/**') }}
+    - name: Prepare locked dependencies
+      shell: bash
+      working-directory: grind
+      env:
+        PROJECTS: ${{ inputs.projects }}
+      run: |
+        mapfile -t projects < <(printf '%s' "$PROJECTS")
+        nix develop --command python3 scripts/prepare-dependencies.py "${projects[@]}"

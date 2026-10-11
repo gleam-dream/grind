@@ -90,7 +90,7 @@ bench_ctl_database_url="postgres://grind_ctl@127.0.0.1:$port/grind_bench?sslmode
 bench_test_database_url="postgres://grind@127.0.0.1:$port/grind_bench_test?sslmode=disable"
 bench_schema_drift_url="postgres://grind@127.0.0.1:$port/grind_bench_schema_drift?sslmode=disable"
 
-(cd "$bench_root" && gleam clean)
+python3 "$repo_root/scripts/prepare-dependencies.py" --clean "$bench_root"
 
 marker="$root/bench-test-ran"
 : >"$marker"

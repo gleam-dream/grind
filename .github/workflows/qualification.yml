@@ -38,11 +38,27 @@ jobs:
           path: sinal
           persist-credentials: false
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - uses: ./grind/.github/actions/dependencies
+        with:
+          scope: ${{ matrix.profile }}
+          projects: |
+            .
+            consumer
+            bench
+            resilience
+            ../sinal
+      - name: Cache isolated Mix downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ runner.temp }}/grind-dependencies/hex/packages
+            ${{ runner.temp }}/grind-dependencies/mix/archives
+          key: mix-archives-v1-${{ runner.os }}-${{ matrix.profile }}-${{ hashFiles('grind/oracle/mix.lock', 'grind/flake.lock') }}
       - name: Scheduled evidence and retained audit checks
         working-directory: grind
         env:
           PROFILE: ${{ matrix.profile }}
-        run: CI_ARTIFACT_DIR="$RUNNER_TEMP/grind-qualification" nix develop --command bash scripts/ci.sh "$PROFILE"
+        run: GRIND_CI_CACHE="$RUNNER_TEMP/grind-dependencies" CI_ARTIFACT_DIR="$RUNNER_TEMP/grind-qualification" nix develop --command bash scripts/ci.sh "$PROFILE"
       - name: Preserve qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -35,7 +35,7 @@ trap cleanup EXIT
 # rather than checking the package directories on disk. Refuse to proceed if
 # either manifest still resolves `pog` from anything but Hex, and always run
 # `gleam clean` first (the officially supported way to discard a project's
-# `build/` directory, forcing every dependency to be re-resolved and
+# `build/` directory, forcing every dependency to be downloaded and
 # recompiled from the manifest's own sources) so a leftover compiled fork
 # can never be silently reused even when the manifest itself is correct.
 # This does cost a full rebuild on every gate run; accepted as the simplest
@@ -46,8 +46,9 @@ for manifest in "$repo_root/manifest.toml" "$repo_root/consumer/manifest.toml"; 
     exit 1
   fi
 done
-(cd "$repo_root" && gleam clean)
-(cd "$repo_root/consumer" && gleam clean)
+# Preserve only configuration fingerprints to avoid redundant Hex resolution.
+# Downloaded source, packages.toml and all compiled output are still discarded.
+python3 "$repo_root/scripts/prepare-dependencies.py" --clean "$repo_root" "$repo_root/consumer"
 
 if pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
   echo "port $port is already in use; refusing to use a non-disposable database" >&2
@@ -210,14 +211,15 @@ for contract in admission-read-passed two-schemas-share-database-isolated two-ur
   # against a Hex dependency with no Hex client installed triggers Mix's own
   # interactive "install Hex?" prompt; on a non-interactive runner that
   # prompt reads EOF from stdin and Mix aborts instead of installing.
-  # Installed here into a script-local MIX_HOME/HEX_HOME (under this run's
-  # own disposable "$root", already `rm -rf`'d by the `cleanup` trap) rather
+  # Installed into isolated MIX_HOME/HEX_HOME (the disposable "$root" locally,
+  # or the explicit GRIND_CI_CACHE on CI) rather
   # than the invoking user's real `~/.mix`/`~/.hex`, and scoped to this one
   # subshell only. MIX_REBAR3 points Mix at the nix store's own `rebar3`
   # (already on PATH from `flake.nix`) instead of letting Mix download and
   # build its own copy over the network.
-  export MIX_HOME="$root/mix_home"
-  export HEX_HOME="$root/hex_home"
+  # CI shares only its isolated client/archive cache across gate steps.
+  export MIX_HOME="${GRIND_CI_CACHE:-$root}/mix"
+  export HEX_HOME="${GRIND_CI_CACHE:-$root}/hex"
   export MIX_REBAR3
   MIX_REBAR3="$(command -v rebar3)"
   mix local.hex --force --if-missing
