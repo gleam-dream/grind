@@ -11,7 +11,7 @@ exec > >(tee "$artifacts/gate.log") 2>&1
 export PYTHONDONTWRITEBYTECODE=1
 mix_root="$(mktemp -d "${TMPDIR:-/tmp}/grind-ci-mix.XXXXXX")"
 trap 'rm -rf "$mix_root"' EXIT
-export MIX_HOME="$mix_root/mix" HEX_HOME="$mix_root/hex" MIX_REBAR3
+export MIX_HOME="${GRIND_CI_CACHE:-$mix_root}/mix" HEX_HOME="${GRIND_CI_CACHE:-$mix_root}/hex" MIX_REBAR3
 MIX_REBAR3="$(command -v rebar3)"
 
 bootstrap_oracle() {
