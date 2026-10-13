@@ -13,4 +13,4 @@ pre-commit:
       run: nix fmt -- {staged_files}
       stage_fixed: true
     design-gate:
-      run: nix run .#design-gate-check -- docs/design .
+      run: env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX nix run .#design-gate-check -- docs/design .
