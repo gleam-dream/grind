@@ -125,8 +125,13 @@ checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Wait
                         %% earlier command committed. Ambiguity stays ambiguous.
                         %% A connection whose search_path could not be
                         %% restored never returns to the shared pool.
-                        case catch leave_search_path(Conn, Restore) of
-                            ok -> catch return_connection(Ref, Conn, ExpiresAt);
+                        case try leave_search_path(Conn, Restore)
+                             catch
+                                 throw:Thrown -> Thrown;
+                                 exit:Reason -> {'EXIT', Reason};
+                                 error:Reason:Stack -> {'EXIT', {Reason, Stack}}
+                             end of
+                            ok -> try return_connection(Ref, Conn, ExpiresAt) catch _:_ -> ok end;
                             _ -> retire_connection(Ref, Conn)
                         end
                     end,
@@ -173,7 +178,12 @@ enter_search_path(_Conn, none) -> {ok, none};
 enter_search_path(Conn, {some, SearchPath}) ->
     Sql = <<"WITH previous AS MATERIALIZED (SELECT current_setting('search_path') AS value) "
             "SELECT previous.value, set_config('search_path', $1, false) FROM previous">>,
-    case catch pgo_handler:extended_query(Conn, Sql, [SearchPath], #{queue_time => undefined}) of
+    case try pgo_handler:extended_query(Conn, Sql, [SearchPath], #{queue_time => undefined})
+         catch
+             throw:Thrown -> Thrown;
+             exit:Reason -> {'EXIT', Reason};
+             error:Reason:Stack -> {'EXIT', {Reason, Stack}}
+         end of
         #{rows := [Row]} -> {ok, {some, row_first(Row)}};
         _ -> error
     end.
@@ -212,7 +222,7 @@ return_connection(Ref, Conn, ExpiresAt) ->
 retire_connection(Ref, Conn) ->
     %% break/1 only casts to the connection owner; it cannot remove a holder
     %% whose owner is dead or has already advanced to a replacement socket.
-    catch pgo_pool:disconnect(Ref, {error, closed}, Conn, []),
+    try pgo_pool:disconnect(Ref, {error, closed}, Conn, []) catch _:_ -> ok end,
     ok.
 
 connection_usable(#conn{owner = Owner, socket = Socket,
@@ -290,7 +300,7 @@ guarded_query(Conn, Fun) ->
         error:function_clause:Stacktrace ->
             case is_convert_error_crash(Stacktrace) of
                 true ->
-                    catch pgo:break(Conn),
+                    try pgo:break(Conn) catch _:_ -> ok end,
                     {error, query_timeout};
                 false ->
                     erlang:raise(error, function_clause, Stacktrace)
@@ -305,7 +315,7 @@ guarded_transaction(Conn, Fun) ->
         error:function_clause:Stacktrace ->
             case is_convert_error_crash(Stacktrace) of
                 true ->
-                    catch pgo:break(Conn),
+                    try pgo:break(Conn) catch _:_ -> ok end,
                     {error, {transaction_query_error, query_timeout}};
                 false ->
                     erlang:raise(error, function_clause, Stacktrace)

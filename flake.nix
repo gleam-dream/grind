@@ -3,7 +3,7 @@
 
   inputs = {
     design-layer.url = "github:lostbean/design-layer";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     treefmt-nix.url = "github:numtide/treefmt-nix";
     treefmt-nix.inputs.nixpkgs.follows = "nixpkgs";
@@ -48,7 +48,7 @@
             type = "app";
             program = "${wrapper}/bin/design-gate-${name}";
           };
-        elixirPackage = pkgs.beam28Packages.elixir_1_18;
+        elixirPackage = pkgs.beam29Packages.elixir_1_20;
 
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
@@ -76,11 +76,11 @@
             lefthook
             git
             gleam
-            beam28Packages.erlang
+            beam29Packages.erlang
             elixirPackage
             postgresql_16
             python3
-            rebar3
+            beam29Packages.rebar3
             actionlint
             shellcheck
             ruff

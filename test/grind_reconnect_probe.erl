@@ -130,7 +130,7 @@ stale_holder_deadline(Connection = {pool, Name}) ->
                 true
         after 4000 -> error(stale_retirement_extended_deadline) end
     after
-        catch exit(Caller, kill),
+        try exit(Caller, kill) catch _:_ -> ok end,
         int:no_break(pgo_pool),
         int:n(pgo_pool),
         false = lists:member(pgo_pool, int:interpreted()),

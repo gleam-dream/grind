@@ -23,7 +23,7 @@ pog = ">= 4.1.0 and < 4.2.0"
 ```
 
 The Erlang target requires Gleam 1.18 or later and PostgreSQL. Development uses
-OTP 28 and PostgreSQL 16 through `nix develop`. The [package manifest](gleam.toml)
+OTP 29 and PostgreSQL 16 through `nix develop`. The [package manifest](gleam.toml)
 records the dependency ranges, including the pinned PostgreSQL driver versions.
 
 ## Quick start

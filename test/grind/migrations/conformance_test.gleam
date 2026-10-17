@@ -329,7 +329,8 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
 /// A 64-bit advisory key appears in `pg_locks` as two unsigned 32-bit halves;
 /// `objsubid = 1` distinguishes it from PostgreSQL's two-key advisory locks.
 /// Both observers below use this same exact key and the current database.
-const migration_lock_identity = "held.locktype = 'advisory' AND held.mode = 'ExclusiveLock' AND held.granted "
+const migration_lock_identity =
+  "held.locktype = 'advisory' AND held.mode = 'ExclusiveLock' AND held.granted "
   <> "AND held.database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
   <> "AND held.classid::bigint = ((hashtextextended('grind-migrate-v1:' || current_schema(), 0) >> 32) & 4294967295) "
   <> "AND held.objid::bigint = (hashtextextended('grind-migrate-v1:' || current_schema(), 0) & 4294967295) "

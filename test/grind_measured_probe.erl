@@ -34,7 +34,7 @@ with_contention({pool, Name}, HoldMs, Run) ->
         %% Give back the test holder if a setup assertion failed before its
         %% ordinary checkin. Never return another process's holder twice.
         case ets:info(element(4, Ref), owner) of
-            Parent -> catch pgo:checkin(Ref, Conn);
+            Parent -> try pgo:checkin(Ref, Conn) catch _:_ -> ok end;
             _ -> ok
         end,
         exit(Caller, kill),

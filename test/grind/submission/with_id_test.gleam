@@ -203,7 +203,8 @@ fn run_submit_with_id_committed_reply_lost_test(database_url: String) -> Nil {
 /// `await_overlap_shape`/`pg_stat_activity` — the "no policy" counterpart to
 /// `unique_insert_query_like` above (that one has the trailing
 /// `unique_key_contract, unique_key_sha256` columns this one omits).
-const plain_insert_query_like = "INSERT INTO grind_jobs (queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at) VALUES%"
+const plain_insert_query_like =
+  "INSERT INTO grind_jobs (queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at) VALUES%"
 
 /// Two concurrent `submit_with_id` callers, same `SubmissionId` and
 /// identical request, forced to actually overlap: a `BEFORE INSERT` barrier

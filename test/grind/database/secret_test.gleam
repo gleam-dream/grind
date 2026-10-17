@@ -10,7 +10,8 @@ import grind/support/env.{database_url, mark_database_test_executed}
 
 const password = "grind-secret-password"
 
-const url = "postgres://grind:grind-secret-password@127.0.0.1:5432/grind?sslmode=disable"
+const url =
+  "postgres://grind:grind-secret-password@127.0.0.1:5432/grind?sslmode=disable"
 
 pub fn settings_do_not_print_the_password_test() {
   let settings = postgres.settings(url)

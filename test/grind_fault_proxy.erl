@@ -134,9 +134,9 @@ controller_loop(State) ->
             end;
         {stop, From} ->
             #{lsock := LSock, acceptor := Acceptor, relays := Relays} = State,
-            catch gen_tcp:close(LSock),
-            catch exit(Acceptor, kill),
-            lists:foreach(fun(Pid) -> catch exit(Pid, kill) end, Relays),
+            try gen_tcp:close(LSock) catch _:_ -> ok end,
+            try exit(Acceptor, kill) catch _:_ -> ok end,
+            lists:foreach(fun(Pid) -> try exit(Pid, kill) catch _:_ -> ok end end, Relays),
             From ! stopped,
             exit(normal)
     end.
@@ -207,7 +207,7 @@ init_conn(ClientSock, Controller, UpstreamHost, UpstreamPort) ->
                 discard_server => false
             });
         {error, _Reason} ->
-            catch gen_tcp:close(ClientSock)
+            try gen_tcp:close(ClientSock) catch _:_ -> ok end
     end.
 
 relay_loop(S) ->
@@ -222,14 +222,14 @@ relay_loop(S) ->
             inet:setopts(Srv, [{active, once}]),
             relay_loop(S1);
         {tcp_closed, C} ->
-            catch gen_tcp:close(Srv),
+            try gen_tcp:close(Srv) catch _:_ -> ok end,
             ok;
         {tcp_closed, Srv} ->
-            catch gen_tcp:close(C),
+            try gen_tcp:close(C) catch _:_ -> ok end,
             ok;
         {tcp_error, _Sock, _Reason} ->
-            catch gen_tcp:close(C),
-            catch gen_tcp:close(Srv),
+            try gen_tcp:close(C) catch _:_ -> ok end,
+            try gen_tcp:close(Srv) catch _:_ -> ok end,
             ok
     end.
 

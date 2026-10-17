@@ -33,9 +33,7 @@ cpu_times_ms(PgDataDir) ->
             {error, nil};
         {ok, Contents} ->
             [FirstLine | _] = binary:split(Contents, <<"\n">>),
-            case catch binary_to_integer(FirstLine) of
-                {'EXIT', _} ->
-                    {error, nil};
+            try binary_to_integer(FirstLine) of
                 Postmaster ->
                     case ps_tree_seconds() of
                         {error, nil} -> {error, nil};
@@ -44,6 +42,8 @@ cpu_times_ms(PgDataDir) ->
                             Total = lists:sum([cpu_seconds_of(P, Tree) || P <- Pids]),
                             {ok, round(Total * 1000)}
                     end
+            catch
+                error:_ -> {error, nil}
             end
     end.
 
@@ -60,11 +60,11 @@ ps_tree_seconds() ->
 parse_ps_line(Line) ->
     case string:tokens(Line, " \t") of
         [PidStr, PPidStr, TimeStr] ->
-            case {catch list_to_integer(PidStr), catch list_to_integer(PPidStr)} of
-                {Pid, PPid} when is_integer(Pid), is_integer(PPid) ->
-                    {true, {Pid, PPid, parse_ps_time(TimeStr)}};
-                _ ->
-                    false
+            try {list_to_integer(PidStr), list_to_integer(PPidStr)} of
+                {Pid, PPid} ->
+                    {true, {Pid, PPid, parse_ps_time(TimeStr)}}
+            catch
+                error:_ -> false
             end;
         _ ->
             false
@@ -98,18 +98,14 @@ parse_ps_time(TimeStr) ->
         + safe_seconds(SecondsPart).
 
 safe_int(S) ->
-    case catch list_to_integer(S) of
-        {'EXIT', _} -> 0;
-        N -> N
-    end.
+    try list_to_integer(S)
+    catch error:_ -> 0 end.
 
 %% The seconds segment alone may be `"SS.ff"` (a float) or plain `"SS"` (an
 %% integer) -- tries both rather than assuming either.
 safe_seconds(S) ->
-    case catch list_to_float(S) of
-        {'EXIT', _} -> safe_int(S) * 1.0;
-        F -> F
-    end.
+    try list_to_float(S)
+    catch error:_ -> safe_int(S) * 1.0 end.
 
 descendants(Pid, Tree, Acc) ->
     Children = [P || {P, PPid, _} <- Tree, PPid =:= Pid, not lists:member(P, Acc)],

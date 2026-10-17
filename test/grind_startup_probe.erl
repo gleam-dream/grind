@@ -46,7 +46,7 @@ late_type_writer_drain({pool, Name}, Close) ->
         assert_clean(Name),
         true
     after
-        catch erlang:resume_process(Tree)
+        try erlang:resume_process(Tree) catch _:_ -> ok end
     end.
 
 late_query_writer_drain({pool, Name}, Close, KillCaller) ->
@@ -91,7 +91,7 @@ late_query_writer_drain({pool, Name}, Close, KillCaller) ->
         assert_clean(Name),
         true
     after
-        catch exit(Caller, kill),
+        try exit(Caller, kill) catch _:_ -> ok end,
         int:no_break(pgo_query_cache),
         int:n(pgo_query_cache),
         false = lists:member(pgo_query_cache, int:interpreted()),

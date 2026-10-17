@@ -161,8 +161,8 @@ terminate(_Reason, State = #owner{name = Name, pool = Pool}) ->
             case whereis(Name) of
                 undefined ->
                     %% Pinned pg_types/pgo private table and key layouts.
-                    catch ets:match_delete(pg_types_table, {{Name, '_'}, '_'}),
-                    catch ets:match_delete(pgo_query_cache, {{Name, '_'}, '_'});
+                    try ets:match_delete(pg_types_table, {{Name, '_'}, '_'}) catch _:_ -> ok end,
+                    try ets:match_delete(pgo_query_cache, {{Name, '_'}, '_'}) catch _:_ -> ok end;
                 _ -> ok
             end,
             persistent_term:erase({grind_pg_deadline, Name});

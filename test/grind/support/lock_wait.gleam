@@ -153,11 +153,13 @@ pub fn await_overlap_shape(
 
 /// The exact query text `grind/internal/unique_admission`'s `insert_job`
 /// issues, as a `LIKE` prefix for `await_overlap_shape`/`pg_stat_activity`.
-pub const unique_insert_query_like = "INSERT INTO grind_jobs (queue, worker_id, worker_version, input_version%"
+pub const unique_insert_query_like =
+  "INSERT INTO grind_jobs (queue, worker_id, worker_version, input_version%"
 
 /// The exact query text `grind/internal/unique_admission`'s `acquire_lock`
 /// issues, as a `LIKE` prefix for `await_overlap_shape`/`pg_stat_activity`.
-pub const unique_domain_lock_query_like = "SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended%"
+pub const unique_domain_lock_query_like =
+  "SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended%"
 
 /// The domain-wide uniqueness advisory lock's own SQL and parameters (`@internal
 /// unique_admission.lock_key_sql`), built from a worker/input pair exactly the

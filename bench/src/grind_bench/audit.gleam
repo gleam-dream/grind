@@ -33,7 +33,8 @@ import pog
 /// with `grind/internal/terminal.states_sql`'s own list; this is exactly the
 /// concern `grind_migrations_conformance_test` etc. already guard on the
 /// grind side, not something bench needs to re-guard.
-const terminal_states_sql = "'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'discarded', 'cancelled'"
+const terminal_states_sql =
+  "'succeeded', 'business_failed', 'runtime_failed', 'contract_mismatch', 'discarded', 'cancelled'"
 
 pub type Violation {
   /// I1a: a ledger-recorded submission whose `job_id` no longer has a
