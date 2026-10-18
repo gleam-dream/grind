@@ -40,7 +40,7 @@ trap cleanup EXIT
 # can never be silently reused even when the manifest itself is correct.
 # This does cost a full rebuild on every gate run; accepted as the simplest
 # guard that cannot itself drift from how `gleam` actually tracks its cache.
-for manifest in "$repo_root/manifest.toml" "$repo_root/consumer/manifest.toml"; do
+for manifest in "$repo_root/manifest.toml" "$repo_root/consumer/manifest.toml" "$repo_root/examples/usage/manifest.toml"; do
   if grep -E '^\s*\{ name = "pog",' "$manifest" | grep -qv 'source = "hex"'; then
     echo "$manifest resolves pog from a non-Hex source; refusing to run the gate against a forked dependency" >&2
     exit 1
@@ -48,7 +48,7 @@ for manifest in "$repo_root/manifest.toml" "$repo_root/consumer/manifest.toml"; 
 done
 # Preserve only configuration fingerprints to avoid redundant Hex resolution.
 # Downloaded source, packages.toml and all compiled output are still discarded.
-python3 "$repo_root/scripts/prepare-dependencies.py" --clean "$repo_root" "$repo_root/consumer"
+python3 "$repo_root/scripts/prepare-dependencies.py" --clean "$repo_root" "$repo_root/consumer" "$repo_root/examples/usage"
 
 if pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
   echo "port $port is already in use; refusing to use a non-disposable database" >&2
@@ -90,6 +90,8 @@ createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_future_foreign
 createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_shape
 createdb -h 127.0.0.1 -p "$port" -U grind grind_schema_mixed_case
 createdb -h 127.0.0.1 -p "$port" -U grind grind_consumer_test
+createdb -h 127.0.0.1 -p "$port" -U grind grind_usage_test
+createdb -h 127.0.0.1 -p "$port" -U grind grind_usage_cigogne
 createdb -h 127.0.0.1 -p "$port" -U grind grind_repeatable_read_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_quarantine_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_fault_proxy
@@ -249,6 +251,23 @@ consumer_bad_url="postgres://grind@127.0.0.1:$port/grind_database_missing?sslmod
 for contract in consumer-resolution-transaction-passed consumer-observes-capacity-passed two-worker-consumer-passed consumer-storage-failure-passed consumer-retry-and-cancellation-passed consumer-uncertainty-audited-recovery-passed consumer-cancellation-preserves-uncertainty-passed consumer-unique-admission-existing-conflict-retry-passed consumer-unique-reschedule-across-queues-passed consumer-observes-acknowledged-passed consumer-observes-claimed-passed consumer-submit-with-id-retry-passed consumer-prune-finished-passed consumer-validating-codec-passed consumer-submit-in-passed consumer-observes-context-passed consumer-testing-support-passed consumer-shared-pool-passed consumer-schema-not-migrated-passed consumer-statistics_a-passed consumer-statistics_pages-passed consumer-statistics_due-passed consumer-statistics_outcomes-passed consumer-statistics_executing-passed consumer-statistics_transaction-passed consumer-statistics_locked-passed consumer-statistics_clock-passed consumer-statistics_unknown-passed; do
   if ! grep -q "$contract" "$root/consumer-test-ran"; then
     echo "external-consumer integration contract did not execute: $contract" >&2
+    exit 1
+  fi
+done
+
+# The usage examples under examples/usage are compiled and run as a test suite.
+# Every topic must reach its last assertion, so a renamed or removed API fails
+# here instead of leaving a stale example behind.
+(
+  cd "$repo_root/examples/usage"
+  GRIND_USAGE_DATABASE_URL="postgres://grind@127.0.0.1:$port/grind_usage_test?sslmode=disable" \
+  GRIND_USAGE_CIGOGNE_DATABASE_URL="postgres://grind@127.0.0.1:$port/grind_usage_cigogne?sslmode=disable" \
+  GRIND_USAGE_TEST_MARKER="$root/usage-test-ran" \
+    gleam test
+)
+for contract in usage-limits-passed usage-handler-testing-offline-passed usage-workers-passed usage-jobs-passed usage-transactions-passed usage-runtime-passed usage-handlers-passed usage-handler-testing-passed usage-isolation-passed usage-observations-passed usage-uniqueness-passed usage-uncertain-passed usage-retention-passed usage-migrations-passed usage-cigogne-passed; do
+  if ! grep -q "$contract" "$root/usage-test-ran"; then
+    echo "usage example did not execute: $contract" >&2
     exit 1
   fi
 done

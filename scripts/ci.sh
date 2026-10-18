@@ -22,7 +22,7 @@ fast() {
   mapfile -d '' shell_files < <(git ls-files -z -- '*.sh')
   shellcheck "${shell_files[@]}"
   ruff check scripts bench resilience oracle --exclude oracle/deps --exclude oracle/_build
-  for project in . consumer bench resilience; do
+  for project in . consumer examples/usage bench resilience; do
     (cd "$project" && gleam build --warnings-as-errors)
   done
   bootstrap_oracle
@@ -35,6 +35,8 @@ fast() {
       if [[ -n "$name" ]]; then unset "$name"; fi
     done <<< "$test_variables"
     gleam test
+    # The examples' offline topics; the database topics run in the full gate.
+    (cd examples/usage && gleam test)
   )
   python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
   python3 -B -m unittest discover -s resilience -p 'test_*.py' -v

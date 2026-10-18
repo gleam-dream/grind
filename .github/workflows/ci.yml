@@ -41,6 +41,7 @@ jobs:
           projects: |
             .
             consumer
+            examples/usage
             bench
             resilience
             ../sinal

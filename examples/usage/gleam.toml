@@ -1,0 +1,21 @@
+name = "grind_usage"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.18.0"
+licenses = ["Apache-2.0"]
+description = "Compiled, runnable usage examples for Grind, one module per topic."
+
+[dependencies]
+grind = { path = "../.." }
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
+gleam_json = ">= 3.1.0 and < 4.0.0"
+gleam_time = ">= 1.0.0 and < 2.0.0"
+exception = ">= 2.1.1 and < 3.0.0"
+pog = ">= 4.1.0 and < 4.2.0"
+cigogne = ">= 5.0.6 and < 6.0.0"
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "9727f9baab6ed4f796780a0c3a1027c3292c5fc7" }
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
