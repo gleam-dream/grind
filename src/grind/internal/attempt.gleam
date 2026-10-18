@@ -580,9 +580,8 @@ fn claim_registered_job(
   // here would otherwise make a claim spuriously contend
   // (`AdmissionContended`) with an unrelated admission reading the exact
   // same row for a reason that was never actually incompatible with this
-  // claim's own write. See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission
-  // transaction" step 6, for the full contention picture across claim,
-  // cancel, and quarantine.
+  // claim's own write. See the "Admission and uniqueness" design section
+  // for the full contention picture across claim, cancel, and quarantine.
   let sql =
     "WITH candidate AS (SELECT id, state AS previous_state FROM grind_jobs WHERE queue = $1 AND "
     <> eligible_state

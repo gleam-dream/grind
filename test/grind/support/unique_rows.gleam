@@ -22,7 +22,7 @@ pub fn raw_input_decoder() -> decode.Decoder(RawInput) {
   decode.success(RawInput(json.null()))
 }
 
-// -- Uniqueness increments 4-7 (queue scope, state eligibility, period
+// -- Shared uniqueness helpers (queue scope, state eligibility, period
 // boundaries at database time, receipts/idempotency) -----------------------
 //
 // Shared helpers for forcing a persisted column via raw SQL and for counting
@@ -84,7 +84,7 @@ pub fn job_available_at_ms(connection: pog.Connection, job_id: Int) -> Int {
 }
 
 /// Forces a row's `available_at` to a due (past) database time directly,
-/// leaving `state` untouched — used by the Increment 10 reschedule/claim race
+/// leaving `state` untouched — used by the reschedule/claim race
 /// test to make a genuinely `scheduled` row immediately claimable without
 /// waiting on wall-clock time, so the only real synchronization point in that
 /// test is the barrier-forced lock overlap itself.

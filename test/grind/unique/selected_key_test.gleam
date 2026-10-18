@@ -11,7 +11,7 @@ import grind/support/unique_rows.{
   type RawInput, RawInput, encode_raw_input, raw_input_decoder,
 }
 
-// -- Uniqueness increment 12 (selected keys) ---------------------------------
+// -- Selected keys -----------------------------------------------------------
 //
 // `unique.selected` projects part of an admitted input into its own key,
 // encoded with its own codec, independently of the rest of the input. These
@@ -231,7 +231,7 @@ fn run_submit_unique_selected_key_containment_test(
 
   // A subset projected value never conflicts with a stored superset: a
   // selected key compares by exact equality, the same as a full-input key
-  // (https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md, Decision 2) -- a deliberate departure from
+  // (see the "Admission and uniqueness" design section) -- a deliberate departure from
   // Oban's own containment semantics for a selected-field comparison.
   let assert Ok(submission.Inserted(_)) =
     submit_keep_existing(

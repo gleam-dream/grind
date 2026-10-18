@@ -135,7 +135,7 @@ fn run_submit_with_id_different_input_conflict_test(
 
 /// A genuinely committed plain admission whose reply is lost after
 /// PostgreSQL has already committed locally (the same SyncRep-park-then-
-/// terminate mechanism Increment 2/11 use), scoped on `grind_unique_submissions`
+/// terminate mechanism the acknowledgement and admission lost-reply tests use), scoped on `grind_unique_submissions`
 /// by `submission_id` — the same receipt table `submit_unique` uses, since
 /// `submit_with_id` reuses it directly. `submit_with_id` itself still
 /// returns `Ok(Inserted(handle))`, resolved by the shared `run`'s own

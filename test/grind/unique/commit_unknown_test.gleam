@@ -24,13 +24,13 @@ import grind/support/unique_rows.{
 }
 import pog
 
-// -- Increment 11: uncertain admission commits -------------------------------
+// -- Uncertain admission commits ---------------------------------------------
 //
-// Full contract: `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission transaction" (the
+// Full contract: the "Admission and uniqueness" design section (the
 // `pog.TransactionQueryError` classification and `CommitUnknown`/
 // `reconcile_unique`). `install_syncrep_reply_trigger` above is generalized
-// (table + predicate) so the same mechanism Increment 2 proved for the
-// acknowledgement path proves the same claims here, scoped by
+// (table + predicate) so the same mechanism the acknowledgement lost-reply
+// tests use proves the same claims here, scoped by
 // `submission_id` on `grind_unique_submissions` rather than a
 // server-generated `job_id` — the submission id is chosen by the caller and
 // known before the admission transaction that would create a job id even
@@ -42,8 +42,7 @@ import pog
 /// pool could not hand out a connection at all, so `BEGIN` never ran) is
 /// reported directly as `NotCommitted(ConnectionUnavailable)`, with no
 /// `PendingSubmission` constructed and no receipt lookup attempted — this is
-/// knowably not-committed, not merely uncertain. See
-/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, Increment 11, for why this needed its own
+/// knowably not-committed, not merely uncertain. This needed its own
 /// FFI wrapper distinguishing a checkout failure from `run`'s other,
 /// genuinely uncertain `pog.TransactionQueryError` case (case (d) below).
 /// Reopening the same pool name and retrying the identical `SubmissionId` —
@@ -225,8 +224,8 @@ fn run_unique_aborted_commit_test(database_url: String) -> Nil {
   // of that connection is a real, transient recovery window (not a
   // steady-state failure), matching every other terminate-then-retry test
   // in this file — `run_ack_commit_connection_loss_test`'s own
-  // `retry_transient_query` (documented `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`,
-  // "Acknowledgement deadline") is the pattern this test was previously
+  // `retry_transient_query` (see the "Attempts and acknowledgements" design
+  // section) is the pattern this test was previously
   // missing, which is exactly why it flaked under load: a plain,
   // unretried call here could observe `QueryTimeout`/`ConnectionUnavailable`
   // during that same window instead of the deterministic recovered state.
@@ -253,7 +252,7 @@ fn run_unique_aborted_commit_test(database_url: String) -> Nil {
 
 /// (c) A genuinely committed admission whose reply is lost after PostgreSQL
 /// has already committed locally (the same SyncRep-park-then-terminate
-/// mechanism Increment 2 uses for the acknowledgement path).
+/// mechanism the acknowledgement path's lost-reply test uses).
 /// `submit_unique` itself still returns `Ok(Inserted(handle))` — resolved by
 /// the follow-up receipt lookup `run` performs on a fresh connection after
 /// the connection loss, not a `CommitUnknown` the caller must separately
@@ -355,9 +354,8 @@ fn run_unique_committed_reply_lost_test(database_url: String) -> Nil {
 /// same `TransactionQueryError` shape a genuinely uncertain mid-transaction
 /// loss produces — R1 alone would have made every checkout failure
 /// (including (a) above) report `CommitUnknown` too, imprecisely; R2
-/// restores (a)'s precise `NotCommitted`. See
-/// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` for the red-before-fix output and the R1
-/// mutation that reverts to the bug.
+/// restores (a)'s precise `NotCommitted`. The R1 mutation that reverts to
+/// the bug turns this test red.
 ///
 /// With the fix: `submit_unique` reports `CommitUnknown(pending)`.
 /// `reconcile_unique(reopened, pending)` while the zombie is still parked is

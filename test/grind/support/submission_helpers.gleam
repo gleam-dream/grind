@@ -2,10 +2,9 @@ import grind/internal/postgres
 import grind/internal/submission
 import grind/internal/worker
 
-// -- Decision B (2026-09-25): retry-safe plain submit (`submit_with_id`) ----
+// -- Retry-safe plain submit (`submit_with_id`) -----------------------------
 //
-// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md`, "Retry-safe plain submit", and
-// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission receipts". Plain `submit`/
+// Admission receipts are described in the "Admission and uniqueness" design section. Plain `submit`/
 // `submit_at` have no request identity, so a caller that retries after
 // `SubmitQueryFailed` (which may itself have committed) risks a duplicate
 // row. `submit_with_id` reuses `submit_unique`'s own admission receipt,

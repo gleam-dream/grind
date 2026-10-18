@@ -545,10 +545,10 @@ fn run_claimed_precedes_acknowledged_test(database_url: String) -> Nil {
   mark_database_test_executed("claimed-precedes-acknowledged-ordering-passed")
 }
 
-// -- Decision A (2026-09-25): cross-version quarantine coverage -------------
+// -- Cross-version quarantine coverage --------------------------------------
 //
-// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md`, "Old-version executing rows". Before this
-// decision, a consumer's per-poll quarantine scan (`claim_one`, via
+// Old-version executing rows. Before the scan covered every version, a
+// consumer's per-poll quarantine scan (`claim_one`, via
 // `quarantine_expired_in_queue`) only ever considered rows whose
 // `(worker_id, worker_version)` the polling consumer itself registered, so
 // after a worker-version bump an old version's still-`executing` row (its

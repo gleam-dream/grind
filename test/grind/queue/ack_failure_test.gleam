@@ -474,7 +474,7 @@ fn kill_ack_backends_until_uncertain(
   }
 }
 
-/// Increment 2: a genuinely successful ack whose reply is lost after
+/// A genuinely successful ack whose reply is lost after
 /// PostgreSQL has already committed locally. The disposable cluster is
 /// started with `synchronous_standby_names=grind_never_standby` and
 /// `synchronous_commit=local` (scripts/test-postgres.sh), so an ordinary

@@ -185,8 +185,8 @@ pub type SubmitError(input, output, error) {
   /// implied. For `submit_unique` this is the domain-wide advisory lock;
   /// `submit_with_id` has no such lock, but the same bound also caps its
   /// internal wait on the `grind_unique_submissions` primary key when a
-  /// concurrent same-id writer's insert is still uncommitted (see
-  /// `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, "Admission receipts").
+  /// concurrent same-id writer's insert is still uncommitted (see the
+  /// "Admission and uniqueness" design section).
   AdmissionContended
   /// This `SubmissionId` was already used for a request that does not match
   /// this one (from `submit_unique`'s or `submit_with_id`'s own

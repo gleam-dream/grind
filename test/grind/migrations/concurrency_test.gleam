@@ -229,9 +229,8 @@ fn migration_lock_url() -> Result(String, Nil)
 /// wait out the full default) — proving `migrate_with` bounds each step by
 /// `Settings.migration_deadline_ms`, via `grind_postgres_ffi:
 /// migration_transaction_safely/3`'s own explicit checkout deadline, not by
-/// the pool's shared `set_deadline`-attached one. See
-/// https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md, "Acknowledgement deadline", for the mutation
-/// this characterizes: a step run under the pool's shared deadline instead
+/// the pool's shared `set_deadline`-attached one. This characterizes a
+/// mutation: a step run under the pool's shared deadline instead
 /// of its own times out at ~4s instead of succeeding at ~6s.
 fn synthetic_v14_slow_migration() -> migrations.Migration {
   migrations.Migration(
@@ -323,8 +322,8 @@ pub fn postgres_migration_step_lock_timeout_returns_lock_unavailable_test() {
 /// not have to wait out the 30000ms default; it stays well under
 /// `spawn_lock_holder`'s own plain, unwrapped `pog.transaction` — bound by
 /// pog's own hardcoded ~5000ms checkout hold time exactly like the
-/// pre-Increment-15 acknowledgement path was (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`,
-/// "Acknowledgement deadline") — which would otherwise auto-release the
+/// acknowledgement path was before it carried its own checkout deadline —
+/// which would otherwise auto-release the
 /// observer's own lock before a longer deadline ever had a chance to fire.
 /// Named mutation, also this change's own red-first evidence (this is
 /// exactly the code shape before this fix): temporarily removing
@@ -332,7 +331,7 @@ pub fn postgres_migration_step_lock_timeout_returns_lock_unavailable_test() {
 /// makes this exact scenario instead block on the table lock until
 /// `main_database`'s 3500ms `migration_deadline_ms` force-closes the
 /// connection, reporting `MigrationCommitUnknown(13)` instead — confirmed
-/// empirically (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` has the observed timings).
+/// empirically.
 fn run_migration_step_lock_timeout_test(database_url: String) -> Nil {
   let assert Ok(main_validated) =
     postgres.settings(database_url)

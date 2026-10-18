@@ -96,7 +96,7 @@ pub fn wait_for_syncrep_trigger_backend(
 
 /// Fails clearly, instead of an opaque `let assert` mismatch far from the
 /// real cause, when the disposable cluster was not started the way the
-/// Increment 2 lost-reply tests require it. Without
+/// lost-reply tests require it. Without
 /// `synchronous_standby_names=grind_never_standby`, a transaction that
 /// raises its own `synchronous_commit` to `on` would either commit
 /// immediately (a real standby present) or never proceed past `SyncRep` at

@@ -19,11 +19,10 @@ import grind/support/submissions.{submit_keep_existing, unique_test_worker}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_databases}
 import pog
 
-// -- Increment 8: concurrent admission under a forced barrier --------------
+// -- Concurrent admission under a forced barrier ---------------------------
 //
-// See `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, Increment 8, for the mutation evidence
-// (a genuine red run with the domain lock skipped, and one with the lock
-// key widened to include the queue) these tests were checked against.
+// These tests were checked against two mutations: a genuine red run with the
+// domain lock skipped, and one with the lock key widened to include the queue.
 
 /// Three `submit_unique` calls, same key, `KeepExisting`, distinct
 /// `SubmissionId`s, from three separate pools, forced to actually overlap by
@@ -179,7 +178,7 @@ fn run_unique_concurrent_overlap_test(database_url: String) -> Nil {
 }
 
 /// The uniqueness domain lock key deliberately excludes queue
-/// (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, admission transaction step 3), so a
+/// (see the "Admission and uniqueness" design section), so a
 /// `WithinQueue` submission in one queue and an `AcrossQueues` submission in
 /// another, on the same key, still serialize against each other: one row,
 /// not two.
@@ -277,8 +276,8 @@ fn run_unique_concurrent_mixed_scope_test(database_url: String) -> Nil {
   // fixes the order without weakening the concurrency being proved: B still
   // arrives while A's insert transaction is genuinely open and still needs
   // the same domain lock A holds, which is exactly what the lock key
-  // excluding queue (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, admission transaction
-  // step 2) is being proved to guarantee.
+  // excluding queue (see the "Admission and uniqueness" design section) is
+  // being proved to guarantee.
   await_overlap_shape(
     barrier_connection,
     unique_insert_query_like,
@@ -326,7 +325,7 @@ fn run_unique_concurrent_mixed_scope_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-concurrent-mixed-scope-passed")
 }
 
-/// Increment 8's deferred receipt-ordering evidence: submitter A commits its
+/// Receipt-ordering evidence: submitter A commits its
 /// `Inserted` decision (and its receipt) while submitter B — the *same*
 /// `SubmissionId` and the same request — is still waiting on the domain
 /// lock A holds. Once A releases, B must return A's recorded `Inserted`

@@ -37,7 +37,7 @@ import pog
 /// A synthetic `v13` (one past the real, current latest `v12`) used only by
 /// the upgrade harness below: adds a nullable column and an index on it to
 /// `grind_jobs`, the shape of change the design calls out
-/// (`https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md`, "Migration mechanism") as the one most
+/// (the "Storage and migrations" design section) as the one most
 /// likely to interact badly with rows a previous release already wrote —
 /// layered on top of the real `v12` (`finished_at`) this harness now also
 /// exercises for real, rather than only against a synthetic stand-in.
@@ -264,7 +264,7 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
     |> pog.parameter(pog.int(succeeded_attempt_id))
     |> pog.execute(on: upgrade_connection)
 
-  // Increment 25: seeds one orphaned receipt per receipt table — a
+  // Seeds one orphaned receipt per receipt table — a
   // `job_id` that never existed in `grind_jobs` at all, exactly what a
   // database that has been running a while under `v11` (no foreign key
   // enforcing this) could already carry for reasons unrelated to this
@@ -580,8 +580,8 @@ fn job_id_for_queue(
   })
 }
 
-/// The genuine lost-reply gap named in `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md`
-/// ("Migration gaps"): every other `reconcile_unique` lost-reply test in
+/// The genuine lost-reply gap across a schema upgrade: every other
+/// `reconcile_unique` lost-reply test in
 /// this file proves the mechanism against a stable, already-latest schema.
 /// This one proves it survives a real schema upgrade landing *between* the
 /// lost reply and the reconciliation call — the exact interaction a caller
@@ -591,7 +591,7 @@ fn job_id_for_queue(
 ///
 /// (a) Genuinely committed, reply lost — the same deferred-constraint
 /// `synchronous_commit` trigger `run_unique_committed_reply_lost_store_unavailable_test`
-/// uses (Increment 11), not the TCP fault proxy: **empirically, the TCP
+/// uses, not the TCP fault proxy: **empirically, the TCP
 /// proxy's `OnCommit`/`DropReply` does not produce this half for
 /// `submit_unique`.** Traced with `pg_stat_activity` while debugging this
 /// test: the admission transaction's own final `commit` reliably parks the
@@ -612,8 +612,8 @@ fn job_id_for_queue(
 /// document their own non-determinism (sometimes a transparent recovery,
 /// sometimes `QueueAckUnknown`) rather than a guaranteed commit either.
 /// Documented here rather than silently worked around, matching this
-/// codebase's own practice (see `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`, Increment 33,
-/// "two findings ... rest on premises that did not hold empirically").
+/// codebase's own practice of recording a finding whose premise did not
+/// hold empirically.
 ///
 /// (b) Genuinely never reaches PostgreSQL — the real TCP fault proxy
 /// (`test/grind_fault_proxy.erl`, the same mechanism

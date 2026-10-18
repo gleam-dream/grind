@@ -346,13 +346,13 @@ fn run_missing_schema_artifact_test(
   missing.rows |> should.equal([True])
 }
 
-/// Increment 25: `v12_foreign_keys` extends the physical-shape check with a
+/// `v12_foreign_keys` extends the physical-shape check with a
 /// `pg_constraint` lookup independent of `v12_shape`'s own `pg_class`
 /// relation check (a plain foreign key backs no relation of its own) — a
 /// database missing one of `grind_v12`'s three `ON DELETE CASCADE`
 /// constraints (dropped by hand, here) must fail closed exactly like a
 /// missing relation does, not silently pass as though the receipt-orphan
-/// backstop `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md` Increment 24 describes were still
+/// backstop were still
 /// in place.
 pub fn postgres_migration_missing_foreign_key_shape_detected_test() {
   case schema_missing_fk_url() {
@@ -705,7 +705,7 @@ fn run_missing_relation_shape_test(database_url: String) -> Nil {
 /// `MigrationStepFailed(12, _)` message, and the schema marker stays at 11
 /// (this step's own transaction rolled back cleanly, never partially
 /// applied) — see `v12_statements`'s own doc comment, "Dropping
-/// `storage_owner`", and `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RECOVERY-EVIDENCE.md`.
+/// `storage_owner`".
 pub fn postgres_migration_submission_collision_detected_test() {
   case migration_collision_submissions_url() {
     Error(Nil) -> Nil
@@ -725,7 +725,7 @@ fn run_migration_submission_collision_test(database_url: String) -> Nil {
   )
   // A real `grind_jobs` row per side: `v12_statements`'s own orphan cleanup
   // (`DELETE FROM grind_unique_submissions r WHERE NOT EXISTS (SELECT 1 FROM
-  // grind_jobs j WHERE j.id = r.job_id)`, Increment 25) runs *before* the
+  // grind_jobs j WHERE j.id = r.job_id)`) runs *before* the
   // collision `DO` block, so a receipt naming a `job_id` with no real row
   // would otherwise be silently swept away as an orphan before the
   // collision it seeds is ever checked — this bit this exact test on its
@@ -828,7 +828,7 @@ fn should_contain(haystack: String, needle: String) -> Nil {
 /// (`storage_owner` still `NOT NULL`, no default) and returns its id — used
 /// by the migration-collision tests so their own seeded receipt rows name a
 /// `job_id` that genuinely exists, never an orphan `v12_statements`'s own
-/// cleanup `DELETE` (Increment 25) would otherwise remove before the
+/// cleanup `DELETE` would otherwise remove before the
 /// collision `DO` block ever runs.
 fn seed_legacy_job(connection: pog.Connection, storage_owner: String) -> Int {
   let query =

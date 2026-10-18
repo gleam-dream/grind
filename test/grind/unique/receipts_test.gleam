@@ -17,7 +17,7 @@ import grind/support/submissions.{submit_keep_existing, unique_test_worker}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{force_job_state, force_job_timestamp}
 
-/// Increment 7(a): the same `SubmissionId` with the same request, retried
+/// The same `SubmissionId` with the same request, retried
 /// after the original row genuinely succeeded and its short period has
 /// elapsed, returns the original `Inserted` handle (same job id) from the
 /// receipt — not a second row (which a fresh, receipt-blind candidate
@@ -91,7 +91,7 @@ fn run_receipt_idempotent_replay_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-receipt-idempotent-replay-passed")
 }
 
-/// Increment 7(b): the same `SubmissionId` with a different input conflicts.
+/// The same `SubmissionId` with a different input conflicts.
 pub fn postgres_submit_unique_receipt_replay_with_different_input_conflicts_test() {
   case database_url() {
     Error(Nil) -> Nil
@@ -207,7 +207,7 @@ fn run_reconcile_unique_mismatched_pending_test(database_url: String) -> Nil {
   )
 }
 
-/// Increment 7(c): a replayed `Existing` decision returns the observed state
+/// A replayed `Existing` decision returns the observed state
 /// recorded in the receipt at decision time, not the row's current
 /// (possibly since-progressed) state.
 pub fn postgres_submit_unique_receipt_replay_returns_originally_observed_state_test() {
@@ -277,7 +277,7 @@ fn run_receipt_replay_observed_state_test(database_url: String) -> Nil {
   )
 }
 
-/// Increment 7(d), proving R2 (Decision 9): replaying the same
+/// Replaying the same
 /// `SubmissionId` and input against a worker whose output codec version has
 /// changed conflicts, rather than returning a handle bound to a different
 /// codec than the one it was originally admitted under.

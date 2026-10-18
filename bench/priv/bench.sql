@@ -1,5 +1,5 @@
 -- Bench-owned ledger schema. Deliberately never the Grind installation's own
--- schema (see bench/README-shaped module docs and AGENTS.md's SQL split):
+-- schema (see AGENTS.md's SQL split):
 -- this DDL lives entirely under a separate PostgreSQL schema (by default
 -- `grind_bench`) so a bench run's own bookkeeping can never collide with, or
 -- be mistaken for, Grind's own `grind_jobs` and receipt tables, which live

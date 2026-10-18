@@ -10,7 +10,7 @@ import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{force_job_timestamp}
 import pog
 
-/// Increment 6(a): the shared `@internal` period predicate at an exact
+/// The shared `@internal` period predicate at an exact
 /// database-time instant, against literal timestamps only (no table
 /// involved) — `now = ts + period` is inclusive (`true`); one microsecond
 /// later is not.
@@ -51,7 +51,7 @@ fn run_period_predicate_exact_instant_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-period-predicate-exact-instant-passed")
 }
 
-/// Increment 6(b): `FromInsertion` at the database clock, live through
+/// `FromInsertion` at the database clock, live through
 /// `submit_unique` (not the predicate alone) — 58 seconds inside a 60-second
 /// window still conflicts; 62 seconds outside it does not.
 pub fn postgres_submit_unique_from_insertion_period_matches_database_time_test() {
@@ -136,7 +136,7 @@ fn run_period_from_insertion_boundary_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-period-from-insertion-boundary-passed")
 }
 
-/// Increment 6(c): `FromSchedule`, "compared to the scheduled time" (Oban's
+/// `FromSchedule`, "compared to the scheduled time" (Oban's
 /// own framing) — a row whose `available_at` is 121 seconds in the past no
 /// longer conflicts under a 120-second period; 119 seconds still does.
 pub fn postgres_submit_unique_from_schedule_period_past_boundary_test() {
@@ -224,7 +224,7 @@ fn run_period_from_schedule_past_boundary_test(database_url: String) -> Nil {
   )
 }
 
-/// Increment 6(d): a future `FromSchedule` deadline extends the occupancy
+/// A future `FromSchedule` deadline extends the occupancy
 /// window well beyond what the same period length would already have let
 /// expire under `FromInsertion` — the same row, the same 60-second period,
 /// inserted 5 minutes ago (long past a `FromInsertion` window) but scheduled
@@ -319,7 +319,7 @@ fn run_period_from_schedule_future_extends_window_test(
   )
 }
 
-/// Increment 6(e): `while_retained()` has no time boundary at all — a row
+/// `while_retained()` has no time boundary at all — a row
 /// inserted a year ago still conflicts.
 pub fn postgres_submit_unique_while_retained_matches_a_year_old_row_test() {
   case database_url() {

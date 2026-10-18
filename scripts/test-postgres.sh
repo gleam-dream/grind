@@ -58,7 +58,7 @@ fi
 initdb -D "$cluster" --username=grind --auth-local=trust --auth-host=trust >/dev/null
 # grind_never_standby never connects, so ordinary commits (synchronous_commit=local)
 # stay local and fast; a test that raises its own transaction's synchronous_commit
-# back to "on" (see the Increment 2 lost-reply tests) will park in SyncRep until
+# back to "on" (see the lost-reply tests) will park in SyncRep until
 # something terminates that backend — raising it anywhere else would hang forever.
 pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port -k $root -c synchronous_standby_names=grind_never_standby -c synchronous_commit=local" -l "$root/postgres.log" start >/dev/null
 started=1
@@ -100,8 +100,7 @@ createdb -h 127.0.0.1 -p "$port" -U grind grind_migration_lock
 createdb -h 127.0.0.1 -p "$port" -U grind grind_prune_test
 createdb -h 127.0.0.1 -p "$port" -U grind grind_prune_owner_b
 createdb -h 127.0.0.1 -p "$port" -U grind grind_squirrel_check
-# Increment 26 (https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/RELEASE-READINESS.md, "Migration gaps"): cigogne
-# end-to-end (a fresh install cigogne itself applies, and its own
+# Cigogne end-to-end (a fresh install cigogne itself applies, and its own
 # concurrent-with-`migrate` serialization) plus the upgrade-harness genuine
 # lost-reply `reconcile_unique` scenario.
 createdb -h 127.0.0.1 -p "$port" -U grind grind_cigogne_e2e

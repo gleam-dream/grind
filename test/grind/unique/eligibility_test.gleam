@@ -16,7 +16,7 @@ import grind/support/submissions.{submit_keep_existing, unique_test_worker}
 import grind/support/unique_fixture.{unique_test_suffix, with_unique_database}
 import grind/support/unique_rows.{force_job_state}
 
-/// Increment 4: `WithinQueue` admits the same key independently in two
+/// `WithinQueue` admits the same key independently in two
 /// queues; `AcrossQueues` then conflicts with the earlier of the two rows
 /// (lowest id) regardless of which queue it lives in.
 pub fn postgres_submit_unique_respects_queue_scope_test() {
@@ -90,7 +90,7 @@ fn run_submit_unique_queue_scope_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-queue-scope-passed")
 }
 
-/// Increment 5(a): force each of the 11 persisted states by raw SQL and
+/// Force each of the 11 persisted states by raw SQL and
 /// assert each of the four named `States` groups' eligibility for it.
 type StateEligibility {
   StateEligibility(
@@ -217,7 +217,7 @@ fn run_state_eligibility_matrix_test(database_url: String) -> Nil {
   mark_database_test_executed("unique-state-eligibility-matrix-passed")
 }
 
-/// Increment 5(b): a live transition through a real, manually-driven
+/// A live transition through a real, manually-driven
 /// consumer — `Incomplete` sees the row while it is genuinely `queued`, then
 /// stops seeing it once the job has genuinely succeeded, while
 /// `IncompleteOrSucceeded` still matches the original succeeded row.

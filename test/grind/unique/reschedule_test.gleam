@@ -31,10 +31,10 @@ import grind/support/unique_rows.{
 }
 import pog
 
-// -- Increment 10: rescheduling ---------------------------------------------
+// -- Rescheduling -----------------------------------------------------------
 //
-// Full contract: `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`, `ConflictAction`,
-// `RescheduleScheduledTo`, and admission transaction steps 5-6.
+// Full contract: the "Admission and uniqueness" design section
+// (`ConflictAction`, `RescheduleScheduledTo`).
 // `postgres_submit_unique_reschedule_row_lock_contention_test` above already
 // proves lock contention on the reschedule candidate's row; the tests below
 // prove the reschedule decision itself (moving `available_at`, leaving other
@@ -271,8 +271,8 @@ fn run_unique_reschedule_claimable_test(database_url: String) -> Nil {
 /// The live race between a manual consumer's claim (which locks the
 /// scheduled row as part of its own claim `UPDATE`) and a concurrent
 /// `RescheduleScheduledTo` submission for the same key (whose candidate
-/// selection also locks that row, per `https://github.com/gleam-dream/grind/blob/510ca006d1af7ee35018676ee6aab026cc151b45/docs/UNIQUENESS-CONTRACT.md`'s
-/// admission transaction step 5). The claim is blocked mid-`UPDATE` — after
+/// selection also locks that row, per the "Admission and uniqueness" design
+/// section). The claim is blocked mid-`UPDATE` — after
 /// it has already locked the row via its own `FOR UPDATE SKIP LOCKED`
 /// candidate CTE, before it commits — by a `BEFORE UPDATE` trigger scoped to
 /// this job id (the same `grind_test_claim_overlap` shape
