@@ -26,7 +26,7 @@ pub fn postgres_two_schemas_share_a_database_but_stay_isolated_test() {
 
 /// Isolation between logically distinct Grind installations is the
 /// PostgreSQL schema (`search_path`) alone now — never a `storage_owner`
-/// column scoping rows within one shared schema; see README, "Isolation".
+/// column scoping rows within one shared schema; see `docs/design/design.typ`, "Installation isolation".
 /// Two roles sharing one physical database, each with its own like-named
 /// schema, prove this directly: `CREATE SCHEMA AUTHORIZATION <role>` gives
 /// each role its own private namespace, and `postgres.with_schema` pins
@@ -199,8 +199,7 @@ pub fn postgres_two_urls_to_the_same_schema_share_it_test() {
 /// genuinely the same schema, not merely "the same-looking URL" (the two
 /// URLs are asserted different first, so this is not a vacuous check).
 /// Isolation is the schema a pool's `search_path` actually resolves to,
-/// never a property of the connection string that reached it — see README,
-/// "Isolation". Deliberately never varies the hostname (`127.0.0.1` versus
+/// never a property of the connection string that reached it — see `docs/design/design.typ`, "Installation isolation". Deliberately never varies the hostname (`127.0.0.1` versus
 /// `localhost`, as an earlier version of this test did): that construction
 /// silently depended on `localhost` resolving to the same IPv4 loopback
 /// address this suite's disposable cluster binds, which is not guaranteed

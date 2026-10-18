@@ -125,8 +125,7 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
   // `storage_owner` still exists as a `NOT NULL` column (no default) on
   // this pre-migration v11 fixture schema exactly as v11 originally shipped
   // it (dropped only once `grind_v12` runs, below) — but today's
-  // application code never writes it at all any more (see README,
-  // "Isolation"), so `submit_unique`'s own `INSERT` below would otherwise
+  // application code never writes it at all any more (see `docs/design/design.typ`, "Installation isolation"), so `submit_unique`'s own `INSERT` below would otherwise
   // fail `23502 not_null_violation` against this exact table shape. Adding
   // a default here — a test-only convenience, not a change to the frozen
   // v11 definition `grind_migrations_conformance_test` checks byte-for-byte
@@ -148,7 +147,7 @@ fn run_upgrade_harness_test(upgrade_url: String, fresh_url: String) -> Nil {
   let legacy_worker = legacy_upgrade_worker()
   // Any non-empty literal works here now, since nothing reads it back: the
   // typed API no longer compares a row's owner to anything at all, only
-  // its queue/worker identity (see README, "Isolation").
+  // its queue/worker identity (see `docs/design/design.typ`, "Installation isolation").
   let storage_owner = "upgrade-legacy-owner"
 
   // Seeded via `submit_unique` itself, against the pre-migration v11
@@ -652,8 +651,7 @@ fn run_upgrade_reconcile_unique_lost_reply_test(direct_url: String) -> Nil {
     read_sql_statements_from_file("test/fixtures/schema/v11.sql"),
   )
   // Same test-only convenience `run_upgrade_harness_test` uses: today's
-  // application code never writes `storage_owner` at all (see README,
-  // "Isolation"), so `submit_unique`'s own `INSERT` below would otherwise
+  // application code never writes `storage_owner` at all (see `docs/design/design.typ`, "Installation isolation"), so `submit_unique`'s own `INSERT` below would otherwise
   // fail `23502 not_null_violation` against this exact pre-migration column
   // shape.
   let assert Ok(_) =

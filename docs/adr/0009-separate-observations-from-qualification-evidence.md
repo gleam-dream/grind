@@ -26,3 +26,5 @@ The following findings belong to the 2026-09-28 exploratory build, not a future 
 - A preceding day-long attempt failed after a 275-second host sleep and contributed no accepted elapsed time. Day-long endurance, encrypted network-fault paths and poolers remain unverified. The rejected partition adapter discarded bytes and stranded pgo waiting for ReadyForQuery; current directional partitions retain bounded bytes and forward them in order after healing.
 
 The harness bookkeeping pool once exhibited a deadline-message/restart noproc race under heavy parallel package gates. The current observer has a separate pool, bookkeeping uses a sixty-second timeout and bounded noproc recovery, and nonzero harness_pool_restart_retries invalidates measurement use. This rationale belongs here; the current run guide states the operational contract without retaining the failure diary.
+
+- **Retained results.** docs/BENCHMARKS.md holds the method, the validity rules and the dated summary of the 2026-09-28 measurements, and docs/ORACLE.md holds the oracle method. ADR-0019 records why both stay as documents.

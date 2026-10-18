@@ -35,7 +35,7 @@ createdb -h 127.0.0.1 -p "$port" -U grind grind_codegen
 # Grind's own migrations.gleam (src/grind/internal/migrations.gleam) is the
 # runtime source of truth; the cigogne-format files under priv/migrations
 # are a byte-identical mirror kept only so an application can apply Grind's
-# schema through cigogne (see README, "Migrations"). Apply their `up`
+# schema through cigogne (see `docs/design/design.typ`, "Migration execution"). Apply their `up`
 # sections here, in filename order, exactly as an application importing them
 # via cigogne would, so Squirrel inspects the same schema either way.
 up_sql="$root/schema-up.sql"

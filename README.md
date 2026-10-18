@@ -106,7 +106,8 @@ pub fn run_once(pool: pog.Config, email: Email) {
 ```
 
 The [compiled quick-start test](test/grind/facade/readme_test.gleam) retains the
-worker, codecs and supervised example. The [separate consumer](consumer/README.md)
+worker, codecs and supervised example. The [usage examples](examples/usage/README.md)
+cover each topic as code that compiles and runs, and the [separate consumer](consumer/README.md)
 exercises public APIs, typed failures, configuration and recovery.
 
 `submit` can fail before admission or return `CommitUnknown(pending)` after a
@@ -118,134 +119,80 @@ last storage read can extend beyond the wait budget.
 
 ## Runtime and recovery
 
-Grind owns the main pool and its supervised processes. Each used queue adds one
-reserved renewal connection. Applications can borrow `grind.connection(jobs)`;
-the pool remains valid only while Grind owns it. A runtime added with
-`grind.supervised` shuts down through the application supervisor. A runtime
-started with `grind.start` must be stopped with `grind.stop`.
+Grind owns the main pool and its supervised processes. Each used queue adds one reserved renewal connection. Applications can borrow `grind.connection(jobs)` while Grind owns the pool. A runtime added with `grind.supervised` shuts down through the application supervisor, and one started with `grind.start` needs `grind.stop`.
 
-Defaults include ten slots per queue per node, a thirty-second renewable lease,
-a fifteen-minute handler timeout, twenty business attempts, a 1 MiB payload
-limit, and pruning of finished jobs after seven days. The four-second storage
-deadline does not hard-bound a queued pool checkout. See the
-[full defaults](docs/USAGE.md#defaults) and [deadline limits](docs/USAGE.md#deadlines-and-capacity).
+An abandoned attempt is held `Uncertain` by default. Investigate the external effect, then confirm an outcome or authorize replay with `grind/admin`. Cancellation is cooperative and cannot retract an effect. Receipt recovery and submission deduplication end when a job is pruned. The defaults, deadline limits and operating obligations are defined in [the design](docs/design/design.typ) under "Public modules and defaults", "Runtime capacity and deadlines" and "Deployment obligations".
 
-An abandoned attempt is held `Uncertain` by default. Investigate the external
-effect before confirming an outcome or authorizing replay with `grind/admin`.
-Cancellation is cooperative and cannot retract an effect. Explicit uncertainty
-retains its evidence and cancellation intent in either order. Pending
-cancellation forbids replay but permits attributed terminal confirmation.
-[Resolution IDs](docs/USAGE.md#resolve-an-uncertain-job) identify one exact
-command across the installation; retain the ID and command when retrying.
-Receipt recovery and submission deduplication end when the job is pruned. See
-[operations](docs/OPERATIONS.md) for these recovery limits.
+## Usage
 
-## Business transactions
+Enqueue inside the application's own READ COMMITTED transaction. The reply means staged admission, not commit, and SERIALIZABLE and REPEATABLE READ transactions are refused:
 
-`admin.resolve_uncertain_in(jobs, tx, handle, resolution)` stages the same
-attributed resolution inside an application's open READ COMMITTED transaction.
-Use it when queue resolution and an application acknowledgment must commit
-together. It returns `Staged(Applied(state))` or `Staged(AlreadyApplied(state))`;
-the caller still owns commit, rollback and recovery if the commit reply is lost.
+```gleam
+pog.transaction(grind.connection(jobs), fn(tx) {
+  use _ <- result.try(orders.confirm(tx, order))
+  grind.submit_in(jobs, tx, job.new(receipt(), order.id) |> job.with_id(order.id))
+  |> result.map_error(ReceiptNotQueued)
+})
+```
 
-Keep provider investigation outside that transaction. Resolution caps PostgreSQL
-lock and statement timeouts by `with_statement_deadline`, preserves stricter
-caller settings, and restores the caller's settings after successful statements.
-Locks remain held until the outer transaction ends. A borrowed connection adds
-no checkout or network deadline, and staging emits no committed-resolution event.
-Propagate errors so the transaction owner rolls back all staged writes.
+Resolve an uncertain job after investigating its effect. The resolution ID names one exact command across the installation, so qualify it with the job ID and persist the command before applying it; `admin.resolve_uncertain_in` stages the same command inside a caller-owned transaction:
 
-The [separate public consumer](consumer/test/grind_consumer/resolution_transaction_test.gleam)
-demonstrates rollback, exact-command retry, cancellation, concurrent resolution,
-and durable application acknowledgment after lost commit replies and pruning.
-No migration is required. Existing missing history still requires investigation.
+```gleam
+let command = admin.resolution(
+  admin.ConfirmSuccess(receipt),
+  id: "job:" <> int.to_string(job.id(handle)) <> ":decision:" <> decision_id,
+  by: operator,
+  details: evidence,
+)
+admin.resolve_uncertain(jobs, handle, command)
+```
 
-`grind.submit_in(jobs, tx, job)` stages admission in the application's open
-READ COMMITTED transaction. The application owns business invariants, account
-locking, commit, and reconciliation after a lost commit reply. Grind rejects
-SERIALIZABLE and REPEATABLE READ transactions; it never lowers their isolation.
-Keep the isolation your application requires. An application outbox can commit
-financial intent and a dispatch record together, then submit with a stable job
-identity in a separate transaction. See [transaction guidance](docs/USAGE.md#one-pool-and-enqueueing-inside-your-transaction)
-and the [financial recovery consumer](https://github.com/gleam-dream/oversight/tree/master/apps/financial_recovery).
+Observe committed lifecycle transitions and diagnostics with plain Sinal calls. Events are best-effort, so outcomes are read from the durable rows:
+
+```gleam
+let _attachment =
+  sinal.observe(telemetry.acknowledged(), fn(_measurements, metadata) {
+    io.println("job " <> int.to_string(metadata.ref.job_id) <> " acknowledged")
+  })
+```
+
+Read one queue as a content-free committed snapshot, and prune finished jobs in bounded batches:
+
+```gleam
+let assert Ok(snapshot) = admin.statistics(jobs, queue: "emails")
+let assert Ok(deleted) =
+  admin.prune_finished(jobs, older_than: duration.minutes(1), limit: 1000)
+```
+
+Every snippet has a compiled, runnable counterpart in [examples/usage](examples/usage/README.md): [transactions](examples/usage/src/grind_usage/transactions.gleam), [uncertain jobs](examples/usage/src/grind_usage/uncertain.gleam), [observations](examples/usage/src/grind_usage/observations.gleam), [retention and statistics](examples/usage/src/grind_usage/retention.gleam), [migrations](examples/usage/src/grind_usage/migrations.gleam) and [limits and defaults](examples/usage/src/grind_usage/limits.gleam). The examples run in the gate, so they stay current with the library.
 
 ## Migrations
 
-`grind.with_startup_migration` migrates before consumers start. Leave it off for
-runtime roles without DDL permission and apply migrations at deployment time.
-Consumers require a current schema. Choose one migration owner for each schema:
-`grind.migrate` or the [Cigogne SQL mirrors](priv/migrations).
-See [migration configuration and upgrade limits](docs/USAGE.md#migrations).
-
-## Queue statistics
-
-Read one queue through the existing administrative boundary:
+`grind.with_startup_migration` migrates before consumers start. Leave it off for runtime roles without DDL permission and apply migrations at deployment time. Choose one migration owner for each schema, either `grind.migrate` or the [cigogne mirrors](priv/migrations). Cigogne can share Grind's pool:
 
 ```gleam
-import grind/admin
-
-let assert Ok(snapshot) = admin.statistics(jobs, queue: "emails")
-// snapshot.sampled_at_ms: the database clock sample in Unix milliseconds.
-// snapshot.states: one StateStatistics for each state, including zero groups.
+let assert Ok(base_config) = config.get("grind")
+let cigogne_config =
+  config.Config(
+    ..base_config,
+    database: config.ConnectionDbConfig(grind.connection(jobs)),
+  )
+let assert Ok(engine) = cigogne.create_engine(cigogne_config)
+let assert Ok(Nil) = cigogne.apply_all(engine)
 ```
 
-Each group reports its `state`, `count`, `oldest_job_age_ms`, `due_count` and
-`oldest_due_age_ms`. Ages are optional when their corresponding count is zero;
-`Some(0)` means an observed age of zero. Insertion age measures time since the
-job was inserted, not time in its current state. Due counts Queued, Scheduled
-and Retryable jobs whose availability has arrived. It does not establish worker
-compatibility, remaining retry budget or execution capacity.
+The execution rules, upgrade limits and schema isolation requirements are defined under "Storage and migrations" in [the design](docs/design/design.typ).
 
-One statement reads committed rows in one snapshot with one database clock
-sample. It returns no payloads, identifiers, keys, correlation or failure text,
-and changes no jobs. Combining `admin.list` pages under concurrent transitions
-does not provide the same snapshot. A stopped runtime, unavailable database or
-unknown stored state returns an error rather than a zero count.
-
-The caller owns access, sampling frequency and export. The result has bounded
-cardinality, but query cost grows with retained jobs in the selected queue. The
-ordinary storage deadline and pool-checkout limitations still apply. Sampling
-separate installations or libraries does not give a shared atomic snapshot.
-
-## More usage
-
-The [usage guide](docs/USAGE.md) keeps the full API guidance and advanced examples:
-
-| Task                                                                 | Guide                                                                                                 |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| Validate application types and define retrying or responding workers | [Workers and codecs](docs/USAGE.md#workers-and-codecs)                                                |
-| Schedule jobs, deduplicate admissions or select unique keys          | [Jobs and receipts](docs/USAGE.md#jobs-receipts-and-outcomes), [uniqueness](docs/USAGE.md#uniqueness) |
-| Enqueue with application writes in one caller-owned transaction      | [Shared pool and transactions](docs/USAGE.md#one-pool-and-enqueueing-inside-your-transaction)         |
-| Attach Sinal events or inspect queue pressure                        | [Observations](docs/USAGE.md#observations), [diagnostics](docs/USAGE.md#operational-diagnostics)      |
-| Run handlers in tests or prune finished jobs                         | [Testing](docs/USAGE.md#testing), [retention](docs/USAGE.md#retention)                                |
-
-Recurring schedules, live queue controls, global limits and dependency workflows
-remain intended capabilities awaiting implementation. The
-[design](docs/design/design-layer.pdf), [vocabulary](docs/design/CONTEXT.typ),
-[coverage map](docs/COVERAGE.md) and [ADRs](docs/adr) distinguish current behavior
-from that retained scope.
-
-## Development and evidence
+## Development
 
 Run from the repository root with the Sinal sibling present:
 
 ```sh
 nix develop --command gleam test
 nix develop --command bash scripts/test-postgres.sh
-nix fmt -- README.md docs/USAGE.md
+nix develop --command bash scripts/ci.sh fast
 ```
 
-Plain `gleam test` skips database cases without their explicit test URL. The
-PostgreSQL script creates and removes its own disposable cluster and includes
-the public consumer and paired oracle checks.
+Plain `gleam test` skips database cases without their explicit test URL. The PostgreSQL script creates and removes its own disposable cluster and includes the public consumer and paired oracle checks. See [AGENTS.md](AGENTS.md) for every gate command.
 
-[Benchmarks](bench/README.md#historical-measurements) include throughput and
-latency summaries for the recorded 2026-09-28 exploratory build, along with
-workloads, repeat counts and reproduction commands. The
-[resilience harness](resilience/README.md) covers independent-node faults and
-soaks. Historical measurements qualify only their recorded inputs; use the
-[qualification guide](docs/evidence/qualification.md) for a new candidate.
-
-Oban OSS `v2.24.1` is a scoped behavioral reference. The
-[oracle guide](oracle/README.md) and [ledger](oracle/ORACLE-LEDGER.md) retain its
-revision, license and measured distinctions.
+The [design](docs/design/design.typ), [vocabulary](docs/design/CONTEXT.typ), [coverage map](docs/COVERAGE.md) and [ADRs](docs/adr) distinguish current behavior from retained intended capabilities. [docs/ORACLE.md](docs/ORACLE.md) names the pinned Oban reference and what is compared, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) states the benchmark method and retained results; the two link each other. The [benchmark](bench/README.md), [resilience](resilience/README.md) and [oracle](oracle/README.md) directories give the harness commands.

@@ -1,6 +1,6 @@
 //// Percentile summarizer: turns raw latency or sampler JSONL into one CSV
 //// row per numeric field. CSVs and raw samples are ignored working outputs.
-//// Record checked results in bench/README.md before removing a run's files.
+//// Record checked results in the ADR evidence section before removing a run's files.
 
 import gleam/dynamic/decode
 import gleam/float

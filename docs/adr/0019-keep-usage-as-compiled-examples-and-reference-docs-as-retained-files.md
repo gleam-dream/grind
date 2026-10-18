@@ -1,0 +1,11 @@
+# Keep usage as compiled examples and keep the oracle and benchmark references as retained documents
+
+<a id="adr-0019"></a>
+
+- **Decision.** Usage lives as compiled, runnable examples under examples/usage, one module per topic, and the README keeps a short usage section that mirrors them. No standalone prose usage guide exists. docs/ORACLE.md names the pinned reference, what is compared and how outcomes are classified, and docs/BENCHMARKS.md states the benchmark method, validity rules and dated retained results. The two documents link to each other, to the design verification section and to the ADRs, and the agent instructions and the README link to both. No changelog is kept before the first release.
+
+- **Rationale.** A usage guide in prose drifts from the library: a renamed function or a changed default stays in the text until a reader trips on it. An example that compiles and runs in a gate fails when the API moves. The oracle pin and the benchmark method are reference facts that a reader and an agent need together, and the design states rules and claims while these documents hold the commands, tables and limits that would otherwise bury the design.
+
+- **Alternatives.** Folding usage into the design left no runnable form and made the design carry tutorial text. Keeping a prose guide beside tests that quote it needs a second copy to keep in sync. Folding the oracle and benchmark method into the design duplicated tables and commands that change more often than the rules do. A changelog before any release restates the ADRs.
+
+- **Evidence and history.** examples/usage holds fifteen topics: limits and defaults, workers and codecs, jobs, transactions, runtime, handler context, handler testing, schema isolation, observations, uniqueness, uncertain jobs, retention and statistics, migrations and cigogne. The fast profile builds the project with warnings as errors and runs its offline topics. The database gate creates two disposable databases, runs every topic and fails unless each topic wrote its marker. The earlier usage and operations guides were folded into the design, the README and these examples, and the qualification guide became the design verification section and ADR-0018. oracle/ORACLE-LEDGER.md remains the machine-checked map from Grind tests to upstream sources.

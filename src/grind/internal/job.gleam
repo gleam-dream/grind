@@ -43,7 +43,7 @@ import grind/internal/worker.{type BusinessFailureCause, type Codec, type Worker
 /// is later used against a different one — see
 /// `postgres.HandleFromAnotherInstallation` and friends. This is a
 /// client-side sanity check only: the real isolation boundary is the
-/// PostgreSQL schema itself (see docs/USAGE.md, "Isolation"), which this token
+/// PostgreSQL schema itself (see `docs/design/design.typ`, "Installation isolation"), which this token
 /// never influences and nothing here is ever written to a row or compared
 /// against one.
 pub type Installation {

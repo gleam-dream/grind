@@ -8,6 +8,6 @@
 
 - **Alternatives.** Automatic destructive reinstall of experimental schemas would risk data. A marker-only probe could accept partial or foreign storage. A global pruner leader is unnecessary when each bounded deletion uses SKIP LOCKED. Permanent deduplication belongs to a business ledger.
 
-- **Evidence and history.** 72fe573db3f83174ea5751ec201ac9dd0b3072e8 closed Cigogne and genuine upgrade lost-reply gaps. Current versions 11–13 and exact-shape probes: src/grind/internal/migrations.gleam, postgres/migration.gleam, postgres/schema_probe.gleam, priv/migrations and test/grind/migrations. Earlier version-11 fresh-install-only narrative is superseded by supported forward upgrade steps; version 10 remains experimental reinstall.
+- **Evidence and history.** 72fe573db3f83174ea5751ec201ac9dd0b3072e8 closed Cigogne and genuine upgrade lost-reply gaps. Current versions 11–13 and exact-shape probes: src/grind/internal/migrations.gleam, postgres/migration.gleam, postgres/schema_probe.gleam, priv/migrations and test/grind/migrations. Earlier version-11 fresh-install-only narrative is superseded by supported forward upgrade steps; version 10 remains experimental reinstall. Measured at 2,000,000 rows, the finished_at portion of version 12 alone took about 6 seconds, which is a lower bound: the later in-place removal of storage_owner adds index and primary-key rebuilds and two collision scans that were not measured at that scale.
 
 - **Source revisions.** [72fe573d](https://github.com/gleam-dream/grind/commit/72fe573db3f83174ea5751ec201ac9dd0b3072e8).

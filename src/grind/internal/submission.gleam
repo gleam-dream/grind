@@ -246,6 +246,6 @@ pub type SubmitError(input, output, error) {
   /// installation tokens — see `grind/job`'s `Installation` type doc comment
   /// for what this client-side check does and, more importantly, does not
   /// guarantee (the real isolation boundary is the PostgreSQL schema itself,
-  /// see `README.md`, "Isolation").
+  /// see `docs/design/design.typ`, "Installation isolation").
   HandleFromAnotherInstallation
 }

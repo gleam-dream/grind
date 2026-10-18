@@ -57,8 +57,7 @@ pub fn run(
 /// is quoted (`quote_ident`), never spliced unescaped. `postgres.start`
 /// itself never creates a schema — only `migrate`/`migrate_with` do, per
 /// this package's documented "migrate creates the schema if absent; other
-/// calls fail typed if tables are missing" split (see `README.md`,
-/// "Isolation").
+/// calls fail typed if tables are missing" split (see `docs/design/design.typ`, "Installation isolation").
 fn ensure_schema_exists(
   connection: pog.Connection,
   schema: String,
@@ -103,7 +102,7 @@ fn ensure_schema_exists(
 /// checks the connecting role's `CREATE` privilege on the *database* before
 /// it ever checks whether the schema already exists, so a role that owns
 /// its own already-existing schema — the exact least-privilege,
-/// non-superuser "recommended setup" README, "Isolation" points to (a role
+/// non-superuser "recommended setup" that "Installation isolation" in `docs/design/design.typ` describes (a role
 /// with `CREATE SCHEMA AUTHORIZATION <role>` run once by an administrator,
 /// but no broader database-level `CREATE` grant) — would otherwise get
 /// `42501 insufficient_privilege` from `ensure_schema_exists` on every

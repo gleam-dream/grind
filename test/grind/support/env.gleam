@@ -79,7 +79,7 @@ pub fn repeatable_read_url() -> Result(String, Nil)
 /// `GRIND_TEST_DATABASE_URL` database would make the test's own row counts
 /// depend on whatever other tests in this suite happen to run first and
 /// leave behind — a dedicated database is a dedicated schema, and therefore
-/// a dedicated Grind installation (see README, "Isolation").
+/// a dedicated Grind installation (see `docs/design/design.typ`, "Installation isolation").
 @external(erlang, "grind_test_env", "quarantine_url")
 pub fn quarantine_url() -> Result(String, Nil)
 

@@ -466,7 +466,7 @@ fn set_lock_timeout(
 /// admission transaction step 3. The configured schema (`postgres.Settings.schema`,
 /// see `postgres.with_schema`) is bound as an ordinary parameter — never
 /// `current_schema()` spliced into the SQL text — so two schemas, now the
-/// whole unit of isolation (see "Isolation" in `README.md`), never share a
+/// whole unit of isolation (see "Installation isolation" in `docs/design/design.typ`), never share a
 /// lock even though nothing else in this key is schema-specific. Binding the
 /// configured schema deliberately, rather than asking PostgreSQL to resolve
 /// `current_schema()` itself, is what makes this key immune to the `$user`
@@ -709,7 +709,7 @@ type ReceiptWrite {
 /// requests — the receipt table itself carries no key material either way,
 /// only the fields every request shape already has: the identity needed to
 /// look this receipt back up (`submission_id`, unique on its own now that
-/// one schema is one installation — see "Isolation" in `README.md`), enough
+/// one schema is one installation — see "Installation isolation" in `docs/design/design.typ`), enough
 /// to detect a mismatched retry (`request_sha256`), and the outcome to
 /// record.
 fn record_receipt(

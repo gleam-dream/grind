@@ -508,7 +508,7 @@
       "id": "multi-node-faults-and-throughput",
       "classification": "missing-accidental-divergence",
       "reason": "This deterministic behavior adapter does not measure node/connection loss, slow commit, pool starvation, or throughput. Dedicated resilience and benchmark suites must supply those release proofs.",
-      "sources": ["docs/evidence/qualification.md", "scripts/bench-matrix.sh"]
+      "sources": ["docs/design/design.typ", "scripts/bench-matrix.sh"]
     }
   ]
 }

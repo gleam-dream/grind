@@ -6,7 +6,7 @@
 //// a sixty-second age. The public Grind runtime overrides the age to seven
 //// days. A large batch can exceed the storage deadline; tune against the
 //// deployed workload. Failure emits [grind, prune, failed] through telemetry
-//// and retries on the next tick. See docs/USAGE.md, "Retention".
+//// and retries on the next tick. See `docs/design/design.typ`, "Reads, administration and retention".
 
 import gleam/erlang/process
 import gleam/otp/actor

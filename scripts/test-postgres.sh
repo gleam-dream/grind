@@ -124,7 +124,7 @@ psql -h 127.0.0.1 -p "$port" -U grind -d grind_repeatable_read_test -c \
 # `nix flake check` stays database-free.
 # Applies the same cigogne-format `up` sections (priv/migrations/*.sql)
 # `src/grind/internal/migrations.gleam` mirrors, exactly as an application
-# importing them via cigogne would — see README, "Migrations".
+# importing them via cigogne would — see `docs/design/design.typ`, "Migration execution".
 squirrel_check_up_sql="$root/schema-up.sql"
 : >"$squirrel_check_up_sql"
 for migration_file in "$repo_root"/priv/migrations/*.sql; do

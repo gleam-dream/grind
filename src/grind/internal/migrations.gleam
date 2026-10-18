@@ -3,7 +3,7 @@
 //// Grind never reads `priv/migrations/*.sql` itself. Those files exist so
 //// an application can install or inspect Grind's schema through cigogne
 //// (`cigogne.include_lib`/`gleam run -m cigogne`) instead of through Grind's
-//// own `postgres.migrate` — see the README, "Migrations". Their up sections
+//// own `postgres.migrate` — see `docs/design/design.typ`, "Migration execution". Their up sections
 //// are kept byte-identical (statement text, minus the trailing `;` a `.sql`
 //// file needs) to each `Migration.statements` below, including the
 //// advisory-lock statement every version's list starts with, so an
@@ -222,7 +222,7 @@ fn v11_shape() -> List(ExpectedRelation) {
 /// **Dropping `storage_owner`.** Isolation between logically distinct Grind
 /// installations is now the PostgreSQL schema (`search_path`) alone, not a
 /// `storage_owner` value scoping rows within one shared schema — see
-/// `docs/adr/0003-separate-command-receipts-from-uniqueness.md` and `docs/USAGE.md`, "Isolation". `v11`
+/// `docs/adr/0003-separate-command-receipts-from-uniqueness.md` and `docs/design/design.typ`, "Installation isolation". `v11`
 /// (frozen, already released — its own statements cannot change) created
 /// `storage_owner` on `grind_jobs` and every receipt/resolution table, plus
 /// every composite key or index that included it; `v12`, still unreleased

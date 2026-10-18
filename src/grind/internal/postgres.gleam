@@ -203,7 +203,7 @@ pub fn with_observation_capacity(
 /// restored before the connection returns to the pool) — the one
 /// schema this `Database` reads and writes, and the schema `migrate`/
 /// `migrate_with` creates if it does not yet exist. Defaults to `"public"`.
-/// See `docs/USAGE.md`, "Isolation": the schema, not any value derived from the
+/// See `docs/design/design.typ`, "Installation isolation": the schema, not any value derived from the
 /// database URL or role, is the whole unit of isolation between logically
 /// distinct Grind installations sharing one PostgreSQL cluster. Validated
 /// non-empty by `validate`; never SQL-injected — every use of `schema` is
@@ -333,8 +333,7 @@ fn schema_is_valid(schema: String) -> Bool {
 /// `migration_deadline_ms`, or until the pooled connection is force-closed
 /// if that elapses first; hitting it surfaces PostgreSQL's own `55P03` as
 /// the typed `MigrationLockUnavailable`, safe to retry. Not applied to
-/// `priv/migrations/*.sql` run directly through cigogne — see README,
-/// "Migrations".
+/// `priv/migrations/*.sql` run directly through cigogne — see `docs/design/design.typ`, "Migration execution".
 const migration_lock_timeout_ms = 2000
 
 /// The margin `validate` requires between `migration_lock_timeout_ms` and
@@ -570,7 +569,7 @@ pub type StartError {
 ///
 /// Isolation between logically distinct Grind installations sharing one
 /// PostgreSQL cluster is the schema this pool's `search_path` resolves to —
-/// see `docs/USAGE.md`, "Isolation" — not a value this call derives or accepts;
+/// see `docs/design/design.typ`, "Installation isolation" — not a value this call derives or accepts;
 /// every job row, quarantine scan, uniqueness domain, and retention sweep
 /// this `Database` performs is simply whatever `grind_jobs` and its sibling
 /// tables in that one schema hold. Also starts this `Database`'s own
@@ -1446,7 +1445,7 @@ pub type JobReadError {
   /// installation tokens — see `grind/job`'s `Installation` type doc comment
   /// for what this client-side check does and, more importantly, does not
   /// guarantee (the real isolation boundary is the PostgreSQL schema itself,
-  /// see `docs/USAGE.md`, "Isolation"). Reachable from every `JobReadError`-
+  /// see `docs/design/design.typ`, "Installation isolation"). Reachable from every `JobReadError`-
   /// returning function except `bind_handle`, which mints a fresh handle
   /// against the `Database` it is called on rather than checking one handed
   /// in.
@@ -1487,7 +1486,7 @@ fn job_read_error(error: postgres_job_reads.JobReadError) -> JobReadError {
 
 /// Reconstructs a typed handle from durable identity after an application
 /// restart, scoped to whatever schema this `Database`'s pool connects to —
-/// see `docs/USAGE.md`, "Isolation". The current worker definition must exactly
+/// see `docs/design/design.typ`, "Installation isolation". The current worker definition must exactly
 /// match the stored worker and codec contract. May return
 /// `JobReadQueryFailed`, `JobNotFound`, `WorkerContractMismatch`, or
 /// `CodecContractMismatch`; never `QueueRouteMismatch`, `CodecFailed`,
@@ -1846,7 +1845,7 @@ pub type QuarantineError {
 
 /// Quarantines up to `limit` expired `executing` rows across every queue in
 /// this schema — not only the queues some running consumer happens to poll
-/// (see `docs/USAGE.md`, "Isolation"). Intended for queues no consumer currently
+/// (see `docs/design/design.typ`, "Installation isolation"). Intended for queues no consumer currently
 /// polls (an idle queue, a worker retired without a replacement consumer,
 /// or an operational sweep run outside any consumer's own poll loop); a
 /// polled queue's own consumer already quarantines its expired rows as part
@@ -1916,8 +1915,7 @@ pub type PruneReport {
 pub type PruneError {
   /// `older_than_ms` was not positive; nothing was touched. There is no
   /// minimum retention floor beyond this (matching Oban's own `max_age`,
-  /// which is likewise only required to be positive) — see docs/USAGE.md,
-  /// "Retention", for what a very short retention window can do to a late
+  /// which is likewise only required to be positive) — see `docs/design/design.typ`, "Reads, administration and retention", for what a very short retention window can do to a late
   /// commit-unknown reconciliation.
   NonPositiveRetention
   /// `older_than_ms` exceeds `worker.retry_delay_maximum_milliseconds()`,
@@ -1932,7 +1930,7 @@ pub type PruneError {
   PruneQueryFailed(pog.QueryError)
 }
 
-/// Deletes up to `limit` rows in this schema (see `docs/USAGE.md`, "Isolation")
+/// Deletes up to `limit` rows in this schema (see `docs/design/design.typ`, "Installation isolation")
 /// that finished (reached one of the six terminal states — see
 /// `grind/internal/terminal`) more than `older_than_ms` milliseconds ago.
 /// Each deleted job's own acknowledgement, uniqueness-submission, and
@@ -1982,7 +1980,7 @@ pub type PruneError {
 /// never resolve, and an automatic acknowledgement retry that reaches the
 /// server after its job was pruned reports `QueueAckStale(AckRecordMissing)`
 /// — the same shape an ordinary lost/reassigned row already produces, not a
-/// new failure mode. See docs/USAGE.md, "Retention", for the full list.
+/// new failure mode. See `docs/design/design.typ`, "Reads, administration and retention", for the full list.
 pub fn prune_finished(
   database: Database,
   older_than_ms older_than_ms: Int,

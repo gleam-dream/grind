@@ -1,13 +1,13 @@
-# Decide how cancellation and effect uncertainty coexist
+# Keep cancellation intent and effect uncertainty as independent facts
 
 <a id="adr-0006"></a>
 
-- **Decision.** Proposed; unresolved. Cancellation intent and an unknown external effect answer independent questions. Do not claim current Cancelled means effects are known absent. A representation preserving both is a candidate, not an accepted runtime change.
+- **Decision.** Treat cancellation intent and an unknown external effect as independent facts. A committed Cancelled never means that effects are known absent. The ordering between the two is decided in [ADR-0012](0012-preserve-uncertainty-through-cancellation.md).
 
-- **Rationale.** Current ACK SQL gives committed cancellation priority even over explicit Uncertain. It clears uncertain_at and evidence, sets finished_at, and removes the row from admin uncertainty listing. Expired-lease quarantine with cancellation instead retains Uncertain and blocks replay. The inconsistent paths lose operational evidence.
+- **Rationale.** The acknowledgement SQL gave committed cancellation priority over an explicit Uncertain. That path cleared the uncertainty timestamp and evidence, set the finished time and removed the row from the operator uncertainty listing. Expired-lease quarantine with cancellation instead retained Uncertain and blocked replay. The two paths disagreed, and the disagreeing path lost operational evidence.
 
-- **Alternatives.** Keep current terminal precedence and require a separate application effect ledger; preserve Uncertain while retaining cancellation intent; or extend outcome state with independent disposition and effect knowledge. Each requires explicit operator, read, telemetry and retention semantics. Merely relabeling Cancelled does not recover lost stored evidence.
+- **Alternatives.** Keep terminal precedence and require a separate application effect ledger; preserve Uncertain while retaining cancellation intent; or extend outcome state with an independent disposition and effect knowledge. Each alternative needs explicit operator, read, observation and retention semantics. Relabeling Cancelled does not recover stored evidence that was already lost.
 
-- **Evidence and history.** src/grind/internal/attempt/acknowledgement.gleam acknowledgement_transaction SQL and test/grind/queue/acknowledgements_test.gleam intentionally assert cancellation precedence. The preceding ecosystem review reported a disposable public PostgreSQL consumer probe at checkout 510ca006d1af7ee35018676ee6aab026cc151b45: cancel followed by worker.Uncertain produced Cancelled and empty uncertain listing. The probe used synthetic evidence, not a real external charge, and was not installed as a retained test. The source and existing acknowledgement test retain the precedence behavior. Original policy rationale beyond cancellation precedence is unknown.
+- **Evidence and history.** The acknowledgement transaction SQL in src/grind/internal/attempt/acknowledgement.gleam and test/grind/queue/acknowledgements_test.gleam asserted cancellation precedence at the time of this decision. A disposable public PostgreSQL consumer probe at checkout 510ca006d1af7ee35018676ee6aab026cc151b45 reported that cancel followed by worker.Uncertain produced Cancelled and an empty uncertain listing. The probe used synthetic evidence, not a real external charge, and was not installed as a retained test. The original policy rationale beyond cancellation precedence is unknown.
 
 - **Source revisions.** [510ca006](https://github.com/gleam-dream/grind/commit/510ca006d1af7ee35018676ee6aab026cc151b45).

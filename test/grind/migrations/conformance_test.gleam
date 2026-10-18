@@ -154,7 +154,7 @@ fn marker_insert_version(statement: String) -> Option(Int) {
 //
 // Grind ships `priv/migrations/*.sql` (cigogne format) as a mirror for an
 // application that wants to apply Grind's schema through cigogne instead of
-// `postgres.migrate` (see README, "Migrations").
+// `postgres.migrate` (see `docs/design/design.typ`, "Migration execution").
 // `grind_migrations_conformance_test` above already proves the two sources
 // stay byte-for-byte in lockstep with no database — these tests prove the
 // two mechanisms actually *interoperate* against a real PostgreSQL server:
@@ -184,7 +184,7 @@ fn cigogne_concurrent_url() -> Result(String, Nil)
 /// server. This is also the shape an application would use to run cigogne
 /// against a `Database` it already started with `postgres.connection`,
 /// rather than pointing cigogne at `DATABASE_URL`/`PGHOST` etc. separately
-/// (see README, "Migrations").
+/// (see `docs/design/design.typ`, "Migration execution").
 fn cigogne_config_for(connection: pog.Connection) -> config.Config {
   let assert Ok(base) = config.get("grind")
   config.Config(..base, database: config.ConnectionDbConfig(connection))
@@ -294,7 +294,7 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   // schema returns to a fully valid, functional v12 install again, and the
   // job seeded above survives (v12's own down section only drops
   // columns/constraints/indexes it itself added, never a whole table — see
-  // README, "Migrations", on `grind_v11`'s own down section being the
+  // `docs/design/design.typ`, "Migration execution", on `grind_v11`'s own down section being the
   // destructive one, not v12's). Deliberately *not* a raw catalog-digest
   // comparison against the fresh install here — a genuine, inherent
   // PostgreSQL property, not a Grind defect, makes that comparison the

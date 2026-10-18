@@ -179,7 +179,7 @@ for scenario in "l2 1 250 0 500" "l3 50 1000" "l5 0 3000" "l5 1 3000" "l7 40 1 4
       exit 1
     }
     # A retried pgo pool restart keeps the run alive but makes it suspect as
-    # evidence (bench/README.md, "Harness pools").
+    # evidence (docs/design/design.typ, "Benchmark method").
     grep -Eq ' harness_pool_restart_retries=0$' "$activation_log" || {
       echo "a harness pool restarted during $scenario; repeat the run" >&2
       exit 1
