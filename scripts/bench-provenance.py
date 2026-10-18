@@ -25,8 +25,8 @@ def source_digest() -> str:
         path = root / name
         if path.is_file():
             digest.update(name.encode() + b"\0" + path.read_bytes() + b"\0")
-    # The unpublished path dependency is also executable benchmark input.
-    sibling = root.parent / "sinal"
+    # The locked Sinal dependency of the benchmark project is also executable input.
+    sibling = root / "bench/build/packages/sinal"
     sibling_inputs = list((sibling / "src").rglob("*")) + [sibling / "gleam.toml", sibling / "manifest.toml"]
     for path in sorted(sibling_inputs):
         if any(part.startswith(".env") or part in {".aws", ".codex"} for part in path.relative_to(sibling).parts):
@@ -69,7 +69,7 @@ def machine_metadata() -> dict[str, str | int | None]:
 
 
 def sinal_metadata() -> dict[str, str | bool | None]:
-    sibling = root.parent / "sinal"
+    sibling = root / "bench/build/packages/sinal"
     try:
         return {"commit": command_output("git", "-C", str(sibling), "rev-parse", "HEAD"),
                 "dirty": bool(command_output("git", "-C", str(sibling), "status", "--porcelain"))}

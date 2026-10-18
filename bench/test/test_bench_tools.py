@@ -83,7 +83,7 @@ class ProvenanceTests(unittest.TestCase):
                 (root / "source.gleam").write_text("changed")
                 second = provenance.source_digest()
                 self.assertNotEqual(first, second)
-                sibling = root.parent / "sinal/src"
+                sibling = root / "bench/build/packages/sinal/src"
                 sibling.mkdir(parents=True)
                 (sibling / "sinal.gleam").write_text("dependency changed")
                 self.assertNotEqual(second, provenance.source_digest())

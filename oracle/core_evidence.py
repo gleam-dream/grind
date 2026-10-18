@@ -23,7 +23,9 @@ def sha256(path: Path) -> str:
 def source_digest() -> str:
     names = command("git", "-C", str(ROOT), "ls-files", "--cached", "--others", "--exclude-standard")
     paths = [(name, ROOT / name) for name in sorted(set(names.splitlines()))]
-    sibling = ROOT.parent / "sinal"
+    sibling = ROOT / "build/packages/sinal"
+    if not sibling.is_dir():
+        raise ValueError("locked Sinal dependency is not downloaded; run gleam deps download")
     paths += [("sinal/" + str(path.relative_to(sibling)), path)
               for path in sorted((sibling / "src").rglob("*")) if path.is_file()]
     paths += [("sinal/" + name, sibling / name) for name in ("gleam.toml", "manifest.toml")]

@@ -183,7 +183,7 @@ class Runner:
             path = ROOT / name
             if path.is_file() and not path.is_relative_to(self.output) and not name.startswith(("bench/results/", "resilience/results/")):
                 digest.update(name.encode() + b"\0" + path.read_bytes())
-        sibling = ROOT.parent / "sinal"
+        sibling = ROOT / "resilience/build/packages/sinal"
         for path in sorted((sibling / "src").rglob("*")):
             if any(part.startswith(".env") or part in {".aws", ".codex"} for part in path.relative_to(sibling).parts):
                 continue
