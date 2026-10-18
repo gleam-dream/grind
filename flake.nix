@@ -56,6 +56,9 @@
             "**/*.pdf"
             ".render/**"
             "bench/results/**"
+            # The checker owns the shape of this machine-parsed ledger; alignment
+            # padding had multiplied its size fourfold.
+            "oracle/ORACLE-LEDGER.md"
             "oracle/results/**"
             "resilience/results/**"
           ];
