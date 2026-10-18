@@ -34,5 +34,5 @@
   (slug: "term-oracle-classification", title: [Oracle classification], body: [The label on each scenario catalog entry: equivalent, intentional-grind-semantics, missing-accidental-divergence or deferred. Only equivalent entries count as paired passes.]),
   (slug: "term-qualification-evidence", title: [Qualification evidence], body: [Reviewed run output, with provenance, for one fixed source and dependency set. It qualifies only that build.#parbreak()_Avoid_: benchmark result — a benchmark result lacks the validity verdicts and failed-run record.]),
   (slug: "term-validation-profile", title: [Validation profile], body: [A named set of CI checks selected by one command: fast, full, matrix or soak.]),
-  (slug: "term-queue-statistics", title: [Queue statistics], body: [A content-free committed snapshot of one selected queue: per state, a count, due count and oldest ages, read with one database clock sample.]),
+  (slug: "term-queue-statistics", title: [Queue statistics], body: [A content-free committed snapshot of one selected queue: per state, a count, due count and oldest ages, read with one database clock sample. Queue is the domain's own name for a named work lane, so behavior rules keep the word.]),
 )
