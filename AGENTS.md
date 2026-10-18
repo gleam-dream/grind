@@ -7,6 +7,7 @@
 ## Tooling and gates
 
 - `nix develop` (or direnv): dev shell with `gleam`, Erlang/OTP 29, `rebar3`, `lefthook`.
+- Dependencies: the unpublished Sinal package is a Git dependency on `main`, and each `manifest.toml` is the lock. Update it by hand with `gleam update sinal` in each project that depends on it (root, `bench`, `consumer`, `examples/usage`, `resilience`). The Oban oracle source is fetched into the gitignored `oracle/deps`; no upstream source is committed.
 - `nix fmt`: formats the repo through treefmt. `lefthook` formats and re-stages staged files on commit. `nix flake check` fails iff the tree is not formatted.
 - `gleam test`: runs the suite and skips database cases without their test URL; it never replaces the database gate.
 - `nix develop --command bash scripts/test-postgres.sh`: database gate on a disposable cluster. It runs the root, consumer and `examples/usage` suites, the twelve paired oracle scenarios, the oracle ledger check and the Squirrel conformance check.

@@ -15,7 +15,7 @@ gleam_time = ">= 1.0.0 and < 2.0.0"
 exception = ">= 2.1.1 and < 3.0.0"
 pog = ">= 4.1.0 and < 4.2.0"
 cigogne = ">= 5.0.6 and < 6.0.0"
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "9727f9baab6ed4f796780a0c3a1027c3292c5fc7" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "main" }
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

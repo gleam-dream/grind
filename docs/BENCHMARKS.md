@@ -8,7 +8,7 @@ This document states what the benchmark project measures, how to run it, when a 
 
 ## Run
 
-Run from the repository root inside `nix develop`, with the Sinal checkout at `../sinal`. Run gates and benchmarks serially, with the host awake and no competing workload.
+Run from the repository root inside `nix develop`. Run gates and benchmarks serially, with the host awake and no competing workload.
 
 ```sh
 # Harness tests, activation checks and an audited 1,000-job drain.

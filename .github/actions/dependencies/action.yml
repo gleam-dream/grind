@@ -24,7 +24,7 @@ runs:
       with:
         path: "**/build/packages/*.config_fingerprint"
         # No fallback: hashes belong to these exact configs, locks and compiler.
-        key: gleam-fingerprints-v1-${{ runner.os }}-${{ inputs.scope }}-${{ hashFiles('**/gleam.toml', '**/manifest.toml', '**/flake.lock', '**/sibling-revisions.txt', '!**/build/**') }}
+        key: gleam-fingerprints-v1-${{ runner.os }}-${{ inputs.scope }}-${{ hashFiles('**/gleam.toml', '**/manifest.toml', '**/flake.lock', '!**/build/**') }}
     - name: Prepare locked dependencies
       shell: bash
       working-directory: grind

@@ -6,13 +6,13 @@ outcomes and runs handlers through a supervised queue runtime.
 
 ## Install
 
-Grind is not yet published to Hex. Use the current checkout as a local path
-dependency, with [Sinal](https://github.com/gleam-dream/sinal) checked out beside
-Grind at `../sinal`:
+Grind is not yet published to Hex. Depend on it through Git; its own unpublished
+dependency, [Sinal](https://github.com/gleam-dream/sinal), resolves through
+Grind's manifest entry. Your manifest holds the resolved commit, and `gleam update grind` moves it:
 
 ```toml
 [dependencies]
-grind = { path = "../grind" }
+grind = { git = "https://github.com/gleam-dream/grind.git", ref = "main" }
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
@@ -185,7 +185,7 @@ The execution rules, upgrade limits and schema isolation requirements are define
 
 ## Development
 
-Run from the repository root with the Sinal sibling present:
+Run from the repository root:
 
 ```sh
 nix develop --command gleam test
