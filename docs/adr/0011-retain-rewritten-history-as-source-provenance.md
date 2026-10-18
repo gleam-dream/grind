@@ -2,7 +2,7 @@
 
 <a id="adr-0011"></a>
 
-- **Decision.** Keep the original-to-milestone commit mapping as this ADR provenance appendix. Material design decisions live in the other ADRs; the standing design does not use implementation-wave numbers.
+- **Decision.** Keep the original-to-milestone commit mapping as this ADR provenance appendix. Material design decisions live in the other ADRs; the standing design carries no implementation-plan numbering.
 
 - **Rationale.** The old implementation history was deliberately collapsed into milestones. Recovery experiments and source attribution can refer to original hashes that are no longer normal current ancestry. The mapping permits a reader to identify the retained commit that represents each original source, including commits whose original objects remain retained.
 

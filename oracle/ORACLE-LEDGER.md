@@ -37,7 +37,7 @@ ledger.
 
 ## API names
 
-Wave 3 replaced Grind's public modules with one facade
+Grind's public modules are one facade
 ([docs/adr/0011-retain-rewritten-history-as-source-provenance.md](../docs/adr/0011-retain-rewritten-history-as-source-provenance.md)). The local tests
 named in this ledger drive the engine modules under `grind/internal`, so
 the rows keep the engine names: `postgres.submit_unique`,
