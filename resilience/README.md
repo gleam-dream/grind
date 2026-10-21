@@ -10,7 +10,7 @@ Serialize runs with other gates in the checkout, inside `nix develop`:
 nix develop --command bash scripts/test-resilience.sh
 nix develop --command bash scripts/test-resilience.sh --scenarios M1,M4
 nix develop --command bash scripts/test-resilience.sh --scenarios '' --soak-seconds 300
-nix develop --command bash scripts/test-resilience.sh --release-evidence --deadline-ms 4000 --lease-ms 30000 --soak-seconds 7200
+nix develop --command bash scripts/test-resilience.sh --deadline-ms 4000 --lease-ms 30000 --soak-seconds 7200
 python3 -m unittest discover -s resilience -p 'test_*.py' -v
 ```
 

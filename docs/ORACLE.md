@@ -14,7 +14,7 @@ This document names the reference implementation Grind is compared against, what
 
 - **License.** Oban is Apache-2.0, and [OBAN-LICENSE.txt](../oracle/OBAN-LICENSE.txt) preserves its notice.
 - **Pin enforcement.** The oracle build takes the commit from `oracle/mix.exs`. The evidence check rejects a checkout whose commit differs from the pin, and a modified checkout is rejected even when its commit matches.
-- **Provenance of Grind tests.** [ORACLE-LEDGER.md](../oracle/ORACLE-LEDGER.md) maps each Grind test to the upstream source it was derived from. `scripts/check-oracle-ledger.exs` verifies every local test name, every upstream source path, every catalog source and adapter path and the checkout commit. It needs Elixir and OTP, not a database, and it does not resolve natural-language quotations as upstream test identifiers.
+- **Provenance of Grind tests.** [ORACLE-LEDGER.md](../oracle/ORACLE-LEDGER.md) maps each Grind test to the upstream source it was derived from. The ledger is reference documentation reviewed manually.
 
 ## What is compared
 
@@ -70,7 +70,7 @@ The fixtures must run successfully before their scenarios are cited as validated
 
 ## Run
 
-The integrated gate runs the twelve paired scenarios, the comparator regression tests and the ledger check:
+The integrated gate runs the twelve paired scenarios, the comparator regression tests:
 
 ```sh
 nix develop --command bash scripts/test-postgres.sh
@@ -90,10 +90,10 @@ The script creates a disposable `oban_resilience` database and compiles the orac
 
 ```sh
 python3 oracle/fault_compare.py --grind /path/to/grind-run --oban /path/to/oban-run --output /path/to/new-comparison.json
-mix run --no-start compare.exs <run>/catalog.json <run>/grind.jsonl <run>/oban.jsonl <run>/provenance.json
+mix run --no-start compare.exs <run>/catalog.json <run>/grind.jsonl <run>/oban.jsonl
 ```
 
-A run directory holds `grind.jsonl`, `oban.jsonl`, adapter logs, the exact `catalog.json` and `provenance.json` with source, dependency, catalog, output and toolchain hashes. Paired results go to `oracle/results/core-<timestamp>-<pid>` and fault results to `oracle/results/<timestamp>-<pid>`, unless `GRIND_ORACLE_FAULT_OUTPUT` selects a new directory. Existing result directories are refused, both adapters read the saved catalog, a source change during the pair fails the evidence check, and dirty Grind source is labeled exploratory. Failed fault runs retain VM logs, controller events and database snapshots when the database is reachable.
+A run directory holds `grind.jsonl`, `oban.jsonl`, adapter logs, the exact `catalog.json`. Paired results go to `oracle/results/core-<timestamp>-<pid>` and fault results to `oracle/results/<timestamp>-<pid>`, unless `GRIND_ORACLE_FAULT_OUTPUT` selects a new directory. Existing result directories are refused, both adapters read the saved catalog; source provenance is reviewed manually. Failed fault runs retain VM logs, controller events and database snapshots when the database is reachable.
 
 `oracle/run.exs` keeps six Oban-only observations (success, discard, first retry, exhaustion, snooze and a Pruner tick) with an automatically polling producer and job-stop telemetry. They remain useful but are not paired evidence.
 

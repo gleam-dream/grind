@@ -10,7 +10,7 @@
 - Dependencies: the unpublished Sinal package is a Git dependency on `main`, and each `manifest.toml` is the lock. Update it by hand with `gleam update sinal` in each project that depends on it (root, `bench`, `consumer`, `examples/usage`, `resilience`). The Oban oracle source is fetched into the gitignored `oracle/deps`; no upstream source is committed.
 - `nix fmt`: formats the repo through treefmt. `lefthook` formats and re-stages staged files on commit. `nix flake check` fails iff the tree is not formatted.
 - `gleam test`: runs the suite and skips database cases without their test URL; it never replaces the database gate.
-- `nix develop --command bash scripts/test-postgres.sh`: database gate on a disposable cluster. It runs the root, consumer and `examples/usage` suites, the twelve paired oracle scenarios, the oracle ledger check and the Squirrel conformance check.
+- `nix develop --command bash scripts/test-postgres.sh`: database gate on a disposable cluster. It runs the root, consumer and `examples/usage` suites, the twelve paired oracle scenarios and the Squirrel conformance check.
 - `nix develop --command bash scripts/ci.sh fast`: edit-loop checks. `scripts/ci.sh full` runs every applicable check and runs before integration. `scripts/ci.sh matrix` and `scripts/ci.sh soak` are the weekly benchmark and endurance profiles. None of them repairs source files.
 - Benchmarks: `scripts/bench-smoke.sh` and `scripts/bench-matrix.sh`. Resilience: `scripts/test-resilience.sh`. Oracle faults: `oracle/run-faults.sh`. Their flags are in `docs/BENCHMARKS.md`, `resilience/README.md` and `docs/ORACLE.md`.
 - Run database gates, benchmarks and resilience runs serially in one checkout. Qualification rules are in the design, "Verification method".
@@ -60,22 +60,10 @@ verbatim): states `needs-triage`, `needs-info`, `ready-for-agent`,
 **AI disclaimer** — AI-authored tracker comments start with
 `AI-assisted contribution.`
 
-**Design gate** — `nix run .#design-gate-check -- docs/design .` checks render freshness,
-vocabulary references and layer integrity (exit 0 clean, 1 violation, 2 error).
-The gate is supplied by the pinned `design-layer` flake input.
-`nix run .#design-gate-render -- docs/design docs/design/design-layer.pdf`
-rebuilds the rendered document. `nix run .#design-gate-context -- docs/design --estimate`
-estimates agent context; the same command without `--estimate` emits ephemeral
-Markdown. `--manifest`, `--preview`, and `--section PATH --expect-digest DIGEST`
-support loading selected sections. A bare Typst compilation does not run the gate.
-
-**Context verification** — use native semantic blocks for lists, tables,
-models and behavior. After authoring, verify context estimation and a selected
-section export as well as rendering and the design gate.
-Run these commands sequentially for each layer; they share its generated
-`.render` workspace.
-
-**Staleness** — source changes since the design last changed require a
-conformance review before the layer is treated as current.
+**Design tools** — `nix run .#design-gate-render -- docs/design docs/design/design-layer.pdf`
+renders the design. `nix run .#design-gate-context -- docs/design --estimate`
+estimates context. CI calls the shared validator directly with
+`nix run .#design-gate-check -- docs/design .`. Run `nix flake check` separately
+for repository formatting. Local test scripts own application compilation and behavior.
 
 <!-- agent-skills:end -->

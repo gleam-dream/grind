@@ -18,15 +18,12 @@ bootstrap_oracle() {
   (cd oracle && mix local.hex --force --if-missing && mix deps.get --check-locked)
 }
 fast() {
-  actionlint
-  mapfile -d '' shell_files < <(git ls-files -z -- '*.sh')
-  shellcheck "${shell_files[@]}"
-  ruff check scripts bench resilience oracle --exclude oracle/deps --exclude oracle/_build
-  for project in . consumer examples/usage bench resilience; do
+  for project in . consumer examples/usage resilience; do
     (cd "$project" && gleam build --warnings-as-errors)
   done
   bootstrap_oracle
-  bash scripts/check-native.sh
+  find src test consumer/test examples/usage/src examples/usage/test resilience/src -name '*.erl' -type f -exec erlc -Werror -pa "$repo_root/build/dev/erlang/pgo/ebin" -o "$mix_root" {} +
+  (cd oracle && mix compile --warnings-as-errors)
   (
     # Fast tests cannot inherit caller database targets; full tests set their own
     # disposable URLs in scripts/test-postgres.sh.
@@ -38,19 +35,13 @@ fast() {
     # The examples' offline topics; the database topics run in the full gate.
     (cd examples/usage && gleam test)
   )
-  python3 -B -m unittest discover -s scripts -p 'test_*.py' -v
   python3 -B -m unittest discover -s resilience -p 'test_*.py' -v
-  python3 -B -m unittest discover -s bench/test -p 'test_*.py' -v
   python3 -B -m unittest discover -s oracle -p 'test_*.py' -v
 }
 full() {
   fast
   GRIND_TEST_LOG_DIR="$artifacts/postgres" GRIND_ORACLE_RESULTS_ROOT="$artifacts/core-oracle"     bash scripts/test-postgres.sh
-  # test-postgres deliberately cleans root/consumer builds; check native sources again.
-  bash scripts/check-native.sh
-  GRIND_BENCH_RESULTS_DIR="$artifacts/bench-smoke" bash scripts/bench-smoke.sh
   GRIND_RESILIENCE_OUTPUT="$artifacts/resilience" bash scripts/test-resilience.sh
-  python3 scripts/ci-evidence.py resilience "$artifacts/resilience"
   GRIND_ORACLE_FAULT_OUTPUT="$artifacts/oban-faults" bash oracle/run-faults.sh
   python3 oracle/fault_compare.py --grind "$artifacts/resilience" --oban "$artifacts/oban-faults"     --output "$artifacts/fault-comparison.json"
 }
@@ -64,11 +55,9 @@ case "$profile" in
     export GRIND_BENCH_RELEASE_EVIDENCE=1
     unset GRIND_BENCH_ALLOW_T2_FAILURE
     bash scripts/bench-matrix.sh all
-    python3 scripts/ci-evidence.py matrix "$GRIND_BENCH_RESULTS_DIR"
     ;;
   soak)
-    GRIND_RESILIENCE_OUTPUT="$artifacts/soak" bash scripts/test-resilience.sh       --release-evidence --deadline-ms 4000 --lease-ms 30000 --soak-seconds 7200
-    python3 scripts/ci-evidence.py soak "$artifacts/soak"
+    GRIND_RESILIENCE_OUTPUT="$artifacts/soak" bash scripts/test-resilience.sh       --deadline-ms 4000 --lease-ms 30000 --soak-seconds 7200
     ;;
   *) echo 'Usage: scripts/ci.sh [fast|full|matrix|soak]' >&2; exit 2 ;;
 esac

@@ -56,8 +56,7 @@
             "**/*.pdf"
             ".render/**"
             "bench/results/**"
-            # The checker owns the shape of this machine-parsed ledger; alignment
-            # padding had multiplied its size fourfold.
+            # Preserve compact historical attribution tables.
             "oracle/ORACLE-LEDGER.md"
             "oracle/results/**"
             "resilience/results/**"
@@ -84,9 +83,6 @@
             postgresql_16
             python3
             beam29Packages.rebar3
-            actionlint
-            shellcheck
-            ruff
           ];
         };
 

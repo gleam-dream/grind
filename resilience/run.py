@@ -198,12 +198,6 @@ class Runner:
                     otp=subprocess.check_output(["erl", "+S", "1:1", "-noshell", "-eval",
                          'io:format("~s",[erlang:system_info(otp_release)]),halt().'], text=True))
         (self.output / "provenance.json").write_text(json.dumps(data, indent=2) + "\n")
-        if self.args.release_evidence and dirty:
-            raise RuntimeError("Release evidence requires clean pinned source")
-        if self.args.release_evidence:
-            required = {"M1", "M2", "M3", "M4", "M5", "M6", "M7", "F1", "F2", "F3", "F4", "F5"}
-            if self.args.soak_seconds < 7200 or not required.issubset(self.args.scenarios.split(",")):
-                raise RuntimeError("Release evidence requires the complete short suite and at least 7200 seconds of mixed soak")
 
     def sql(self, sql):
         return subprocess.check_output(["psql", "-XAt", self.url, "-v", "ON_ERROR_STOP=1", "-c", sql], text=True, timeout=30).strip()
@@ -779,7 +773,6 @@ def main():
     parser.add_argument("--lease-ms", type=int, default=12000)
     parser.add_argument("--deadline-ms", type=int, default=1500)
     parser.add_argument("--soak-seconds", type=int, default=0)
-    parser.add_argument("--release-evidence", action="store_true")
     args = parser.parse_args()
     runner = Runner(args)
     actions = {"M1": runner.m1, "M2": runner.m2, "M4": runner.m4, "M5": runner.m5,

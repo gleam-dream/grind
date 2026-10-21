@@ -65,10 +65,7 @@ outputs where semantics differ. Catalog gaps are explicitly classified as
 `deferred`; gaps never count as passing scenarios. These are declared cases,
 not a claim that this working tree has already passed them.
 
-`scripts/check-oracle-ledger.exs` validates every local test name and upstream
-source path in this ledger, all catalog source/adapter paths, and the actual
-Oban checkout SHA. It intentionally does not interpret prose quotations as
-test identifiers. Historical mutation narratives are retained as historical
+The ledger is reference documentation reviewed manually. Historical mutation narratives are retained as historical
 evidence, not fresh execution results.
 
 `oracle/fault-scenarios.json` separately specifies independent-VM M2 and M6

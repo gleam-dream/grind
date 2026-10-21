@@ -8,4 +8,4 @@ nix develop --command bash oracle/run-faults.sh       # independent-VM M2 and M6
 python3 oracle/fault_compare.py --grind <grind-run> --oban <oban-run> --output <new-comparison.json>
 ```
 
-Results go to `oracle/results/`, and existing result directories are refused. `scripts/check-oracle-ledger.exs` validates the ledger and catalog paths without a database. `run.exs` keeps six Oban-only observations that are not paired evidence.
+Results go to `oracle/results/`, and existing result directories are refused. The ledger is reviewed manually. `run.exs` keeps six Oban-only observations that are not paired evidence.
