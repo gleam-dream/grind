@@ -6,6 +6,8 @@
 
 ## Tooling and gates
 
+- When updating dependency pins, reconcile affected `manifest.toml` files in examples, consumers and nested packages through Gleam, then run the full repository gate; updating the root lock alone is insufficient.
+
 - `nix develop` (or direnv): dev shell with `gleam`, Erlang/OTP 29, `rebar3`, `lefthook`.
 - Dependencies: the unpublished Sinal package is a Git dependency on `main`, and each `manifest.toml` is the lock. Update it by hand with `gleam update sinal` in each project that depends on it (root, `bench`, `consumer`, `examples/usage`, `resilience`). The Oban oracle source is fetched into the gitignored `oracle/deps`; no upstream source is committed.
 - `nix fmt`: formats the repo through treefmt. `lefthook` formats and re-stages staged files on commit. `nix flake check` fails iff the tree is not formatted.
