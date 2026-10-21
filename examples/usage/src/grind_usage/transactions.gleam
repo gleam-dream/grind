@@ -36,6 +36,7 @@ pub fn run(url: String) -> Nil {
 
   // The order row and its receipt job commit together. The reply means the
   // admission is staged in the application's transaction, not committed.
+  // snips-start: transaction
   let order = support.unique("order")
   let assert Ok(grind.Inserted(handle)) =
     pog.transaction(db, fn(tx) {
@@ -45,6 +46,7 @@ pub fn run(url: String) -> Nil {
         |> pog.execute(tx)
       grind.submit_in(jobs, tx, job.new(receipt, 9) |> job.with_id(order))
     })
+  // snips-end: transaction
   let assert Ok(grind.Succeeded(9)) = grind.await(jobs, handle, within:)
 
   // A rollback takes the job with it: the same id is still free afterwards.

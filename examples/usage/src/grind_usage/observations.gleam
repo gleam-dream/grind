@@ -29,6 +29,7 @@ pub fn run(url: String) -> Nil {
     )
     |> worker.with_queue(support.unique("observed"))
 
+  // snips-start: observe
   let acknowledged = process.new_subject()
   let capacity = process.new_subject()
   // A lifecycle event: one committed disposition for one claimed attempt.
@@ -39,6 +40,7 @@ pub fn run(url: String) -> Nil {
         False -> Nil
       }
     })
+  // snips-end: observe
   // A diagnostic event: the coordinator's local capacity ledger.
   let capacity_handler =
     sinal.observe(telemetry.capacity(), fn(measurements, metadata) {

@@ -32,10 +32,11 @@ Define a worker, add Grind to the application's supervision tree, and submit
 through its registered name. This example uses application-owned `Email` values
 and simulates delivery by returning a message ID. Pass your `pog.Config` to
 `children`; the application supervisor owns startup, restart and shutdown.
-For a script, `run_once` starts the runtime and calls `grind.stop` on exit.
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: test/grind/facade/readme_test.gleam#quick-start -->
 ```gleam
-import exception
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
@@ -73,8 +74,6 @@ pub fn mailer() -> worker.Worker(Email, String, Nil) {
   |> worker.with_queue("mailers")
 }
 
-/// One child in the application's supervision tree migrates the schema,
-/// then runs the pool, one consumer per queue and the pruner.
 pub fn children(pool: pog.Config, name: process.Name(grind.Message)) {
   let config =
     grind.new(pool)
@@ -84,26 +83,15 @@ pub fn children(pool: pog.Config, name: process.Name(grind.Message)) {
   |> supervisor.add(grind.supervised(config, name))
 }
 
-/// Anywhere in the application: a handle found by name.
 pub fn send(name: process.Name(grind.Message), email: Email) {
   let jobs = grind.named(name)
   let assert Ok(admission) = grind.submit(jobs, job.new(mailer(), email))
   grind.await(jobs, grind.handle(admission), within: duration.seconds(5))
-  // Ok(grind.Succeeded("msg:a@b.c"))
 }
 
-/// A script owns its runtime and stops it when this call finishes or raises.
-pub fn run_once(pool: pog.Config, email: Email) {
-  let name = process.new_name("mailer_jobs")
-  let config =
-    grind.new(pool)
-    |> grind.with_worker(mailer())
-    |> grind.with_startup_migration
-  let assert Ok(jobs) = grind.start(config, name)
-  use <- exception.defer(fn() { grind.stop(jobs) })
-  send(name, email)
-}
 ```
+
+<!-- prettier-ignore-end -->
 
 The [compiled quick-start test](test/grind/facade/readme_test.gleam) retains the
 worker, codecs and supervised example. The [usage examples](examples/usage/README.md)
@@ -125,44 +113,87 @@ An abandoned attempt is held `Uncertain` by default. Investigate the external ef
 
 ## Usage
 
-Enqueue inside the application's own READ COMMITTED transaction. The reply means staged admission, not commit, and SERIALIZABLE and REPEATABLE READ transactions are refused:
+Enqueue inside the application's own READ COMMITTED transaction. This excerpt uses the receipt worker and database connection configured by the runnable transaction example. The reply means staged admission, not commit, and SERIALIZABLE and REPEATABLE READ transactions are refused:
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/usage/src/grind_usage/transactions.gleam#transaction -->
 ```gleam
-pog.transaction(grind.connection(jobs), fn(tx) {
-  use _ <- result.try(orders.confirm(tx, order))
-  grind.submit_in(jobs, tx, job.new(receipt(), order.id) |> job.with_id(order.id))
-  |> result.map_error(ReceiptNotQueued)
-})
-```
-
-Resolve an uncertain job after investigating its effect. The resolution ID names one exact command across the installation, so qualify it with the job ID and persist the command before applying it; `admin.resolve_uncertain_in` stages the same command inside a caller-owned transaction:
-
-```gleam
-let command = admin.resolution(
-  admin.ConfirmSuccess(receipt),
-  id: "job:" <> int.to_string(job.id(handle)) <> ":decision:" <> decision_id,
-  by: operator,
-  details: evidence,
-)
-admin.resolve_uncertain(jobs, handle, command)
-```
-
-Observe committed lifecycle transitions and diagnostics with plain Sinal calls. Events are best-effort, so outcomes are read from the durable rows:
-
-```gleam
-let _attachment =
-  sinal.observe(telemetry.acknowledged(), fn(_measurements, metadata) {
-    io.println("job " <> int.to_string(metadata.ref.job_id) <> " acknowledged")
+let order = support.unique("order")
+let assert Ok(grind.Inserted(handle)) =
+  pog.transaction(db, fn(tx) {
+    let assert Ok(_) =
+      pog.query("INSERT INTO usage_orders (id) VALUES ($1)")
+      |> pog.parameter(pog.text(order))
+      |> pog.execute(tx)
+    grind.submit_in(jobs, tx, job.new(receipt, 9) |> job.with_id(order))
   })
 ```
 
+<!-- prettier-ignore-end -->
+
+Resolve an uncertain job after investigating its effect. The resolution ID names one exact command across the installation, so qualify it with the job ID and persist the command before applying it; `admin.resolve_uncertain_in` stages the same command inside a caller-owned transaction:
+
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/usage/src/grind_usage/uncertain.gleam#resolve-uncertain -->
+```gleam
+let command =
+  admin.resolution(
+    admin.ConfirmSuccess(42),
+    id: "job:" <> int.to_string(job.id(handle)) <> ":decision:1",
+    by: "operator@example.com",
+    details: "the provider ledger confirms op-42",
+  )
+let assert Ok(admin.Applied(job.Succeeded)) =
+  admin.resolve_uncertain(jobs, handle, command)
+```
+
+<!-- prettier-ignore-end -->
+
+Observe committed lifecycle transitions and diagnostics with plain Sinal calls. Events are best-effort, so outcomes are read from the durable rows:
+
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/usage/src/grind_usage/observations.gleam#observe -->
+```gleam
+let acknowledged = process.new_subject()
+let capacity = process.new_subject()
+// A lifecycle event: one committed disposition for one claimed attempt.
+let ack_handler =
+  sinal.observe(telemetry.acknowledged(), fn(_measurements, metadata) {
+    case metadata.ref.queue == double.queue {
+      True -> process.send(acknowledged, metadata)
+      False -> Nil
+    }
+  })
+```
+
+<!-- prettier-ignore-end -->
+
 Read one queue as a content-free committed snapshot, and prune finished jobs in bounded batches:
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/usage/src/grind_usage/retention.gleam#retention -->
 ```gleam
-let assert Ok(snapshot) = admin.statistics(jobs, queue: "emails")
-let assert Ok(deleted) =
-  admin.prune_finished(jobs, older_than: duration.minutes(1), limit: 1000)
+let assert Ok(statistics) = admin.statistics(jobs, queue: work.queue)
+let assert Ok(finished) =
+  list.find(statistics.states, fn(group) { group.state == job.Succeeded })
+let assert 1 = finished.count
+
+// One call is one bounded batch of finished jobs older than the age.
+process.sleep(20)
+let assert Ok(pruned) =
+  admin.prune_finished(
+    jobs,
+    older_than: duration.milliseconds(10),
+    limit: 1000,
+  )
+let assert True = pruned >= 1
 ```
+
+<!-- prettier-ignore-end -->
 
 Every snippet has a compiled, runnable counterpart in [examples/usage](examples/usage/README.md): [transactions](examples/usage/src/grind_usage/transactions.gleam), [uncertain jobs](examples/usage/src/grind_usage/uncertain.gleam), [observations](examples/usage/src/grind_usage/observations.gleam), [retention and statistics](examples/usage/src/grind_usage/retention.gleam), [migrations](examples/usage/src/grind_usage/migrations.gleam) and [limits and defaults](examples/usage/src/grind_usage/limits.gleam). The examples run in the gate, so they stay current with the library.
 
@@ -170,6 +201,9 @@ Every snippet has a compiled, runnable counterpart in [examples/usage](examples/
 
 `grind.with_startup_migration` migrates before consumers start. Leave it off for runtime roles without DDL permission and apply migrations at deployment time. Choose one migration owner for each schema, either `grind.migrate` or the [cigogne mirrors](priv/migrations). Cigogne can share Grind's pool:
 
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/usage/src/grind_usage/migrations.gleam#migrate-cigogne -->
 ```gleam
 let assert Ok(base_config) = config.get("grind")
 let cigogne_config =
@@ -180,6 +214,8 @@ let cigogne_config =
 let assert Ok(engine) = cigogne.create_engine(cigogne_config)
 let assert Ok(Nil) = cigogne.apply_all(engine)
 ```
+
+<!-- prettier-ignore-end -->
 
 The execution rules, upgrade limits and schema isolation requirements are defined under "Storage and migrations" in [the design](docs/design/design.typ).
 

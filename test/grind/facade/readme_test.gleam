@@ -1,16 +1,18 @@
 //// The README's quick start, compiled and run.
 
 import exception
+import gleeunit/should
+import grind/facade/support.{pool_config}
+import grind/support/env.{mark_database_test_executed, queue_database_url}
+
+// snips-start: quick-start
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/json
 import gleam/otp/static_supervisor as supervisor
 import gleam/time/duration
-import gleeunit/should
 import grind
-import grind/facade/support.{pool_config}
 import grind/job
-import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/worker
 import pog
 
@@ -55,6 +57,8 @@ pub fn send(name: process.Name(grind.Message), email: Email) {
   let assert Ok(admission) = grind.submit(jobs, job.new(mailer(), email))
   grind.await(jobs, grind.handle(admission), within: duration.seconds(5))
 }
+
+// snips-end: quick-start
 
 pub fn readme_quick_start_test() {
   case queue_database_url() {

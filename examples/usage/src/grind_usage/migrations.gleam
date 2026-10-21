@@ -32,6 +32,7 @@ pub fn run_cigogne(url: String) -> Nil {
   let assert Ok(jobs) = grind.start(config, process.new_name("usage_cigogne"))
   use <- exception.defer(fn() { grind.stop(jobs) })
 
+  // snips-start: migrate-cigogne
   let assert Ok(base_config) = config.get("grind")
   let cigogne_config =
     config.Config(
@@ -40,6 +41,7 @@ pub fn run_cigogne(url: String) -> Nil {
     )
   let assert Ok(engine) = cigogne.create_engine(cigogne_config)
   let assert Ok(Nil) = cigogne.apply_all(engine)
+  // snips-end: migrate-cigogne
   let assert Ok(Nil) = grind.migrate(jobs)
   io.println("migrations: cigogne applied the schema, migrate was a no-op")
   support.mark("usage-cigogne-passed")

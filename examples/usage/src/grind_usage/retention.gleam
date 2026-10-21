@@ -38,6 +38,7 @@ pub fn run(url: String) -> Nil {
     grind.await(jobs, handle, within: duration.seconds(10))
 
   // Every known state is present; empty groups carry a zero count.
+  // snips-start: retention
   let assert Ok(statistics) = admin.statistics(jobs, queue: work.queue)
   let assert Ok(finished) =
     list.find(statistics.states, fn(group) { group.state == job.Succeeded })
@@ -52,6 +53,7 @@ pub fn run(url: String) -> Nil {
       limit: 1000,
     )
   let assert True = pruned >= 1
+  // snips-end: retention
   let assert Error(grind.JobNotFound) = grind.state(jobs, handle)
   let assert Error(admin.InvalidLimit(limit: 0, maximum: 10_000)) =
     admin.prune_finished(jobs, older_than: duration.seconds(1), limit: 0)

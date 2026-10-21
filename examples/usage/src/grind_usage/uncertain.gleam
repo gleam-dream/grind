@@ -54,6 +54,7 @@ pub fn run(url: String) -> Nil {
 
   // The decision identity is persisted before it is applied, qualified by
   // the job, so a retry after a lost reply repeats the same command.
+  // snips-start: resolve-uncertain
   let command =
     admin.resolution(
       admin.ConfirmSuccess(42),
@@ -63,6 +64,7 @@ pub fn run(url: String) -> Nil {
     )
   let assert Ok(admin.Applied(job.Succeeded)) =
     admin.resolve_uncertain(jobs, handle, command)
+  // snips-end: resolve-uncertain
   let assert Ok(admin.AlreadyApplied(job.Succeeded)) =
     admin.resolve_uncertain(jobs, handle, command)
   let assert Ok(grind.Succeeded(42)) = grind.outcome(jobs, handle)

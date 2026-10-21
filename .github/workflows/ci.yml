@@ -44,6 +44,8 @@ jobs:
       - name: Shared design validation
         working-directory: grind
         run: nix run .#design-gate-check -- docs/design .
+      - name: README snippets
+        run: nix run --no-update-lock-file .#snips -- --check --commands deny README.md
       - name: Complete ordinary gate
         working-directory: grind
         run: GRIND_CI_CACHE="$RUNNER_TEMP/grind-dependencies" CI_ARTIFACT_DIR="$RUNNER_TEMP/grind-ci" nix develop --command bash scripts/ci.sh full
