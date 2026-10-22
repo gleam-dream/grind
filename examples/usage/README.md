@@ -34,4 +34,4 @@ GRIND_USAGE_CIGOGNE_DATABASE_URL=postgres://user@localhost/grind_usage_cigogne \
   gleam test        # or: gleam run
 ```
 
-The database gate, `scripts/test-postgres.sh`, creates both databases, runs every topic and fails unless each one reached its last assertion. See the [design](../../docs/design/design.typ), "Usage examples".
+The database gate, `scripts/test-postgres.sh`, creates both databases, runs every topic and fails unless each one reached its last assertion. See the [design](../../docs/design/design-layer.pdf), "Usage examples".

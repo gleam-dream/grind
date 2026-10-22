@@ -1,14 +1,25 @@
 # Grind
 
-Grind runs typed background jobs on PostgreSQL and Erlang/OTP. Workers define
-input, output and error types with JSON codecs; Grind stores admissions and
-outcomes and runs handlers through a supervised queue runtime.
+Grind is a durable background-job runtime for Gleam applications on Erlang/OTP and PostgreSQL. It retains typed job outcomes in PostgreSQL and runs handlers under OTP supervision. It is not yet published to Hex; install it from Git as shown below.
+
+Use Grind when work must outlive the request that created it and your application already fits Erlang/OTP and PostgreSQL. Typical work includes sending notifications, processing provider callbacks, and running delayed or retryable tasks. It also supports jobs admitted in the same database transaction as an application write, and an operator recovery path when an external effect is uncertain.
+
+Grind is a fit for durable individual jobs with local per-node queue limits. It does not currently provide cron schedules, durable dependency workflows, batch coordination, or cluster-wide rate limits.
+
+## Capabilities
+
+- Define workers with typed input, output, and optional error values, explicit JSON codecs, and versioned stored contracts.
+- Submit jobs immediately or for a scheduled time; use stable submission IDs and recover an ambiguous admission with its pending command.
+- Configure scoped uniqueness, retries, snoozes, handler timeouts, and what happens after an abandoned attempt.
+- Run named queues under OTP supervision with per-node concurrency, database leases, and independent lease renewal.
+- Read typed job state and outcomes; list jobs, inspect queue statistics, quarantine expired attempts, and prune finished jobs in bounded batches.
+- Observe typed lifecycle events and runtime diagnostics through Sinal. Events are best-effort; durable rows are the source of job outcomes.
+- Submit in the caller's open `READ COMMITTED` transaction, or let Grind own admission's transaction.
+- Apply Grind migrations at startup or as a deployment step, with one migration owner for each schema.
 
 ## Install
 
-Grind is not yet published to Hex. Depend on it through Git; its own unpublished
-dependency, [Sinal](https://github.com/gleam-dream/sinal), resolves through
-Grind's manifest entry. Your manifest holds the resolved commit, and `gleam update grind` moves it:
+Add Grind from Git. The `main` ref selects the branch; commit your `manifest.toml`, which records the resolved commit. Run `gleam update grind` when you intend to advance it. Grind's manifest resolves its unpublished Sinal dependency, so fetching and building needs no adjacent Grind or Sinal checkout.
 
 ```toml
 [dependencies]
@@ -22,16 +33,11 @@ exception = ">= 2.1.1 and < 3.0.0"
 pog = ">= 4.1.0 and < 4.2.0"
 ```
 
-The Erlang target requires Gleam 1.18 or later and PostgreSQL. Development uses
-OTP 29 and PostgreSQL 16 through `nix develop`. The [package manifest](gleam.toml)
-records the dependency ranges, including the pinned PostgreSQL driver versions.
+The Erlang target requires Gleam 1.18 or later and PostgreSQL. The repository's development shell uses OTP 29 and PostgreSQL 16.
 
 ## Quick start
 
-Define a worker, add Grind to the application's supervision tree, and submit
-through its registered name. This example uses application-owned `Email` values
-and simulates delivery by returning a message ID. Pass your `pog.Config` to
-`children`; the application supervisor owns startup, restart and shutdown.
+Define a worker, add Grind to the application's supervision tree, and submit through its registered name. This example uses application-owned `Email` values and simulates delivery by returning a message ID. The application supervisor owns startup, restart, and shutdown.
 
 <!-- prettier-ignore-start -->
 
@@ -93,27 +99,30 @@ pub fn send(name: process.Name(grind.Message), email: Email) {
 
 <!-- prettier-ignore-end -->
 
-The [compiled quick-start test](test/grind/facade/readme_test.gleam) retains the
-worker, codecs and supervised example. The [usage examples](examples/usage/README.md)
-cover each topic as code that compiles and runs, and the [separate consumer](consumer/README.md)
-exercises public APIs, typed failures, configuration and recovery.
+The example opts into startup migration. In production, give DDL permission to the runtime only when that is your migration plan; otherwise call `grind.migrate` in a deployment step or use your migration tool. Choose one migration owner per schema.
 
-`submit` can fail before admission or return `CommitUnknown(pending)` after a
-lost reply. Retain that pending command and use `grind.reconcile_submission`.
-The example asserts successful startup and admission; application code can use
-`grind.submit_error_kind` and `grind.describe_submit_error` to handle failures.
-A five-second `await` can return `Pending`; it does not cancel the job, and its
-last storage read can extend beyond the wait budget.
+## How the runtime fits together
 
-## Runtime and recovery
+Each configured worker has typed codecs and a stable identity. The runtime starts a coordinator for each used queue; a coordinator claims work into local capacity and starts one temporary attempt actor per handler invocation. Each attempt is fenced by its lease and identity. A separate renewer uses a reserved database connection so ordinary pool saturation does not also stop lease renewal.
 
-Grind owns the main pool and its supervised processes. Each used queue adds one reserved renewal connection. Applications can borrow `grind.connection(jobs)` while Grind owns the pool. A runtime added with `grind.supervised` shuts down through the application supervisor, and one started with `grind.start` needs `grind.stop`.
+```mermaid
+flowchart LR
+  App[Application registers workers and submits jobs] --> Runtime[Grind OTP supervisor]
+  Runtime --> Queue[Per-queue coordinator]
+  Queue --> Attempt[Attempt actor]
+  Attempt --> Handler[Linked application handler]
+  Handler -->|application-owned effect| Provider[External system]
+  Attempt -->|fenced outcome and receipt| Postgres[(PostgreSQL)]
+  Queue --> Renewer[Lease renewer]
+  Renewer -->|reserved connection| Postgres
+  Runtime -->|best-effort events| Sinal[Sinal]
+```
 
-An abandoned attempt is held `Uncertain` by default. Investigate the external effect, then confirm an outcome or authorize replay with `grind/admin`. Cancellation is cooperative and cannot retract an effect. Receipt recovery and submission deduplication end when a job is pruned. The defaults, deadline limits and operating obligations are defined in [the design](docs/design/design.typ) under "Public modules and defaults", "Runtime capacity and deadlines" and "Deployment obligations".
+Queue concurrency is local to each node. Budget one dedicated renewal connection per used queue in addition to the main pool. The application owns external effects; a committed job outcome records Grind's view of the handler result, not an atomic transaction with a provider.
 
-## Usage
+## Enqueue with an application write
 
-Enqueue inside the application's own READ COMMITTED transaction. This excerpt uses the receipt worker and database connection configured by the runnable transaction example. The reply means staged admission, not commit, and SERIALIZABLE and REPEATABLE READ transactions are refused:
+`grind.submit_in` stages admission in the caller's open `READ COMMITTED` transaction on the same database. The job commits or rolls back with the application write. Its reply is staged admission, not proof that the outer transaction committed.
 
 <!-- prettier-ignore-start -->
 
@@ -132,103 +141,20 @@ let assert Ok(grind.Inserted(handle)) =
 
 <!-- prettier-ignore-end -->
 
-Resolve an uncertain job after investigating its effect. The resolution ID names one exact command across the installation, so qualify it with the job ID and persist the command before applying it; `admin.resolve_uncertain_in` stages the same command inside a caller-owned transaction:
+The full runnable transaction example also shows rollback behavior: [transactions.gleam](examples/usage/src/grind_usage/transactions.gleam).
 
-<!-- prettier-ignore-start -->
+## Recovery and operating limits
 
-<!-- snips: examples/usage/src/grind_usage/uncertain.gleam#resolve-uncertain -->
-```gleam
-let command =
-  admin.resolution(
-    admin.ConfirmSuccess(42),
-    id: "job:" <> int.to_string(job.id(handle)) <> ":decision:1",
-    by: "operator@example.com",
-    details: "the provider ledger confirms op-42",
-  )
-let assert Ok(admin.Applied(job.Succeeded)) =
-  admin.resolve_uncertain(jobs, handle, command)
-```
+- A lost admission reply can return `CommitUnknown(pending)`. Retain that pending command and call `grind.reconcile_submission`; a missing receipt is still unknown. Reuse the same command identity when retrying.
+- External effects are not exactly-once: submission receipts deduplicate the admission command, not a provider call. Use a provider-enforced idempotency key or an application ledger when effects must not repeat.
+- An abandoned attempt is `Uncertain` by default because its external effect may have happened. Investigate the provider or business ledger before confirming the outcome or authorizing replay. Resolution attribution does not enforce operator permissions.
+- Cancellation is cooperative intent. It cannot retract an effect or promise that the handler did no work.
+- `await` may return `Pending`; it does not cancel the job. Its final storage read can exceed the requested wait, and queued database checkout can exceed the storage-call deadline.
+- Receipts are pruned with finished jobs. For deduplication or audit history that must outlive job retention, keep an application-owned business record.
 
-<!-- prettier-ignore-end -->
+## Learn more
 
-Observe committed lifecycle transitions and diagnostics with plain Sinal calls. Events are best-effort, so outcomes are read from the durable rows:
-
-<!-- prettier-ignore-start -->
-
-<!-- snips: examples/usage/src/grind_usage/observations.gleam#observe -->
-```gleam
-let acknowledged = process.new_subject()
-let capacity = process.new_subject()
-// A lifecycle event: one committed disposition for one claimed attempt.
-let ack_handler =
-  sinal.observe(telemetry.acknowledged(), fn(_measurements, metadata) {
-    case metadata.ref.queue == double.queue {
-      True -> process.send(acknowledged, metadata)
-      False -> Nil
-    }
-  })
-```
-
-<!-- prettier-ignore-end -->
-
-Read one queue as a content-free committed snapshot, and prune finished jobs in bounded batches:
-
-<!-- prettier-ignore-start -->
-
-<!-- snips: examples/usage/src/grind_usage/retention.gleam#retention -->
-```gleam
-let assert Ok(statistics) = admin.statistics(jobs, queue: work.queue)
-let assert Ok(finished) =
-  list.find(statistics.states, fn(group) { group.state == job.Succeeded })
-let assert 1 = finished.count
-
-// One call is one bounded batch of finished jobs older than the age.
-process.sleep(20)
-let assert Ok(pruned) =
-  admin.prune_finished(
-    jobs,
-    older_than: duration.milliseconds(10),
-    limit: 1000,
-  )
-let assert True = pruned >= 1
-```
-
-<!-- prettier-ignore-end -->
-
-Every snippet has a compiled, runnable counterpart in [examples/usage](examples/usage/README.md): [transactions](examples/usage/src/grind_usage/transactions.gleam), [uncertain jobs](examples/usage/src/grind_usage/uncertain.gleam), [observations](examples/usage/src/grind_usage/observations.gleam), [retention and statistics](examples/usage/src/grind_usage/retention.gleam), [migrations](examples/usage/src/grind_usage/migrations.gleam) and [limits and defaults](examples/usage/src/grind_usage/limits.gleam). The examples run in the gate, so they stay current with the library.
-
-## Migrations
-
-`grind.with_startup_migration` migrates before consumers start. Leave it off for runtime roles without DDL permission and apply migrations at deployment time. Choose one migration owner for each schema, either `grind.migrate` or the [cigogne mirrors](priv/migrations). Cigogne can share Grind's pool:
-
-<!-- prettier-ignore-start -->
-
-<!-- snips: examples/usage/src/grind_usage/migrations.gleam#migrate-cigogne -->
-```gleam
-let assert Ok(base_config) = config.get("grind")
-let cigogne_config =
-  config.Config(
-    ..base_config,
-    database: config.ConnectionDbConfig(grind.connection(jobs)),
-  )
-let assert Ok(engine) = cigogne.create_engine(cigogne_config)
-let assert Ok(Nil) = cigogne.apply_all(engine)
-```
-
-<!-- prettier-ignore-end -->
-
-The execution rules, upgrade limits and schema isolation requirements are defined under "Storage and migrations" in [the design](docs/design/design.typ).
-
-## Development
-
-Run from the repository root:
-
-```sh
-nix develop --command gleam test
-nix develop --command bash scripts/test-postgres.sh
-nix develop --command bash scripts/ci.sh fast
-```
-
-Plain `gleam test` skips database cases without their explicit test URL. The PostgreSQL script creates and removes its own disposable cluster and includes the public consumer and paired oracle checks. See [AGENTS.md](AGENTS.md) for every gate command.
-
-The [design](docs/design/design.typ), [vocabulary](docs/design/CONTEXT.typ), [coverage map](docs/COVERAGE.md) and [ADRs](docs/adr) distinguish current behavior from retained intended capabilities. [docs/ORACLE.md](docs/ORACLE.md) names the pinned Oban reference and what is compared, and [docs/BENCHMARKS.md](docs/BENCHMARKS.md) states the benchmark method and retained results; the two link each other. The [benchmark](bench/README.md), [resilience](resilience/README.md) and [oracle](oracle/README.md) directories give the harness commands.
+- [Compiled usage examples](examples/usage/README.md) cover workers, jobs, transactions, handlers, runtime configuration, uniqueness, recovery, retention, and migrations.
+- [Public consumer guide](consumer/README.md) exercises the API from a separate package.
+- [Design and operating contracts](docs/design/design-layer.pdf) document defaults and the detailed boundaries.
+- [Benchmark method and retained results](docs/BENCHMARKS.md) include historical measurements and their limits.

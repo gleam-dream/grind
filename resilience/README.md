@@ -1,6 +1,6 @@
 # Resilience harness
 
-This Gleam project launches independent, named BEAM operating-system processes against one disposable PostgreSQL cluster and consumes only Grind's public API. Python controls the processes and the TCP streams. The scenarios (M1 to M7, F1 to F5 and the soak), their required observations and the resource bounds are defined in "Verification method" in [the design](../docs/design/design.typ).
+This Gleam project launches independent, named BEAM operating-system processes against one disposable PostgreSQL cluster and consumes only Grind's public API. Python controls the processes and the TCP streams. The scenarios (M1 to M7, F1 to F5 and the soak), their required observations and the resource bounds are defined in "Verification method" in [the design](../docs/design/design-layer.pdf).
 
 ## Run
 
