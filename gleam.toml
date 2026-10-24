@@ -1,0 +1,31 @@
+name = "grind"
+version = "0.1.0"
+target = "erlang"
+gleam = ">= 1.18.0"
+licenses = ["Apache-2.0"]
+description = "A strongly-typed Oban for Gleam: durable, typed background jobs on OTP + Postgres."
+repository = { type = "github", user = "gleam-dream", repo = "grind" }
+
+[dependencies]
+gleam_stdlib = ">= 0.70.0 and < 2.0.0"
+gleam_erlang = ">= 1.0.0 and < 2.0.0"
+gleam_otp = ">= 1.0.0 and < 2.0.0"
+# Pinned tight, not the usual `>= x.y.0 and < (x+1).0.0`:
+# `src/grind_postgres_ffi.erl` matches pog's private `Connection` shape
+# (`{pool, Name} | {single_connection, Conn}`), pgo's private connection record
+# and checkout/return APIs. Pool teardown also depends on pgo's internal
+# supervisor identity and the per-pool cache key shapes. Widening either range
+# requires review of those contracts and the startup/reconnect regressions;
+# `pog_connection_pool_shape_test` alone does not cover these private details.
+pog = ">= 4.1.0 and < 4.2.0"
+pgo = ">= 0.20.0 and < 0.21.0"
+gleam_json = ">= 3.1.0 and < 4.0.0"
+gleam_time = ">= 1.0.0 and < 2.0.0"
+exception = ">= 2.1.1 and < 3.0.0"
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "main" }
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
+squirrel = ">= 4.7.0 and < 5.0.0"
+simplifile = ">= 2.7.0 and < 3.0.0"
+cigogne = ">= 5.0.6 and < 6.0.0"

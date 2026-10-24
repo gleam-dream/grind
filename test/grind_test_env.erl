@@ -1,0 +1,94 @@
+-module(grind_test_env).
+-export([database_url/0, queue_database_url/0, owner_a_url/0, user_schema_fallback_url/0, migration_collision_submissions_url/0, migration_collision_resolutions_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_missing_fk_url/0, schema_atomic_url/0, schema_concurrent_url/0, schema_partial_url/0, schema_upgrade_url/0, schema_upgrade_fresh_url/0, schema_future_foreign_url/0, schema_shape_url/0, schema_mixed_case_url/0, repeatable_read_url/0, quarantine_url/0, fault_proxy_url/0, migration_deadline_url/0, migration_lock_url/0, prune_url/0, prune_owner_b_url/0, cigogne_e2e_url/0, cigogne_e2e_fresh_url/0, cigogne_concurrent_url/0, upgrade_lost_reply_url/0, postgres_log_path/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0, pool_connection_atom/1]).
+
+database_url() -> env("GRIND_TEST_DATABASE_URL").
+queue_database_url() -> env("GRIND_TEST_QUEUE_DATABASE_URL").
+owner_a_url() -> env("GRIND_TEST_OWNER_A_URL").
+user_schema_fallback_url() -> env("GRIND_TEST_USER_SCHEMA_FALLBACK_URL").
+migration_collision_submissions_url() -> env("GRIND_TEST_MIGRATION_COLLISION_SUBMISSIONS_URL").
+migration_collision_resolutions_url() -> env("GRIND_TEST_MIGRATION_COLLISION_RESOLUTIONS_URL").
+schema_bad_url() -> env("GRIND_TEST_SCHEMA_BAD_URL").
+schema_fresh_url() -> env("GRIND_TEST_SCHEMA_FRESH_URL").
+schema_markers_url() -> env("GRIND_TEST_SCHEMA_MARKERS_URL").
+schema_missing_jobs_url() -> env("GRIND_TEST_SCHEMA_MISSING_JOBS_URL").
+schema_missing_migrations_url() -> env("GRIND_TEST_SCHEMA_MISSING_MIGRATIONS_URL").
+schema_missing_resolutions_url() -> env("GRIND_TEST_SCHEMA_MISSING_RESOLUTIONS_URL").
+schema_missing_acknowledgements_url() -> env("GRIND_TEST_SCHEMA_MISSING_ACK_URL").
+schema_missing_attempt_sequence_url() -> env("GRIND_TEST_SCHEMA_MISSING_ATTEMPT_SEQUENCE_URL").
+schema_missing_unique_submissions_url() -> env("GRIND_TEST_SCHEMA_MISSING_UNIQUE_SUBMISSIONS_URL").
+schema_missing_fk_url() -> env("GRIND_TEST_SCHEMA_MISSING_FK_URL").
+schema_atomic_url() -> env("GRIND_TEST_SCHEMA_ATOMIC_URL").
+schema_concurrent_url() -> env("GRIND_TEST_SCHEMA_CONCURRENT_URL").
+schema_partial_url() -> env("GRIND_TEST_SCHEMA_PARTIAL_URL").
+schema_upgrade_url() -> env("GRIND_TEST_SCHEMA_UPGRADE_URL").
+schema_upgrade_fresh_url() -> env("GRIND_TEST_SCHEMA_UPGRADE_FRESH_URL").
+schema_future_foreign_url() -> env("GRIND_TEST_SCHEMA_FUTURE_FOREIGN_URL").
+schema_shape_url() -> env("GRIND_TEST_SCHEMA_SHAPE_URL").
+schema_mixed_case_url() -> env("GRIND_TEST_SCHEMA_MIXED_CASE_URL").
+repeatable_read_url() -> env("GRIND_TEST_REPEATABLE_READ_URL").
+quarantine_url() -> env("GRIND_TEST_QUARANTINE_URL").
+fault_proxy_url() -> env("GRIND_TEST_FAULT_PROXY_URL").
+migration_deadline_url() -> env("GRIND_TEST_MIGRATION_DEADLINE_URL").
+migration_lock_url() -> env("GRIND_TEST_MIGRATION_LOCK_URL").
+prune_url() -> env("GRIND_TEST_PRUNE_URL").
+prune_owner_b_url() -> env("GRIND_TEST_PRUNE_OWNER_B_URL").
+%% Cigogne end-to-end databases.
+cigogne_e2e_url() -> env("GRIND_TEST_CIGOGNE_E2E_URL").
+cigogne_e2e_fresh_url() -> env("GRIND_TEST_CIGOGNE_E2E_FRESH_URL").
+cigogne_concurrent_url() -> env("GRIND_TEST_CIGOGNE_CONCURRENT_URL").
+upgrade_lost_reply_url() -> env("GRIND_TEST_UPGRADE_LOST_REPLY_URL").
+%% The disposable PostgreSQL cluster's own server log
+%% (`scripts/test-postgres.sh`'s `pg_ctl ... -l`) — read-only, used solely to
+%% prove `read_cluster_identifier`'s `has_function_privilege` guard actually
+%% suppresses the server-side `ERROR:  permission denied for function
+%% pg_control_system` a non-superuser role would otherwise raise (and have
+%% logged) on every `postgres.start`, a fact no Gleam-visible return value
+%% distinguishes on its own (both the guarded and unguarded query already
+%% resolve to `None` for such a role).
+postgres_log_path() -> env("GRIND_TEST_POSTGRES_LOG").
+
+env(Name) ->
+    case os:getenv(Name) of
+        false -> {error, nil};
+        Url -> {ok, unicode:characters_to_binary(Url)}
+    end.
+
+mark_database_test_executed(Name) ->
+    case os:getenv("GRIND_TEST_MARKER") of
+        false -> erlang:error(missing_grind_test_marker);
+        Path ->
+            ok = file:write_file(Path, <<Name/binary, "\n">>, [append]),
+            nil
+    end.
+
+%% Monotonic wall-clock milliseconds, for measuring elapsed duration in a
+%% timing-sensitive test. Never used to derive a shared point in time across
+%% processes or as a substitute for a database-time boundary.
+monotonic_ms() -> erlang:monotonic_time(millisecond).
+
+%% A positive integer unique across both calls within one `gleam test` run
+%% AND separate runs (each of which is its own fresh Erlang VM, where
+%% `erlang:unique_integer/1` alone restarts from a small value every time —
+%% confirmed by observation: reusing it alone made a second, immediate
+%% `gleam test` run against the same un-recreated database collide with the
+%% first run's leftover receipt and fail). Combines wall-clock microseconds
+%% (differs across separate VM invocations) with the per-VM monotonic
+%% counter (differs across calls within one run). For suffixing fixed test
+%% literals (worker ids, submission ids, queue names) so uniqueness tests
+%% can be re-run against a persistent development database without
+%% colliding with rows/receipts a previous run left behind. Never used as a
+%% substitute for the disposable-cluster isolation the CI gate already
+%% provides.
+unique_test_run_id() ->
+    erlang:system_time(microsecond) * 1000000 +
+        erlang:unique_integer([positive, monotonic]) rem 1000000.
+
+%% Canary for `grind_postgres_ffi`'s own dependency on pog's private
+%% `pog.Connection` shape (`{pool, Name} | {single_connection, Conn}`):
+%% `pog_connection_pool_shape_test` (test/grind_test.gleam) asserts a freshly
+%% named connection is still the `{pool, Name}` tuple this matches. A pog
+%% upgrade that changes that internal representation would fail this probe
+%% loudly instead of letting `grind_postgres_ffi:with_deadline/3` silently
+%% stop matching and fall through to some other, wrong behavior.
+pool_connection_atom({pool, Name}) -> {ok, Name};
+pool_connection_atom(_Other) -> {error, nil}.

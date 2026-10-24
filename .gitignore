@@ -1,0 +1,9 @@
+build/
+erl_crash.dump
+*.beam
+.direnv/
+oracle/_build/
+oracle/deps/
+.render/
+**/.render/
+.ci-results/

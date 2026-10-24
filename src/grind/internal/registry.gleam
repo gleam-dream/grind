@@ -1,0 +1,164 @@
+//// Collects the workers that one queue's consumer runs.
+////
+//// Create a `Registry` for a queue name with `new`, add each worker with
+//// `register`, and pass it to `queue.start`. A registry may hold workers with
+//// different input, output and error types. Each worker id and version may be
+//// registered once. A consumer runs only jobs whose exact worker id and version
+//// are registered; there is no fallback to another version.
+
+import gleam/list
+import gleam/option.{type Option}
+import grind/internal/worker.{type Worker}
+
+/// Immutable worker selections for one queue name.
+pub opaque type Registry {
+  Registry(queue: String, workers: List(Selection))
+}
+
+type Selection {
+  Selection(
+    id: String,
+    version: String,
+    input_version: String,
+    output_version: String,
+    error_version: Option(String),
+    run: fn(String, String, worker.Context, Int) -> worker.Execution,
+    timeout_ms: Option(Int),
+    abandonment: worker.Abandonment,
+  )
+}
+
+/// A registered worker selected for one claimed row: its codec contract, its
+/// erased execution (stored input version, encoded input, context, payload
+/// limit) and the policies the attempt process enforces around it.
+pub type Selected {
+  Selected(
+    input_version: String,
+    output_version: String,
+    error_version: Option(String),
+    run: fn(String, String, worker.Context, Int) -> worker.Execution,
+    timeout_ms: Option(Int),
+    abandonment: worker.Abandonment,
+  )
+}
+
+pub type RegisterError {
+  EmptyQueueName
+  DuplicateWorker(id: String, version: String)
+}
+
+pub fn new(queue: String) -> Result(Registry, RegisterError) {
+  case queue {
+    "" -> Error(EmptyQueueName)
+    _ -> Ok(Registry(queue:, workers: []))
+  }
+}
+
+/// Binds the typed worker before adding it to the heterogeneous registry.
+pub fn register(
+  registry: Registry,
+  definition: Worker(input, output, error),
+) -> Result(Registry, RegisterError) {
+  let Registry(queue:, workers: workers) = registry
+  let metadata = worker.metadata(definition)
+  let worker.Metadata(
+    id:,
+    worker_version: version,
+    input_version:,
+    output_version:,
+    error_version:,
+    ..,
+  ) = metadata
+  case
+    list.any(workers, fn(selection) {
+      let Selection(id: registered_id, version: registered_version, ..) =
+        selection
+      registered_id == id && registered_version == version
+    })
+  {
+    True -> Error(DuplicateWorker(id:, version:))
+    False ->
+      Ok(
+        Registry(queue:, workers: [
+          Selection(
+            id:,
+            version:,
+            input_version:,
+            output_version:,
+            error_version:,
+            run: fn(input_version, encoded_input, context, max_payload_bytes) {
+              worker.execute_encoded(
+                definition,
+                input_version,
+                encoded_input,
+                context,
+                max_payload_bytes,
+              )
+            },
+            timeout_ms: definition.timeout_ms,
+            abandonment: definition.abandonment,
+          ),
+          ..workers
+        ]),
+      )
+  }
+}
+
+pub fn queue(registry: Registry) -> String {
+  let Registry(queue:, ..) = registry
+  queue
+}
+
+pub fn identities(registry: Registry) -> List(#(String, String)) {
+  let Registry(workers:, ..) = registry
+  list.map(workers, fn(selection) {
+    let Selection(id:, version:, ..) = selection
+    #(id, version)
+  })
+}
+
+pub type SelectionError {
+  WrongQueue(expected: String, actual: String)
+  WorkerNotRegistered(id: String, version: String)
+}
+
+/// Internal exact selection; no worker-version fallback is permitted.
+pub fn select(
+  registry: Registry,
+  queue: String,
+  id: String,
+  version: String,
+) -> Result(Selected, SelectionError) {
+  let Registry(queue: registered_queue, workers: workers) = registry
+  case registered_queue == queue {
+    False -> Error(WrongQueue(expected: registered_queue, actual: queue))
+    True -> {
+      let matching =
+        list.find(workers, fn(selection) {
+          let Selection(id: registered_id, version: registered_version, ..) =
+            selection
+          registered_id == id && registered_version == version
+        })
+      case matching {
+        Ok(Selection(
+          input_version:,
+          output_version:,
+          error_version:,
+          run:,
+          timeout_ms:,
+          abandonment:,
+          ..,
+        )) ->
+          Ok(Selected(
+            input_version:,
+            output_version:,
+            error_version:,
+            run:,
+            timeout_ms:,
+            abandonment:,
+          ))
+        Error(Nil) -> Error(WorkerNotRegistered(id:, version:))
+      }
+    }
+  }
+}

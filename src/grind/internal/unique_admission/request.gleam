@@ -1,0 +1,222 @@
+//// Constructs admission requests and their stable request fingerprints.
+
+import gleam/bit_array
+import gleam/json
+import gleam/list
+import gleam/option.{type Option, None, Some}
+import gleam/result
+import gleam/string
+import grind/internal/job
+import grind/internal/submission
+import grind/internal/unique
+import grind/internal/worker.{type Worker}
+
+/// SHA-256 for the exact prepared request envelope.
+@external(erlang, "grind_unique_ffi", "sha256")
+fn sha256(data: BitArray) -> BitArray
+
+/// The uniqueness-policy fields a `submit_unique` request carries and a
+/// `submit_with_id` request does not. Held as its own type (rather than
+/// flattened into `Request`) so `Request.policy: Option(PolicyPart)` alone
+/// expresses "does this request have a uniqueness policy" — no separate
+/// sentinel key/scope/period/states/action values are ever constructed for
+/// the "no policy" case.
+pub type PolicyPart {
+  PolicyPart(
+    key_contract: String,
+    encoded_key: String,
+    scope: unique.QueueScope,
+    period: unique.Period,
+    states: unique.States,
+    on_conflict: unique.ConflictAction,
+  )
+}
+
+/// Every value the admission transaction needs, gathered once by `submit`/
+/// `submit_plain`. `request_sha256` starts empty and is filled in by
+/// `fingerprint`, which takes this whole record as its input — one field
+/// list, built once. `policy: None` is `submit_with_id`'s "no policy" case:
+/// no uniqueness key, no candidate selection, no domain-wide advisory lock,
+/// always an insert (or a replayed receipt) — see the module doc comment.
+pub type Request(input, output, error) {
+  Request(
+    installation: job.Installation,
+    submission_id: submission.SubmissionId,
+    queue: String,
+    worker: Worker(input, output, error),
+    worker_id: String,
+    worker_version: String,
+    input_version: String,
+    encoded_input: String,
+    output_version: String,
+    error_version: Option(String),
+    max_attempts: Int,
+    availability: submission.Availability,
+    policy: Option(PolicyPart),
+    request_sha256: BitArray,
+    /// Stored with the job; not part of the fingerprint, so a retried
+    /// submission converges whatever correlation it carries.
+    correlation: Option(String),
+    /// The worker's abandonment replay limit; not part of the fingerprint.
+    max_replays: Option(Int),
+  )
+}
+
+/// Gathers every value the admission transaction needs. `build_policy`
+/// receives the submitting worker's input codec version and encoded input
+/// so a policy's key uses the exact same encoding as the request. Returns
+/// `submission.InvalidInput` when the input codec or `build_policy` rejects
+/// the value, before any storage call.
+pub fn build_request(
+  installation: job.Installation,
+  submission_id: submission.SubmissionId,
+  queue: String,
+  worker_def: Worker(input, output, error),
+  input: input,
+  availability: submission.Availability,
+  correlation: Option(String),
+  max_payload_bytes: Int,
+  build_policy: fn(String, String) -> Result(Option(PolicyPart), String),
+) -> Result(
+  Request(input, output, error),
+  submission.SubmitError(input, output, error),
+) {
+  let worker.Metadata(
+    id: worker_id,
+    worker_version:,
+    input_version:,
+    output_version:,
+    error_version:,
+    max_attempts:,
+  ) = worker.metadata(worker_def)
+  use encoded_input <- result.try(
+    worker.encode_input(worker_def, input)
+    |> result.map_error(submission.InvalidInput),
+  )
+  use Nil <- result.try({
+    let bytes = string.byte_size(encoded_input)
+    case bytes > max_payload_bytes {
+      True ->
+        Error(submission.PayloadTooLarge(bytes:, limit: max_payload_bytes))
+      False -> Ok(Nil)
+    }
+  })
+  use policy <- result.try(
+    build_policy(input_version, encoded_input)
+    |> result.map_error(submission.InvalidInput),
+  )
+  let request =
+    Request(
+      installation:,
+      submission_id:,
+      queue:,
+      worker: worker_def,
+      worker_id:,
+      worker_version:,
+      input_version:,
+      encoded_input:,
+      output_version:,
+      error_version:,
+      max_attempts:,
+      availability:,
+      policy:,
+      request_sha256: <<>>,
+      correlation:,
+      max_replays: worker.max_replays(worker_def),
+    )
+  Ok(Request(..request, request_sha256: fingerprint(request)))
+}
+
+/// Plain and unique admissions use different envelope tags. Reusing a
+/// SubmissionId across those command kinds must return SubmissionConflict.
+/// Policy fields are included only when present; field order and encoding
+/// remain stable so retries reproduce the original fingerprint.
+/// See docs/adr/0003-separate-command-receipts-from-uniqueness.md.
+fn fingerprint(request: Request(input, output, error)) -> BitArray {
+  let tag = case request.policy {
+    Some(_) -> "grind-unique-request-v1"
+    None -> "grind-plain-request-v1"
+  }
+  let policy_fields = case request.policy {
+    None -> []
+    Some(PolicyPart(
+      key_contract:,
+      encoded_key:,
+      scope:,
+      period:,
+      states:,
+      on_conflict:,
+    )) -> {
+      let #(period_ms, period_origin) = case unique.period_spec(period) {
+        unique.Unbounded -> #(None, None)
+        unique.FinitePeriod(ms, from) -> #(
+          Some(ms),
+          Some(unique.period_origin_label(from)),
+        )
+      }
+      let reschedule_ms = unique.reschedule_target_ms(on_conflict)
+      [
+        json.string(key_contract),
+        json.string(encoded_key),
+        json.string(unique.scope_label(scope)),
+        json.bool(option.is_some(period_ms)),
+        json.nullable(period_ms, json.int),
+        json.bool(option.is_some(period_origin)),
+        json.nullable(period_origin, json.string),
+        json.string(unique.states_label(states)),
+        json.string(unique.action_label(on_conflict)),
+        json.bool(option.is_some(reschedule_ms)),
+        json.nullable(reschedule_ms, json.int),
+      ]
+    }
+  }
+  // `Delayed` is relative to admission time, so a retry converges; it is
+  // encoded with a string tag, which no absolute availability can produce.
+  let availability_fields = case request.availability {
+    submission.Delayed(milliseconds) -> [
+      json.string("delayed"),
+      json.int(milliseconds),
+    ]
+    _ -> {
+      let availability_ms = submission.availability_ms(request.availability)
+      [
+        json.bool(option.is_some(availability_ms)),
+        json.nullable(availability_ms, json.int),
+      ]
+    }
+  }
+  let envelope =
+    list.flatten([
+      [
+        json.string(tag),
+        json.string(request.queue),
+        json.string(request.worker_id),
+        json.string(request.worker_version),
+        json.string(request.input_version),
+        json.string(request.encoded_input),
+      ],
+      policy_fields,
+      availability_fields,
+      [
+        json.string(request.output_version),
+        json.bool(option.is_some(request.error_version)),
+        json.nullable(request.error_version, json.string),
+        json.int(request.max_attempts),
+      ],
+    ])
+  json.preprocessed_array(envelope)
+  |> json.to_string
+  |> bit_array.from_string
+  |> sha256
+}
+
+pub fn pending_submission(
+  request: Request(input, output, error),
+) -> submission.PendingSubmission(input, output, error) {
+  submission.new_pending_submission(
+    request.installation,
+    request.submission_id,
+    request.worker,
+    request.request_sha256,
+  )
+}
