@@ -1,6 +1,6 @@
 # Grind
 
-Grind is a durable background-job runtime for Gleam applications on Erlang/OTP and PostgreSQL. It retains typed job outcomes in PostgreSQL and runs handlers under OTP supervision. It is not yet published to Hex; install it from Git as shown below.
+Grind is a durable background-job runtime for Gleam applications on Erlang/OTP and PostgreSQL. It retains typed job outcomes in PostgreSQL and runs handlers under OTP supervision.
 
 Use Grind when work must outlive the request that created it and your application already fits Erlang/OTP and PostgreSQL. Typical work includes sending notifications, processing provider callbacks, and running delayed or retryable tasks. It also supports jobs admitted in the same database transaction as an application write, and an operator recovery path when an external effect is uncertain.
 
@@ -19,11 +19,18 @@ Grind is a fit for durable individual jobs with local per-node queue limits. It 
 
 ## Install
 
-Add Grind from Git. The `main` ref selects the branch; commit your `manifest.toml`, which records the resolved commit. Run `gleam update grind` when you intend to advance it. Grind's manifest resolves its unpublished Sinal dependency, so fetching and building needs no adjacent Grind or Sinal checkout.
+Add Grind from Hex:
+
+```sh
+gleam add grind
+```
+
+The example below uses these direct dependencies. Commit `gleam.toml` and
+`manifest.toml` to retain the resolved versions.
 
 ```toml
 [dependencies]
-grind = { git = "https://github.com/gleam-dream/grind.git", ref = "main" }
+grind = ">= 0.1.0 and < 0.2.0"
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
