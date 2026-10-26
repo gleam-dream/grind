@@ -16,4 +16,4 @@ pog = ">= 4.1.0 and < 4.2.0"
 gleeunit = ">= 1.0.0 and < 2.0.0"
 exception = ">= 2.1.1 and < 3.0.0"
 gleam_time = ">= 1.0.0 and < 2.0.0"
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "95f2dbce4459942e16e819e3527eb00d9c503c9d" }
+sinal = ">= 0.1.0 and < 0.2.0"
