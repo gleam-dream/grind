@@ -67,7 +67,9 @@ if pg_isready -h 127.0.0.1 -p "$port" >/dev/null 2>&1; then
 fi
 
 initdb -D "$cluster" --username=grind --auth-local=trust --auth-host=trust >/dev/null
-pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port \
+# Every client below uses TCP. Avoid depending on a runner's shared/default
+# Unix socket directory, and retain startup diagnostics in the gate receipt.
+if ! pg_ctl -D "$cluster" -o "-h 127.0.0.1 -k '' -p $port \
   -c shared_preload_libraries=pg_stat_statements \
   -c log_lock_waits=on \
   -c deadlock_timeout=100 \
@@ -75,7 +77,10 @@ pg_ctl -D "$cluster" -o "-h 127.0.0.1 -p $port \
   -c max_connections=600 \
   -c synchronous_standby_names=grind_bench_never_standby \
   -c synchronous_commit=local" \
-  -l "$root/postgres.log" start >/dev/null
+  -l "$root/postgres.log" start >/dev/null; then
+  cat "$root/postgres.log" >&2
+  exit 1
+fi
 started=1
 
 createuser -h 127.0.0.1 -p "$port" -U grind --superuser grind_a
