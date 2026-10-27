@@ -91,6 +91,69 @@ class ProvenanceTests(unittest.TestCase):
                 provenance.root = original_root
 
 
+class SinalProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="grind-sinal-provenance-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        subprocess.run(["git", "init", "--quiet", str(self.root)], check=True)
+        subprocess.run([
+            "git", "-C", str(self.root), "-c", "user.name=Provenance test",
+            "-c", "user.email=provenance@example.invalid", "-c", "commit.gpgsign=false",
+            "-c", "core.hooksPath=/dev/null", "commit", "--quiet", "--allow-empty", "-m", "Parent checkout",
+        ], check=True)
+        self.parent_commit = subprocess.check_output(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True
+        ).strip()
+        self.bench = self.root / "bench"
+        self.installed = self.bench / "build/packages/sinal"
+        self.installed.mkdir(parents=True)
+        patch = mock.patch.object(provenance, "root", self.root)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def lock(self, package: str) -> None:
+        (self.bench / "manifest.toml").write_text(f"packages = [{package}]\n")
+
+    def test_hex_identity_comes_from_the_lock_without_parent_git_metadata(self):
+        checksum = "358D776FDFD6B0BE56E6FA63BBE3FA8D5A9A05C2DDD256270E54E133EB4A71FC"
+        self.lock(f'{{ name = "sinal", version = "0.1.0", source = "hex", outer_checksum = "{checksum}" }}')
+        metadata = provenance.sinal_metadata()
+        self.assertEqual(metadata["source"], "hex")
+        self.assertEqual(metadata["version"], "0.1.0")
+        self.assertEqual(metadata["outer_checksum"], checksum)
+        self.assertIsNone(metadata["commit"])
+        self.assertIsNone(metadata["dirty"])
+
+    def test_git_identity_uses_the_locked_commit_without_a_dependency_checkout(self):
+        commit = "0123456789abcdef0123456789abcdef01234567"
+        self.lock('{ name = "sinal", version = "0.1.0", source = "git", '
+                  f'repo = "https://example.invalid/sinal.git", commit = "{commit}", path = "packages/sinal" }}')
+        self.installed.rmdir()
+        metadata = provenance.sinal_metadata()
+        self.assertEqual(metadata["source"], "git")
+        self.assertEqual(metadata["version"], "0.1.0")
+        self.assertEqual(metadata["repo"], "https://example.invalid/sinal.git")
+        self.assertEqual(metadata["path"], "packages/sinal")
+        self.assertEqual(metadata["commit"], commit)
+        self.assertNotEqual(metadata["commit"], self.parent_commit)
+        self.assertIsNone(metadata["dirty"])
+
+    def test_local_source_does_not_inherit_the_enclosing_checkout_identity(self):
+        self.lock('{ name = "sinal", version = "0.1.0", source = "local", path = "../../sinal" }')
+        metadata = provenance.sinal_metadata()
+        self.assertEqual(metadata["source"], "local")
+        self.assertEqual(metadata["path"], "../../sinal")
+        self.assertIsNone(metadata["commit"])
+        self.assertIsNone(metadata["dirty"])
+
+    def test_absent_lock_or_package_has_no_inferred_source_identity(self):
+        absent = {"source": None, "version": None, "commit": None, "dirty": None}
+        self.assertEqual(provenance.sinal_metadata(), absent)
+        self.lock("")
+        self.assertEqual(provenance.sinal_metadata(), absent)
+
+
 class DelayTests(unittest.IsolatedAsyncioTestCase):
     async def test_configured_delay_is_in_the_actual_tcp_path(self):
         async def echo(reader, writer):

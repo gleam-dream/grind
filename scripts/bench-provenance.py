@@ -7,6 +7,7 @@ import platform
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 root = Path(__file__).resolve().parent.parent
 
@@ -69,12 +70,28 @@ def machine_metadata() -> dict[str, str | int | None]:
 
 
 def sinal_metadata() -> dict[str, str | bool | None]:
-    sibling = root / "bench/build/packages/sinal"
+    """Read the selected dependency identity, never the enclosing Git worktree."""
+    metadata: dict[str, str | bool | None] = {
+        "source": None, "version": None, "commit": None, "dirty": None,
+    }
     try:
-        return {"commit": command_output("git", "-C", str(sibling), "rev-parse", "HEAD"),
-                "dirty": bool(command_output("git", "-C", str(sibling), "status", "--porcelain"))}
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        return {"commit": None, "dirty": None}
+        with (root / "bench/manifest.toml").open("rb") as lock:
+            packages = tomllib.load(lock)["packages"]
+    except FileNotFoundError:
+        return metadata
+    package = next((package for package in packages if package["name"] == "sinal"), None)
+    if package is None:
+        return metadata
+    metadata.update(source=package["source"], version=package["version"])
+    if package["source"] == "hex":
+        metadata["outer_checksum"] = package["outer_checksum"]
+    elif package["source"] == "git":
+        metadata.update(repo=package["repo"], commit=package["commit"])
+        if "path" in package:
+            metadata["path"] = package["path"]
+    elif package["source"] == "local":
+        metadata["path"] = package["path"]
+    return metadata
 
 
 def drain_timeout_ms(raw: str | None) -> int:
