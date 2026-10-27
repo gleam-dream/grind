@@ -6,7 +6,7 @@
 
 Grind is a durable background-job runtime for Gleam applications on Erlang/OTP and PostgreSQL. It retains typed job outcomes in PostgreSQL and runs handlers under OTP supervision.
 
-Use Grind when work must outlive the request that created it and your application already fits Erlang/OTP and PostgreSQL. Typical work includes sending notifications, processing provider callbacks, and running delayed or retryable tasks. It also supports jobs admitted in the same database transaction as an application write, and an operator recovery path when an external effect is uncertain.
+Use Grind for work that must outlive its request in an Erlang/OTP and PostgreSQL application: notifications, provider callbacks, and delayed or retryable tasks. Jobs can be admitted in the same database transaction as an application write. Operators can recover work when an external effect is uncertain.
 
 Grind is a fit for durable individual jobs with local per-node queue limits. It does not currently provide cron schedules, durable dependency workflows, batch coordination, or cluster-wide rate limits.
 
@@ -152,7 +152,7 @@ let assert Ok(grind.Inserted(handle)) =
 
 <!-- prettier-ignore-end -->
 
-The full runnable transaction example also shows rollback behavior: [transactions.gleam](examples/usage/src/grind_usage/transactions.gleam).
+The [runnable transaction example](examples/usage/src/grind_usage/transactions.gleam) also shows rollback behavior.
 
 ## Recovery and operating limits
 

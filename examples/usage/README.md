@@ -4,7 +4,7 @@
 [![grind on Hex](https://img.shields.io/hexpm/v/grind?label=Hex%3A%20grind)](https://hex.pm/packages/grind)
 [![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
 
-Compiled, runnable examples of the public API, one module under `src/grind_usage/` per topic. They are the usage documentation: a changed function or default fails the build here instead of leaving stale prose.
+Compiled, runnable public API examples, one module under `src/grind_usage/` per topic. Incompatible function or default changes fail the build here.
 
 | Module            | Shows                                                                                    |
 | ----------------- | ---------------------------------------------------------------------------------------- |
