@@ -1,5 +1,9 @@
 # Resilience harness
 
+[![CI](https://github.com/gleam-dream/grind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/grind/actions/workflows/ci.yml)
+[![grind on Hex](https://img.shields.io/hexpm/v/grind?label=Hex%3A%20grind)](https://hex.pm/packages/grind)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 This Gleam project launches independent, named BEAM operating-system processes against one disposable PostgreSQL cluster and consumes only Grind's public API. Python controls the processes and the TCP streams. The scenarios (M1 to M7, F1 to F5 and the soak), their required observations and the resource bounds are defined in "Verification method" in [the design](../docs/design/design-layer.pdf).
 
 ## Run

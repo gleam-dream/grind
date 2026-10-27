@@ -1,5 +1,9 @@
 # Grind
 
+[![CI](https://github.com/gleam-dream/grind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/grind/actions/workflows/ci.yml)
+[![grind on Hex](https://img.shields.io/hexpm/v/grind?label=Hex%3A%20grind)](https://hex.pm/packages/grind)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 Grind is a durable background-job runtime for Gleam applications on Erlang/OTP and PostgreSQL. It retains typed job outcomes in PostgreSQL and runs handlers under OTP supervision.
 
 Use Grind when work must outlive the request that created it and your application already fits Erlang/OTP and PostgreSQL. Typical work includes sending notifications, processing provider callbacks, and running delayed or retryable tasks. It also supports jobs admitted in the same database transaction as an application write, and an operator recovery path when an external effect is uncertain.

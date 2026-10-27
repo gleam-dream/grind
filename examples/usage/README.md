@@ -1,5 +1,9 @@
 # Grind usage examples
 
+[![CI](https://github.com/gleam-dream/grind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/grind/actions/workflows/ci.yml)
+[![grind on Hex](https://img.shields.io/hexpm/v/grind?label=Hex%3A%20grind)](https://hex.pm/packages/grind)
+[![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
+
 Compiled, runnable examples of the public API, one module under `src/grind_usage/` per topic. They are the usage documentation: a changed function or default fails the build here instead of leaving stale prose.
 
 | Module            | Shows                                                                                    |
