@@ -175,7 +175,7 @@
       ))
       #md-table(3, ([Rejected value], [Result], [Write],
         [Input or selected unique key at submission], [InvalidInput with the reason, before any connection is used], [None],
-        [Encoded input carrying a NUL character], [InvalidInput, before any SQL runs; a borrowed transaction stays usable], [None],
+        [Encoded input or selected unique key carrying a NUL character, at any size], [InvalidInput, before any SQL runs and before the size check; a borrowed transaction stays usable], [None],
         [Job id, queue or correlation carrying a control character (U+0000 to U+001F, U+007F)], [InvalidInput, before any SQL runs; a borrowed transaction stays usable], [None],
         [Handler output or error after the handler ran], [Terminal RuntimeFailed with the output codec reason; no retry], [Acknowledgement],
         [Value confirmed by an operator resolution, including one carrying a NUL character; a resolution id or by carrying a control character; details carrying a NUL], [ResolutionValueRejected with the reason, before any SQL runs], [None],

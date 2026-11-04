@@ -67,8 +67,9 @@ pub type Request(input, output, error) {
 /// so a policy's key uses the exact same encoding as the request. Returns
 /// `submission.InvalidInput` when the job id, queue or correlation carries a
 /// control character, when the input codec or `build_policy` rejects the
-/// value, or when the encoded input carries a NUL that `jsonb` cannot
-/// store, before any storage call.
+/// value, or when the encoded input or a selected unique key carries a NUL
+/// that `jsonb` cannot store, before any storage call. A NUL is refused
+/// before the payload size is checked, so it is `InvalidInput` at any size.
 pub fn build_request(
   installation: job.Installation,
   submission_id: submission.SubmissionId,
@@ -109,18 +110,23 @@ pub fn build_request(
     worker.encode_input(worker_def, input)
     |> result.map_error(submission.InvalidInput),
   )
+  // Storability is checked before size: a NUL is refused as InvalidInput
+  // whatever the payload's size.
+  use Nil <- result.try(
+    worker.jsonb_storable(encoded_input)
+    |> result.map_error(submission.InvalidInput),
+  )
   use Nil <- result.try({
     let bytes = string.byte_size(encoded_input)
     case bytes > max_payload_bytes {
       True ->
         Error(submission.PayloadTooLarge(bytes:, limit: max_payload_bytes))
-      False ->
-        worker.jsonb_storable(encoded_input)
-        |> result.map_error(submission.InvalidInput)
+      False -> Ok(Nil)
     }
   })
   use policy <- result.try(
     build_policy(input_version, encoded_input)
+    |> result.try(storable_policy)
     |> result.map_error(submission.InvalidInput),
   )
   let request =
@@ -143,6 +149,28 @@ pub fn build_request(
       max_replays: worker.max_replays(worker_def),
     )
   Ok(Request(..request, request_sha256: fingerprint(request)))
+}
+
+/// Refuses a policy whose key `jsonb` cannot store: the encoded key is cast
+/// to `jsonb` by the admission's lock and candidate queries, and its
+/// contract is stored as `text`.
+fn storable_policy(
+  policy: Option(PolicyPart),
+) -> Result(Option(PolicyPart), String) {
+  case policy {
+    None -> Ok(None)
+    Some(part) -> {
+      use Nil <- result.try(
+        worker.jsonb_storable(part.encoded_key)
+        |> result.map_error(fn(reason) { "the unique key: " <> reason }),
+      )
+      use Nil <- result.try(worker.storable_text(
+        "the unique key contract",
+        part.key_contract,
+      ))
+      Ok(policy)
+    }
+  }
 }
 
 /// Plain and unique admissions use different envelope tags. Reusing a

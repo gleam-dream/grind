@@ -160,6 +160,21 @@ pub fn facade_nul_payload_is_refused_before_storage_test() {
         pog.transaction(db, fn(tx) {
           grind.submit_in(jobs, tx, job.new(echo_worker, "a\u{0}b"))
           |> should.equal(Error(grind.InvalidInput(refused)))
+          let nul_key =
+            unique.selected(
+              "suffixed",
+              fn(text) { text <> "\u{0}" },
+              string_codec(),
+            )
+          grind.submit_in(
+            jobs,
+            tx,
+            job.new(echo_worker, "ok")
+              |> job.unique(unique.policy(nul_key, unique.while_retained())),
+          )
+          |> should.equal(
+            Error(grind.InvalidInput("the unique key: " <> refused)),
+          )
           grind.submit_in(
             jobs,
             tx,

@@ -6,10 +6,11 @@
 
 import gleam/dynamic/decode
 import gleam/json
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleeunit/should
 import grind/internal/job
 import grind/internal/submission
+import grind/internal/unique
 import grind/internal/unique_admission/request
 import grind/internal/worker
 
@@ -45,6 +46,15 @@ fn context() -> worker.Context {
 }
 
 fn build(input: String) {
+  build_with(input, 1_048_576, fn(_, _) { Ok(None) })
+}
+
+fn build_with(
+  input: String,
+  max_payload_bytes: Int,
+  build_policy: fn(String, String) ->
+    Result(option.Option(request.PolicyPart), String),
+) {
   let assert Ok(id) = submission.submission_id("jsonb-probe")
   request.build_request(
     job.Installation(
@@ -58,9 +68,47 @@ fn build(input: String) {
     input,
     submission.Immediately,
     None,
-    1_048_576,
-    fn(_, _) { Ok(None) },
+    max_payload_bytes,
+    build_policy,
   )
+}
+
+fn selected_key(encoded_key: String) {
+  fn(_, _) {
+    Ok(
+      Some(request.PolicyPart(
+        key_contract: "selected:probe:jsonb-key-v1",
+        encoded_key:,
+        scope: unique.WithinQueue,
+        period: unique.while_retained(),
+        states: unique.Incomplete,
+        on_conflict: unique.KeepExisting,
+      )),
+    )
+  }
+}
+
+pub fn an_oversized_input_with_a_nul_is_invalid_not_too_large_test() {
+  let assert Error(submission.InvalidInput(reason)) =
+    build_with("a\u{0}bcdefgh", 4, fn(_, _) { Ok(None) })
+  reason |> should.equal(worker.jsonb_unstorable_reason)
+}
+
+pub fn an_oversized_input_without_a_nul_is_too_large_test() {
+  build_with("abcdefgh", 4, fn(_, _) { Ok(None) })
+  |> should.equal(Error(submission.PayloadTooLarge(bytes: 10, limit: 4)))
+}
+
+pub fn a_nul_in_a_selected_unique_key_is_refused_test() {
+  let assert Error(submission.InvalidInput(reason)) =
+    build_with("plain", 1_048_576, selected_key("\"a\\u0000b\""))
+  reason
+  |> should.equal("the unique key: " <> worker.jsonb_unstorable_reason)
+}
+
+pub fn a_storable_selected_unique_key_is_admitted_test() {
+  let assert Ok(_) =
+    build_with("plain", 1_048_576, selected_key("\"a\\\\u0000b\""))
 }
 
 pub fn admission_refuses_a_nul_in_the_input_test() {
