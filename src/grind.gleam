@@ -200,7 +200,9 @@ pub fn with_connect_timeout(config: Config, timeout: Duration) -> Config {
 
 /// The largest encoded input, output or error, in bytes. A larger input
 /// fails the submit with `PayloadTooLarge`; a larger output or error ends
-/// the job as a runtime failure.
+/// the job as a runtime failure. A payload carrying a NUL character, which
+/// PostgreSQL `jsonb` cannot store, is refused the same way at any size,
+/// with `InvalidInput` for an input.
 pub fn with_max_payload_bytes(config: Config, bytes: Int) -> Config {
   Config(..config, max_payload_bytes: bytes)
 }
@@ -809,8 +811,10 @@ pub type PendingSubmission(input, output, error) =
   submission.PendingSubmission(input, output, error)
 
 pub type SubmitError(input, output, error) {
-  /// The input codec, or a uniqueness key's codec, rejected the value.
-  /// Nothing was written.
+  /// The input codec, or a uniqueness key's codec, rejected the value, or
+  /// the encoded input carries a NUL character, which PostgreSQL `jsonb`
+  /// cannot store. Checked before any SQL runs, so nothing was written and a
+  /// `submit_in` transaction stays usable.
   InvalidInput(reason: String)
   /// The encoded input is larger than the payload limit. Nothing was
   /// written.

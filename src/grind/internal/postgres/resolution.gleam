@@ -11,6 +11,7 @@ import grind/internal/postgres/resolution_queries.{
 } as postgres_resolution_queries
 import grind/internal/postgres/resolution_transaction
 import grind/internal/store
+import grind/internal/worker
 import grind/telemetry
 import pog
 import sinal/correlation.{type Correlation}
@@ -464,6 +465,7 @@ fn prepare(
       ConfirmSuccess(value) -> {
         use #(version, encoded) <- result.map(
           job.encode_reconciled_success(handle, value)
+          |> result.try(storable)
           |> result.map_error(ResolutionInvalidValue),
         )
         #(
@@ -477,7 +479,10 @@ fn prepare(
         )
       }
       ConfirmBusinessFailure(value) ->
-        case job.encode_reconciled_error(handle, value) {
+        case
+          job.encode_reconciled_error(handle, value)
+          |> option.map(result.try(_, storable))
+        {
           None -> Error(ResolutionRequiresErrorCodec)
           Some(Error(reason)) -> Error(ResolutionInvalidValue(reason))
           Some(Ok(#(version, encoded))) ->
@@ -563,4 +568,11 @@ pub fn resolve_uncertain_in(
     Ok(_), Error(error) -> Error(ReconciliationQueryFailed(error))
     Ok(value), Ok(Nil) -> Ok(value)
   }
+}
+
+/// Refuses an encoded resolution value that `jsonb` cannot store, before
+/// any write, so a borrowed resolution does not abort the caller's
+/// transaction.
+fn storable(encoded: #(String, String)) -> Result(#(String, String), String) {
+  worker.jsonb_storable(encoded.1) |> result.replace(encoded)
 }

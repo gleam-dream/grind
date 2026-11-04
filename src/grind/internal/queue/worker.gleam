@@ -261,20 +261,33 @@ fn acknowledge(
   case request.automatic, result {
     True, Error(postgres.QueueAckUnknown(_, proposed)) ->
       retry(state, proposed, telemetry.RetryAfterUnknown)
-    True, Error(postgres.QueueAckFailed(_)) ->
-      retry(state, execution, telemetry.RetryAfterFailure)
-    _, _ -> {
-      let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
-      process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
-      process.send(
-        request.queue_subject,
-        request.on_complete(id, attempt_id, epoch, result),
-      )
-      // The coordinator stops and demonitors us after consuming completion.
-      // This keeps normal completion distinguishable from unexpected death.
-      actor.continue(WorkerState(..state, phase: Finished))
-    }
+    True, Error(postgres.QueueAckFailed(error)) ->
+      case postgres.data_exception_code(error) {
+        // `attempt.acknowledge` already replaced a proposal refused with a
+        // data exception; a replacement refused the same way cannot commit
+        // on retry either, so the attempt completes with the error and
+        // lease recovery applies.
+        Some(_) -> complete(state, result)
+        None -> retry(state, execution, telemetry.RetryAfterFailure)
+      }
+    _, _ -> complete(state, result)
   }
+}
+
+fn complete(
+  state: WorkerState(message),
+  result: Result(Bool, postgres.QueueRunError),
+) -> actor.Next(WorkerState(message), WorkerMessage) {
+  let request = state.request
+  let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
+  process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
+  process.send(
+    request.queue_subject,
+    request.on_complete(id, attempt_id, epoch, result),
+  )
+  // The coordinator stops and demonitors us after consuming completion.
+  // This keeps normal completion distinguishable from unexpected death.
+  actor.continue(WorkerState(..state, phase: Finished))
 }
 
 fn retry(

@@ -551,10 +551,11 @@ pub type Execution {
   ExecutedUncertain(String)
   ExecutedInvalidInput(String)
   /// The handler ran, and its output codec (`OutputCodec`) or error codec
-  /// (`ErrorCodec`) rejected the value it returned, or the encoded value was
-  /// larger than the payload limit. Committed as `runtime_failed`, which is
-  /// terminal: the job is not retried, because the handler's effects already
-  /// happened.
+  /// (`ErrorCodec`) rejected the value it returned, the encoded value was
+  /// larger than the payload limit or carried a NUL that `jsonb` cannot
+  /// store, or PostgreSQL refused the acknowledgement with a data
+  /// exception. Committed as `runtime_failed`, which is terminal: the job
+  /// is not retried, because the handler's effects already happened.
   ExecutedUnencodable(codec: CodecKind, reason: String)
 }
 
@@ -618,6 +619,70 @@ pub fn execute_encoded(
   }
 }
 
+/// The reason an encoded payload carrying a NUL character is refused.
+/// PostgreSQL `jsonb` rejects the `\u0000` escape (SQLSTATE `22P05`), so
+/// such a payload could never be stored.
+pub const jsonb_unstorable_reason =
+  "encoded payload contains a NUL character (\\u0000), which PostgreSQL jsonb cannot store"
+
+/// Whether PostgreSQL `jsonb` can store the encoded JSON `text`. A NUL
+/// character, as the escape `\u0000` or as a raw byte, is refused with
+/// `jsonb_unstorable_reason`. An escaped backslash followed by `u0000` is
+/// ordinary text and is accepted.
+pub fn jsonb_storable(text: String) -> Result(Nil, String) {
+  let suspect =
+    string.contains(text, "\\u0000") || string.contains(text, "\u{0}")
+  case suspect && contains_nul(<<text:utf8>>) {
+    True -> Error(jsonb_unstorable_reason)
+    False -> Ok(Nil)
+  }
+}
+
+/// Scans JSON text for a NUL: a raw zero byte, or a `\u0000` escape whose
+/// backslash is not itself escaped.
+fn contains_nul(bytes: BitArray) -> Bool {
+  case bytes {
+    <<>> -> False
+    <<0, _:bytes>> -> True
+    <<"\\u0000":utf8, _:bytes>> -> True
+    <<"\\":utf8, _, rest:bytes>> -> contains_nul(rest)
+    <<_, rest:bytes>> -> contains_nul(rest)
+    _ -> False
+  }
+}
+
+/// The failure description for an acknowledgement that PostgreSQL refused
+/// with a data exception (SQLSTATE class 22). Grind-authored, so the
+/// replacement proposal cannot be refused for its text again.
+pub fn storage_refusal_reason(sqlstate: String) -> String {
+  "PostgreSQL refused the acknowledgement with SQLSTATE "
+  <> sqlstate
+  <> " (data exception); the handler's value was not stored"
+}
+
+/// The replacement for a proposal whose acknowledgement PostgreSQL refused
+/// with a data exception, which no retry can change. A refused output or
+/// error becomes a terminal `ExecutedUnencodable`, the same outcome as an
+/// encoder rejection after the handler ran. A proposal that carries only
+/// text keeps the handler's disposition, including `ExecutedUncertain`, and
+/// replaces its text with `storage_refusal_reason`.
+pub fn refused_by_storage(execution: Execution, sqlstate: String) -> Execution {
+  let reason = storage_refusal_reason(sqlstate)
+  case execution {
+    ExecutedSuccess(_, _) -> ExecutedUnencodable(OutputCodec, reason)
+    ExecutedRetryable(_, _, _, _) | ExecutedBusinessFailure(_, _, _, _) ->
+      ExecutedUnencodable(ErrorCodec, reason)
+    ExecutedUnencodable(codec, _) -> ExecutedUnencodable(codec, reason)
+    ExecutedInvalidInput(_) -> ExecutedInvalidInput(reason)
+    ExecutedSnoozed(delay_ms, _) -> ExecutedSnoozed(delay_ms, reason)
+    ExecutedSnoozeLimitReached(limit:, reason: _) ->
+      ExecutedSnoozeLimitReached(limit:, reason:)
+    ExecutedDiscarded(_) -> ExecutedDiscarded(reason)
+    ExecutedCancelled(_) -> ExecutedCancelled(reason)
+    ExecutedUncertain(_) -> ExecutedUncertain(reason)
+  }
+}
+
 /// The reason a payload of `bytes` bytes is refused under `limit`.
 pub fn payload_too_large_reason(bytes: Int, limit: Int) -> String {
   "encoded payload of "
@@ -635,7 +700,7 @@ fn bounded(
   let bytes = string.byte_size(text)
   case bytes > max_payload_bytes {
     True -> Error(payload_too_large_reason(bytes, max_payload_bytes))
-    False -> Ok(#(version, text))
+    False -> jsonb_storable(text) |> result.replace(#(version, text))
   }
 }
 

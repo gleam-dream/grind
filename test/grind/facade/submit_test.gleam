@@ -1,7 +1,8 @@
 //// The public path: one runtime, typed workers, one submit, `await`.
 
 import gleam/erlang/process
-import gleam/option.{Some}
+import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
 import gleam/time/duration
 import gleeunit/should
@@ -13,6 +14,7 @@ import grind/queue
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/unique
 import grind/worker
+import pog
 import sinal/correlation
 
 pub fn facade_quickstart_submit_and_await_test() {
@@ -119,6 +121,60 @@ pub fn facade_payload_limit_rejects_before_writing_test() {
       grind.await(jobs, handle, within: duration.seconds(10))
       |> should.equal(Ok(grind.Succeeded("short")))
       mark_database_test_executed("facade-payload-limit-passed")
+    }
+  }
+}
+
+/// PostgreSQL `jsonb` cannot store a NUL character. A NUL in the input is
+/// refused before any SQL runs, so the caller's transaction stays usable; a
+/// NUL in the handler's output ends the job `RuntimeFailed` instead of an
+/// acknowledgement that can never commit.
+pub fn facade_nul_payload_is_refused_before_storage_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let echo_worker =
+        worker.new(
+          unique("facade.nul"),
+          input: string_codec(),
+          output: string_codec(),
+          perform: fn(text) { Ok(text <> "\u{0}") },
+        )
+        |> worker.with_queue(unique("facade-nul"))
+      use jobs <- with_runtime(url, grind.with_worker(_, echo_worker))
+      let refused =
+        "encoded payload contains a NUL character (\\u0000), which PostgreSQL jsonb cannot store"
+      grind.submit(jobs, job.new(echo_worker, "a\u{0}b"))
+      |> should.equal(Error(grind.InvalidInput(refused)))
+
+      let db = grind.connection(jobs)
+      let assert Ok(Nil) =
+        pog.query(
+          "CREATE TABLE IF NOT EXISTS facade_nul_orders (id text PRIMARY KEY)",
+        )
+        |> pog.execute(db)
+        |> result.replace(Nil)
+      let order = unique("nul-order")
+      let assert Ok(grind.Inserted(handle)) =
+        pog.transaction(db, fn(tx) {
+          grind.submit_in(jobs, tx, job.new(echo_worker, "a\u{0}b"))
+          |> should.equal(Error(grind.InvalidInput(refused)))
+          let assert Ok(_) =
+            pog.query("INSERT INTO facade_nul_orders (id) VALUES ($1)")
+            |> pog.parameter(pog.text(order))
+            |> pog.execute(tx)
+          grind.submit_in(jobs, tx, job.new(echo_worker, "ok"))
+        })
+
+      grind.await(jobs, handle, within: duration.seconds(10))
+      |> should.equal(
+        Ok(grind.Failed(
+          grind.RuntimeFailure,
+          None,
+          "output codec rejected the handler's output: " <> refused,
+        )),
+      )
+      mark_database_test_executed("facade-nul-payload-refused-passed")
     }
   }
 }

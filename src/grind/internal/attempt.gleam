@@ -452,7 +452,40 @@ fn emit_released(
 }
 
 /// Commits the proposed worker outcome through the same attempt fence.
+///
+/// A PostgreSQL data exception (SQLSTATE class 22) rolled the transaction
+/// back and is a property of the proposed values, so the same proposal can
+/// never commit. It is replaced once by `worker.refused_by_storage`, whose
+/// text is Grind-authored, and that replacement is acknowledged under the
+/// same command. Nothing committed for the refused proposal, so no receipt
+/// can conflict with the replacement.
 pub fn acknowledge(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  claimed: ClaimedJob,
+  execution: worker.Execution,
+) -> Result(Bool, postgres.QueueRunError) {
+  let result =
+    acknowledge_once(database, queue, attempt_owner, claimed, execution)
+  case result {
+    Error(postgres.QueueAckFailed(error)) ->
+      case postgres.data_exception_code(error) {
+        Some(sqlstate) ->
+          acknowledge_once(
+            database,
+            queue,
+            attempt_owner,
+            claimed,
+            worker.refused_by_storage(execution, sqlstate),
+          )
+        None -> result
+      }
+    _ -> result
+  }
+}
+
+fn acknowledge_once(
   database: Database,
   queue: String,
   attempt_owner: String,

@@ -66,7 +66,8 @@ pub type Request(input, output, error) {
 /// receives the submitting worker's input codec version and encoded input
 /// so a policy's key uses the exact same encoding as the request. Returns
 /// `submission.InvalidInput` when the input codec or `build_policy` rejects
-/// the value, before any storage call.
+/// the value, or when the encoded input carries a NUL that `jsonb` cannot
+/// store, before any storage call.
 pub fn build_request(
   installation: job.Installation,
   submission_id: submission.SubmissionId,
@@ -98,7 +99,9 @@ pub fn build_request(
     case bytes > max_payload_bytes {
       True ->
         Error(submission.PayloadTooLarge(bytes:, limit: max_payload_bytes))
-      False -> Ok(Nil)
+      False ->
+        worker.jsonb_storable(encoded_input)
+        |> result.map_error(submission.InvalidInput)
     }
   })
   use policy <- result.try(
