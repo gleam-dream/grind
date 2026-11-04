@@ -12,7 +12,13 @@
 //// ```
 ////
 //// `perform` round-trips the input, output and error through the worker's
-//// codecs, as a consumer does, so a codec defect shows up in the test.
+//// codecs, as a consumer does, so a codec defect shows up in the test. It
+//// also refuses an encoded value carrying a NUL character, which
+//// PostgreSQL `jsonb` cannot store: a NUL input fails with `InputRejected`
+//// as `grind.submit` would, and a NUL output or error fails with
+//// `OutputRejected` or `ErrorRejected` where a consumer would end the job
+//// as a runtime failure. The payload size limit belongs to the runtime
+//// configuration and is not applied here.
 //// `drain` claims and runs a queue's due jobs in the test's own node, with
 //// a bound on how long it may take; configure the runtime
 //// `without_consumers` so nothing else claims them.
@@ -33,13 +39,15 @@ import pog
 /// Why `perform` could not run the handler, or could not encode its
 /// result.
 pub type Error {
-  /// The input codec rejected the input.
+  /// The input codec rejected the input, or its encoding carries a NUL.
   InputRejected(reason: String)
   /// The encoded input did not decode with the input codec.
   InputUndecodable(reason: String)
-  /// The output codec rejected the handler's output, or it did not decode.
+  /// The output codec rejected the handler's output, its encoding carries
+  /// a NUL, or it did not decode.
   OutputRejected(reason: String)
-  /// The error codec rejected the handler's error, or it did not decode.
+  /// The error codec rejected the handler's error, its encoding carries a
+  /// NUL, or it did not decode.
   ErrorRejected(reason: String)
 }
 
@@ -105,7 +113,11 @@ pub fn perform_with(
   input: input,
 ) -> Result(Response(output, error), Error) {
   use encoded <- result.try(
-    definition.encode_input(worker, input) |> result.map_error(InputRejected),
+    definition.encode_input(worker, input)
+    |> result.try(fn(encoded) {
+      definition.jsonb_storable(encoded) |> result.replace(encoded)
+    })
+    |> result.map_error(InputRejected),
   )
   use input <- result.try(
     definition.decode_codec(worker.input, worker.input.version, encoded)
@@ -140,6 +152,7 @@ fn round_trip(
   value: value,
 ) -> Result(value, String) {
   use #(version, encoded) <- result.try(definition.encode_value(codec, value))
+  use Nil <- result.try(definition.jsonb_storable(encoded))
   definition.decode_codec(codec, version, encoded)
   |> result.map_error(string.inspect)
 }

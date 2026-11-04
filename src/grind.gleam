@@ -811,9 +811,10 @@ pub type PendingSubmission(input, output, error) =
   submission.PendingSubmission(input, output, error)
 
 pub type SubmitError(input, output, error) {
-  /// The input codec, or a uniqueness key's codec, rejected the value, or
-  /// the encoded input carries a NUL character, which PostgreSQL `jsonb`
-  /// cannot store. Checked before any SQL runs, so nothing was written and a
+  /// The input codec, or a uniqueness key's codec, rejected the value; the
+  /// encoded input carries a NUL character, which PostgreSQL `jsonb` cannot
+  /// store; or the job id, queue or correlation carries a control
+  /// character. Checked before any SQL runs, so nothing was written and a
   /// `submit_in` transaction stays usable.
   InvalidInput(reason: String)
   /// The encoded input is larger than the payload limit. Nothing was

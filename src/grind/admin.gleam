@@ -97,7 +97,9 @@ pub type Error {
   RecordMismatch
   /// A `ConfirmFailure` needs a worker with an error codec.
   ResolutionNeedsErrorCodec
-  /// The confirmed value was rejected by its codec.
+  /// The confirmed value was rejected by its codec or carries a NUL, the
+  /// resolution id or `by` carries a control character, or the details
+  /// carry a NUL. Checked before any SQL runs, so nothing was written.
   ResolutionValueRejected(reason: String)
   /// Cancellation intent forbids replay. Investigate the effect and use an
   /// attributed terminal confirmation to settle the job.

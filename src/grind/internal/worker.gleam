@@ -638,6 +638,45 @@ pub fn jsonb_storable(text: String) -> Result(Nil, String) {
   }
 }
 
+/// Refuses caller-chosen identifier text that Grind stores in a `text`
+/// column (a job id, queue, correlation, resolution id or resolver) when it
+/// contains a control character, U+0000 to U+001F or U+007F. PostgreSQL
+/// `text` refuses only NUL, but no identifier needs the others.
+pub fn identifier_text(field: String, value: String) -> Result(Nil, String) {
+  case has_control_character(<<value:utf8>>) {
+    True -> Error(control_character_reason(field))
+    False -> Ok(Nil)
+  }
+}
+
+/// Refuses caller-chosen free text that Grind stores in a `text` column
+/// when it contains a NUL, which PostgreSQL `text` cannot store (SQLSTATE
+/// `22021`). Other control characters, such as line breaks, are kept.
+pub fn storable_text(field: String, value: String) -> Result(Nil, String) {
+  case string.contains(value, "\u{0}") {
+    True -> Error(nul_text_reason(field))
+    False -> Ok(Nil)
+  }
+}
+
+/// The reason `identifier_text` refuses `field`.
+pub fn control_character_reason(field: String) -> String {
+  field <> " contains a control character"
+}
+
+/// The reason `storable_text` refuses `field`.
+pub fn nul_text_reason(field: String) -> String {
+  field <> " contains a NUL character, which PostgreSQL text cannot store"
+}
+
+fn has_control_character(bytes: BitArray) -> Bool {
+  case bytes {
+    <<byte, _:bytes>> if byte < 0x20 || byte == 0x7f -> True
+    <<_, rest:bytes>> -> has_control_character(rest)
+    _ -> False
+  }
+}
+
 /// Scans JSON text for a NUL: a raw zero byte, or a `\u0000` escape whose
 /// backslash is not itself escaped.
 fn contains_nul(bytes: BitArray) -> Bool {

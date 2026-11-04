@@ -111,9 +111,9 @@
     #md-table(3, ([Refinement], [Validation owner], [Failure contract],
       [Worker/codec/queue identity and positive source limits], [Source-owned builders], [Panic at definition time; no deployment starts],
       [Runtime schema, deadlines, used queue tuning, duplicate workers], [Config.check and start], [Typed configuration error before resources start],
-      [Encoded input/key, payload byte limit and jsonb storability], [Preparation], [InvalidInput before checkout or writes],
+      [Encoded input/key, payload byte limit and jsonb storability; job id, queue and correlation free of control characters], [Preparation], [InvalidInput before checkout or writes],
       [Output/error codec acceptance, byte limit and jsonb storability], [After handler returns], [Terminal runtime failure; no synthetic business error],
-      [Nonempty resolution identity/by/details], [Operator command construction], [Rejected attribution/command before resolution],
+      [Nonempty resolution identity/by/details; identity and by free of control characters, details free of NUL], [Operator command construction], [Rejected attribution/command before resolution],
       [List limit and quarantine/prune batch], [Administration], [Positive bounded page/batch; maximum ten thousand],
     ))
     #md-table(3, ([Axis], [Owner and identity], [What it proves],
@@ -176,8 +176,9 @@
       #md-table(3, ([Rejected value], [Result], [Write],
         [Input or selected unique key at submission], [InvalidInput with the reason, before any connection is used], [None],
         [Encoded input carrying a NUL character], [InvalidInput, before any SQL runs; a borrowed transaction stays usable], [None],
+        [Job id, queue or correlation carrying a control character (U+0000 to U+001F, U+007F)], [InvalidInput, before any SQL runs; a borrowed transaction stays usable], [None],
         [Handler output or error after the handler ran], [Terminal RuntimeFailed with the output codec reason; no retry], [Acknowledgement],
-        [Value confirmed by an operator resolution, including one carrying a NUL character], [ResolutionValueRejected with the reason], [None],
+        [Value confirmed by an operator resolution, including one carrying a NUL character; a resolution id or by carrying a control character; details carrying a NUL], [ResolutionValueRejected with the reason, before any SQL runs], [None],
       ))
       #points([A validating codec encoder returns Result with a reason, and worker.infallible wraps a plain encoder. A json_blueprint codec maps its encode error to the reason with its describe function.])
     ]

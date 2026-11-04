@@ -155,10 +155,29 @@ pub fn facade_nul_payload_is_refused_before_storage_test() {
         |> pog.execute(db)
         |> result.replace(Nil)
       let order = unique("nul-order")
+      let assert Ok(nul_correlation) = correlation.from_string("trace\u{0}1")
       let assert Ok(grind.Inserted(handle)) =
         pog.transaction(db, fn(tx) {
           grind.submit_in(jobs, tx, job.new(echo_worker, "a\u{0}b"))
           |> should.equal(Error(grind.InvalidInput(refused)))
+          grind.submit_in(
+            jobs,
+            tx,
+            job.new(echo_worker, "ok") |> job.with_id("order\u{0}1"),
+          )
+          |> should.equal(
+            Error(grind.InvalidInput("the job id contains a control character")),
+          )
+          grind.submit_in(
+            jobs,
+            tx,
+            job.new(echo_worker, "ok") |> job.with_correlation(nul_correlation),
+          )
+          |> should.equal(
+            Error(grind.InvalidInput(
+              "the correlation contains a control character",
+            )),
+          )
           let assert Ok(_) =
             pog.query("INSERT INTO facade_nul_orders (id) VALUES ($1)")
             |> pog.parameter(pog.text(order))

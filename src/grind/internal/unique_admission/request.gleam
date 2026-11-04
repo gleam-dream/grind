@@ -65,8 +65,9 @@ pub type Request(input, output, error) {
 /// Gathers every value the admission transaction needs. `build_policy`
 /// receives the submitting worker's input codec version and encoded input
 /// so a policy's key uses the exact same encoding as the request. Returns
-/// `submission.InvalidInput` when the input codec or `build_policy` rejects
-/// the value, or when the encoded input carries a NUL that `jsonb` cannot
+/// `submission.InvalidInput` when the job id, queue or correlation carries a
+/// control character, when the input codec or `build_policy` rejects the
+/// value, or when the encoded input carries a NUL that `jsonb` cannot
 /// store, before any storage call.
 pub fn build_request(
   installation: job.Installation,
@@ -90,6 +91,20 @@ pub fn build_request(
     error_version:,
     max_attempts:,
   ) = worker.metadata(worker_def)
+  use Nil <- result.try(
+    {
+      use Nil <- result.try(worker.identifier_text(
+        "the job id",
+        submission.submission_id_value(submission_id),
+      ))
+      use Nil <- result.try(worker.identifier_text("the job's queue", queue))
+      case correlation {
+        Some(value) -> worker.identifier_text("the correlation", value)
+        None -> Ok(Nil)
+      }
+    }
+    |> result.map_error(submission.InvalidInput),
+  )
   use encoded_input <- result.try(
     worker.encode_input(worker_def, input)
     |> result.map_error(submission.InvalidInput),

@@ -443,11 +443,27 @@ fn write_resolution(
   }
 }
 
-fn prepare(
+/// Validates and encodes a resolution request before any storage call. A
+/// control character in the resolution id or resolver, a NUL in the
+/// details, or a rejected or unstorable value returns
+/// `ResolutionInvalidValue`, so a borrowed resolution leaves the caller's
+/// transaction usable.
+pub fn prepare(
   handle: JobHandle(input, output, error),
   request: Request(output, error),
 ) -> Result(ResolutionCommand, ResolutionError) {
   let Request(resolution_id:, resolved_by:, details:, decision:) = request
+  use Nil <- result.try(
+    {
+      use Nil <- result.try(worker.identifier_text(
+        "the resolution id",
+        resolution_id,
+      ))
+      use Nil <- result.try(worker.identifier_text("the resolver", resolved_by))
+      worker.storable_text("the resolution details", details)
+    }
+    |> result.map_error(ResolutionInvalidValue),
+  )
   {
     let #(_, _, _, _, _, bound_output_version, _) =
       job.reconciliation_fields(handle)
