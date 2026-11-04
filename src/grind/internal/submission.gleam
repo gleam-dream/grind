@@ -176,7 +176,9 @@ pub fn pending_submission_request_sha256(
 pub type SubmitError(input, output, error) {
   EmptyQueueName
   /// The worker's input codec, or a `unique.selected` key's codec, rejected
-  /// the value. `reason` is the codec's own text. Checked before any
+  /// the value, and `reason` is the codec's own text; or the encoded input
+  /// carries a NUL character that PostgreSQL `jsonb` cannot store, and
+  /// `reason` is `worker.jsonb_unstorable_reason`. Checked before any
   /// connection is checked out, so nothing was written and no
   /// `PendingSubmission` exists. Retrying the same value fails the same way.
   InvalidInput(reason: String)

@@ -1743,6 +1743,21 @@ fn cancel_locked_state(
   }
 }
 
+/// The SQLSTATE of a PostgreSQL data exception (class `22`), such as
+/// `22P05` for a `jsonb` `\u0000` escape or `22021` for a NUL byte in
+/// `text`. Such an error is a property of the values sent, so retrying the
+/// same statement fails the same way.
+pub fn data_exception_code(error: pog.QueryError) -> Option(String) {
+  case error {
+    pog.PostgresqlError(code:, ..) ->
+      case string.starts_with(code, "22") {
+        True -> Some(code)
+        False -> None
+      }
+    _ -> None
+  }
+}
+
 /// Failures returned while running one claimed job. `QueueCodecMismatch` is
 /// returned after the row is durably marked `ContractMismatch`; it is an error
 /// to the batch caller but a committed job disposition.

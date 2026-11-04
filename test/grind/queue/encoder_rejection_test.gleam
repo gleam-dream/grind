@@ -56,6 +56,20 @@ pub fn postgres_rejected_resolution_value_writes_nothing_test() {
   }
 }
 
+pub fn postgres_nul_output_ends_runtime_failed_without_retry_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_nul_output_test(database_url)
+  }
+}
+
+pub fn postgres_nul_discard_reason_keeps_the_disposition_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_nul_discard_reason_test(database_url)
+  }
+}
+
 /// Accepts only non-negative integers.
 fn non_negative(value: Int) -> Result(json.Json, String) {
   case value >= 0 {
@@ -350,4 +364,59 @@ fn run_rejected_resolution_test(database_url: String) -> Nil {
   mark_database_test_executed(
     "encoder-rejected-resolution-writes-nothing-passed",
   )
+}
+
+fn run_nul_output_test(database_url: String) -> Nil {
+  use database <- with_database(database_url)
+  let suffix = int.to_string(unique_test_run_id())
+  let queue_name = "encoder-rejection-nul-output-" <> suffix
+  let definition =
+    checked_worker("encoder-rejection.nul-output." <> suffix, fn(_) {
+      worker.WorkerSucceeded("a\u{0}b")
+    })
+  use consumer <- with_consumer(database, queue_name, definition)
+  let assert Ok(handle) = postgres.submit(database, queue_name, definition, 1)
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.RuntimeFailed))
+  postgres.outcome(database, handle)
+  |> should.equal(
+    Ok(
+      job.RuntimeFailedWith(worker.unencodable_description(
+        worker.OutputCodec,
+        worker.jsonb_unstorable_reason,
+      )),
+    ),
+  )
+  lease_queries.attempt_count_for(
+    postgres.connection(database),
+    job.id_value(handle),
+  )
+  |> should.equal(Ok(1))
+  queue.process_one(consumer) |> should.equal(Ok(False))
+  mark_database_test_executed("encoder-nul-output-runtime-failed-passed")
+}
+
+/// A NUL in a discard reason reaches the `text` failure description, which
+/// PostgreSQL refuses with `22021`. The acknowledgement keeps the handler's
+/// disposition with a Grind-authored description instead of retrying a
+/// write that can never commit.
+fn run_nul_discard_reason_test(database_url: String) -> Nil {
+  use database <- with_database(database_url)
+  let suffix = int.to_string(unique_test_run_id())
+  let queue_name = "encoder-rejection-nul-discard-" <> suffix
+  let definition =
+    checked_worker("encoder-rejection.nul-discard." <> suffix, fn(_) {
+      worker.WorkerDiscarded("a\u{0}b")
+    })
+  use consumer <- with_consumer(database, queue_name, definition)
+  let assert Ok(handle) = postgres.submit(database, queue_name, definition, 1)
+
+  queue.process_one(consumer) |> should.equal(Ok(True))
+  postgres.state(database, handle) |> should.equal(Ok(job.Discarded))
+  postgres.outcome(database, handle)
+  |> should.equal(
+    Ok(job.DiscardedWithReason(worker.storage_refusal_reason("22021"))),
+  )
+  mark_database_test_executed("encoder-nul-discard-reason-kept-passed")
 }
