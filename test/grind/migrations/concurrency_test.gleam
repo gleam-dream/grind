@@ -369,7 +369,7 @@ fn run_migration_step_lock_timeout_test(database_url: String) -> Nil {
   let start_ms = monotonic_ms()
   let outcome = postgres.migrate_with(main_database, steps)
   let elapsed_ms = monotonic_ms() - start_ms
-  outcome |> should.equal(Error(postgres.MigrationLockUnavailable(14)))
+  outcome |> should.equal(Error(postgres.MigrationLockUnavailable(15)))
   // Comfortably clears the 2000ms lock_timeout plus ordinary scheduling
   // jitter, but well under the 3500ms `migration_deadline_ms` configured
   // above (never mind the 30000ms default) a caller who removed
