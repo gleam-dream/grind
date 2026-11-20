@@ -156,7 +156,7 @@ The [runnable transaction example](examples/usage/src/grind_usage/transactions.g
 
 ## When a job is left uncertain
 
-An attempt is abandoned when its node dies or its handler exceeds its timeout. Grind cannot know whether its effect happened, so once `with_abandonment` allows no further replay it holds the job `uncertain` and never decides on its own. Declare on the worker how such a job is settled, and the queue's consumer hands it to that function once, inside a transaction that also records the decision:
+An attempt is abandoned when its node dies or its handler exceeds its timeout. Grind cannot know whether its effect happened, so once `with_abandonment` allows no further replay it holds the job `uncertain` and never decides on its own. Declare on the worker how such a job is settled, and the queue's consumer hands it to that function, inside a transaction that also records the decision:
 
 <!-- prettier-ignore-start -->
 
@@ -179,9 +179,13 @@ worker.new("agent.run", input: text(), output: text(), perform: run_agent)
 
 <!-- prettier-ignore-end -->
 
-The notice and the failed outcome commit together or not at all. Returning `Error` tries again later, with a growing delay; `LeaveUncertain(reason)` keeps the job for an operator. The function must make only short writes on the transaction it is given, and it may run more than once for one abandonment, so anything else repeats; for a slow outside read, submit a checker job on the same transaction with `grind.submit_in` and return `LeaveUncertain`. Consumers settle due jobs as they poll; where they are polled by hand or not at all, call `admin.settle_due`. `grind/testing.abandoned` builds the abandoned job for a test of the function.
+The function runs inside that transaction and is for database writes only: the notice and the failed outcome commit together or not at all. An effect that must happen only after the commit, such as a notification, an outside call or a message, is a follow-up job submitted on the same transaction with `grind.submit_in`. It commits with the decision and runs afterwards with a job's usual at-least-once delivery, so its handler must be safe to repeat. The function reaches the runtime through `grind.named`, captured when the worker is defined.
 
-A periodic sweep of `admin.list(... |> admin.in_state(job.Uncertain))` is still needed for handler-reported uncertainty, for workers that declare no settlement, for worker versions no running consumer registers, and for queues no node consumes.
+- Returning `Error` tries again later, with a growing delay, and the function may run more than once for one abandonment, so nothing in it may have effects outside the transaction. `LeaveUncertain(reason)` keeps the job for an operator; a slow outside read belongs in a checker job submitted the same way.
+- A follow-up does not cover a job resolved by hand with `admin.resolve_uncertain`; an application's own tool uses `admin.resolve_uncertain_in` and `grind.submit_in` in one transaction. `AuthorizeReplay` under a pending cancellation declines the job and rolls back the follow-up, so check `cancellation_requested` first.
+- Consumers settle due jobs as they poll; where they are polled by hand or not at all, call `admin.settle_due`. `grind/testing.abandoned` builds the abandoned job for a test of the function.
+
+A periodic sweep of `admin.list(... |> admin.in_state(job.Uncertain))` is still needed for a handler that returns `Uncertain` itself, for workers that declare no settlement, for worker versions no running consumer registers, and for queues no node consumes.
 
 ## Recovery and operating limits
 

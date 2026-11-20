@@ -163,3 +163,94 @@ pub fn postgres_settlement_hands_a_slow_check_to_a_job_test() {
     }
   }
 }
+
+/// An effect that must happen only after the decision commits is a
+/// follow-up job submitted in the settlement's transaction: it commits with
+/// the decision and runs afterwards, for an applied decision and for an
+/// authorized replay alike.
+pub fn postgres_follow_up_job_commits_with_the_decision_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let queue = unique("settle-follow-up")
+      let name = process.new_name("settle_follow_up_grind")
+      let jobs = grind.named(name)
+      let told = process.new_subject()
+      let tell =
+        worker.new(
+          "settle.tell",
+          input: int_codec(),
+          output: int_codec(),
+          perform: fn(run_id) {
+            process.send(told, run_id)
+            Ok(run_id)
+          },
+        )
+        |> worker.with_queue(queue)
+      let agent =
+        worker.new(
+          "settle.followed",
+          input: string_codec(),
+          output: string_codec(),
+          perform: fn(prompt) {
+            case prompt {
+              "replayed" -> Ok(prompt)
+              _ -> {
+                process.sleep(60_000)
+                Ok(prompt)
+              }
+            }
+          },
+        )
+        |> worker.with_queue(queue)
+        |> worker.with_error_codec(string_codec())
+        |> worker.with_timeout(worker.After(duration.milliseconds(50)))
+        |> worker.with_settlement(fn(transaction, abandoned) {
+          let run_id = abandonment.job_id(abandoned)
+          case grind.submit_in(jobs, transaction, job.new(tell, run_id)) {
+            Error(error) -> Error(grind.describe_submit_error(error))
+            Ok(_) ->
+              case abandonment.input(abandoned) {
+                "replay me" -> Ok(worker.AuthorizeReplay)
+                _ -> Ok(worker.ConfirmFailure("the agent run stopped mid-way"))
+              }
+          }
+        })
+      let assert Ok(_) =
+        grind.start(
+          grind.new(support.pool_config(url))
+            |> grind.with_worker(agent)
+            |> grind.with_worker(tell)
+            |> grind.without_consumers
+            |> grind.with_startup_migration,
+          name,
+        )
+      use <- exception.defer(fn() { grind.stop(jobs) })
+
+      // An applied decision.
+      let assert Ok(grind.Inserted(failed)) =
+        grind.submit(jobs, job.new(agent, "summarise"))
+      let assert Ok(1) =
+        testing.drain(jobs, queue:, limit: 1, within: duration.seconds(10))
+      process.receive(told, within: 0) |> should.equal(Error(Nil))
+      admin.settle_due(jobs, queue:, limit: 10) |> should.equal(Ok(1))
+      let assert Ok(grind.Failed(_, _, _)) = grind.outcome(jobs, failed)
+      let assert Ok(1) =
+        testing.drain(jobs, queue:, limit: 1, within: duration.seconds(10))
+      process.receive(told, within: 1000) |> should.equal(Ok(job.id(failed)))
+
+      // An authorized replay.
+      let assert Ok(grind.Inserted(replayed)) =
+        grind.submit(jobs, job.new(agent, "replay me"))
+      let assert Ok(1) =
+        testing.drain(jobs, queue:, limit: 1, within: duration.seconds(10))
+      admin.settle_due(jobs, queue:, limit: 10) |> should.equal(Ok(1))
+      let assert Ok(grind.Pending(job.Queued)) = grind.outcome(jobs, replayed)
+      // The follow-up and the replayed run are both due now.
+      let assert Ok(2) =
+        testing.drain(jobs, queue:, limit: 2, within: duration.seconds(10))
+      process.receive(told, within: 1000) |> should.equal(Ok(job.id(replayed)))
+      mark_database_test_executed("settlement-follow-up-job")
+    }
+  }
+}
