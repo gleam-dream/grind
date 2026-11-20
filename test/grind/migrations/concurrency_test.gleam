@@ -76,10 +76,10 @@ fn run_concurrent_migrators_test(database_url: String) -> Nil {
       decode.success(count)
     })
     |> pog.execute(on: connection)
-  // One marker row per real step (11, 12 and 13) — never a duplicate for any,
+  // One marker row per real step (11 to 14) — never a duplicate for any,
   // which is what would show up here had the advisory lock not actually
   // serialised the two concurrent migrators against each step.
-  marker.rows |> should.equal([3])
+  marker.rows |> should.equal([4])
   mark_database_test_executed("migrate-concurrent-migrators-single-marker")
 }
 
@@ -162,7 +162,7 @@ fn run_concurrent_schema_creation_test(base_url: String) -> Nil {
   process.receive(result_a, within: 10_000) |> should.equal(Ok(Ok(Nil)))
   process.receive(result_b, within: 10_000) |> should.equal(Ok(Ok(Nil)))
 
-  schema_marker_max_version(connection_a) |> should.equal(13)
+  schema_marker_max_version(connection_a) |> should.equal(14)
   mark_database_test_executed("migrate-concurrent-schema-creation-both-succeed")
 }
 

@@ -43,6 +43,10 @@ const released_migration_sha256 = [
     "20260926000000-grind_v12.sql",
     "47364E79BB2EDB52C1BB99BA0D2E3498AB0B73ECF4B6EB0B3F39C5DD5F4DB32F",
   ),
+  #(
+    "20261002000000-grind_v13.sql",
+    "86717F6DA252F0BB149E053DC48AFD1E7C2BDF12A913D320FE843486BE36A994",
+  ),
 ]
 
 /// Proves `grind/internal/migrations.migrations()` (what `postgres.migrate`
