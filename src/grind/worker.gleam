@@ -26,6 +26,19 @@
 //// definition it was submitted under. Versions default to `"1"`; change one
 //// with `with_version` or `with_codec_version` when a stored shape changes.
 ////
+//// Each job carries a closure over the whole worker definition: the handler,
+//// the codecs, the retry policy and the settlement, with everything they
+//// capture. Grind copies it three times per job: into the attempt
+//// supervisor, the attempt actor and the handler process. Only the handler keeps it while the job runs. A copy
+//// loses internal sharing, so each costs the closure's flat size. Capture
+//// small references, such as an id or a process name, and keep static data
+//// in module constants, which Gleam inlines and the runtime does not copy.
+//// Bound the worker value in a test with
+//// `erts_debug:flat_size(Worker) * erlang:system_info(wordsize)`. The README
+//// section "What each job copies" has an example; for codecs built with
+//// json_blueprint, see its
+//// [codec guide](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+////
 //// A handler built with `new` returns `Result(output, error)`. One built
 //// with `responding` receives the job's `Context` (job id, attempt, snooze
 //// count, correlation, cancellation, deadline and the runtime's database

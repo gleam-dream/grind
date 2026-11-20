@@ -15,6 +15,7 @@ Compiled, runnable public API examples, one module under `src/grind_usage/` per 
 | `runtime`         | A supervised runtime and its named handle, a script, a submit-only node.                 |
 | `handlers`        | The job context, snooze, discard and cooperative cancellation.                           |
 | `handler_testing` | `testing.perform` without a database and `testing.drain` on demand.                      |
+| `copy_cost`       | A worker that captures nothing large, and a test that bounds its size.                   |
 | `isolation`       | One installation per schema, and one pool shared with the application.                   |
 | `observations`    | Sinal events for acknowledgements and capacity.                                          |
 | `uniqueness`      | Finding an existing job and rescheduling one across queues.                              |
@@ -24,7 +25,7 @@ Compiled, runnable public API examples, one module under `src/grind_usage/` per 
 
 ## Run
 
-Without a database, the `limits` and offline `handler_testing` topics run:
+Without a database, the `limits`, `copy_cost` and offline `handler_testing` topics run:
 
 ```sh
 nix develop --command sh -c 'cd examples/usage && gleam test'
