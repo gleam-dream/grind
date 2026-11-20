@@ -1,7 +1,7 @@
 //// Copy cost: a worker that keeps its static data in a module constant and
 //// captures nothing large, and a test that bounds its size. Grind copies a
-//// worker's handler closure, with everything it captures, into each job's
-//// processes.
+//// worker's whole definition, handler and codecs with everything they
+//// capture, into each job's processes.
 
 import gleam/dynamic/decode
 import gleam/io

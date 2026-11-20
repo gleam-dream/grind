@@ -1,7 +1,8 @@
 //// Measures what Grind copies between processes for each job. A claimed
-//// job carries its worker's handler closure from the coordinator through
-//// the attempt supervisor and the attempt actor into the handler process,
-//// so the closure's captures are copied with every job. Only the handler
+//// job carries a closure over its whole worker definition from the
+//// coordinator through the attempt supervisor and the attempt actor into the
+//// handler process, so everything the definition captures is copied with
+//// every job. Only the handler
 //// keeps it: the attempt actor drops it once the handler starts, and the
 //// lease renewer gets only the attempt fence.
 

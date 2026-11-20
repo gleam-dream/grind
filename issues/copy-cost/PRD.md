@@ -2,9 +2,10 @@
 
 ## Problem
 
-BEAM processes share no heap. Grind moves each claimed job's handler closure,
-the worker's `perform` or `handle` function with everything it captures,
-across process boundaries. Consumers whose workers captured whole
+BEAM processes share no heap. Grind moves each claimed job's execution
+closure across process boundaries. It holds the whole worker definition: the
+`perform` or `handle` function, the codecs and the policies, with everything
+they capture. Consumers whose workers captured whole
 environments (agents, catalogues, codecs) paid that size several times per
 job, and one service ran out of memory. Grind's documentation did not say
 what it copies.
