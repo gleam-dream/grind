@@ -154,11 +154,40 @@ let assert Ok(grind.Inserted(handle)) =
 
 The [runnable transaction example](examples/usage/src/grind_usage/transactions.gleam) also shows rollback behavior.
 
+## When a job is left uncertain
+
+An attempt is abandoned when its node dies or its handler exceeds its timeout. Grind cannot know whether its effect happened, so once `with_abandonment` allows no further replay it holds the job `uncertain` and never decides on its own. Declare on the worker how such a job is settled, and the queue's consumer hands it to that function once, inside a transaction that also records the decision:
+
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/usage/src/grind_usage/uncertain.gleam#declare-settlement -->
+```gleam
+worker.new("agent.run", input: text(), output: text(), perform: run_agent)
+|> worker.with_error_codec(text())
+|> worker.with_timeout(worker.After(duration.milliseconds(100)))
+|> worker.with_settlement(fn(transaction, abandoned) {
+  // Short writes on the transaction only: they commit with the decision.
+  use _ <- result.try(
+    pog.query("INSERT INTO " <> notices <> " (run_id) VALUES ($1)")
+    |> pog.parameter(pog.int(abandoned.job_id))
+    |> pog.execute(on: transaction)
+    |> result.map_error(string.inspect),
+  )
+  Ok(worker.ConfirmFailure("the agent run stopped mid-way"))
+})
+```
+
+<!-- prettier-ignore-end -->
+
+The notice and the failed outcome commit together or not at all. Returning `Error` tries again later, with a growing delay; `LeaveUncertain(reason)` keeps the job for an operator. The function must make only short writes on the transaction it is given: anything else repeats on every try. A handler's own `Uncertain` response is not handed over, because it already asked for an operator.
+
+A periodic sweep of `admin.list(... |> admin.in_state(job.Uncertain))` is still needed for handler-reported uncertainty, for workers that declare no settlement, for worker versions no running consumer registers, and for queues no node consumes.
+
 ## Recovery and operating limits
 
 - A lost admission reply can return `CommitUnknown(pending)`. Retain that pending command and call `grind.reconcile_submission`; a missing receipt is still unknown. Reuse the same command identity when retrying.
 - External effects are not exactly-once: submission receipts deduplicate the admission command, not a provider call. Use a provider-enforced idempotency key or an application ledger when effects must not repeat.
-- An abandoned attempt is `Uncertain` by default because its external effect may have happened. Investigate the provider or business ledger before confirming the outcome or authorizing replay. Resolution attribution does not enforce operator permissions.
+- An abandoned attempt is `Uncertain` by default because its external effect may have happened. Investigate the provider or business ledger before confirming the outcome or authorizing replay, or declare a settlement on the worker. Resolution attribution does not enforce operator permissions.
 - Cancellation is cooperative intent. It cannot retract an effect or promise that the handler did no work.
 - `await` may return `Pending`; it does not cancel the job. Its final storage read can exceed the requested wait, and queued database checkout can exceed the storage-call deadline.
 - Receipts are pruned with finished jobs. For deduplication or audit history that must outlive job retention, keep an application-owned business record.
