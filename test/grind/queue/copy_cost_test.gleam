@@ -1,18 +1,24 @@
 //// Measures what Grind copies between processes for each job. A claimed
-//// job carries its worker's handler closure from the consumer into the
-//// attempt actor and the handler process, so the closure's captures are
-//// copied with every job. The lease renewer gets only the attempt fence.
+//// job carries its worker's handler closure from the coordinator through
+//// the attempt supervisor and the attempt actor into the handler process,
+//// so the closure's captures are copied with every job. Only the handler
+//// keeps it: the attempt actor drops it once the handler starts, and the
+//// lease renewer gets only the attempt fence.
 
 import exception
+import gleam/dynamic
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{Some}
+import gleam/otp/actor
 import gleam/string
 import gleeunit/should
 import grind/internal/attempt
 import grind/internal/postgres
+import grind/internal/queue/worker as queue_worker
 import grind/internal/registry
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/worker
@@ -145,6 +151,12 @@ const catalogue = [
 @external(erlang, "grind_copy_size", "flat_bytes")
 fn flat_bytes(term: a) -> Int
 
+@external(erlang, "sys", "get_state")
+fn actor_state(pid: process.Pid) -> dynamic.Dynamic
+
+@external(erlang, "grind_copy_size", "heap_bytes_after_gc")
+fn heap_bytes_after_gc(pid: process.Pid) -> Int
+
 /// Data built at run time, as an application builds a catalogue or an
 /// environment when it starts.
 fn built_catalogue() -> List(String) {
@@ -195,35 +207,83 @@ pub fn selecting_a_worker_carries_that_worker_only_test() {
   should.be_true(flat_bytes(large_run) > 100_000)
 }
 
-pub fn postgres_lease_fence_carries_no_worker_test() {
+pub fn postgres_attempt_actor_holds_no_worker_after_start_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
-    Ok(database_url) -> run_lease_fence_test(database_url)
+    Ok(database_url) -> run_attempt_actor_test(database_url)
   }
 }
 
-fn run_lease_fence_test(database_url: String) -> Nil {
+type AttemptEvent {
+  Acknowledging
+  Completed
+}
+
+/// A worker that captures a large runtime value, reports that its handler
+/// started, then blocks until the test kills its attempt.
+fn blocking_worker(
+  id: String,
+  queue: String,
+  started: process.Subject(Nil),
+) -> worker.Worker(String, String, Nil) {
+  let entries = built_catalogue()
+  worker.new(id, input: text_codec(), output: text_codec(), perform: fn(key) {
+    process.send(started, Nil)
+    process.sleep_forever()
+    Ok(key <> int.to_string(list.length(entries)))
+  })
+  |> worker.with_queue(queue)
+}
+
+fn run_attempt_actor_test(database_url: String) -> Nil {
   let assert Ok(validated) =
     postgres.settings(database_url) |> postgres.validate
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let assert Ok(Nil) = postgres.migrate(database)
-  let queue = "copy-cost-fence"
-  let large =
-    capturing_worker("copy.fence.large")
-    |> worker.with_queue(queue)
+  let queue = "copy-cost-actor"
+  let owner = "copy-cost-owner"
+  let started = process.new_subject()
+  let large = blocking_worker("copy.actor.large", queue, started)
   let assert Ok(workers) = registry.new(queue)
   let assert Ok(workers) = registry.register(workers, large)
-  let input = string.repeat("x", 200)
-  let assert Ok(_) = postgres.submit(database, queue, large, input)
-  let owner = "copy-cost-owner"
+  let assert Ok(_) =
+    postgres.submit(database, queue, large, string.repeat("x", 200))
   let assert Ok(Some(claimed)) =
     attempt.claim_one(database, queue, workers, owner, 30_000)
-  // The attempt actor and its handler each receive the whole claim.
-  should.be_true(flat_bytes(claimed) > flat_bytes(built_catalogue()))
-  // The renewer receives only the fence, whatever the worker captures.
-  should.be_true(flat_bytes(attempt.lease_fence(claimed, owner)) < 1024)
-  let assert Ok(True) =
-    attempt.release_unstarted(database, queue, owner, claimed)
-  mark_database_test_executed("copy-cost-lease-fence-passed")
+  // The claim carries the worker into the attempt supervisor, the attempt
+  // actor and the handler process.
+  let captured = flat_bytes(built_catalogue())
+  should.be_true(flat_bytes(claimed) > captured)
+  let renewals = process.new_subject()
+  let request =
+    queue_worker.WorkerRequest(
+      queue_subject: process.new_subject(),
+      claimed:,
+      on_acknowledging: fn(_, _, _) { Acknowledging },
+      on_complete: fn(_, _, _, _) { Completed },
+      database:,
+      queue:,
+      owner:,
+      renewer: renewals,
+      retry_interval_ms: 1000,
+      automatic: True,
+    )
+  let assert Ok(attempt_actor) = actor.start(queue_worker.worker_actor(request))
+  let pid = attempt_actor.pid
+  use <- exception.defer(fn() {
+    process.unlink(pid)
+    process.kill(pid)
+  })
+  process.send(attempt_actor.data, queue_worker.StartAttempt)
+  let assert Ok(Nil) = process.receive(started, 5000)
+  // The message the renewer receives carries no worker, its cancellation
+  // callback included.
+  let assert Ok(track) = process.receive(renewals, 1000)
+  should.be_true(flat_bytes(track) < 1024)
+  // Once the handler runs, the attempt actor keeps no worker, in its state
+  // or its heap.
+  should.be_true(flat_bytes(actor_state(pid)) < 8192)
+  should.be_true(heap_bytes_after_gc(pid) < captured / 2)
+  mark_database_test_executed("copy-cost-attempt-actor-passed")
 }

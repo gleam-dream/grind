@@ -105,6 +105,18 @@ pub fn execute_claim(
   run(context)
 }
 
+/// The claim once its handler closure has gone to the handler process: the
+/// same fence, policies and connection, without the worker. The attempt
+/// actor keeps this, so a running job's worker lives only in its handler.
+/// Executing it again is a programming error and panics.
+pub fn handed_off(claimed: ClaimedJob) -> ClaimedJob {
+  ClaimedJob(..claimed, run: already_handed_off)
+}
+
+fn already_handed_off(_context: worker.Context) -> worker.Execution {
+  panic as "grind: this claim's handler already went to its handler process"
+}
+
 /// The worker's handler timeout, `None` when it has none.
 pub fn claim_timeout_ms(claimed: ClaimedJob) -> Option(Int) {
   claimed.timeout_ms

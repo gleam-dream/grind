@@ -180,9 +180,12 @@ fn start_handler(
     Some(ms) -> Some(process.send_after(self, ms, HandlerTimedOut))
     None -> None
   }
+  // The handler process has its own copy of the worker; this actor keeps
+  // only the fence, policies and connection it acknowledges with.
   actor.continue(
     WorkerState(
       ..state,
+      request: WorkerRequest(..request, claimed: attempt.handed_off(claimed)),
       phase: Running(handler:, cancel: None, cancel_requested: False, timer:),
     ),
   )
