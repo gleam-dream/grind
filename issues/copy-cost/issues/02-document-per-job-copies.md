@@ -4,8 +4,9 @@ Status: in-progress
 Category: enhancement
 
 State Grind's part of the copy cost for consumers: the handler closure crosses
-three process boundaries per job, the attempt actor and handler each hold a
-copy while it runs, and only the selected worker is copied.
+three process boundaries per job, each copy loses sharing, only the handler
+keeps its copy while the job runs, and only the selected worker is copied.
+Name the per-consumer registry copies too.
 
 ## Acceptance
 

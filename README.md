@@ -133,14 +133,16 @@ Queue concurrency is local to each node. Budget one dedicated renewal connection
 
 ## What each job copies
 
-BEAM processes share no heap, so a value sent to another process is copied in full. Grind runs each job's handler in its own processes, and the claimed job carries the worker's handler closure: your `perform` or `handle` function and everything it captures. That closure is copied three times per job: from the coordinator to the attempt supervisor, into the attempt actor, and into the handler process. The attempt actor and the handler each hold their copy while the job runs. A worker that captures 1 MB therefore costs about 3 MB of copying per job and 2 MB of heap per running job. Grind copies only the worker that runs the job, never the other registered workers. The input and output travel as encoded JSON strings; the runtime shares a string over 64 bytes by reference instead of copying it.
+BEAM processes share no heap. Sending a term to another process copies it and loses its internal sharing, so each copy costs the term's flat size, which can be many times what the term occupies on the sender's heap. Module literals and binaries over 64 bytes are the exceptions: the runtime passes them by reference.
+
+Each claimed job carries its worker's handler closure: your `perform` or `handle` function and everything it captures. Grind copies that closure three times per job: into the attempt supervisor's start call, into the attempt actor, and into the handler process. Only the handler keeps its copy while the job runs. The attempt actor drops its copy once the handler starts, and the lease renewer receives only the attempt's fence. A worker with a flat size of 1 MB therefore costs about 3 MB of copying per job, and each running handler's heap holds about 1.5 MB after collection. Grind copies only the worker that runs the job, not the other registered workers, and the input and output travel as encoded JSON strings. Separately, each queue's consumer holds that queue's whole registry in its supervisor's child specification and in its coordinator, and copies it each time the coordinator starts.
 
 Keep the worker value small:
 
 - Capture small references, such as an id, a process name or a pool name, not an environment record that holds catalogues, agents, codecs or clients.
 - Keep static data in module constants or behind a handle such as a `persistent_term` key. Gleam inlines a constant where it is used, so a handler that refers to one captures nothing.
 - Build codecs as the [json_blueprint codec guide](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md) describes, on json_blueprint 2.1.1 or later.
-- Bound the worker value in a test. The Erlang helper returns `erts_debug:flat_size(Term) * erlang:system_info(wordsize)`, the bytes one copy takes:
+- Bound the worker value in a test. Add a one-function Erlang module, like [`grind_usage_copy_size.erl`](examples/usage/src/grind_usage_copy_size.erl), that returns `erts_debug:flat_size(Term) * erlang:system_info(wordsize)`, the bytes one copy takes:
 
 <!-- prettier-ignore-start -->
 
