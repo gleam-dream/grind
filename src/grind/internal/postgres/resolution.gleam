@@ -115,7 +115,7 @@ pub fn resolve_uncertain(
 /// (`Replied`); `ResolutionAlreadyApplied` is a prior commit of this exact
 /// `resolution_id` proven by a receipt read (`Reconciled`) — see
 /// `resolution_receipt_outcome`.
-fn emit_resolved(
+pub fn emit_resolved(
   fwd: Forwarder,
   correlation: Correlation,
   queue: String,
@@ -159,6 +159,22 @@ fn resolution_decision_of_stored(
     "confirm_business_failure" -> Ok(telemetry.DecisionConfirmBusinessFailure)
     "authorize_replay" -> Ok(telemetry.DecisionAuthorizeReplay)
     _ -> Error(Nil)
+  }
+}
+
+/// Applies `command` inside a transaction Grind owns and has already scoped
+/// to its schema, for a declared settlement. Only a fresh application
+/// counts: a receipt already applied under the same identity is
+/// `ReconciliationNotRequired`, so the caller rolls its own writes back
+/// rather than committing them a second time.
+pub fn apply_fresh_in(
+  transaction: pog.Connection,
+  command: ResolutionCommand,
+) -> Result(State, ResolutionError) {
+  case reconcile_transaction(transaction, command) {
+    Ok(ResolutionApplied(state)) -> Ok(state)
+    Ok(ResolutionAlreadyApplied(_)) -> Error(ReconciliationNotRequired)
+    Error(error) -> Error(error)
   }
 }
 

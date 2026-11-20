@@ -732,6 +732,7 @@ fn claim_registered_job(
               run:,
               timeout_ms:,
               abandonment:,
+              ..,
             )) ->
               case
                 codec_contract_mismatch(

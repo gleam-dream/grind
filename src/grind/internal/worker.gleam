@@ -225,7 +225,37 @@ pub type Worker(input, output, error) {
     timeout_ms: Option(Int),
     max_snoozes: Int,
     abandonment: Abandonment,
+    settlement: Option(
+      fn(pog.Connection, Abandoned(input)) ->
+        Result(Settlement(output, error), String),
+    ),
   )
+}
+
+/// A job that an abandoned attempt left uncertain, as its worker's declared
+/// settlement receives it. `grind/worker.Abandoned` is the public shape.
+pub type Abandoned(input) {
+  Abandoned(
+    job_id: Int,
+    input: input,
+    attempt_id: Int,
+    attempt: Int,
+    replays: Int,
+    settlement_try: Int,
+    cancellation_requested: Bool,
+    held_at: Timestamp,
+    description: String,
+    correlation: Correlation,
+  )
+}
+
+/// A declared settlement's decision. `grind/worker.Settlement` is the
+/// public shape.
+pub type Settlement(output, error) {
+  SettleSuccess(output)
+  SettleFailure(error)
+  SettleReplay
+  SettleLeaveUncertain(reason: String)
 }
 
 /// Builds a worker with the engine defaults. The public constructors in
@@ -251,6 +281,7 @@ pub fn new(
     timeout_ms: Some(default_timeout_ms),
     max_snoozes: default_max_snoozes,
     abandonment: HoldUncertain,
+    settlement: None,
   )
 }
 

@@ -30,6 +30,7 @@ import grind/internal/postgres.{type Database}
 import grind/internal/queue/active.{type ActiveAttempt, ActiveAttempt} as queue_active
 import grind/internal/queue/handoff as queue_handoff
 import grind/internal/queue/renewer as queue_renewer
+import grind/internal/queue/settler as queue_settler
 import grind/internal/queue/timing as queue_timing
 import grind/internal/queue/worker as queue_worker
 import grind/internal/registry.{type Registry}
@@ -814,12 +815,29 @@ fn consumer_supervisor(
       }
     })
     |> supervision.timeout(shutdown_grace_ms + 2000)
-  static_supervisor.new(static_supervisor.OneForAll)
-  |> static_supervisor.add(pool.supervised(
-    renewal_config,
-    postgres.statement_deadline_ms(database),
-  ))
-  |> static_supervisor.add(child)
+  let supervisor =
+    static_supervisor.new(static_supervisor.OneForAll)
+    |> static_supervisor.add(pool.supervised(
+      renewal_config,
+      postgres.statement_deadline_ms(database),
+    ))
+    |> static_supervisor.add(child)
+  // Only a consumer that polls on its own and declares a settlement runs a
+  // settler (docs/design/design.typ, "Settler").
+  case polling, registry.settlements(workers) {
+    PollEvery(interval_ms), [_, ..] ->
+      static_supervisor.add(
+        supervisor,
+        queue_settler.supervised(
+          database,
+          workers,
+          lease_duration_ms,
+          interval_ms,
+          fn(_outcome) { Nil },
+        ),
+      )
+    _, _ -> supervisor
+  }
 }
 
 /// Sends through a consumer's named coordinator subject. That name is a

@@ -41,12 +41,14 @@
 //// | handler timeout    | 15 minutes                                | `with_timeout(Infinity)`    |
 //// | snoozes per job    | 100, then `SnoozeLimitReached`            | `with_max_snoozes`          |
 //// | abandoned attempts | `HoldUncertain`                           | `with_abandonment`          |
+//// | abandoned, held    | waits for an operator                     | `with_settlement`           |
 
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/json
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
 import grind/internal/worker as definition
@@ -115,6 +117,48 @@ pub type Abandonment {
   /// same number again. `[grind, job, quarantined]` reports it with
   /// `replayed: True`.
   ReplayAfterLeaseExpiry(max_replays: Int)
+}
+
+/// A job that an abandoned attempt left `uncertain`, handed to the worker's
+/// settlement (see `with_settlement`).
+pub type Abandoned(input) {
+  Abandoned(
+    job_id: Int,
+    /// The job's input, decoded with the worker's input codec.
+    input: input,
+    /// The abandoned attempt; the settlement decides the effect of this one.
+    attempt_id: Int,
+    /// Its business attempt number, from 1.
+    attempt: Int,
+    /// How many lease-expiry replays the job used.
+    replays: Int,
+    /// Which settlement try this is for the abandoned attempt, from 1. A
+    /// settlement may stop trying with `LeaveUncertain` after its own limit.
+    settlement_try: Int,
+    /// Whether a cancellation of the job is pending; `AuthorizeReplay` is
+    /// then refused.
+    cancellation_requested: Bool,
+    /// When Grind held the job uncertain. The abandoned handler may still be
+    /// running on a node cut off from the database until its own timeout.
+    held_at: Timestamp,
+    /// The job's description, which says why it is uncertain.
+    description: String,
+    correlation: Correlation,
+  )
+}
+
+/// What a worker's settlement decides about an abandoned job.
+pub type Settlement(output, error) {
+  /// The abandoned attempt succeeded with this output.
+  ConfirmSuccess(output)
+  /// The abandoned attempt failed with this error. Needs an error codec.
+  ConfirmFailure(error)
+  /// Run the job again.
+  AuthorizeReplay
+  /// Keep the job `uncertain` for an operator; `reason` joins its
+  /// description. The job is not handed over again unless a later attempt
+  /// is abandoned.
+  LeaveUncertain(reason: String)
 }
 
 /// A codec with version `"1"`. `encode` may reject a value with a reason:
@@ -359,6 +403,91 @@ pub fn with_abandonment(
           }
       }
   }
+}
+
+/// Declares how a job that an abandoned attempt left `uncertain` is
+/// settled, so that it reaches the application as a decision instead of
+/// waiting for an operator.
+///
+/// An attempt is abandoned when its lease expires without an
+/// acknowledgement and `with_abandonment` allows no further replay, or when
+/// its handler exceeds its timeout under `HoldUncertain`. A handler's own
+/// `Uncertain` response is not handed over: it already asked for an
+/// operator.
+///
+/// The queue's consumer calls `settle` with an open transaction on the
+/// runtime's pool and the abandoned job. What `settle` writes on that
+/// transaction commits together with the decision, or not at all. It runs
+/// under the application's `search_path` (on a runtime built from a
+/// database URL, Grind's own schema, so qualify your tables), with the
+/// job's row locked, within the storage deadline:
+///
+/// - Make only short database writes on `transaction`. Do not commit, roll
+///   back or change its session, and do not call other systems: a try that
+///   fails is repeated.
+/// - Return `Error(reason)` to try again later. The next try waits a lease
+///   of the queue, doubling up to one hour. A decision Grind refuses
+///   (`ConfirmFailure` without an error codec, `AuthorizeReplay` under a
+///   pending cancellation), a crash and a lost connection are tried again
+///   the same way.
+/// - The decision is recorded as a resolution with the id
+///   `grind-settlement:<job id>:<attempt id>`; do not use that prefix for
+///   your own resolution ids.
+///
+/// ```gleam
+/// worker.new("agent.run", input:, output:, perform: run_agent)
+/// |> worker.with_error_codec(error_codec)
+/// |> worker.with_abandonment(worker.ReplayAfterLeaseExpiry(1))
+/// |> worker.with_settlement(fn(transaction, abandoned) {
+///   use Nil <- result.try(insert_notice(transaction, abandoned.job_id))
+///   Ok(worker.ConfirmFailure("the agent run stopped mid-way"))
+/// })
+/// ```
+pub fn with_settlement(
+  worker: Worker(input, output, error),
+  settle: fn(pog.Connection, Abandoned(input)) ->
+    Result(Settlement(output, error), String),
+) -> Worker(input, output, error) {
+  definition.Worker(
+    ..worker,
+    settlement: Some(fn(transaction, abandoned) {
+      let definition.Abandoned(
+        job_id:,
+        input:,
+        attempt_id:,
+        attempt:,
+        replays:,
+        settlement_try:,
+        cancellation_requested:,
+        held_at:,
+        description:,
+        correlation:,
+      ) = abandoned
+      settle(
+        transaction,
+        Abandoned(
+          job_id:,
+          input:,
+          attempt_id:,
+          attempt:,
+          replays:,
+          settlement_try:,
+          cancellation_requested:,
+          held_at:,
+          description:,
+          correlation:,
+        ),
+      )
+      |> result.map(fn(settlement) {
+        case settlement {
+          ConfirmSuccess(output) -> definition.SettleSuccess(output)
+          ConfirmFailure(error) -> definition.SettleFailure(error)
+          AuthorizeReplay -> definition.SettleReplay
+          LeaveUncertain(reason:) -> definition.SettleLeaveUncertain(reason:)
+        }
+      })
+    }),
+  )
 }
 
 /// The worker's id.
