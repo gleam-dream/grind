@@ -13,4 +13,4 @@ pre-commit:
       run: nix fmt -- {staged_files}
       stage_fixed: true
     design:
-      run: nix run .#design-gate-check -- docs/design
+      run: nix run .#design-gate-check -- docs/design .
