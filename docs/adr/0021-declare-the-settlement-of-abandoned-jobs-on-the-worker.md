@@ -20,7 +20,7 @@
 - One transaction carries the application's writes, the resolution and the ended mark. Whatever commits, commits together. A commit whose reply is lost is unknown; the next take selects only jobs still uncertain under the same mark, so it either finds the job settled or tries again.
 - The original attempt cannot contradict the settlement: its acknowledgement requires a live lease, and the job was only marked after that lease expired or after Grind's own timeout acknowledgement.
 - Every Grind storage call runs on a managed checkout bounded by the storage deadline (ADR-0008), and that checkout sets Grind's schema for its duration. The settlement keeps that bound rather than borrowing an application transaction, and hands the function the application's search_path saved by the checkout, set for the function's part of the transaction only. Grind sets its schema and timeouts again before its own statements and treats a transaction the function ended or replaced as a failed try.
-- Each try runs in a process of its own that the settler ends at the storage deadline, because the deadline closes the connection but cannot interrupt a function stuck outside the database.
+- Each try runs in a process linked to the settler, which ends the try at the storage deadline, because the deadline closes the connection but cannot interrupt a function stuck outside the database. The settler sits under a supervisor of its own, as the observation forwarder does, because the consumer's supervisor restarts every child together and a crashing settler must not stop claims and renewals.
 
 ## Alternatives
 
@@ -39,10 +39,10 @@
 ## Consequences
 
 - Every consumer applies schema version 14 before running this Grind, including consumers that declare no settlement; Cigogne users add its mirror file. Without a declared settlement, abandoned jobs are marked and wait for an operator: no settler starts and no settlement query runs.
-- A node on the previous Grind release that only checks the schema at start, or skips that check, runs on schema 14. One that migrates at start refuses to start on a newer schema, as for any migration. A node on the previous release writes no mark, so a job it holds uncertain during a rolling deploy waits for an operator; an application that keeps its own sweep until the deploy completes covers that window.
+- A node on the previous Grind release that only checks the schema at start, or skips that check, runs on schema 14. One that migrates at start refuses to start on a newer schema, as for any migration. A node on the previous release writes no mark, so a job it holds uncertain during a rolling deploy waits for an operator; each settler marks such jobs of its queue when it starts, by the recognition schema 14 uses, so the next start of an upgraded node hands them over.
 - The function runs while the job row is locked, in a transaction on the main pool bounded by the storage deadline. It must make only short database writes and must not end the transaction; an external call in it repeats with every try. On a runtime built from a database URL, the pool is Grind's alone, so the function sees Grind's schema and qualifies its own tables.
 - An expired lease does not prove the abandoned handler stopped: a node cut off from the database may still run it until its own timeout. The function sees when the job was held uncertain and can return an error to wait; operators faced the same window before, at human pace.
-- Operators end a mark by resolving the job. Grind adds no command to end or list marks; whether operators need one is left open.
+- Operators end a mark by resolving the job. Grind adds no command to end or list marks, and the uncertain listing does not show a mark, so an operator cannot yet tell a job waiting for a settler from a declined one; whether to add that is an open ruling.
 - Settlement needs the deployed typed worker. A job of a worker version no consumer registers stays due until one does; a queue no node consumes is never settled.
 
 ## Evidence
