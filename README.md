@@ -169,7 +169,7 @@ worker.new("agent.run", input: text(), output: text(), perform: run_agent)
   // Short writes on the transaction only: they commit with the decision.
   use _ <- result.try(
     pog.query("INSERT INTO " <> notices <> " (run_id) VALUES ($1)")
-    |> pog.parameter(pog.int(abandoned.job_id))
+    |> pog.parameter(pog.int(abandonment.job_id(abandoned)))
     |> pog.execute(on: transaction)
     |> result.map_error(string.inspect),
   )
