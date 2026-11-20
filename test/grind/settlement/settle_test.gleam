@@ -341,7 +341,7 @@ pub fn postgres_concurrent_settlers_commit_one_decision_test() {
       let _ = process.receive(release, within: 5000)
       Ok(worker.ConfirmFailure("settled"))
     })
-  let assert Ok(handle) = postgres.submit(database, name, agent, "read inbox")
+  let assert Ok(_) = postgres.submit(database, name, agent, "read inbox")
   let _ = abandon(database, name, agent)
   let first = process.new_subject()
   process.spawn(fn() {
