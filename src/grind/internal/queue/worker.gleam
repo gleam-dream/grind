@@ -216,7 +216,7 @@ fn timed_out(
     worker.HoldUncertain ->
       begin_acknowledgement(
         state,
-        worker.ExecutedUncertain(
+        worker.ExecutedAbandoned(
           "handler exceeded its timeout of "
           <> timeout
           <> " ms and was stopped; its effect is unknown",

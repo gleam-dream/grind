@@ -281,6 +281,23 @@ pub fn acknowledge_transaction(
             pog.text(attempt_owner),
           ],
         )
+        // Grind's own timeout stop under `HoldUncertain`: committed exactly
+        // as an uncertain proposal, plus the settlement mark naming this
+        // attempt (docs/design/design.typ, "Declared settlement of
+        // abandoned jobs").
+        "abandoned" -> #(
+          "UPDATE grind_jobs SET state = 'uncertain', failure_description = $1, uncertain_at = clock_timestamp(), finished_at = NULL, settle_attempt_id = attempt_id, settle_at = clock_timestamp(), settle_tries = 0 WHERE id = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
+            <> lease.live_lease_predicate("clock_timestamp()")
+            <> " RETURNING id, state, failure_description, (extract(epoch FROM available_at) * 1000)::bigint",
+          [
+            pog.nullable(pog.text, failure_description),
+            pog.int(id),
+            pog.text(queue),
+            pog.int(attempt_id),
+            pog.int(epoch),
+            pog.text(attempt_owner),
+          ],
+        )
         "runtime_failed" -> #(
           "UPDATE grind_jobs SET state = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled' ELSE 'runtime_failed' END, output = NULL, error = NULL, failure_description = CASE WHEN cancel_requested_at IS NOT NULL THEN 'cancelled by caller' ELSE $1 END, failure_cause = NULL, attempt_owner = NULL, lease_expires_at = NULL, cancel_requested_at = NULL, finished_at = clock_timestamp() WHERE id = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
             <> lease.live_lease_predicate("clock_timestamp()")

@@ -7,7 +7,8 @@
 //// are registered; there is no fallback to another version.
 
 import gleam/list
-import gleam/option.{type Option}
+import gleam/option.{type Option, None, Some}
+import grind/internal/settlement/declared
 import grind/internal/worker.{type Worker}
 
 /// Immutable worker selections for one queue name.
@@ -25,6 +26,7 @@ type Selection {
     run: fn(String, String, worker.Context, Int) -> worker.Execution,
     timeout_ms: Option(Int),
     abandonment: worker.Abandonment,
+    settle: Option(declared.Settle),
   )
 }
 
@@ -39,6 +41,7 @@ pub type Selected {
     run: fn(String, String, worker.Context, Int) -> worker.Execution,
     timeout_ms: Option(Int),
     abandonment: worker.Abandonment,
+    settle: Option(declared.Settle),
   )
 }
 
@@ -97,6 +100,7 @@ pub fn register(
             },
             timeout_ms: definition.timeout_ms,
             abandonment: definition.abandonment,
+            settle: declared.erase(definition),
           ),
           ..workers
         ]),
@@ -114,6 +118,21 @@ pub fn identities(registry: Registry) -> List(#(String, String)) {
   list.map(workers, fn(selection) {
     let Selection(id:, version:, ..) = selection
     #(id, version)
+  })
+}
+
+/// The worker identities and versions whose definitions declare a
+/// settlement, with their erased settlement.
+pub fn settlements(
+  registry: Registry,
+) -> List(#(String, String, declared.Settle)) {
+  let Registry(workers:, ..) = registry
+  list.filter_map(workers, fn(selection) {
+    let Selection(id:, version:, settle:, ..) = selection
+    case settle {
+      Some(settle) -> Ok(#(id, version, settle))
+      None -> Error(Nil)
+    }
   })
 }
 
@@ -147,6 +166,7 @@ pub fn select(
           run:,
           timeout_ms:,
           abandonment:,
+          settle:,
           ..,
         )) ->
           Ok(Selected(
@@ -156,6 +176,7 @@ pub fn select(
             run:,
             timeout_ms:,
             abandonment:,
+            settle:,
           ))
         Error(Nil) -> Error(WorkerNotRegistered(id:, version:))
       }

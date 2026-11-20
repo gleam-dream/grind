@@ -608,7 +608,8 @@ fn acknowledge_once(
     | worker.ExecutedSnoozeLimitReached(_, _)
     | worker.ExecutedDiscarded(_)
     | worker.ExecutedCancelled(_)
-    | worker.ExecutedUncertain(_) ->
+    | worker.ExecutedUncertain(_)
+    | worker.ExecutedAbandoned(_) ->
       run_acknowledgement(
         database,
         queue,
@@ -777,6 +778,7 @@ fn claim_registered_job(
               run:,
               timeout_ms:,
               abandonment:,
+              ..,
             )) ->
               case
                 codec_contract_mismatch(
@@ -1169,6 +1171,17 @@ fn run_acknowledgement(
         error: None,
         failure_description: Some(reason),
       )
+    worker.ExecutedAbandoned(reason) ->
+      AckProposal(
+        proposed_state: "abandoned",
+        failure_cause: None,
+        requested_delay_ms: None,
+        output_version: None,
+        output: None,
+        error_version: None,
+        error: None,
+        failure_description: Some(reason),
+      )
   }
   let command_id =
     attempt_acknowledgement.acknowledgement_command_id(id, attempt_id, epoch)
@@ -1333,7 +1346,8 @@ fn proposed_of_execution(execution: worker.Execution) -> telemetry.Proposed {
     worker.ExecutedSnoozeLimitReached(_, _) -> telemetry.ProposedBusinessFailure
     worker.ExecutedDiscarded(_) -> telemetry.ProposedDiscarded
     worker.ExecutedCancelled(_) -> telemetry.ProposedCancelled
-    worker.ExecutedUncertain(_) -> telemetry.ProposedUncertain
+    worker.ExecutedUncertain(_) | worker.ExecutedAbandoned(_) ->
+      telemetry.ProposedUncertain
   }
 }
 

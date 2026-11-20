@@ -2294,6 +2294,9 @@ pub type JobRow {
     finished_at_us: Option(Int),
     failure_description: Option(String),
     correlation: Option(String),
+    /// The settlement mark: the attempt it names, its due time in Unix
+    /// microseconds when still due, and the tries taken.
+    settlement: Option(#(Int, Option(Int), Int)),
   )
 }
 
@@ -2322,7 +2325,7 @@ pub fn list_jobs(
       let Database(connection:, ..) = database
       let query =
         pog.query(
-          "SELECT id, queue, worker_id, worker_version, state, attempt_count, max_attempts, snooze_count, replay_count, (extract(epoch FROM inserted_at) * 1000000)::bigint, (extract(epoch FROM available_at) * 1000000)::bigint, (extract(epoch FROM finished_at) * 1000000)::bigint, failure_description, correlation FROM grind_jobs WHERE id > $1 AND ($2::text IS NULL OR queue = $2) AND ($3::text IS NULL OR state = $3) ORDER BY id LIMIT $4",
+          "SELECT id, queue, worker_id, worker_version, state, attempt_count, max_attempts, snooze_count, replay_count, (extract(epoch FROM inserted_at) * 1000000)::bigint, (extract(epoch FROM available_at) * 1000000)::bigint, (extract(epoch FROM finished_at) * 1000000)::bigint, failure_description, correlation, settle_attempt_id, CASE WHEN state = 'uncertain' AND settle_attempt_id = attempt_id THEN (extract(epoch FROM settle_at) * 1000000)::bigint END, settle_tries FROM grind_jobs WHERE id > $1 AND ($2::text IS NULL OR queue = $2) AND ($3::text IS NULL OR state = $3) ORDER BY id LIMIT $4",
         )
         |> pog.parameter(pog.int(after_id))
         |> pog.parameter(pog.nullable(pog.text, queue))
@@ -2349,6 +2352,13 @@ pub fn list_jobs(
             decode.optional(decode.string),
           )
           use correlation <- decode.field(13, decode.optional(decode.string))
+          use settle_attempt_id <- decode.field(14, decode.optional(decode.int))
+          use settle_at_us <- decode.field(15, decode.optional(decode.int))
+          use settle_tries <- decode.field(16, decode.int)
+          let settlement =
+            option.map(settle_attempt_id, fn(attempt_id) {
+              #(attempt_id, settle_at_us, settle_tries)
+            })
           decode.success(
             #(state, fn(state) {
               JobRow(
@@ -2366,6 +2376,7 @@ pub fn list_jobs(
                 finished_at_us:,
                 failure_description:,
                 correlation:,
+                settlement:,
               )
             }),
           )

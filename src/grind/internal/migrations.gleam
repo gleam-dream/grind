@@ -100,6 +100,13 @@ pub fn migrations() -> List(Migration) {
       v12_foreign_keys(),
       v12_forbidden_columns(),
     ),
+    Migration(
+      14,
+      v14_statements(),
+      v14_shape(),
+      v12_foreign_keys(),
+      v12_forbidden_columns(),
+    ),
   ]
 }
 
@@ -426,6 +433,70 @@ fn v13_shape() -> List(ExpectedRelation) {
     ExpectedRelation("grind_jobs", Table, [
       "unique_key_contract", "unique_key_sha256", "finished_at", "correlation",
       "max_replays", "replay_count",
+    ]),
+    ExpectedRelation("grind_jobs_id_seq", Sequence, []),
+    ExpectedRelation("grind_jobs_pkey", Index, []),
+    ExpectedRelation("grind_jobs_unique_candidate_idx", Index, []),
+    ExpectedRelation("grind_jobs_finished_idx", Index, []),
+    ExpectedRelation("grind_jobs_claim_idx", Index, []),
+    ExpectedRelation("grind_jobs_quarantine_idx", Index, []),
+    ExpectedRelation("grind_jobs_uncertain_idx", Index, []),
+    ExpectedRelation("grind_job_resolutions", Table, []),
+    ExpectedRelation("grind_job_resolutions_pkey", Index, []),
+    ExpectedRelation("grind_job_resolutions_job_idx", Index, []),
+    ExpectedRelation("grind_job_acknowledgements", Table, []),
+    ExpectedRelation("grind_job_acknowledgements_pkey", Index, []),
+    ExpectedRelation("grind_job_acknowledgements_attempt_key", Index, []),
+    ExpectedRelation("grind_job_acknowledgements_job_idx", Index, []),
+    ExpectedRelation("grind_attempts_id_seq", Sequence, []),
+    ExpectedRelation("grind_unique_submissions", Table, []),
+    ExpectedRelation("grind_unique_submissions_pkey", Index, []),
+    ExpectedRelation("grind_unique_submissions_job_idx", Index, []),
+  ]
+}
+
+/// Version 14 adds the settlement mark of a job held uncertain by an
+/// abandoned attempt (docs/design/design.typ, "Declared settlement of
+/// abandoned jobs"; ADR-0021):
+///
+/// - `settle_attempt_id`: the abandoned attempt the mark names. The job is
+///   due only while it is uncertain and still retains that attempt, so a
+///   later claim, resolution or acknowledgement never has to clear it.
+/// - `settle_at`: when the job is next due for its worker's settlement.
+///   An ended mark keeps the attempt it settled and has no due time, so the
+///   settler's start-time recognition does not mark that attempt again.
+/// - `settle_tries`: how many times a settler took the job.
+/// - No backfill: jobs already held uncertain by lease expiry are marked by
+///   each settler when it starts (`settlement.recognise_unmarked`), outside
+///   this migration and its lock, by the same recognition: uncertain, with no
+///   acknowledgement receipt for the retained attempt. A handler's own
+///   `Uncertain`, and a timeout acknowledged before this version, carry such
+///   a receipt and stay unmarked.
+/// - Nothing scans or rebuilds the table under the `ACCESS EXCLUSIVE` lock
+///   the new columns take: they are nullable or have a constant default, the
+///   check is `NOT VALID` (enforced on every row written from now on; the
+///   rows already there hold `NULL` and the defaults, which satisfy it), and
+///   the settler selects due jobs through `grind_jobs_uncertain_idx` instead
+///   of a new index.
+fn v14_statements() -> List(String) {
+  [
+    advisory_lock_statement(),
+    "ALTER TABLE grind_jobs ADD COLUMN settle_attempt_id bigint",
+    "ALTER TABLE grind_jobs ADD COLUMN settle_at timestamptz",
+    "ALTER TABLE grind_jobs ADD COLUMN settle_tries bigint NOT NULL DEFAULT 0",
+    "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_settlement_mark_check CHECK ((settle_at IS NULL OR settle_attempt_id IS NOT NULL) AND settle_tries >= 0) NOT VALID",
+    "INSERT INTO grind_schema_migrations (version) VALUES (14)",
+  ]
+}
+
+fn v14_shape() -> List(ExpectedRelation) {
+  [
+    ExpectedRelation("grind_schema_migrations", Table, []),
+    ExpectedRelation("grind_schema_migrations_pkey", Index, []),
+    ExpectedRelation("grind_jobs", Table, [
+      "unique_key_contract", "unique_key_sha256", "finished_at", "correlation",
+      "max_replays", "replay_count", "settle_attempt_id", "settle_at",
+      "settle_tries",
     ]),
     ExpectedRelation("grind_jobs_id_seq", Sequence, []),
     ExpectedRelation("grind_jobs_pkey", Index, []),
