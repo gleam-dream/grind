@@ -166,6 +166,40 @@ pub fn claim_correlation(claimed: ClaimedJob) -> correlation.Correlation {
   stored_correlation(id, correlation)
 }
 
+/// What lease renewal needs from a claim: its fence and its diagnostic
+/// identity. It holds no handler closure or input, so tracking a lease
+/// neither copies nor retains the worker, whatever the worker captures.
+pub opaque type LeaseFence {
+  LeaseFence(
+    id: Int,
+    attempt_id: Int,
+    epoch: Int,
+    context: telemetry.AttemptContext,
+  )
+}
+
+/// The claim's lease fence, for the renewer.
+pub fn lease_fence(claimed: ClaimedJob, owner: String) -> LeaseFence {
+  let ClaimedJob(claim:, queue:, ..) = claimed
+  let Claim(id:, attempt_id:, epoch:, ..) = claim
+  LeaseFence(
+    id:,
+    attempt_id:,
+    epoch:,
+    context: diagnostic_context_from_claim(claim, queue, owner),
+  )
+}
+
+/// The fence's job id, attempt id and epoch.
+pub fn fence_identity(fence: LeaseFence) -> #(Int, Int, Int) {
+  #(fence.id, fence.attempt_id, fence.epoch)
+}
+
+/// The fence's diagnostic context.
+pub fn fence_context(fence: LeaseFence) -> telemetry.AttemptContext {
+  fence.context
+}
+
 /// Returns stable fencing fields for the queue actor's private active entry.
 pub fn claim_identity(claimed: ClaimedJob) -> #(Int, Int, Int) {
   let ClaimedJob(claim: claim, ..) = claimed
@@ -239,11 +273,11 @@ pub fn renew_many(
   connection: pog.Connection,
   queue: String,
   owner: String,
-  claims: List(ClaimedJob),
+  fences: List(LeaseFence),
   lease_duration_ms: Int,
 ) -> Result(List(#(Int, Int, BatchRenewal)), pog.QueryError) {
   case
-    renew_many_observed(connection, queue, owner, claims, lease_duration_ms).value
+    renew_many_observed(connection, queue, owner, fences, lease_duration_ms).value
   {
     Error(error) -> Error(error)
     Ok(rows) ->
@@ -266,10 +300,10 @@ pub fn renew_many_observed(
   connection: pog.Connection,
   queue: String,
   owner: String,
-  claims: List(ClaimedJob),
+  fences: List(LeaseFence),
   lease_duration_ms: Int,
 ) -> store.Measured(Result(List(ObservedRenewal), pog.QueryError)) {
-  let identities = list.map(claims, claim_identity)
+  let identities = list.map(fences, fence_identity)
   let live = lease.live_lease_predicate("clock_timestamp()")
   let query =
     pog.query(

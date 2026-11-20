@@ -154,9 +154,11 @@ fn start_handler(
   let self = state.subject
   process.send(
     request.renewer,
-    renewer.Track(request.claimed, process.self(), fn() {
-      process.send(self, CancelRequested)
-    }),
+    renewer.Track(
+      attempt.lease_fence(request.claimed, request.owner),
+      process.self(),
+      fn() { process.send(self, CancelRequested) },
+    ),
   )
   let timeout_ms = attempt.claim_timeout_ms(request.claimed)
   let deadline = case timeout_ms {

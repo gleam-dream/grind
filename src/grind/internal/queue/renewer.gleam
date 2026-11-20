@@ -18,9 +18,10 @@ pub type Status {
 }
 
 pub type Message {
-  /// Starts renewing a claim. `on_cancel` runs once, from the renewer, when
-  /// a renewal sees that a cancellation of this attempt has committed.
-  Track(attempt.ClaimedJob, process.Pid, on_cancel: fn() -> Nil)
+  /// Starts renewing a claim's lease. `on_cancel` runs once, from the
+  /// renewer, when a renewal sees that a cancellation of this attempt has
+  /// committed. The fence carries no worker, so tracking copies none.
+  Track(attempt.LeaseFence, process.Pid, on_cancel: fn() -> Nil)
   AwaitAcknowledgement(attempt_id: Int, epoch: Int)
   Untrack(attempt_id: Int, epoch: Int)
   Tick
@@ -36,7 +37,7 @@ type Phase {
 
 type Entry {
   Entry(
-    claim: attempt.ClaimedJob,
+    fence: attempt.LeaseFence,
     attempt_id: Int,
     epoch: Int,
     monitor: process.Monitor,
@@ -144,11 +145,11 @@ fn start_with_forwarder(
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
-    Track(claim, pid, on_cancel) -> {
-      let #(_, attempt_id, epoch) = attempt.claim_identity(claim)
+    Track(fence, pid, on_cancel) -> {
+      let #(_, attempt_id, epoch) = attempt.fence_identity(fence)
       let entry =
         Entry(
-          claim:,
+          fence:,
           attempt_id:,
           epoch:,
           monitor: process.monitor(pid),
@@ -236,7 +237,7 @@ fn renew(state: State) -> State {
           state.connection,
           state.queue,
           state.owner,
-          list.map(eligible, fn(entry) { entry.claim }),
+          list.map(eligible, fn(entry) { entry.fence }),
           state.lease_ms,
         )
       let result = case state.forwarder {
@@ -342,11 +343,7 @@ fn emit_renewal(
             remaining_lease_ms:,
           ),
           telemetry.RenewalMetadata(
-            context: attempt.diagnostic_context(
-              entry.claim,
-              state.queue,
-              state.owner,
-            ),
+            context: attempt.fence_context(entry.fence),
             phase:,
             outcome:,
           ),
