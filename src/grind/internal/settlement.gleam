@@ -53,6 +53,18 @@ pub type Outcome {
   CommitUnknown(job_id: Int)
 }
 
+/// The job an outcome is about, or `None` for `NothingDue`.
+pub fn outcome_job_id(outcome: Outcome) -> Option(Int) {
+  case outcome {
+    NothingDue -> None
+    Settled(job_id:, ..)
+    | Declined(job_id:)
+    | TryFailed(job_id:, ..)
+    | Superseded(job_id:)
+    | CommitUnknown(job_id:) -> Some(job_id)
+  }
+}
+
 /// Why a try committed nothing.
 pub type TryFailure {
   FunctionFailed(reason: String)
@@ -92,6 +104,18 @@ pub fn settle_next(
   workers: Registry,
   lease_ms: Int,
 ) -> Result(Outcome, pog.QueryError) {
+  settle_next_except(database, workers, lease_ms, [])
+}
+
+/// `settle_next`, never taking a job in `already`: a round that runs one try
+/// per job passes the jobs it already tried, which a short lease may have
+/// made due again.
+pub fn settle_next_except(
+  database: Database,
+  workers: Registry,
+  lease_ms: Int,
+  already: List(Int),
+) -> Result(Outcome, pog.QueryError) {
   let settling = registry.settlements(workers)
   case settling {
     [] -> Ok(NothingDue)
@@ -101,6 +125,7 @@ pub fn settle_next(
         registry.queue(workers),
         settling,
         lease_ms,
+        already,
       ))
       case taken {
         None -> NothingDue
@@ -119,7 +144,8 @@ pub fn settle_next(
 /// Marks the jobs of `workers`' queue that a node of the previous release
 /// held uncertain by lease expiry without a mark: uncertain, no
 /// acknowledgement receipt for the retained attempt, and no mark for it.
-/// The same recognition as schema 14. Returns how many it marked.
+/// It also marks the jobs held that way before schema 14, which adds the
+/// mark without a backfill. Returns how many it marked.
 pub fn recognise_unmarked(
   database: Database,
   workers: Registry,
@@ -159,14 +185,16 @@ fn take(
   queue: String,
   settling: List(#(String, String, declared.Settle)),
   lease_ms: Int,
+  already: List(Int),
 ) -> Result(Option(Taken), pog.QueryError) {
   pog.query(
-    "UPDATE grind_jobs AS job SET settle_at = clock_timestamp() + make_interval(secs => GREATEST(LEAST($4::float8 * power(2::float8, LEAST(job.settle_tries, 40)::float8), GREATEST($5::float8, $4::float8)), $4::float8) / 1000.0), settle_tries = job.settle_tries + 1 FROM (SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'uncertain' AND settle_at IS NOT NULL AND settle_attempt_id = attempt_id AND settle_at <= clock_timestamp() AND (worker_id, worker_version) IN (SELECT * FROM unnest($2::text[], $3::text[])) ORDER BY settle_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) AS candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.settle_attempt_id, job.settle_tries, job.correlation",
+    "UPDATE grind_jobs AS job SET settle_at = clock_timestamp() + make_interval(secs => GREATEST(LEAST($4::float8 * power(2::float8, LEAST(job.settle_tries, 40)::float8), GREATEST($5::float8, $4::float8)), $4::float8) / 1000.0), settle_tries = job.settle_tries + 1 FROM (SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'uncertain' AND settle_at IS NOT NULL AND settle_attempt_id = attempt_id AND settle_at <= clock_timestamp() AND (worker_id, worker_version) IN (SELECT * FROM unnest($2::text[], $3::text[])) AND NOT (id = ANY($6::bigint[])) ORDER BY settle_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) AS candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.settle_attempt_id, job.settle_tries, job.correlation",
   )
   |> pog.parameter(pog.text(queue))
   |> identities(settling)
   |> pog.parameter(pog.int(lease_ms))
   |> pog.parameter(pog.int(retry_cap_ms))
+  |> pog.parameter(pog.array(pog.int, already))
   |> pog.returning({
     use job_id <- decode.field(0, decode.int)
     use queue <- decode.field(1, decode.string)
@@ -275,18 +303,30 @@ fn run_linked_try(
     process.spawn(fn() {
       process.send(reply, try_once(database, taken, settle, committing))
     })
+  let monitor = process.monitor(pid)
   let deadline_ms = postgres.statement_deadline_ms(database) + 1000
-  case process.receive(reply, within: deadline_ms) {
+  let outcome = case process.receive(reply, within: deadline_ms) {
     Ok(outcome) -> outcome
     Error(Nil) -> {
       process.unlink(pid)
       process.kill(pid)
+      // The kill is asynchronous: wait for the try to be gone, so a commit
+      // intent it sent before dying is in the mailbox when we look.
+      let _ =
+        process.new_selector()
+        |> process.select_specific_monitor(monitor, fn(_) { Nil })
+        |> process.selector_receive(within: deadline_ms)
       case process.receive(committing, within: 0) {
         Ok(Nil) -> CommitUnknown(taken.job_id)
         Error(Nil) -> TryFailed(taken.job_id, FunctionTimedOut)
       }
     }
   }
+  // Leave nothing of the try in the caller's mailbox: a long-lived settler
+  // runs one try after another.
+  process.demonitor_process(monitor)
+  let _ = process.receive(committing, within: 0)
+  outcome
 }
 
 type Locked {
@@ -421,7 +461,7 @@ fn try_once(
       TryFailed(job_id, failure)
     Error(pog.TransactionRolledBack(NotDue)) -> Superseded(job_id)
     Error(pog.TransactionRolledBack(Declines(reason))) ->
-      decline(database, job_id, attempt_id, reason)
+      decline(database, job_id, attempt_id, reason, committing)
     Error(pog.TransactionQueryError(_)) -> CommitUnknown(job_id)
   }
 }
@@ -433,10 +473,18 @@ fn decline(
   job_id: Int,
   attempt_id: Int,
   reason: String,
+  committing: process.Subject(Nil),
 ) -> Outcome {
   case
     store.transaction_safely(postgres.connection(database), fn(transaction) {
-      end_mark(transaction, job_id, attempt_id, Some(reason))
+      use Nil <- result.map(end_mark(
+        transaction,
+        job_id,
+        attempt_id,
+        Some(reason),
+      ))
+      // From here COMMIT may be sent, as for a try's own commit.
+      process.send(committing, Nil)
     })
   {
     Ok(Nil) -> Declined(job_id)

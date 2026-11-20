@@ -2325,7 +2325,7 @@ pub fn list_jobs(
       let Database(connection:, ..) = database
       let query =
         pog.query(
-          "SELECT id, queue, worker_id, worker_version, state, attempt_count, max_attempts, snooze_count, replay_count, (extract(epoch FROM inserted_at) * 1000000)::bigint, (extract(epoch FROM available_at) * 1000000)::bigint, (extract(epoch FROM finished_at) * 1000000)::bigint, failure_description, correlation, settle_attempt_id, (extract(epoch FROM settle_at) * 1000000)::bigint, settle_tries FROM grind_jobs WHERE id > $1 AND ($2::text IS NULL OR queue = $2) AND ($3::text IS NULL OR state = $3) ORDER BY id LIMIT $4",
+          "SELECT id, queue, worker_id, worker_version, state, attempt_count, max_attempts, snooze_count, replay_count, (extract(epoch FROM inserted_at) * 1000000)::bigint, (extract(epoch FROM available_at) * 1000000)::bigint, (extract(epoch FROM finished_at) * 1000000)::bigint, failure_description, correlation, settle_attempt_id, CASE WHEN state = 'uncertain' AND settle_attempt_id = attempt_id THEN (extract(epoch FROM settle_at) * 1000000)::bigint END, settle_tries FROM grind_jobs WHERE id > $1 AND ($2::text IS NULL OR queue = $2) AND ($3::text IS NULL OR state = $3) ORDER BY id LIMIT $4",
         )
         |> pog.parameter(pog.int(after_id))
         |> pog.parameter(pog.nullable(pog.text, queue))

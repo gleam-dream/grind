@@ -376,7 +376,8 @@ pub fn quarantine_expired(
 }
 
 /// Runs the declared settlements of up to `limit` (at most 10,000) due jobs
-/// of `queue`, one try each, on this node, and returns how many tries ran.
+/// of `queue`, one try each and each job at most once, on this node, and
+/// returns how many tries ran.
 /// A consumer that polls on its own does this once per poll interval; call
 /// it where consumers are polled by hand or not at all (`without_consumers`,
 /// `testing.drain`). It first marks the jobs of `queue` a node of the
@@ -413,7 +414,7 @@ pub fn settle_due(
         plan.workers,
         consumer.lease_duration_ms(plan.policy),
         limit,
-        0,
+        [],
       )
     }
   }
@@ -424,16 +425,25 @@ fn settle_tries(
   workers: registry.Registry,
   lease_ms: Int,
   remaining: Int,
-  tried: Int,
+  already: List(Int),
 ) -> Result(Int, Error) {
   case remaining {
-    0 -> Ok(tried)
+    0 -> Ok(list.length(already))
     _ ->
-      case settlement.settle_next(database, workers, lease_ms) {
+      case settlement.settle_next_except(database, workers, lease_ms, already) {
         Error(error) -> Error(Unavailable(error))
-        Ok(settlement.NothingDue) -> Ok(tried)
-        Ok(_) ->
-          settle_tries(database, workers, lease_ms, remaining - 1, tried + 1)
+        Ok(settlement.NothingDue) -> Ok(list.length(already))
+        Ok(outcome) ->
+          settle_tries(
+            database,
+            workers,
+            lease_ms,
+            remaining - 1,
+            list.append(
+              option.values([settlement.outcome_job_id(outcome)]),
+              already,
+            ),
+          )
       }
   }
 }

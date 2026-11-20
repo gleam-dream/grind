@@ -254,3 +254,53 @@ pub fn postgres_follow_up_job_commits_with_the_decision_test() {
     }
   }
 }
+
+/// A mark only counts while the job is uncertain under it: once an operator
+/// resolves the job, the listing shows no due time.
+pub fn postgres_listing_shows_no_due_time_after_an_operator_resolves_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let queue = unique("settle-listed")
+      let agent =
+        worker.new(
+          "settle.listed",
+          input: string_codec(),
+          output: string_codec(),
+          perform: fn(prompt) {
+            process.sleep(60_000)
+            Ok(prompt)
+          },
+        )
+        |> worker.with_queue(queue)
+        |> worker.with_timeout(worker.After(duration.milliseconds(50)))
+        |> worker.with_settlement(fn(_transaction, _abandoned) {
+          Error("not deciding in this test")
+        })
+      use jobs <- with_runtime(url, fn(config) {
+        config |> grind.with_worker(agent) |> grind.without_consumers
+      })
+      let assert Ok(grind.Inserted(run)) =
+        grind.submit(jobs, job.new(agent, "summarise"))
+      let assert Ok(1) =
+        testing.drain(jobs, queue:, limit: 1, within: duration.seconds(10))
+      let assert Ok(_) =
+        admin.resolve_uncertain(
+          jobs,
+          run,
+          admin.resolution(
+            admin.ConfirmSuccess("done by hand"),
+            id: "by-hand:" <> int.to_string(job.id(run)),
+            by: "operator",
+            details: "checked by hand",
+          ),
+        )
+
+      let assert Ok(summary) = summary_of(jobs, queue, job.id(run))
+      let assert Some(mark) = summary.settlement
+      admin.mark_due_at(mark) |> should.equal(None)
+      admin.settle_due(jobs, queue:, limit: 10) |> should.equal(Ok(0))
+      mark_database_test_executed("settlement-listing-after-operator")
+    }
+  }
+}

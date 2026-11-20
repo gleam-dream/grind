@@ -10,7 +10,6 @@ ALTER TABLE grind_jobs ADD COLUMN settle_tries bigint NOT NULL DEFAULT 0;
 
 ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_settlement_mark_check CHECK ((settle_at IS NULL OR settle_attempt_id IS NOT NULL) AND settle_tries >= 0) NOT VALID;
 
-UPDATE grind_jobs AS job SET settle_attempt_id = job.attempt_id, settle_at = clock_timestamp() WHERE job.state = 'uncertain' AND job.attempt_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM grind_job_acknowledgements AS receipt WHERE receipt.job_id = job.id AND receipt.attempt_id = job.attempt_id AND receipt.attempt_epoch = job.attempt_epoch);
 
 INSERT INTO grind_schema_migrations (version) VALUES (14);
 

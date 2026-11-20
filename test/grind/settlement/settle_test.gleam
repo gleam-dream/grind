@@ -680,6 +680,50 @@ pub fn postgres_function_that_swallows_a_failed_statement_failed_test() {
   mark_database_test_executed("settlement-aborted-transaction-function-failed")
 }
 
+pub fn postgres_a_job_taken_in_this_round_is_not_taken_again_test() {
+  use database <- with_database()
+  let name = queue_name("settle-once")
+  let agent =
+    agent_worker(name, fn(_transaction, _abandoned) { Error("not yet") })
+  let assert Ok(_) = postgres.submit(database, name, agent, "read inbox")
+  let _ = abandon(database, name, agent)
+  // A lease of zero makes the failed job due again at once, as a long round
+  // would after a lease.
+  let assert Ok(settlement.TryFailed(job_id, _)) =
+    settlement.settle_next(database, registry_of(name, agent), 0)
+
+  settlement.settle_next_except(database, registry_of(name, agent), 0, [
+    job_id,
+  ])
+  |> should.equal(Ok(settlement.NothingDue))
+  let assert Ok(settlement.TryFailed(again, _)) =
+    settlement.settle_next(database, registry_of(name, agent), 0)
+  again |> should.equal(job_id)
+  mark_database_test_executed("settlement-once-per-round")
+}
+
+pub fn postgres_settled_try_leaves_no_message_behind_test() {
+  use database <- with_database()
+  let name = queue_name("settle-mailbox")
+  let agent =
+    agent_worker(name, fn(_transaction, _abandoned) {
+      Ok(worker.ConfirmFailure("settled"))
+    })
+  let assert Ok(_) = postgres.submit(database, name, agent, "read inbox")
+  let _ = abandon(database, name, agent)
+  let before = message_queue_len()
+
+  let assert Ok(settlement.Settled(_, _)) =
+    settlement.settle_next(database, registry_of(name, agent), lease_ms)
+
+  // A long-lived settler must not collect one stale message per settlement.
+  message_queue_len() |> should.equal(before)
+  mark_database_test_executed("settlement-no-stale-message")
+}
+
+@external(erlang, "grind_test_env", "message_queue_len")
+fn message_queue_len() -> Int
+
 // -- Support -----------------------------------------------------------------
 
 fn with_database(run: fn(postgres.Database) -> Nil) -> Nil {

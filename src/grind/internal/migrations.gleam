@@ -466,17 +466,18 @@ fn v13_shape() -> List(ExpectedRelation) {
 ///   An ended mark keeps the attempt it settled and has no due time, so the
 ///   settler's start-time recognition does not mark that attempt again.
 /// - `settle_tries`: how many times a settler took the job.
-/// - The backfill marks every job already held uncertain by lease expiry:
-///   uncertain, with no acknowledgement receipt for its retained attempt.
-///   A handler's own `Uncertain`, and a timeout acknowledged before this
-///   version, carry such a receipt and stay unmarked.
+/// - No backfill: jobs already held uncertain by lease expiry are marked by
+///   each settler when it starts (`settlement.recognise_unmarked`), outside
+///   this migration and its lock, by the same recognition: uncertain, with no
+///   acknowledgement receipt for the retained attempt. A handler's own
+///   `Uncertain`, and a timeout acknowledged before this version, carry such
+///   a receipt and stay unmarked.
 /// - Nothing scans or rebuilds the table under the `ACCESS EXCLUSIVE` lock
 ///   the new columns take: they are nullable or have a constant default, the
 ///   check is `NOT VALID` (enforced on every row written from now on; the
-///   rows already there hold `NULL` and the defaults, which satisfy it), the
-///   backfill reaches the uncertain jobs through `grind_jobs_uncertain_idx`,
-///   and the settler selects due jobs through that same index instead of a
-///   new one.
+///   rows already there hold `NULL` and the defaults, which satisfy it), and
+///   the settler selects due jobs through `grind_jobs_uncertain_idx` instead
+///   of a new index.
 fn v14_statements() -> List(String) {
   [
     advisory_lock_statement(),
@@ -484,7 +485,6 @@ fn v14_statements() -> List(String) {
     "ALTER TABLE grind_jobs ADD COLUMN settle_at timestamptz",
     "ALTER TABLE grind_jobs ADD COLUMN settle_tries bigint NOT NULL DEFAULT 0",
     "ALTER TABLE grind_jobs ADD CONSTRAINT grind_jobs_settlement_mark_check CHECK ((settle_at IS NULL OR settle_attempt_id IS NOT NULL) AND settle_tries >= 0) NOT VALID",
-    "UPDATE grind_jobs AS job SET settle_attempt_id = job.attempt_id, settle_at = clock_timestamp() WHERE job.state = 'uncertain' AND job.attempt_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM grind_job_acknowledgements AS receipt WHERE receipt.job_id = job.id AND receipt.attempt_id = job.attempt_id AND receipt.attempt_epoch = job.attempt_epoch)",
     "INSERT INTO grind_schema_migrations (version) VALUES (14)",
   ]
 }

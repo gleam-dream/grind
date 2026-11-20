@@ -1027,8 +1027,9 @@ pub type SettlementMeasurements {
 /// What a settlement try did, when it did not apply a decision. An applied
 /// decision is reported as `[grind, job, resolved]` instead.
 pub type SettlementOutcome {
-  /// The settlement kept the job uncertain for an operator; its writes
-  /// committed.
+  /// The job stays uncertain for an operator and its mark ended. After
+  /// `LeaveUncertain` the function's writes committed; after `AuthorizeReplay`
+  /// under a pending cancellation, which can never commit, they rolled back.
   SettlementDeclined
   /// The job was no longer due when the try locked it: another settler or
   /// an operator decided it first, or holds it now. Nothing was written.

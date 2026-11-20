@@ -10,6 +10,8 @@
 //// coordinator or renewal pool.
 
 import gleam/erlang/process
+import gleam/list
+import gleam/option
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
@@ -66,7 +68,7 @@ fn start(
         let recognised =
           recognised
           || settlement.recognise_unmarked(database, workers) |> result.is_ok
-        look(database, workers, lease_ms, tries_per_look)
+        look(database, workers, lease_ms, tries_per_look, [])
         process.send_after(self, interval_ms, Look)
         actor.continue(#(self, recognised))
       }
@@ -76,20 +78,29 @@ fn start(
 }
 
 /// Takes and tries due jobs until none is due, a take fails, or the look
-/// has run `remaining` tries. A failed take is tried again at the next
-/// look.
+/// has run `remaining` tries, taking each due job at most once. A failed
+/// take is tried again at the next look.
 fn look(
   database: Database,
   workers: Registry,
   lease_ms: Int,
   remaining: Int,
+  already: List(Int),
 ) -> Nil {
   case remaining > 0 {
     False -> Nil
     True ->
-      case settlement.settle_next(database, workers, lease_ms) {
+      case settlement.settle_next_except(database, workers, lease_ms, already) {
         Error(_) | Ok(settlement.NothingDue) -> Nil
-        Ok(_) -> look(database, workers, lease_ms, remaining - 1)
+        Ok(outcome) ->
+          look(
+            database,
+            workers,
+            lease_ms,
+            remaining - 1,
+            option.values([settlement.outcome_job_id(outcome)])
+              |> list.append(already),
+          )
       }
   }
 }

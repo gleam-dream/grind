@@ -1,5 +1,5 @@
-//// Schema version 14 adds the settlement mark and marks the jobs a
-//// lease-expiry scan already held uncertain (docs/design/design.typ,
+//// Schema version 14 adds the settlement mark; a settler's start marks the
+//// jobs a lease-expiry scan already held uncertain (docs/design/design.typ,
 //// "Declared settlement of abandoned jobs"; ADR-0021).
 
 import exception
@@ -12,6 +12,8 @@ import gleeunit/should
 import grind/internal/job
 import grind/internal/migrations
 import grind/internal/postgres
+import grind/internal/registry
+import grind/internal/settlement
 import grind/internal/worker
 import grind/support/env.{
   mark_database_test_executed, queue_database_url, unique_test_run_id,
@@ -63,6 +65,27 @@ fn run_backfill(url: String) -> Nil {
 
   let assert Ok(Nil) = postgres.migrate(database)
 
+  // The migration only adds the columns: it scans nothing under the lock
+  // they take.
+  mark(connection, expired) |> should.equal(None)
+
+  // A settler's start marks the job a lease expiry held, and not the one a
+  // handler reported uncertain.
+  let assert Ok(workers) = registry.new("v14-backfill")
+  let assert Ok(workers) =
+    registry.register(
+      workers,
+      definition
+        |> fn(definition) {
+          worker.Worker(
+            ..definition,
+            settlement: Some(fn(_transaction, _abandoned) {
+              Ok(worker.SettleLeaveUncertain("test"))
+            }),
+          )
+        },
+    )
+  settlement.recognise_unmarked(database, workers) |> should.equal(Ok(1))
   mark(connection, expired)
   |> should.equal(Some(attempt_id(connection, expired)))
   mark(connection, reported) |> should.equal(None)

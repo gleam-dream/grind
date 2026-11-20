@@ -124,7 +124,9 @@ pub type Abandonment {
 pub type Settlement(output, error) {
   /// The abandoned attempt succeeded with this output.
   ConfirmSuccess(output)
-  /// The abandoned attempt failed with this error. Needs an error codec.
+  /// The abandoned attempt failed with this error. The error is stored when
+  /// the worker has an error codec; without one the job ends as a failure
+  /// with no stored error, as the handler's own `Failed` does.
   ConfirmFailure(error)
   /// Run the job again.
   AuthorizeReplay
