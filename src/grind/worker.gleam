@@ -389,30 +389,43 @@ pub fn with_abandonment(
 /// operator.
 ///
 /// The queue's consumer calls `settle` with an open transaction on the
-/// runtime's pool and the abandoned job. What `settle` writes on that
-/// transaction commits together with the decision, or not at all. It runs
-/// under the application's `search_path` (on a runtime built from a
-/// database URL, Grind's own schema, so qualify your tables), with the
-/// job's row locked, within the storage deadline:
+/// runtime's pool and the abandoned job (`grind/abandoned`). What `settle`
+/// writes on that transaction commits together with the decision, or not at
+/// all. It runs under the application's `search_path` (on a runtime built
+/// from a database URL, Grind's own schema, so qualify your tables), with
+/// the job's row locked, within the storage deadline:
 ///
 /// - Make only short database writes on `transaction`. Do not commit, roll
-///   back or change its session, and do not call other systems: a try that
-///   fails is repeated.
+///   back or change its session, and do not call other systems.
+/// - `settle` may run more than once for one abandonment, even after it
+///   returned a decision: a try that fails after it returns and before the
+///   commit keeps none of its writes and is tried again. For a slow outside
+///   read, submit a checker job on `transaction` with `grind.submit_in`,
+///   return `LeaveUncertain`, and resolve the job from the checker with
+///   `admin.resolve_uncertain`.
 /// - Return `Error(reason)` to try again later. The next try waits a lease
-///   of the queue, doubling up to one hour. A decision Grind refuses
-///   (`ConfirmFailure` without an error codec, `AuthorizeReplay` under a
-///   pending cancellation), a crash and a lost connection are tried again
-///   the same way.
+///   of the queue, doubling up to one hour; `abandoned.try_number` says
+///   which try this is. A crash, a lost connection or a decision Grind
+///   refuses (a value the output or error codec rejects) is tried again the
+///   same way.
+/// - `ConfirmFailure` on a worker without an error codec ends the job as a
+///   failure with no stored error, as the handler's own `Failed` does.
+///   `AuthorizeReplay` while a cancellation is pending declines the job for
+///   an operator. Bound replays with `abandoned.authorized_replays`.
 /// - The decision is recorded as a resolution with the id
 ///   `grind-settlement:<job id>:<attempt id>`; do not use that prefix for
 ///   your own resolution ids.
+/// - A consumer that polls on its own settles due jobs once per poll
+///   interval. Where consumers are polled by hand or not at all, call
+///   `admin.settle_due`. Test the function itself with
+///   `grind/testing.abandoned`.
 ///
 /// ```gleam
 /// worker.new("agent.run", input:, output:, perform: run_agent)
 /// |> worker.with_error_codec(error_codec)
 /// |> worker.with_abandonment(worker.ReplayAfterLeaseExpiry(1))
-/// |> worker.with_settlement(fn(transaction, abandoned) {
-///   use Nil <- result.try(insert_notice(transaction, abandoned.job_id))
+/// |> worker.with_settlement(fn(transaction, job) {
+///   use Nil <- result.try(insert_notice(transaction, abandoned.job_id(job)))
 ///   Ok(worker.ConfirmFailure("the agent run stopped mid-way"))
 /// })
 /// ```

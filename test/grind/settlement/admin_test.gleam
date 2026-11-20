@@ -2,14 +2,17 @@
 //// the public API (docs/design/design.typ, "Declared settlement of abandoned
 //// jobs").
 
+import exception
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/time/duration
 import gleeunit/should
 import grind
+import grind/abandoned as abandonment
 import grind/admin
-import grind/facade/support.{string_codec, unique, with_runtime}
+import grind/facade/support.{int_codec, string_codec, unique, with_runtime}
 import grind/job
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/testing
@@ -74,4 +77,89 @@ fn summary_of(
   let assert Ok(summaries) =
     admin.list(jobs, admin.query(limit: 10) |> admin.in_queue(queue))
   list.find(summaries, fn(summary) { summary.id == id })
+}
+
+/// A settlement that needs a slow outside read cannot make it inside its
+/// function. It submits a checker job on its own transaction and leaves the
+/// job for it; the checker resolves the job once it has its evidence.
+pub fn postgres_settlement_hands_a_slow_check_to_a_job_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let queue = unique("settle-checker")
+      let name = process.new_name("settle_checker_grind")
+      let jobs = grind.named(name)
+      let agent =
+        worker.new(
+          "settle.checked",
+          input: string_codec(),
+          output: string_codec(),
+          perform: fn(prompt) {
+            process.sleep(60_000)
+            Ok(prompt)
+          },
+        )
+        |> worker.with_queue(queue)
+        |> worker.with_error_codec(string_codec())
+        |> worker.with_timeout(worker.After(duration.milliseconds(50)))
+      let checker =
+        worker.new(
+          "settle.checker",
+          input: int_codec(),
+          output: int_codec(),
+          perform: fn(run_id) {
+            // The slow outside read happens here, outside any lock.
+            let assert Ok(run) = grind.bind(jobs, agent, run_id)
+            let assert Ok(_) =
+              admin.resolve_uncertain(
+                jobs,
+                run,
+                admin.resolution(
+                  admin.ConfirmFailure("the provider has no record of the run"),
+                  id: "checked:" <> int.to_string(run_id),
+                  by: "settle.checker",
+                  details: "provider status read after abandonment",
+                ),
+              )
+            Ok(run_id)
+          },
+        )
+        |> worker.with_queue(queue)
+      let agent =
+        agent
+        |> worker.with_settlement(fn(transaction, abandoned) {
+          let run_id = abandonment.job_id(abandoned)
+          case grind.submit_in(jobs, transaction, job.new(checker, run_id)) {
+            Ok(_) ->
+              Ok(worker.LeaveUncertain("a checker job reads the provider"))
+            Error(error) -> Error(grind.describe_submit_error(error))
+          }
+        })
+      let assert Ok(_) =
+        grind.start(
+          grind.new(support.pool_config(url))
+            |> grind.with_worker(agent)
+            |> grind.with_worker(checker)
+            |> grind.without_consumers
+            |> grind.with_startup_migration,
+          name,
+        )
+      use <- exception.defer(fn() { grind.stop(jobs) })
+      let assert Ok(grind.Inserted(run)) =
+        grind.submit(jobs, job.new(agent, "summarise"))
+      let assert Ok(1) =
+        testing.drain(jobs, queue:, limit: 1, within: duration.seconds(10))
+
+      admin.settle_due(jobs, queue:, limit: 10) |> should.equal(Ok(1))
+      let assert Ok(grind.Uncertain(_)) = grind.outcome(jobs, run)
+
+      // The checker job committed with the declined settlement; it runs.
+      let assert Ok(1) =
+        testing.drain(jobs, queue:, limit: 1, within: duration.seconds(10))
+      let assert Ok(grind.Failed(grind.Business(reason), _, _)) =
+        grind.outcome(jobs, run)
+      reason |> should.equal("the provider has no record of the run")
+      mark_database_test_executed("settlement-checker-job")
+    }
+  }
 }

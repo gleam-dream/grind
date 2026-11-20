@@ -179,7 +179,7 @@ worker.new("agent.run", input: text(), output: text(), perform: run_agent)
 
 <!-- prettier-ignore-end -->
 
-The notice and the failed outcome commit together or not at all. Returning `Error` tries again later, with a growing delay; `LeaveUncertain(reason)` keeps the job for an operator. The function must make only short writes on the transaction it is given: anything else repeats on every try. A handler's own `Uncertain` response is not handed over, because it already asked for an operator.
+The notice and the failed outcome commit together or not at all. Returning `Error` tries again later, with a growing delay; `LeaveUncertain(reason)` keeps the job for an operator. The function must make only short writes on the transaction it is given, and it may run more than once for one abandonment, so anything else repeats; for a slow outside read, submit a checker job on the same transaction with `grind.submit_in` and return `LeaveUncertain`. Consumers settle due jobs as they poll; where they are polled by hand or not at all, call `admin.settle_due`. `grind/testing.abandoned` builds the abandoned job for a test of the function.
 
 A periodic sweep of `admin.list(... |> admin.in_state(job.Uncertain))` is still needed for handler-reported uncertainty, for workers that declare no settlement, for worker versions no running consumer registers, and for queues no node consumes.
 
