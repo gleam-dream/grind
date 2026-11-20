@@ -51,6 +51,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
+import grind/abandoned
 import grind/internal/worker as definition
 import pog
 import sinal/correlation.{type Correlation}
@@ -117,34 +118,6 @@ pub type Abandonment {
   /// same number again. `[grind, job, quarantined]` reports it with
   /// `replayed: True`.
   ReplayAfterLeaseExpiry(max_replays: Int)
-}
-
-/// A job that an abandoned attempt left `uncertain`, handed to the worker's
-/// settlement (see `with_settlement`).
-pub type Abandoned(input) {
-  Abandoned(
-    job_id: Int,
-    /// The job's input, decoded with the worker's input codec.
-    input: input,
-    /// The abandoned attempt; the settlement decides the effect of this one.
-    attempt_id: Int,
-    /// Its business attempt number, from 1.
-    attempt: Int,
-    /// How many lease-expiry replays the job used.
-    replays: Int,
-    /// Which settlement try this is for the abandoned attempt, from 1. A
-    /// settlement may stop trying with `LeaveUncertain` after its own limit.
-    settlement_try: Int,
-    /// Whether a cancellation of the job is pending; `AuthorizeReplay` is
-    /// then refused.
-    cancellation_requested: Bool,
-    /// When Grind held the job uncertain. The abandoned handler may still be
-    /// running on a node cut off from the database until its own timeout.
-    held_at: Timestamp,
-    /// The job's description, which says why it is uncertain.
-    description: String,
-    correlation: Correlation,
-  )
 }
 
 /// What a worker's settlement decides about an abandoned job.
@@ -445,39 +418,13 @@ pub fn with_abandonment(
 /// ```
 pub fn with_settlement(
   worker: Worker(input, output, error),
-  settle: fn(pog.Connection, Abandoned(input)) ->
+  settle: fn(pog.Connection, abandoned.Abandoned(input)) ->
     Result(Settlement(output, error), String),
 ) -> Worker(input, output, error) {
   definition.Worker(
     ..worker,
-    settlement: Some(fn(transaction, abandoned) {
-      let definition.Abandoned(
-        job_id:,
-        input:,
-        attempt_id:,
-        attempt:,
-        replays:,
-        settlement_try:,
-        cancellation_requested:,
-        held_at:,
-        description:,
-        correlation:,
-      ) = abandoned
-      settle(
-        transaction,
-        Abandoned(
-          job_id:,
-          input:,
-          attempt_id:,
-          attempt:,
-          replays:,
-          settlement_try:,
-          cancellation_requested:,
-          held_at:,
-          description:,
-          correlation:,
-        ),
-      )
+    settlement: Some(fn(transaction, held) {
+      settle(transaction, abandoned.from_definition(held))
       |> result.map(fn(settlement) {
         case settlement {
           ConfirmSuccess(output) -> definition.SettleSuccess(output)

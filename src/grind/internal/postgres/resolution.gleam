@@ -20,6 +20,10 @@ import sinal/forwarder.{type Forwarder}
 pub type Decision(output, error) {
   ConfirmSuccess(output)
   ConfirmBusinessFailure(error)
+  /// A business failure with no stored error, as a handler's `Failed` on a
+  /// worker without an error codec commits. Only a declared settlement
+  /// proposes it; operator resolution keeps requiring an error codec.
+  ConfirmUnrecordedFailure
   AuthorizeReplay
 }
 
@@ -565,6 +569,16 @@ pub fn prepare(
               Some(details),
             ))
         }
+      ConfirmUnrecordedFailure ->
+        Ok(#(
+          "confirm_business_failure",
+          "business_failed",
+          bound_output_version,
+          None,
+          None,
+          None,
+          Some(details),
+        ))
       AuthorizeReplay ->
         Ok(#(
           "authorize_replay",

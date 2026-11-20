@@ -30,8 +30,10 @@ pub type Request {
     encoded_input: String,
     attempt_id: Int,
     attempt: Int,
+    cause: worker.AbandonmentCause,
     replays: Int,
-    settlement_try: Int,
+    authorized_replays: Int,
+    try_number: Int,
     cancellation_requested: Bool,
     held_at_us: Int,
     description: String,
@@ -55,8 +57,13 @@ pub type Failure {
   FunctionCrashed(reason: String)
   /// The stored input does not decode under the deployed codec.
   Undecodable(reason: String)
-  /// The resolution protocol refuses the decision before any write.
+  /// The resolution protocol refuses the decision before any write; a later
+  /// try or deploy may change that.
   Refused(reason: String)
+  /// A refusal no later try can change: `AuthorizeReplay` under a pending
+  /// cancellation, which cannot be withdrawn. The try ends the mark as
+  /// declined, with this reason, without the function's writes.
+  RefusedForGood(reason: String)
 }
 
 /// An erased declared settlement.
@@ -95,8 +102,10 @@ fn settle_erased(
     encoded_input:,
     attempt_id:,
     attempt:,
+    cause:,
     replays:,
-    settlement_try:,
+    authorized_replays:,
+    try_number:,
     cancellation_requested:,
     held_at_us:,
     description:,
@@ -112,8 +121,10 @@ fn settle_erased(
       input:,
       attempt_id:,
       attempt:,
+      cause:,
       replays:,
-      settlement_try:,
+      authorized_replays:,
+      try_number:,
       cancellation_requested:,
       held_at: timestamp.from_unix_seconds_and_nanoseconds(
         held_at_us / 1_000_000,
@@ -149,9 +160,21 @@ fn settle_erased(
   }
   case decided {
     worker.SettleSuccess(output) -> command(resolution.ConfirmSuccess(output))
+    // Without an error codec, the failure commits with no stored error, as a
+    // handler's `Failed` does on the same worker.
     worker.SettleFailure(error) ->
-      command(resolution.ConfirmBusinessFailure(error))
-    worker.SettleReplay -> command(resolution.AuthorizeReplay)
+      case definition.error {
+        Some(_) -> command(resolution.ConfirmBusinessFailure(error))
+        None -> command(resolution.ConfirmUnrecordedFailure)
+      }
+    worker.SettleReplay ->
+      case cancellation_requested {
+        True ->
+          Error(RefusedForGood(
+            "replay refused: a cancellation of the job is pending",
+          ))
+        False -> command(resolution.AuthorizeReplay)
+      }
     worker.SettleLeaveUncertain(reason:) ->
       worker.storable_text("the settlement reason", reason)
       |> result.replace(Leave(reason))

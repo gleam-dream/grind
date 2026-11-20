@@ -6,8 +6,10 @@ import exception
 import gleam/dynamic/decode
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/option.{Some}
 import gleeunit/should
+import grind/abandoned as abandonment
 import grind/internal/attempt
 import grind/internal/job
 import grind/internal/postgres
@@ -22,6 +24,8 @@ import grind/telemetry
 import grind/worker
 import pog
 import sinal
+import sinal/correlation
+import sinal/fields
 
 pub fn postgres_settlement_reports_each_try_test() {
   case queue_database_url() {
@@ -38,7 +42,7 @@ pub fn postgres_settlement_reports_each_try_test() {
         |> worker.with_queue(name)
         |> worker.with_error_codec(codec)
         |> worker.with_settlement(fn(_transaction, abandoned) {
-          case abandoned.settlement_try {
+          case abandonment.try_number(abandoned) {
             1 -> Error("not yet")
             _ -> Ok(worker.ConfirmFailure("settled"))
           }
@@ -79,8 +83,10 @@ pub fn postgres_settlement_reports_each_try_test() {
         diagnostics.await(tried, fn(_) { True }, 1000)
       failed.ref.job_id |> should.equal(job.id_value(handle))
       failed.attempt_id |> should.equal(attempt_id)
-      failed.outcome |> should.equal(telemetry.SettlementFailed)
-      failed.failure |> should.equal(Some(telemetry.SettlementFunctionFailed))
+      failed.outcome
+      |> should.equal(telemetry.SettlementFailed(
+        telemetry.SettlementFunctionFailed,
+      ))
       measurements.settlement_try |> should.equal(1)
 
       let assert Ok(_) =
@@ -108,4 +114,37 @@ pub fn postgres_settlement_reports_each_try_test() {
       mark_database_test_executed("settlement-observations")
     }
   }
+}
+
+/// Every settlement outcome survives the diagnostic's metadata codec.
+pub fn settlement_outcomes_round_trip_test() {
+  let ref =
+    telemetry.JobRef(
+      job_id: 1,
+      queue: "q",
+      worker_id: "w",
+      worker_version: "1",
+      correlation: correlation.from_key("grind-job-1"),
+    )
+  let codec = sinal.metadata_fields(telemetry.settlement())
+  list.each(
+    [
+      telemetry.SettlementDeclined,
+      telemetry.SettlementSuperseded,
+      telemetry.SettlementCommitUnknown,
+      telemetry.SettlementFailed(telemetry.SettlementFunctionFailed),
+      telemetry.SettlementFailed(telemetry.SettlementFunctionCrashed),
+      telemetry.SettlementFailed(telemetry.SettlementFunctionTimedOut),
+      telemetry.SettlementFailed(telemetry.SettlementTransactionEnded),
+      telemetry.SettlementFailed(telemetry.SettlementDecisionRefused),
+      telemetry.SettlementFailed(telemetry.SettlementInputUndecodable),
+      telemetry.SettlementFailed(telemetry.SettlementStorageFailed),
+    ],
+    fn(outcome) {
+      let metadata = telemetry.SettlementMetadata(ref:, attempt_id: 2, outcome:)
+      let assert Ok(Nil) = fields.check(codec, metadata)
+      fields.decode(codec, fields.encode(codec, metadata))
+      |> should.equal(Ok(metadata))
+    },
+  )
 }

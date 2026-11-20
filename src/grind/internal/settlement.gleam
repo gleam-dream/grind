@@ -27,6 +27,7 @@ import grind/internal/postgres/resolution_transaction
 import grind/internal/registry.{type Registry}
 import grind/internal/settlement/declared
 import grind/internal/store
+import grind/internal/worker
 import grind/telemetry
 import pog
 import sinal/forwarder
@@ -44,6 +45,9 @@ pub type Outcome {
   /// The try committed nothing; the job is due again at the time its take
   /// set.
   TryFailed(job_id: Int, failure: TryFailure)
+  /// The job was no longer due when the try locked it: another settler or an
+  /// operator decided it first, or holds its row. Nothing was written.
+  Superseded(job_id: Int)
   /// The try's COMMIT was sent and its reply was lost or cut; the next take
   /// finds the job decided or still due.
   CommitUnknown(job_id: Int)
@@ -62,8 +66,6 @@ pub type TryFailure {
   Refused(reason: String)
   /// The stored input does not decode under the deployed codec.
   Undecodable(reason: String)
-  /// Another holder had the job locked, or it was no longer due.
-  NoLongerDue
   StorageFailed(reason: String)
 }
 
@@ -215,14 +217,15 @@ fn observe(
 ) -> Nil {
   let reported = case outcome {
     NothingDue | Settled(..) -> None
-    Declined(_) -> Some(#(telemetry.SettlementDeclined, None))
-    CommitUnknown(_) -> Some(#(telemetry.SettlementCommitUnknown, None))
+    Declined(_) -> Some(telemetry.SettlementDeclined)
+    Superseded(_) -> Some(telemetry.SettlementSuperseded)
+    CommitUnknown(_) -> Some(telemetry.SettlementCommitUnknown)
     TryFailed(_, failure) ->
-      Some(#(telemetry.SettlementFailed, Some(failure_kind(failure))))
+      Some(telemetry.SettlementFailed(failure_kind(failure)))
   }
   case reported {
     None -> Nil
-    Some(#(kind, failure)) -> {
+    Some(outcome) -> {
       let _ =
         forwarder.emit(
           postgres.forwarder(database),
@@ -241,8 +244,7 @@ fn observe(
               correlation: events.correlation(taken.job_id, taken.correlation),
             ),
             attempt_id: taken.attempt_id,
-            outcome: kind,
-            failure:,
+            outcome:,
           ),
         )
       Nil
@@ -258,7 +260,6 @@ fn failure_kind(failure: TryFailure) -> telemetry.SettlementFailure {
     TransactionEnded -> telemetry.SettlementTransactionEnded
     Refused(_) -> telemetry.SettlementDecisionRefused
     Undecodable(_) -> telemetry.SettlementInputUndecodable
-    NoLongerDue -> telemetry.SettlementNoLongerDue
     StorageFailed(_) -> telemetry.SettlementStorageFailed
   }
 }
@@ -295,8 +296,10 @@ type Locked {
     input_version: String,
     encoded_input: String,
     attempt: Int,
+    timed_out: Bool,
     replays: Int,
-    settlement_try: Int,
+    authorized_replays: Int,
+    try_number: Int,
     cancellation_requested: Bool,
     held_at_us: Int,
     description: String,
@@ -307,6 +310,18 @@ type Locked {
 type Commit {
   CommitResolved(State, ResolutionCommand)
   CommitDeclined
+}
+
+/// Why a try's transaction rolled back.
+type Abort {
+  /// The try failed; the job is due again later.
+  Failed(TryFailure)
+  /// The job was no longer due under the taken mark, or another holder had
+  /// its row.
+  NotDue
+  /// The decision can never commit; the mark ends as declined, with this
+  /// reason, in a separate write.
+  Declines(reason: String)
 }
 
 fn try_once(
@@ -321,7 +336,9 @@ fn try_once(
   let outcome =
     store.transaction_safely(postgres.connection(database), fn(transaction) {
       use locked <- result.try(lock(transaction, job_id, attempt_id))
-      use Nil <- result.try(enter_application(transaction))
+      use Nil <- result.try(
+        enter_application(transaction) |> result.map_error(Failed),
+      )
       let request =
         declared.Request(
           installation:,
@@ -331,8 +348,13 @@ fn try_once(
           encoded_input: locked.encoded_input,
           attempt_id:,
           attempt: locked.attempt,
+          cause: case locked.timed_out {
+            True -> worker.TimedOut
+            False -> worker.LeaseExpired
+          },
           replays: locked.replays,
-          settlement_try: locked.settlement_try,
+          authorized_replays: locked.authorized_replays,
+          try_number: locked.try_number,
           cancellation_requested: locked.cancellation_requested,
           held_at_us: locked.held_at_us,
           description: locked.description,
@@ -342,24 +364,32 @@ fn try_once(
       // even when a failed statement of the function aborted the
       // transaction.
       use decided <- result.try(case settle(transaction, request) {
-        Error(declared.FunctionFailed(reason)) -> Error(FunctionFailed(reason))
+        Error(declared.FunctionFailed(reason)) ->
+          Error(Failed(FunctionFailed(reason)))
         Error(declared.FunctionCrashed(reason)) ->
-          Error(FunctionCrashed(reason))
-        Error(declared.Undecodable(reason)) -> Error(Undecodable(reason))
-        Error(declared.Refused(reason)) -> Error(Refused(reason))
+          Error(Failed(FunctionCrashed(reason)))
+        Error(declared.Undecodable(reason)) ->
+          Error(Failed(Undecodable(reason)))
+        Error(declared.Refused(reason)) -> Error(Failed(Refused(reason)))
+        Error(declared.RefusedForGood(reason)) -> Error(Declines(reason))
         Ok(decided) -> Ok(decided)
       })
-      use Nil <- result.try(enter_grind(
-        transaction,
-        installation,
-        deadline_ms,
-        locked.transaction_id,
-      ))
+      use Nil <- result.try(
+        enter_grind(
+          transaction,
+          installation,
+          deadline_ms,
+          locked.transaction_id,
+        )
+        |> result.map_error(Failed),
+      )
       let commit = case decided {
         declared.Resolve(command) -> {
           use state <- result.try(
             resolution.apply_fresh_in(transaction, command)
-            |> result.map_error(fn(error) { Refused(string.inspect(error)) }),
+            |> result.map_error(fn(error) {
+              Failed(Refused(string.inspect(error)))
+            }),
           )
           use Nil <- result.map(end_mark(transaction, job_id, attempt_id, None))
           CommitResolved(state, command)
@@ -387,20 +417,48 @@ fn try_once(
       Settled(job_id, state)
     }
     Ok(CommitDeclined) -> Declined(job_id)
-    Error(pog.TransactionRolledBack(failure)) -> TryFailed(job_id, failure)
+    Error(pog.TransactionRolledBack(Failed(failure))) ->
+      TryFailed(job_id, failure)
+    Error(pog.TransactionRolledBack(NotDue)) -> Superseded(job_id)
+    Error(pog.TransactionRolledBack(Declines(reason))) ->
+      decline(database, job_id, attempt_id, reason)
+    Error(pog.TransactionQueryError(_)) -> CommitUnknown(job_id)
+  }
+}
+
+/// Ends the mark of a decision that can never commit, as declined, without
+/// the function's writes, which rolled back with the try.
+fn decline(
+  database: Database,
+  job_id: Int,
+  attempt_id: Int,
+  reason: String,
+) -> Outcome {
+  case
+    store.transaction_safely(postgres.connection(database), fn(transaction) {
+      end_mark(transaction, job_id, attempt_id, Some(reason))
+    })
+  {
+    Ok(Nil) -> Declined(job_id)
+    Error(pog.TransactionRolledBack(NotDue)) -> Superseded(job_id)
+    Error(pog.TransactionRolledBack(Failed(failure))) ->
+      TryFailed(job_id, failure)
+    Error(pog.TransactionRolledBack(Declines(_))) -> Superseded(job_id)
     Error(pog.TransactionQueryError(_)) -> CommitUnknown(job_id)
   }
 }
 
 /// Locks the job without waiting and reads it, only while it is still due
-/// under the mark the take counted.
+/// under the mark the take counted. An attempt Grind acknowledged as
+/// abandoned at its timeout has an acknowledgement receipt; one whose lease
+/// expired has none.
 fn lock(
   transaction: pog.Connection,
   job_id: Int,
   attempt_id: Int,
-) -> Result(Locked, TryFailure) {
+) -> Result(Locked, Abort) {
   pog.query(
-    "SELECT pg_current_xact_id()::text, queue, input_version, input::text, attempt_count, replay_count, settle_tries, cancel_requested_at IS NOT NULL, (extract(epoch FROM COALESCE(uncertain_at, clock_timestamp())) * 1000000)::bigint, COALESCE(failure_description, ''), correlation FROM grind_jobs WHERE id = $1 AND state = 'uncertain' AND settle_at IS NOT NULL AND settle_attempt_id = attempt_id AND attempt_id = $2 FOR NO KEY UPDATE SKIP LOCKED",
+    "SELECT pg_current_xact_id()::text, job.queue, job.input_version, job.input::text, job.attempt_count, EXISTS (SELECT 1 FROM grind_job_acknowledgements AS receipt WHERE receipt.job_id = job.id AND receipt.attempt_id = job.attempt_id AND receipt.attempt_epoch = job.attempt_epoch), job.replay_count, (SELECT count(*) FROM grind_job_resolutions AS resolution WHERE resolution.job_id = job.id AND resolution.decision = 'authorize_replay')::bigint, job.settle_tries, job.cancel_requested_at IS NOT NULL, (extract(epoch FROM COALESCE(job.uncertain_at, clock_timestamp())) * 1000000)::bigint, COALESCE(job.failure_description, ''), job.correlation FROM grind_jobs AS job WHERE job.id = $1 AND job.state = 'uncertain' AND job.settle_at IS NOT NULL AND job.settle_attempt_id = job.attempt_id AND job.attempt_id = $2 FOR NO KEY UPDATE OF job SKIP LOCKED",
   )
   |> pog.parameter(pog.int(job_id))
   |> pog.parameter(pog.int(attempt_id))
@@ -410,20 +468,24 @@ fn lock(
     use input_version <- decode.field(2, decode.string)
     use encoded_input <- decode.field(3, decode.string)
     use attempt <- decode.field(4, decode.int)
-    use replays <- decode.field(5, decode.int)
-    use settlement_try <- decode.field(6, decode.int)
-    use cancellation_requested <- decode.field(7, decode.bool)
-    use held_at_us <- decode.field(8, decode.int)
-    use description <- decode.field(9, decode.string)
-    use correlation <- decode.field(10, decode.optional(decode.string))
+    use timed_out <- decode.field(5, decode.bool)
+    use replays <- decode.field(6, decode.int)
+    use authorized_replays <- decode.field(7, decode.int)
+    use try_number <- decode.field(8, decode.int)
+    use cancellation_requested <- decode.field(9, decode.bool)
+    use held_at_us <- decode.field(10, decode.int)
+    use description <- decode.field(11, decode.string)
+    use correlation <- decode.field(12, decode.optional(decode.string))
     decode.success(Locked(
       transaction_id:,
       queue:,
       input_version:,
       encoded_input:,
       attempt:,
+      timed_out:,
       replays:,
-      settlement_try:,
+      authorized_replays:,
+      try_number:,
       cancellation_requested:,
       held_at_us:,
       description:,
@@ -431,11 +493,11 @@ fn lock(
     ))
   })
   |> store.execute_safely(on: transaction)
-  |> result.map_error(storage_failed)
+  |> result.map_error(fn(error) { Failed(storage_failed(error)) })
   |> result.try(fn(returned) {
     case returned.rows {
       [locked] -> Ok(locked)
-      _ -> Error(NoLongerDue)
+      _ -> Error(NotDue)
     }
   })
 }
@@ -501,7 +563,7 @@ fn end_mark(
   job_id: Int,
   attempt_id: Int,
   declined: Option(String),
-) -> Result(Nil, TryFailure) {
+) -> Result(Nil, Abort) {
   let query = case declined {
     None ->
       pog.query(
@@ -520,11 +582,11 @@ fn end_mark(
   query
   |> pog.returning(decode.field(0, decode.int, decode.success))
   |> store.execute_safely(on: transaction)
-  |> result.map_error(storage_failed)
+  |> result.map_error(fn(error) { Failed(storage_failed(error)) })
   |> result.try(fn(returned) {
     case returned.rows {
       [_] -> Ok(Nil)
-      _ -> Error(NoLongerDue)
+      _ -> Error(NotDue)
     }
   })
 }

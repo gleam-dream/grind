@@ -233,20 +233,31 @@ pub type Worker(input, output, error) {
 }
 
 /// A job that an abandoned attempt left uncertain, as its worker's declared
-/// settlement receives it. `grind/worker.Abandoned` is the public shape.
+/// settlement receives it. `grind/abandoned` reads it.
 pub type Abandoned(input) {
   Abandoned(
     job_id: Int,
     input: input,
     attempt_id: Int,
     attempt: Int,
+    cause: AbandonmentCause,
     replays: Int,
-    settlement_try: Int,
+    authorized_replays: Int,
+    try_number: Int,
     cancellation_requested: Bool,
     held_at: Timestamp,
     description: String,
     correlation: Correlation,
   )
+}
+
+/// Why an attempt was abandoned.
+pub type AbandonmentCause {
+  /// Its lease expired without an acknowledgement: its node died, lost the
+  /// database, or a replay-safe timeout let the lease run out.
+  LeaseExpired
+  /// Grind stopped its handler at the worker's timeout under `HoldUncertain`.
+  TimedOut
 }
 
 /// A declared settlement's decision. `grind/worker.Settlement` is the

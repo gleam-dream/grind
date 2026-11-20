@@ -9,6 +9,7 @@ import gleam/int
 import gleam/json
 import gleam/option.{Some}
 import gleeunit/should
+import grind/abandoned as abandonment
 import grind/internal/attempt
 import grind/internal/consumer as queue
 import grind/internal/job
@@ -42,7 +43,7 @@ pub fn postgres_job_abandoned_while_no_node_ran_is_settled_at_start_test() {
         |> worker.with_settlement(fn(transaction, abandoned) {
           let assert Ok(_) =
             pog.query("INSERT INTO " <> table <> " (job_id) VALUES ($1)")
-            |> pog.parameter(pog.int(abandoned.job_id))
+            |> pog.parameter(pog.int(abandonment.job_id(abandoned)))
             |> pog.execute(on: transaction)
           Ok(worker.ConfirmFailure("the run stopped mid-way"))
         })
