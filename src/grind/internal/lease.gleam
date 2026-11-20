@@ -48,6 +48,11 @@ pub fn expired_lease_predicate(now_expression: String) -> String {
 /// `expired_lease_predicate`, the single-sourced fragment both callers
 /// splice in.
 ///
+/// A row held `uncertain` gets its settlement mark: it names the expired
+/// attempt and is due at once (docs/design/design.typ, "Declared settlement
+/// of abandoned jobs"). A replayed row keeps whatever mark it had; the mark
+/// names an attempt the row no longer retains, so it has no effect.
+///
 /// `candidate_select` must select `id, attempt_id, attempt_count`: the
 /// `RETURNING` list reports the expired attempt from the candidate row as it
 /// was before the update, because a replay clears `attempt_id` and refunds
@@ -75,7 +80,13 @@ pub fn quarantine_update_sql(candidate_select: String) -> String {
   <> replay
   <> " THEN 'expired attempt replayed (' || (job.replay_count + 1)::text || ' of ' || job.max_replays::text || ')' WHEN job.cancel_requested_at IS NOT NULL THEN 'expired after cancellation request; prior effect unknown' WHEN job.failure_description IS NULL THEN 'expired attempt requires outcome reconciliation' ELSE job.failure_description || '; expired attempt requires outcome reconciliation' END, uncertain_at = CASE WHEN "
   <> replay
-  <> " THEN NULL ELSE clock_timestamp() END FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, candidate.attempt_id, job.attempt_epoch, candidate.attempt_count, (job.cancel_requested_at IS NOT NULL), job.state = 'queued', job.correlation"
+  <> " THEN NULL ELSE clock_timestamp() END, settle_attempt_id = CASE WHEN "
+  <> replay
+  <> " THEN job.settle_attempt_id ELSE job.attempt_id END, settle_at = CASE WHEN "
+  <> replay
+  <> " THEN job.settle_at ELSE clock_timestamp() END, settle_tries = CASE WHEN "
+  <> replay
+  <> " THEN job.settle_tries ELSE 0 END FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, candidate.attempt_id, job.attempt_epoch, candidate.attempt_count, (job.cancel_requested_at IS NOT NULL), job.state = 'queued', job.correlation"
 }
 
 /// Whether an expired attempt of the row `alias` is replayed instead of held
