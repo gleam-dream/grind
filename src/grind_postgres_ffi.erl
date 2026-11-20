@@ -1,5 +1,7 @@
 -module(grind_postgres_ffi).
 -include_lib("pgo/src/pgo_internal.hrl").
+
+-define(APPLICATION_SEARCH_PATH, grind_application_search_path).
 -export([
     call_safely/2,
     execute_safely/2,
@@ -11,7 +13,8 @@
     transaction_measured/2,
     transaction_or_checkout_failure/2,
     migration_transaction_safely/3,
-    is_single_connection/1
+    is_single_connection/1,
+    application_search_path/0
 ]).
 
 %% Grind's own checkout deadline (`postgres.Settings.statement_deadline_ms`;
@@ -119,8 +122,10 @@ checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Wait
             end,
             case Entered of
                 {ok, Restore} ->
+                    Previous = put(?APPLICATION_SEARCH_PATH, Restore),
                     Value = try Fun({single_connection, Conn}, Conn)
                     after
+                        restore_application_search_path(Previous),
                         %% Cleanup cannot change a result or prove whether an
                         %% earlier command committed. Ambiguity stays ambiguous.
                         %% A connection whose search_path could not be
@@ -187,6 +192,21 @@ enter_search_path(Conn, {some, SearchPath}) ->
         #{rows := [Row]} -> {ok, {some, row_first(Row)}};
         _ -> error
     end.
+
+%% The session `search_path` a managed checkout saved before setting Grind's
+%% schema, for the calling process while its callback runs: `{some, Value}`
+%% on a pool shared with the application, `none` on a pool Grind owns alone
+%% or outside a managed checkout. A declared settlement sets it again,
+%% transaction-locally, for the application's own statements
+%% (`grind/internal/settlement`).
+application_search_path() ->
+    case get(?APPLICATION_SEARCH_PATH) of
+        {some, Value} -> {some, Value};
+        _ -> none
+    end.
+
+restore_application_search_path(undefined) -> erase(?APPLICATION_SEARCH_PATH);
+restore_application_search_path(Previous) -> put(?APPLICATION_SEARCH_PATH, Previous).
 
 leave_search_path(_Conn, none) -> ok;
 leave_search_path(Conn, {some, Previous}) ->

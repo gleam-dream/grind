@@ -1,5 +1,5 @@
 -module(grind_test_env).
--export([database_url/0, queue_database_url/0, owner_a_url/0, user_schema_fallback_url/0, migration_collision_submissions_url/0, migration_collision_resolutions_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_missing_fk_url/0, schema_atomic_url/0, schema_concurrent_url/0, schema_partial_url/0, schema_upgrade_url/0, schema_upgrade_fresh_url/0, schema_future_foreign_url/0, schema_shape_url/0, schema_mixed_case_url/0, repeatable_read_url/0, quarantine_url/0, fault_proxy_url/0, migration_deadline_url/0, migration_lock_url/0, prune_url/0, prune_owner_b_url/0, cigogne_e2e_url/0, cigogne_e2e_fresh_url/0, cigogne_concurrent_url/0, upgrade_lost_reply_url/0, postgres_log_path/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0, pool_connection_atom/1]).
+-export([database_url/0, queue_database_url/0, owner_a_url/0, user_schema_fallback_url/0, migration_collision_submissions_url/0, migration_collision_resolutions_url/0, schema_bad_url/0, schema_fresh_url/0, schema_markers_url/0, schema_missing_jobs_url/0, schema_missing_migrations_url/0, schema_missing_resolutions_url/0, schema_missing_acknowledgements_url/0, schema_missing_attempt_sequence_url/0, schema_missing_unique_submissions_url/0, schema_missing_fk_url/0, schema_atomic_url/0, schema_concurrent_url/0, schema_partial_url/0, schema_upgrade_url/0, schema_upgrade_fresh_url/0, schema_future_foreign_url/0, schema_shape_url/0, schema_mixed_case_url/0, repeatable_read_url/0, quarantine_url/0, fault_proxy_url/0, migration_deadline_url/0, migration_lock_url/0, prune_url/0, prune_owner_b_url/0, cigogne_e2e_url/0, cigogne_e2e_fresh_url/0, cigogne_concurrent_url/0, upgrade_lost_reply_url/0, postgres_log_path/0, mark_database_test_executed/1, monotonic_ms/0, unique_test_run_id/0, pool_connection_atom/1, message_queue_len/0]).
 
 database_url() -> env("GRIND_TEST_DATABASE_URL").
 queue_database_url() -> env("GRIND_TEST_QUEUE_DATABASE_URL").
@@ -92,3 +92,8 @@ unique_test_run_id() ->
 %% stop matching and fall through to some other, wrong behavior.
 pool_connection_atom({pool, Name}) -> {ok, Name};
 pool_connection_atom(_Other) -> {error, nil}.
+
+%% How many messages wait in the calling process's mailbox.
+message_queue_len() ->
+    {message_queue_len, Length} = erlang:process_info(self(), message_queue_len),
+    Length.

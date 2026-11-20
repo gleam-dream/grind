@@ -18,7 +18,7 @@ Compiled, runnable public API examples, one module under `src/grind_usage/` per 
 | `isolation`       | One installation per schema, and one pool shared with the application.                   |
 | `observations`    | Sinal events for acknowledgements and capacity.                                          |
 | `uniqueness`      | Finding an existing job and rescheduling one across queues.                              |
-| `uncertain`       | Resolving an uncertain job, alone and inside a transaction.                              |
+| `uncertain`       | Resolving an uncertain job, alone and in a transaction; declaring a worker's settlement. |
 | `retention`       | Queue statistics and bounded pruning.                                                    |
 | `migrations`      | `grind.migrate` as a deploy step, and cigogne sharing Grind's pool.                      |
 

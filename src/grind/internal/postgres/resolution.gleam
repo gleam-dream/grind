@@ -20,6 +20,10 @@ import sinal/forwarder.{type Forwarder}
 pub type Decision(output, error) {
   ConfirmSuccess(output)
   ConfirmBusinessFailure(error)
+  /// A business failure with no stored error, as a handler's `Failed` on a
+  /// worker without an error codec commits. Only a declared settlement
+  /// proposes it; operator resolution keeps requiring an error codec.
+  ConfirmUnrecordedFailure
   AuthorizeReplay
 }
 
@@ -115,6 +119,43 @@ pub fn resolve_uncertain(
 /// (`Replied`); `ResolutionAlreadyApplied` is a prior commit of this exact
 /// `resolution_id` proven by a receipt read (`Reconciled`) — see
 /// `resolution_receipt_outcome`.
+/// `[grind, job, resolved]` for a declared settlement's resolution, after
+/// the settlement's transaction committed with this call's reply.
+pub fn emit_settled(
+  fwd: Forwarder,
+  correlation: Correlation,
+  command: ResolutionCommand,
+  committed_state: State,
+) -> Nil {
+  let ResolutionCommand(
+    decision:,
+    id:,
+    queue:,
+    worker_id:,
+    worker_version:,
+    resolution_id:,
+    resolved_by:,
+    ..,
+  ) = command
+  case resolution_decision_of_stored(decision) {
+    Error(Nil) -> Nil
+    Ok(decision) ->
+      emit_resolved(
+        fwd,
+        correlation,
+        queue,
+        id,
+        worker_id,
+        worker_version,
+        decision,
+        committed_state,
+        resolution_id,
+        resolved_by,
+        telemetry.Replied,
+      )
+  }
+}
+
 fn emit_resolved(
   fwd: Forwarder,
   correlation: Correlation,
@@ -159,6 +200,22 @@ fn resolution_decision_of_stored(
     "confirm_business_failure" -> Ok(telemetry.DecisionConfirmBusinessFailure)
     "authorize_replay" -> Ok(telemetry.DecisionAuthorizeReplay)
     _ -> Error(Nil)
+  }
+}
+
+/// Applies `command` inside a transaction Grind owns and has already scoped
+/// to its schema, for a declared settlement. Only a fresh application
+/// counts: a receipt already applied under the same identity is
+/// `ReconciliationNotRequired`, so the caller rolls its own writes back
+/// rather than committing them a second time.
+pub fn apply_fresh_in(
+  transaction: pog.Connection,
+  command: ResolutionCommand,
+) -> Result(State, ResolutionError) {
+  case reconcile_transaction(transaction, command) {
+    Ok(ResolutionApplied(state)) -> Ok(state)
+    Ok(ResolutionAlreadyApplied(_)) -> Error(ReconciliationNotRequired)
+    Error(error) -> Error(error)
   }
 }
 
@@ -512,6 +569,16 @@ pub fn prepare(
               Some(details),
             ))
         }
+      ConfirmUnrecordedFailure ->
+        Ok(#(
+          "confirm_business_failure",
+          "business_failed",
+          bound_output_version,
+          None,
+          None,
+          None,
+          Some(details),
+        ))
       AuthorizeReplay ->
         Ok(#(
           "authorize_replay",

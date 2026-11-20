@@ -1,14 +1,20 @@
 //// Authority and failure boundaries: a handler that cannot tell whether its
 //// effect happened reports `Uncertain`; an operator investigates and
-//// resolves the job with an attributed, idempotent decision.
+//// resolves the job with an attributed, idempotent decision. A worker whose
+//// attempts can be abandoned declares how such a job is settled, and the
+//// application's writes commit with the decision.
 
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/int
 import gleam/io
 import gleam/json
 import gleam/option.{Some}
+import gleam/result
+import gleam/string
 import gleam/time/duration
 import grind
+import grind/abandoned as abandonment
 import grind/admin
 import grind/job
 import grind/worker
@@ -86,5 +92,79 @@ pub fn run(url: String) -> Nil {
     })
 
   io.println("uncertain: two uncertain jobs resolved")
+  settled(url)
   support.mark("usage-uncertain-passed")
+}
+
+/// An agent run that stops mid-way. Its timeout holds it uncertain, and its
+/// declared settlement writes a notice and records the run as failed, in
+/// one transaction.
+fn settled(url: String) -> Nil {
+  let notices = support.identifier("agent_notices")
+  let agent = agent(support.unique("agent"), notices)
+  use jobs <- support.with_grind(url, fn(config) {
+    config |> grind.with_worker(agent) |> grind.without_pruner
+  })
+  let assert Ok(_) =
+    pog.query("CREATE TABLE " <> notices <> " (run_id bigint PRIMARY KEY)")
+    |> pog.execute(on: grind.connection(jobs))
+  let assert Ok(grind.Inserted(run)) =
+    grind.submit(jobs, job.new(agent, "summarise the inbox"))
+  let assert Ok(grind.Failed(grind.Business(reason), _, _)) =
+    await_decided(jobs, run, 200)
+  let assert True = reason == "the agent run stopped mid-way"
+  let assert Ok(returned) =
+    pog.query("SELECT count(*)::bigint FROM " <> notices)
+    |> pog.returning(decode.field(0, decode.int, decode.success))
+    |> pog.execute(on: grind.connection(jobs))
+  let assert [1] = returned.rows
+  io.println("uncertain: an abandoned agent run settled as failed")
+}
+
+fn text() -> worker.Codec(String) {
+  worker.codec(worker.infallible(json.string), decode.string)
+}
+
+fn agent(
+  queue: String,
+  notices: String,
+) -> worker.Worker(String, String, String) {
+  // snips-start: declare-settlement
+  worker.new("agent.run", input: text(), output: text(), perform: run_agent)
+  |> worker.with_error_codec(text())
+  |> worker.with_timeout(worker.After(duration.milliseconds(100)))
+  |> worker.with_settlement(fn(transaction, abandoned) {
+    // Short writes on the transaction only: they commit with the decision.
+    use _ <- result.try(
+      pog.query("INSERT INTO " <> notices <> " (run_id) VALUES ($1)")
+      |> pog.parameter(pog.int(abandonment.job_id(abandoned)))
+      |> pog.execute(on: transaction)
+      |> result.map_error(string.inspect),
+    )
+    Ok(worker.ConfirmFailure("the agent run stopped mid-way"))
+  })
+  // snips-end: declare-settlement
+  |> worker.with_queue(queue)
+}
+
+/// Never returns in time: its timeout abandons the attempt.
+fn run_agent(_prompt: String) -> Result(String, String) {
+  process.sleep(60_000)
+  Ok("unreachable")
+}
+
+/// Reads the outcome until it is no longer pending or uncertain: the
+/// settler decides on its own schedule.
+fn await_decided(
+  jobs: grind.Grind,
+  run: job.JobHandle(String, String, String),
+  checks: Int,
+) -> Result(grind.Outcome(String, String), grind.ReadError) {
+  case grind.outcome(jobs, run) {
+    Ok(grind.Pending(_)) | Ok(grind.Uncertain(_)) if checks > 0 -> {
+      process.sleep(50)
+      await_decided(jobs, run, checks - 1)
+    }
+    other -> other
+  }
 }

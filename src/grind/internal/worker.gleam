@@ -225,7 +225,48 @@ pub type Worker(input, output, error) {
     timeout_ms: Option(Int),
     max_snoozes: Int,
     abandonment: Abandonment,
+    settlement: Option(
+      fn(pog.Connection, Abandoned(input)) ->
+        Result(Settlement(output, error), String),
+    ),
   )
+}
+
+/// A job that an abandoned attempt left uncertain, as its worker's declared
+/// settlement receives it. `grind/abandoned` reads it.
+pub type Abandoned(input) {
+  Abandoned(
+    job_id: Int,
+    input: input,
+    attempt_id: Int,
+    attempt: Int,
+    cause: AbandonmentCause,
+    replays: Int,
+    authorized_replays: Int,
+    try_number: Int,
+    cancellation_requested: Bool,
+    held_at: Timestamp,
+    description: String,
+    correlation: Correlation,
+  )
+}
+
+/// Why an attempt was abandoned.
+pub type AbandonmentCause {
+  /// Its lease expired without an acknowledgement: its node died, lost the
+  /// database, or a replay-safe timeout let the lease run out.
+  LeaseExpired
+  /// Grind stopped its handler at the worker's timeout under `HoldUncertain`.
+  TimedOut
+}
+
+/// A declared settlement's decision. `grind/worker.Settlement` is the
+/// public shape.
+pub type Settlement(output, error) {
+  SettleSuccess(output)
+  SettleFailure(error)
+  SettleReplay
+  SettleLeaveUncertain(reason: String)
 }
 
 /// Builds a worker with the engine defaults. The public constructors in
@@ -251,6 +292,7 @@ pub fn new(
     timeout_ms: Some(default_timeout_ms),
     max_snoozes: default_max_snoozes,
     abandonment: HoldUncertain,
+    settlement: None,
   )
 }
 
@@ -549,6 +591,10 @@ pub type Execution {
   ExecutedDiscarded(String)
   ExecutedCancelled(String)
   ExecutedUncertain(String)
+  /// Grind stopped the handler at its timeout under `HoldUncertain`: an
+  /// abandoned attempt, committed as `uncertain` with a settlement mark
+  /// naming the attempt, unlike the handler's own `ExecutedUncertain`.
+  ExecutedAbandoned(String)
   ExecutedInvalidInput(String)
   /// The handler ran, and its output codec (`OutputCodec`) or error codec
   /// (`ErrorCodec`) rejected the value it returned, the encoded value was
@@ -703,7 +749,8 @@ pub fn storage_refusal_reason(sqlstate: String) -> String {
 /// with a data exception, which no retry can change. A refused output or
 /// error becomes a terminal `ExecutedUnencodable`, the same outcome as an
 /// encoder rejection after the handler ran. A proposal that carries only
-/// text keeps the handler's disposition, including `ExecutedUncertain`, and
+/// text keeps the handler's disposition, including `ExecutedUncertain` and
+/// `ExecutedAbandoned`, and
 /// replaces its text with `storage_refusal_reason`.
 pub fn refused_by_storage(execution: Execution, sqlstate: String) -> Execution {
   let reason = storage_refusal_reason(sqlstate)
@@ -719,6 +766,7 @@ pub fn refused_by_storage(execution: Execution, sqlstate: String) -> Execution {
     ExecutedDiscarded(_) -> ExecutedDiscarded(reason)
     ExecutedCancelled(_) -> ExecutedCancelled(reason)
     ExecutedUncertain(_) -> ExecutedUncertain(reason)
+    ExecutedAbandoned(_) -> ExecutedAbandoned(reason)
   }
 }
 

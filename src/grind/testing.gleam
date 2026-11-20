@@ -24,17 +24,21 @@
 //// `without_consumers` so nothing else claims them.
 
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option.{None}
 import gleam/result
 import gleam/string
 import gleam/time/duration.{type Duration}
+import gleam/time/timestamp.{type Timestamp}
 import grind.{type Grind}
+import grind/abandoned.{type Abandoned}
 import grind/internal/consumer
 import grind/internal/runtime
 import grind/internal/worker as definition
 import grind/worker.{type Context, type Response, type Worker}
 import pog
+import sinal/correlation.{type Correlation}
 
 /// Why `perform` could not run the handler, or could not encode its
 /// result.
@@ -256,3 +260,111 @@ fn await_drain(
 
 @external(erlang, "grind_queue_ffi", "monotonic_ms")
 fn monotonic_ms() -> Int
+
+/// An abandoned job for testing a worker's settlement function directly:
+/// call the function with it and a transaction. Its attempt is 1, its cause
+/// `LeaseExpired`, it used no replays, none were authorized, this is try 1,
+/// no cancellation is pending, it was held at the Unix epoch, and its
+/// description and correlation are the ones Grind would write. Change them
+/// with the `with_*` functions below.
+pub fn abandoned(
+  job_id job_id: Int,
+  input input: input,
+  attempt_id attempt_id: Int,
+) -> Abandoned(input) {
+  abandoned.from_definition(definition.Abandoned(
+    job_id:,
+    input:,
+    attempt_id:,
+    attempt: 1,
+    cause: definition.LeaseExpired,
+    replays: 0,
+    authorized_replays: 0,
+    try_number: 1,
+    cancellation_requested: False,
+    held_at: timestamp.from_unix_seconds(0),
+    description: "expired attempt requires outcome reconciliation",
+    correlation: correlation.from_key("grind-job-" <> int.to_string(job_id)),
+  ))
+}
+
+fn with_abandoned(
+  held: Abandoned(input),
+  change: fn(definition.Abandoned(input)) -> definition.Abandoned(input),
+) -> Abandoned(input) {
+  held |> abandoned.to_definition |> change |> abandoned.from_definition
+}
+
+/// Sets the abandoned attempt's business attempt number.
+pub fn with_attempt(held: Abandoned(input), attempt: Int) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) { definition.Abandoned(..inner, attempt:) })
+}
+
+/// Sets why the attempt was abandoned.
+pub fn with_cause(
+  held: Abandoned(input),
+  cause: abandoned.Cause,
+) -> Abandoned(input) {
+  let cause = case cause {
+    abandoned.LeaseExpired -> definition.LeaseExpired
+    abandoned.TimedOut -> definition.TimedOut
+  }
+  with_abandoned(held, fn(inner) { definition.Abandoned(..inner, cause:) })
+}
+
+/// Sets how many lease-expiry replays the job used.
+pub fn with_replays(held: Abandoned(input), replays: Int) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) { definition.Abandoned(..inner, replays:) })
+}
+
+/// Sets how many replays were authorized after earlier abandonments.
+pub fn with_authorized_replays(
+  held: Abandoned(input),
+  authorized_replays: Int,
+) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) {
+    definition.Abandoned(..inner, authorized_replays:)
+  })
+}
+
+/// Sets which settlement try this is, from 1.
+pub fn with_try_number(
+  held: Abandoned(input),
+  try_number: Int,
+) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) { definition.Abandoned(..inner, try_number:) })
+}
+
+/// Sets whether a cancellation of the job is pending.
+pub fn with_cancellation_requested(
+  held: Abandoned(input),
+  cancellation_requested: Bool,
+) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) {
+    definition.Abandoned(..inner, cancellation_requested:)
+  })
+}
+
+/// Sets when the job was held uncertain.
+pub fn with_held_at(
+  held: Abandoned(input),
+  held_at: Timestamp,
+) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) { definition.Abandoned(..inner, held_at:) })
+}
+
+/// Sets the job's description.
+pub fn with_description(
+  held: Abandoned(input),
+  description: String,
+) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) { definition.Abandoned(..inner, description:) })
+}
+
+/// Sets the job's correlation.
+pub fn with_correlation(
+  held: Abandoned(input),
+  correlation: Correlation,
+) -> Abandoned(input) {
+  with_abandoned(held, fn(inner) { definition.Abandoned(..inner, correlation:) })
+}
