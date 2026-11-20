@@ -26,10 +26,13 @@ import gleam/string
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
 import grind.{type Grind}
+import grind/internal/consumer
 import grind/internal/convert
 import grind/internal/job as stored_job
 import grind/internal/postgres
+import grind/internal/registry
 import grind/internal/runtime
+import grind/internal/settlement
 import grind/job.{type JobHandle, type State}
 import pog
 import sinal/correlation.{type Correlation}
@@ -78,7 +81,34 @@ pub type JobSummary {
     finished_at: Option(Timestamp),
     description: Option(String),
     correlation: Option(Correlation),
+    /// The settlement mark of a job an abandoned attempt left uncertain, or
+    /// `None` when no attempt of the job was ever held that way.
+    settlement: Option(SettlementMark),
   )
+}
+
+/// The settlement mark of a job that an abandoned attempt left uncertain
+/// (see `grind/worker.with_settlement`). Read it with `mark_attempt_id`,
+/// `mark_due_at` and `mark_tries`.
+pub opaque type SettlementMark {
+  SettlementMark(attempt_id: Int, due_at: Option(Timestamp), tries: Int)
+}
+
+/// The abandoned attempt the mark names.
+pub fn mark_attempt_id(mark: SettlementMark) -> Int {
+  mark.attempt_id
+}
+
+/// When a settler next takes the job, or `None` once the mark ended: its
+/// decision committed, it declined the job, or the job left uncertainty. A
+/// mark only counts while the job is uncertain and still holds its attempt.
+pub fn mark_due_at(mark: SettlementMark) -> Option(Timestamp) {
+  mark.due_at
+}
+
+/// How many settlement tries were taken for the attempt.
+pub fn mark_tries(mark: SettlementMark) -> Int {
+  mark.tries
 }
 
 pub type Error {
@@ -277,6 +307,7 @@ pub fn list(grind: Grind, query: Query) -> Result(List(JobSummary), Error) {
         finished_at_us:,
         failure_description:,
         correlation:,
+        settlement:,
       ) = row
       JobSummary(
         id:,
@@ -293,6 +324,14 @@ pub fn list(grind: Grind, query: Query) -> Result(List(JobSummary), Error) {
         finished_at: option.map(finished_at_us, from_unix_us),
         description: failure_description,
         correlation: option.map(correlation, correlation.from_key),
+        settlement: option.map(settlement, fn(mark) {
+          let #(attempt_id, due_at_us, tries) = mark
+          SettlementMark(
+            attempt_id:,
+            due_at: option.map(due_at_us, from_unix_us),
+            tries:,
+          )
+        }),
       )
     })
   })
@@ -333,6 +372,69 @@ pub fn quarantine_expired(
           postgres.QuarantineQueryFailed(reason) -> Unavailable(reason)
         }
       })
+  }
+}
+
+/// Runs the declared settlements of up to `limit` (at most 10,000) due jobs
+/// of `queue`, one try each, on this node, and returns how many tries ran.
+/// A consumer that polls on its own does this once per poll interval; call
+/// it where consumers are polled by hand or not at all (`without_consumers`,
+/// `testing.drain`). It first marks the jobs of `queue` a node of the
+/// previous release held uncertain without a mark. Read each job's outcome
+/// or `list` afterwards: a try can fail and leave the job due later. A queue
+/// with no worker on this node, or none that declares a settlement, runs no
+/// try.
+pub fn settle_due(
+  grind: Grind,
+  queue queue: String,
+  limit limit: Int,
+) -> Result(Int, Error) {
+  use #(database, plan) <- result.try(
+    runtime.lookup(grind)
+    |> result.replace_error(NotRunning)
+    |> result.map(fn(running) {
+      #(
+        running.database,
+        list.find(running.plans, fn(plan) { plan.name == queue }),
+      )
+    }),
+  )
+  case limit > 0 && limit <= postgres.list_limit_maximum, plan {
+    False, _ ->
+      Error(InvalidLimit(limit:, maximum: postgres.list_limit_maximum))
+    True, Error(Nil) -> Ok(0)
+    True, Ok(plan) -> {
+      use _ <- result.try(
+        settlement.recognise_unmarked(database, plan.workers)
+        |> result.map_error(Unavailable),
+      )
+      settle_tries(
+        database,
+        plan.workers,
+        consumer.lease_duration_ms(plan.policy),
+        limit,
+        0,
+      )
+    }
+  }
+}
+
+fn settle_tries(
+  database: postgres.Database,
+  workers: registry.Registry,
+  lease_ms: Int,
+  remaining: Int,
+  tried: Int,
+) -> Result(Int, Error) {
+  case remaining {
+    0 -> Ok(tried)
+    _ ->
+      case settlement.settle_next(database, workers, lease_ms) {
+        Error(error) -> Error(Unavailable(error))
+        Ok(settlement.NothingDue) -> Ok(tried)
+        Ok(_) ->
+          settle_tries(database, workers, lease_ms, remaining - 1, tried + 1)
+      }
   }
 }
 

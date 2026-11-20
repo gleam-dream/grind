@@ -200,6 +200,11 @@ pub opaque type ValidatedPolicy {
   )
 }
 
+/// The attempt lease, in milliseconds.
+pub fn lease_duration_ms(policy: ValidatedPolicy) -> Int {
+  policy.lease_duration_ms
+}
+
 /// Validates the policy before a queue actor is started.
 pub fn validate_policy(
   policy: QueuePolicy,
