@@ -17,14 +17,19 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import grind/internal/diagnostics
+import grind/internal/events
 import grind/internal/job.{type State}
 import grind/internal/postgres.{type Database}
 import grind/internal/postgres/resolution
+import grind/internal/postgres/resolution_queries.{type ResolutionCommand}
 import grind/internal/postgres/resolution_transaction
 import grind/internal/registry.{type Registry}
 import grind/internal/settlement/declared
 import grind/internal/store
+import grind/telemetry
 import pog
+import sinal/forwarder
 
 /// What one call of `settle_next` did.
 pub type Outcome {
@@ -65,7 +70,15 @@ pub type TryFailure {
 /// The take: one due job, its due time moved by one lease doubling per try
 /// up to the larger of one hour and one lease, its try counted.
 type Taken {
-  Taken(job_id: Int, worker_id: String, worker_version: String, attempt_id: Int)
+  Taken(
+    job_id: Int,
+    queue: String,
+    worker_id: String,
+    worker_version: String,
+    attempt_id: Int,
+    settlement_try: Int,
+    correlation: Option(String),
+  )
 }
 
 const retry_cap_ms = 3_600_000
@@ -146,7 +159,7 @@ fn take(
   lease_ms: Int,
 ) -> Result(Option(Taken), pog.QueryError) {
   pog.query(
-    "UPDATE grind_jobs AS job SET settle_at = clock_timestamp() + make_interval(secs => GREATEST(LEAST($4::float8 * power(2::float8, LEAST(job.settle_tries, 40)::float8), GREATEST($5::float8, $4::float8)), $4::float8) / 1000.0), settle_tries = job.settle_tries + 1 FROM (SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'uncertain' AND settle_at IS NOT NULL AND settle_attempt_id = attempt_id AND settle_at <= clock_timestamp() AND (worker_id, worker_version) IN (SELECT * FROM unnest($2::text[], $3::text[])) ORDER BY settle_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) AS candidate WHERE job.id = candidate.id RETURNING job.id, job.worker_id, job.worker_version, job.settle_attempt_id",
+    "UPDATE grind_jobs AS job SET settle_at = clock_timestamp() + make_interval(secs => GREATEST(LEAST($4::float8 * power(2::float8, LEAST(job.settle_tries, 40)::float8), GREATEST($5::float8, $4::float8)), $4::float8) / 1000.0), settle_tries = job.settle_tries + 1 FROM (SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'uncertain' AND settle_at IS NOT NULL AND settle_attempt_id = attempt_id AND settle_at <= clock_timestamp() AND (worker_id, worker_version) IN (SELECT * FROM unnest($2::text[], $3::text[])) ORDER BY settle_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) AS candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.settle_attempt_id, job.settle_tries, job.correlation",
   )
   |> pog.parameter(pog.text(queue))
   |> identities(settling)
@@ -154,10 +167,21 @@ fn take(
   |> pog.parameter(pog.int(retry_cap_ms))
   |> pog.returning({
     use job_id <- decode.field(0, decode.int)
-    use worker_id <- decode.field(1, decode.string)
-    use worker_version <- decode.field(2, decode.string)
-    use attempt_id <- decode.field(3, decode.int)
-    decode.success(Taken(job_id:, worker_id:, worker_version:, attempt_id:))
+    use queue <- decode.field(1, decode.string)
+    use worker_id <- decode.field(2, decode.string)
+    use worker_version <- decode.field(3, decode.string)
+    use attempt_id <- decode.field(4, decode.int)
+    use settlement_try <- decode.field(5, decode.int)
+    use correlation <- decode.field(6, decode.optional(decode.string))
+    decode.success(Taken(
+      job_id:,
+      queue:,
+      worker_id:,
+      worker_version:,
+      attempt_id:,
+      settlement_try:,
+      correlation:,
+    ))
   })
   |> store.execute_safely(on: postgres.connection(database))
   |> result.map(fn(returned) {
@@ -171,6 +195,75 @@ fn take(
 /// Runs the try in a process linked to the caller, so the try ends with
 /// it, and ends a try that outlives the storage deadline.
 fn run_try(
+  database: Database,
+  taken: Taken,
+  settle: declared.Settle,
+) -> Outcome {
+  let started_us = diagnostics.monotonic_us()
+  let outcome = run_linked_try(database, taken, settle)
+  observe(database, taken, outcome, diagnostics.monotonic_us() - started_us)
+  outcome
+}
+
+/// `[grind, diagnostic, settlement]` for a try that applied no decision; an
+/// applied decision was reported as `[grind, job, resolved]`.
+fn observe(
+  database: Database,
+  taken: Taken,
+  outcome: Outcome,
+  duration_us: Int,
+) -> Nil {
+  let reported = case outcome {
+    NothingDue | Settled(..) -> None
+    Declined(_) -> Some(#(telemetry.SettlementDeclined, None))
+    CommitUnknown(_) -> Some(#(telemetry.SettlementCommitUnknown, None))
+    TryFailed(_, failure) ->
+      Some(#(telemetry.SettlementFailed, Some(failure_kind(failure))))
+  }
+  case reported {
+    None -> Nil
+    Some(#(kind, failure)) -> {
+      let _ =
+        forwarder.emit(
+          postgres.forwarder(database),
+          telemetry.settlement(),
+          telemetry.SettlementMeasurements(
+            count: 1,
+            settlement_try: taken.settlement_try,
+            duration_us:,
+          ),
+          telemetry.SettlementMetadata(
+            ref: telemetry.JobRef(
+              job_id: taken.job_id,
+              queue: taken.queue,
+              worker_id: taken.worker_id,
+              worker_version: taken.worker_version,
+              correlation: events.correlation(taken.job_id, taken.correlation),
+            ),
+            attempt_id: taken.attempt_id,
+            outcome: kind,
+            failure:,
+          ),
+        )
+      Nil
+    }
+  }
+}
+
+fn failure_kind(failure: TryFailure) -> telemetry.SettlementFailure {
+  case failure {
+    FunctionFailed(_) -> telemetry.SettlementFunctionFailed
+    FunctionCrashed(_) -> telemetry.SettlementFunctionCrashed
+    FunctionTimedOut -> telemetry.SettlementFunctionTimedOut
+    TransactionEnded -> telemetry.SettlementTransactionEnded
+    Refused(_) -> telemetry.SettlementDecisionRefused
+    Undecodable(_) -> telemetry.SettlementInputUndecodable
+    NoLongerDue -> telemetry.SettlementNoLongerDue
+    StorageFailed(_) -> telemetry.SettlementStorageFailed
+  }
+}
+
+fn run_linked_try(
   database: Database,
   taken: Taken,
   settle: declared.Settle,
@@ -208,7 +301,7 @@ type Locked {
 }
 
 type Commit {
-  CommitResolved(State)
+  CommitResolved(State, ResolutionCommand)
   CommitDeclined
 }
 
@@ -264,7 +357,7 @@ fn try_once(
             |> result.map_error(fn(error) { Refused(string.inspect(error)) }),
           )
           use Nil <- result.map(end_mark(transaction, job_id, attempt_id, None))
-          CommitResolved(state)
+          CommitResolved(state, command)
         }
         declared.Leave(reason) ->
           end_mark(transaction, job_id, attempt_id, Some(reason))
@@ -272,7 +365,15 @@ fn try_once(
       }
     })
   case outcome {
-    Ok(CommitResolved(state)) -> Settled(job_id, state)
+    Ok(CommitResolved(state, command)) -> {
+      resolution.emit_settled(
+        postgres.forwarder(database),
+        events.correlation(job_id, taken.correlation),
+        command,
+        state,
+      )
+      Settled(job_id, state)
+    }
     Ok(CommitDeclined) -> Declined(job_id)
     Error(pog.TransactionRolledBack(failure)) -> TryFailed(job_id, failure)
     Error(pog.TransactionQueryError(_)) -> CommitUnknown(job_id)

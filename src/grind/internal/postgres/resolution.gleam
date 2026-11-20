@@ -115,7 +115,44 @@ pub fn resolve_uncertain(
 /// (`Replied`); `ResolutionAlreadyApplied` is a prior commit of this exact
 /// `resolution_id` proven by a receipt read (`Reconciled`) — see
 /// `resolution_receipt_outcome`.
-pub fn emit_resolved(
+/// `[grind, job, resolved]` for a declared settlement's resolution, after
+/// the settlement's transaction committed with this call's reply.
+pub fn emit_settled(
+  fwd: Forwarder,
+  correlation: Correlation,
+  command: ResolutionCommand,
+  committed_state: State,
+) -> Nil {
+  let ResolutionCommand(
+    decision:,
+    id:,
+    queue:,
+    worker_id:,
+    worker_version:,
+    resolution_id:,
+    resolved_by:,
+    ..,
+  ) = command
+  case resolution_decision_of_stored(decision) {
+    Error(Nil) -> Nil
+    Ok(decision) ->
+      emit_resolved(
+        fwd,
+        correlation,
+        queue,
+        id,
+        worker_id,
+        worker_version,
+        decision,
+        committed_state,
+        resolution_id,
+        resolved_by,
+        telemetry.Replied,
+      )
+  }
+}
+
+fn emit_resolved(
   fwd: Forwarder,
   correlation: Correlation,
   queue: String,

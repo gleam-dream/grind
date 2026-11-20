@@ -13,6 +13,7 @@ import gleam/erlang/process
 import gleam/otp/actor
 import gleam/otp/static_supervisor
 import gleam/otp/supervision
+import gleam/result
 import grind/internal/postgres.{type Database}
 import grind/internal/registry.{type Registry}
 import grind/internal/settlement
@@ -35,13 +36,10 @@ pub fn supervised(
   workers: Registry,
   lease_ms: Int,
   interval_ms: Int,
-  observe: fn(settlement.Outcome) -> Nil,
 ) -> supervision.ChildSpecification(static_supervisor.Supervisor) {
   static_supervisor.new(static_supervisor.OneForOne)
   |> static_supervisor.add(
-    supervision.worker(fn() {
-      start(database, workers, lease_ms, interval_ms, observe)
-    }),
+    supervision.worker(fn() { start(database, workers, lease_ms, interval_ms) }),
   )
   |> static_supervisor.supervised()
   |> supervision.restart(supervision.Transient)
@@ -52,22 +50,25 @@ fn start(
   workers: Registry,
   lease_ms: Int,
   interval_ms: Int,
-  observe: fn(settlement.Outcome) -> Nil,
 ) -> Result(actor.Started(process.Subject(Message)), actor.StartError) {
   actor.new_with_initialiser(1000, fn(self) {
-    // Jobs of the previous release first, so they join this look.
-    let _ = settlement.recognise_unmarked(database, workers)
     process.send(self, Look)
-    actor.initialised(self)
+    actor.initialised(#(self, False))
     |> actor.returning(self)
     |> Ok
   })
-  |> actor.on_message(fn(self, message) {
+  |> actor.on_message(fn(state, message) {
+    let #(self, recognised) = state
     case message {
       Look -> {
-        look(database, workers, lease_ms, observe, tries_per_look)
+        // Jobs a node of the previous release left unmarked first, until
+        // that succeeds once, so they join this look.
+        let recognised =
+          recognised
+          || settlement.recognise_unmarked(database, workers) |> result.is_ok
+        look(database, workers, lease_ms, tries_per_look)
         process.send_after(self, interval_ms, Look)
-        actor.continue(self)
+        actor.continue(#(self, recognised))
       }
     }
   })
@@ -81,7 +82,6 @@ fn look(
   database: Database,
   workers: Registry,
   lease_ms: Int,
-  observe: fn(settlement.Outcome) -> Nil,
   remaining: Int,
 ) -> Nil {
   case remaining > 0 {
@@ -89,10 +89,7 @@ fn look(
     True ->
       case settlement.settle_next(database, workers, lease_ms) {
         Error(_) | Ok(settlement.NothingDue) -> Nil
-        Ok(outcome) -> {
-          observe(outcome)
-          look(database, workers, lease_ms, observe, remaining - 1)
-        }
+        Ok(_) -> look(database, workers, lease_ms, remaining - 1)
       }
   }
 }

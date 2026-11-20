@@ -833,7 +833,6 @@ fn consumer_supervisor(
           workers,
           lease_duration_ms,
           interval_ms,
-          fn(_outcome) { Nil },
         ),
       )
     _, _ -> supervisor

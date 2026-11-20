@@ -16,8 +16,8 @@
 //// generated), and `JobMeasurements` with the node's monotonic time.
 //// `[grind, prune, completed]` and `[grind, prune, failed]` report one
 //// pruner batch. Diagnostic events, named `[grind, diagnostic, <event>]`,
-//// report renewal, acknowledgement, retry, checkout, claim-failure and
-//// capacity details; they do not imply a committed state.
+//// report renewal, acknowledgement, retry, checkout, claim-failure,
+//// capacity and settlement details; they do not imply a committed state.
 ////
 //// Events go through the runtime's bounded forwarder (1,024 in flight by
 //// default), so a slow handler never stalls a consumer. Delivery is
@@ -1015,6 +1015,124 @@ pub type CapacityMeasurements {
 /// Observed consumer draining state; this is not a global queue-depth sample.
 pub type CapacityMetadata {
   CapacityMetadata(queue: QueueRef, draining: Bool)
+}
+
+/// One settlement try of a job that an abandoned attempt left uncertain:
+/// which try it was for the abandoned attempt, from 1, and how long it ran
+/// in local microseconds.
+pub type SettlementMeasurements {
+  SettlementMeasurements(count: Int, settlement_try: Int, duration_us: Int)
+}
+
+/// What a settlement try did, when it did not apply a decision. An applied
+/// decision is reported as `[grind, job, resolved]` instead.
+pub type SettlementOutcome {
+  /// The settlement kept the job uncertain for an operator; its writes
+  /// committed.
+  SettlementDeclined
+  /// The try committed nothing; the job is due again later.
+  SettlementFailed
+  /// The try's commit reply was lost; the next try finds the job decided or
+  /// still due.
+  SettlementCommitUnknown
+}
+
+/// Why a settlement try committed nothing.
+pub type SettlementFailure {
+  SettlementFunctionFailed
+  SettlementFunctionCrashed
+  SettlementFunctionTimedOut
+  SettlementTransactionEnded
+  SettlementDecisionRefused
+  SettlementInputUndecodable
+  SettlementNoLongerDue
+  SettlementStorageFailed
+}
+
+/// `[grind, diagnostic, settlement]` metadata: the job, the abandoned
+/// attempt being settled, the outcome and, for a failed try, why.
+pub type SettlementMetadata {
+  SettlementMetadata(
+    ref: JobRef,
+    attempt_id: Int,
+    outcome: SettlementOutcome,
+    failure: Option(SettlementFailure),
+  )
+}
+
+/// `[grind, diagnostic, settlement]`.
+pub fn settlement() -> Event(SettlementMeasurements, SettlementMetadata) {
+  sinal.event(
+    ["grind", "diagnostic", "settlement"],
+    settlement_measurements_fields(),
+    settlement_metadata_fields(),
+  )
+}
+
+fn settlement_measurements_fields() -> fields.Fields(SettlementMeasurements) {
+  use count <- fields.include(fields.int("count"), get: fn(m) { m.count })
+  use settlement_try <- fields.include(
+    fields.int("settlement_try"),
+    get: fn(m: SettlementMeasurements) { m.settlement_try },
+  )
+  use duration_us <- fields.include(fields.int("duration_us"), get: fn(m) {
+    m.duration_us
+  })
+  fields.success(SettlementMeasurements(count:, settlement_try:, duration_us:))
+}
+
+fn settlement_metadata_fields() -> fields.Fields(SettlementMetadata) {
+  use ref <- fields.include(job_ref_fields(), get: fn(m: SettlementMetadata) {
+    m.ref
+  })
+  use attempt_id <- fields.include(fields.int("attempt_id"), get: fn(m) {
+    m.attempt_id
+  })
+  use outcome <- fields.include(
+    fields.enum(
+      "outcome",
+      [SettlementDeclined, SettlementFailed, SettlementCommitUnknown],
+      fn(outcome) {
+        case outcome {
+          SettlementDeclined -> "declined"
+          SettlementFailed -> "failed"
+          SettlementCommitUnknown -> "commit_unknown"
+        }
+      },
+    ),
+    get: fn(m) { m.outcome },
+  )
+  use failure <- fields.include(
+    fields.optional(
+      fields.enum(
+        "failure",
+        [
+          SettlementFunctionFailed,
+          SettlementFunctionCrashed,
+          SettlementFunctionTimedOut,
+          SettlementTransactionEnded,
+          SettlementDecisionRefused,
+          SettlementInputUndecodable,
+          SettlementNoLongerDue,
+          SettlementStorageFailed,
+        ],
+        fn(failure) {
+          case failure {
+            SettlementFunctionFailed -> "function_failed"
+            SettlementFunctionCrashed -> "function_crashed"
+            SettlementFunctionTimedOut -> "function_timed_out"
+            SettlementTransactionEnded -> "transaction_ended"
+            SettlementDecisionRefused -> "decision_refused"
+            SettlementInputUndecodable -> "input_undecodable"
+            SettlementNoLongerDue -> "no_longer_due"
+            SettlementStorageFailed -> "storage_failed"
+          }
+        },
+      ),
+    ),
+    get: fn(m) { m.failure },
+  )
+  fields.success(SettlementMetadata(ref:, attempt_id:, outcome:, failure:))
 }
 
 /// `[grind, diagnostic, renewal]`.
