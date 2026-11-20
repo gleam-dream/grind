@@ -243,10 +243,10 @@ fn run_schema_marker_rejection_test(database_url: String) -> Nil {
     pog.query("DELETE FROM grind_schema_migrations")
     |> pog.execute(on: connection)
   let assert Ok(_) =
-    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (14)")
+    pog.query("INSERT INTO grind_schema_migrations (version) VALUES (15)")
     |> pog.execute(on: connection)
   postgres.migrate(database)
-  |> should.equal(Error(postgres.UnsupportedSchemaVersion(14)))
+  |> should.equal(Error(postgres.UnsupportedSchemaVersion(15)))
 
   let assert Ok(_) =
     pog.query("DELETE FROM grind_schema_migrations")

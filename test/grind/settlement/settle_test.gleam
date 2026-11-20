@@ -20,6 +20,7 @@ import grind/internal/worker as definition
 import grind/support/env.{
   mark_database_test_executed, queue_database_url, unique_test_run_id,
 }
+import grind/support/syncrep
 import grind/worker
 import pog
 
@@ -214,7 +215,7 @@ pub fn postgres_late_acknowledgement_cannot_contradict_the_settlement_test() {
     settlement.settle_next(database, registry_of(name, agent), lease_ms)
 
   // The abandoned attempt's process returns and acknowledges success.
-  let _ =
+  let assert Error(_) =
     attempt.acknowledge(
       database,
       name,
@@ -355,7 +356,14 @@ pub fn postgres_hanging_function_is_ended_at_the_deadline_test() {
         settlement.settle_next(database, registry_of(name, agent), lease_ms)
 
       postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
-      // The settler outlived the try and the job's row is free again.
+      // The killed try holds no lock on the job's row.
+      let assert Ok(_) =
+        pog.transaction(postgres.connection(database), fn(transaction) {
+          pog.query("SELECT id FROM grind_jobs WHERE id = $1 FOR UPDATE NOWAIT")
+          |> pog.parameter(pog.int(job.id_value(handle)))
+          |> pog.execute(on: transaction)
+        })
+      // The settler outlived the try.
       let assert Ok(_) =
         postgres.resolve_uncertain(
           database,
@@ -407,6 +415,72 @@ pub fn postgres_settler_start_marks_jobs_left_unmarked_test() {
   settlement.recognise_unmarked(database, registry_of(name, agent))
   |> should.equal(Ok(0))
   mark_database_test_executed("settlement-recognises-unmarked")
+}
+
+pub fn postgres_commit_cut_at_the_deadline_is_unknown_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let assert Ok(validated) =
+        postgres.settings(url)
+        |> postgres.with_statement_deadline(1500)
+        |> postgres.with_unique_lock_wait(100)
+        |> postgres.validate
+      let assert Ok(database) = postgres.start(validated)
+      use <- exception.defer(fn() { postgres.close(database) })
+      let assert Ok(Nil) = postgres.migrate(database)
+      let name = queue_name("settle-commit-cut")
+      let agent =
+        agent_worker(name, fn(transaction, _abandoned) {
+          // This transaction's COMMIT waits for a standby that never
+          // exists, so its reply never arrives before the deadline.
+          let assert Ok(_) =
+            pog.query("SET LOCAL synchronous_commit = on")
+            |> pog.execute(on: transaction)
+          Ok(worker.ConfirmFailure("settled"))
+        })
+      let assert Ok(handle) =
+        postgres.submit(database, name, agent, "read inbox")
+      let _ = abandon(database, name, agent)
+
+      let assert Ok(settlement.CommitUnknown(job_id)) =
+        settlement.settle_next(database, registry_of(name, agent), lease_ms)
+
+      job_id |> should.equal(job.id_value(handle))
+      let connection = postgres.connection(database)
+      let assert Ok(parked) =
+        syncrep.wait_for_syncrep_trigger_backend(connection, 200)
+      let _ = syncrep.terminate_backend(connection, parked)
+      let assert Ok(Nil) =
+        syncrep.wait_for_backend_gone(connection, parked, 500)
+      // The commit was written locally before it waited: the decision
+      // stands, and the next take finds nothing due.
+      postgres.state(database, handle) |> should.equal(Ok(job.BusinessFailed))
+      settlement.settle_next(database, registry_of(name, agent), lease_ms)
+      |> should.equal(Ok(settlement.NothingDue))
+      mark_database_test_executed("settlement-commit-cut-unknown")
+    }
+  }
+}
+
+pub fn postgres_function_that_swallows_a_failed_statement_failed_test() {
+  use database <- with_database()
+  let name = queue_name("settle-aborted")
+  let agent =
+    agent_worker(name, fn(transaction, _abandoned) {
+      let _ =
+        pog.query("SELECT no_such_column FROM pg_class")
+        |> pog.execute(on: transaction)
+      Ok(worker.ConfirmFailure("never applied"))
+    })
+  let assert Ok(handle) = postgres.submit(database, name, agent, "read inbox")
+  let _ = abandon(database, name, agent)
+
+  let assert Ok(settlement.TryFailed(_, settlement.FunctionFailed(_))) =
+    settlement.settle_next(database, registry_of(name, agent), lease_ms)
+
+  postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
+  mark_database_test_executed("settlement-aborted-transaction-function-failed")
 }
 
 // -- Support -----------------------------------------------------------------

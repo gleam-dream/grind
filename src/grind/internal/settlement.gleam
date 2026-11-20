@@ -269,9 +269,10 @@ fn run_linked_try(
   settle: declared.Settle,
 ) -> Outcome {
   let reply = process.new_subject()
+  let committing = process.new_subject()
   let pid =
     process.spawn(fn() {
-      process.send(reply, try_once(database, taken, settle))
+      process.send(reply, try_once(database, taken, settle, committing))
     })
   let deadline_ms = postgres.statement_deadline_ms(database) + 1000
   case process.receive(reply, within: deadline_ms) {
@@ -279,7 +280,10 @@ fn run_linked_try(
     Error(Nil) -> {
       process.unlink(pid)
       process.kill(pid)
-      TryFailed(taken.job_id, FunctionTimedOut)
+      case process.receive(committing, within: 0) {
+        Ok(Nil) -> CommitUnknown(taken.job_id)
+        Error(Nil) -> TryFailed(taken.job_id, FunctionTimedOut)
+      }
     }
   }
 }
@@ -309,6 +313,7 @@ fn try_once(
   database: Database,
   taken: Taken,
   settle: declared.Settle,
+  committing: process.Subject(Nil),
 ) -> Outcome {
   let Taken(job_id:, attempt_id:, ..) = taken
   let installation = postgres.installation(database)
@@ -350,7 +355,7 @@ fn try_once(
         deadline_ms,
         locked.transaction_id,
       ))
-      case decided {
+      let commit = case decided {
         declared.Resolve(command) -> {
           use state <- result.try(
             resolution.apply_fresh_in(transaction, command)
@@ -363,6 +368,13 @@ fn try_once(
           end_mark(transaction, job_id, attempt_id, Some(reason))
           |> result.replace(CommitDeclined)
       }
+      // From here COMMIT may be sent: a try ended after this point has an
+      // unknown outcome, not a failed one.
+      case commit {
+        Ok(_) -> process.send(committing, Nil)
+        Error(_) -> Nil
+      }
+      commit
     })
   case outcome {
     Ok(CommitResolved(state, command)) -> {
@@ -455,7 +467,17 @@ fn enter_grind(
     pog.query("SELECT pg_current_xact_id()::text")
     |> pog.returning(decode.field(0, decode.string, decode.success))
     |> store.execute_safely(on: transaction)
-    |> result.map_error(fn(_) { TransactionEnded }),
+    |> result.map_error(fn(error) {
+      case error {
+        // A failed statement of the function aborted the transaction and
+        // the function went on as if it had not.
+        pog.PostgresqlError(code: "25P02", ..) ->
+          FunctionFailed(
+            "a failed statement aborted the settlement transaction",
+          )
+        _ -> TransactionEnded
+      }
+    }),
   )
   use Nil <- result.try(case current.rows {
     [id] if id == transaction_id -> Ok(Nil)

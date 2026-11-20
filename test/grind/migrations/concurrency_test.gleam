@@ -232,9 +232,9 @@ fn migration_lock_url() -> Result(String, Nil)
 /// the pool's shared `set_deadline`-attached one. This characterizes a
 /// mutation: a step run under the pool's shared deadline instead
 /// of its own times out at ~4s instead of succeeding at ~6s.
-fn synthetic_v14_slow_migration() -> migrations.Migration {
+fn synthetic_v15_slow_migration() -> migrations.Migration {
   migrations.Migration(
-    14,
+    15,
     [
       // `pg_types` cannot decode a bare `void` result (`pg_sleep`'s own
       // return type — see `grind/internal/unique_admission`'s identical
@@ -242,7 +242,7 @@ fn synthetic_v14_slow_migration() -> migrations.Migration {
       // its own doc comment for the full driver note), so the sleep is
       // wrapped in an outer scalar `SELECT` rather than selected directly.
       "SELECT true FROM (SELECT pg_sleep(6)) AS grind_migration_deadline_probe",
-      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (15)",
     ],
     latest_migration().shape,
     latest_migration().foreign_keys,
@@ -265,7 +265,7 @@ fn run_migration_deadline_long_step_test(database_url: String) -> Nil {
   let assert Ok(database) = postgres.start(validated)
   use <- exception.defer(fn() { postgres.close(database) })
   let steps =
-    list.append(migrations.migrations(), [synthetic_v14_slow_migration()])
+    list.append(migrations.migrations(), [synthetic_v15_slow_migration()])
   let start_ms = monotonic_ms()
   postgres.migrate_with(database, steps) |> should.equal(Ok(Nil))
   let elapsed_ms = monotonic_ms() - start_ms
@@ -278,10 +278,10 @@ fn run_migration_deadline_long_step_test(database_url: String) -> Nil {
 
 fn migration_lock_timeout_probe_migration() -> migrations.Migration {
   migrations.Migration(
-    14,
+    15,
     [
       "ALTER TABLE grind_jobs ADD COLUMN grind_lock_timeout_probe text",
-      "INSERT INTO grind_schema_migrations (version) VALUES (14)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (15)",
     ],
     latest_migration().shape,
     latest_migration().foreign_keys,
