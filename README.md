@@ -131,6 +131,56 @@ flowchart LR
 
 Queue concurrency is local to each node. Budget one dedicated renewal connection per used queue in addition to the main pool. The application owns external effects; a committed job outcome records Grind's view of the handler result, not an atomic transaction with a provider.
 
+## What each job copies
+
+BEAM processes share no heap, so a value sent to another process is copied in full. Grind runs each job's handler in its own processes, and the claimed job carries the worker's handler closure: your `perform` or `handle` function and everything it captures. That closure is copied three times per job: from the coordinator to the attempt supervisor, into the attempt actor, and into the handler process. The attempt actor and the handler each hold their copy while the job runs. A worker that captures 1 MB therefore costs about 3 MB of copying per job and 2 MB of heap per running job. Grind copies only the worker that runs the job, never the other registered workers. The input and output travel as encoded JSON strings; the runtime shares a string over 64 bytes by reference instead of copying it.
+
+Keep the worker value small:
+
+- Capture small references, such as an id, a process name or a pool name, not an environment record that holds catalogues, agents, codecs or clients.
+- Keep static data in module constants or behind a handle such as a `persistent_term` key. Gleam inlines a constant where it is used, so a handler that refers to one captures nothing.
+- Build codecs as the [json_blueprint codec guide](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md) describes, on json_blueprint 2.1.1 or later.
+- Bound the worker value in a test. The Erlang helper returns `erts_debug:flat_size(Term) * erlang:system_info(wordsize)`, the bytes one copy takes:
+
+<!-- prettier-ignore-start -->
+
+<!-- snips: examples/usage/src/grind_usage/copy_cost.gleam#copy-cost -->
+```gleam
+/// Static data lives in a module constant. Gleam inlines a constant where
+/// it is used, so the handler below captures nothing and the runtime does
+/// not copy the table with each job.
+const vat_percent = [#("DE", 19), #("ES", 21), #("FR", 20), #("PT", 23)]
+
+pub fn pricing() -> worker.Worker(Order, Int, Nil) {
+  worker.new(
+    "pricing.total",
+    input: order_codec(),
+    output: worker.codec(worker.infallible(json.int), decode.int),
+    perform: fn(order) {
+      case list.key_find(vat_percent, order.country) {
+        Ok(percent) -> Ok(order.cents * { 100 + percent } / 100)
+        Error(Nil) -> Ok(order.cents)
+      }
+    },
+  )
+}
+
+@external(erlang, "grind_usage_copy_size", "flat_bytes")
+fn flat_bytes(term: a) -> Int
+
+/// Bound the worker value in a test, so a later capture of a large value
+/// fails here instead of in production memory.
+pub fn worker_stays_small() -> Nil {
+  let assert True = flat_bytes(pricing()) < 4096
+  Nil
+}
+
+```
+
+<!-- prettier-ignore-end -->
+
+`erts_debug:flat_size` also counts a module constant captured through a variable, which the runtime does not copy. Refer to the constant inside the handler, as above, and the measurement matches the copy.
+
 ## Enqueue with an application write
 
 `grind.submit_in` stages admission in the caller's open `READ COMMITTED` transaction on the same database. The job commits or rolls back with the application write. Its reply is staged admission, not proof that the outer transaction committed.

@@ -8,6 +8,7 @@
 //// one as the answer to "how do I ...".
 
 import gleam/io
+import grind_usage/copy_cost
 import grind_usage/handler_testing
 import grind_usage/handlers
 import grind_usage/isolation
@@ -26,6 +27,7 @@ import grind_usage/workers
 pub fn main() -> Nil {
   limits.run()
   handler_testing.offline()
+  copy_cost.offline()
   case support.database_url() {
     Error(Nil) ->
       io.println(

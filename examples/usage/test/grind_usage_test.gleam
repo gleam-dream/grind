@@ -3,6 +3,7 @@
 //// `GRIND_USAGE_DATABASE_URL`; the full database gate sets it.
 
 import gleeunit
+import grind_usage/copy_cost
 import grind_usage/handler_testing
 import grind_usage/handlers
 import grind_usage/isolation
@@ -35,6 +36,10 @@ pub fn limits_test() {
 
 pub fn handler_testing_offline_test() {
   handler_testing.offline()
+}
+
+pub fn copy_cost_test() {
+  copy_cost.offline()
 }
 
 pub fn workers_test() {
