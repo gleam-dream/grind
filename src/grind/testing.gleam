@@ -25,7 +25,6 @@
 
 import gleam/erlang/process
 import gleam/int
-import gleam/list
 import gleam/option.{None}
 import gleam/result
 import gleam/string
@@ -181,26 +180,23 @@ type DrainMessage {
 
 /// Claims and runs up to `limit` due jobs from `queue`, one at a time, and
 /// returns how many ran. Stops early when no job is due. Fails with
-/// `DrainTimedOut` when `within` elapses first.
+/// `DrainTimedOut` when `within` elapses first. Each call copies the
+/// queue's registered workers, and only that queue's, into this process.
 pub fn drain(
   grind: Grind,
   queue queue: String,
   limit limit: Int,
   within within: Duration,
 ) -> Result(Int, DrainError) {
-  use runtime <- result.try(
-    runtime.lookup(grind) |> result.replace_error(DrainNotRunning),
+  // Only this queue's workers are copied here; the drain runs them.
+  use runtime.QueueLookup(database:, plan:) <- result.try(
+    runtime.queue(grind, queue) |> result.replace_error(DrainNotRunning),
   )
-  use plan <- result.try(
-    list.find(runtime.plans, fn(plan) { plan.name == queue })
-    |> result.replace_error(UnknownQueue(queue)),
-  )
+  use plan <- result.try(plan |> option.to_result(UnknownQueue(queue)))
   let reply = process.new_subject()
   let runner =
     process.spawn_unlinked(fn() {
-      let outcome = case
-        consumer.start(runtime.database, plan.workers, plan.manual)
-      {
+      let outcome = case consumer.start(database, plan.workers, plan.manual) {
         Error(error) -> Error(string.inspect(error))
         Ok(started) -> {
           let outcome = drain_loop(started, reply, limit)

@@ -683,21 +683,21 @@ pub type StopError {
 /// stops claiming and waits up to its grace for running jobs, then every
 /// process stops, the pool last.
 pub fn stop(grind: Grind) -> Result(StopOutcome, StopError) {
-  case runtime.lookup(grind) {
+  case runtime.stop_plan(grind) {
     Error(Nil) -> Error(NotStarted)
-    Ok(runtime.Runtime(supervised: True, ..)) -> Error(OwnedBySupervisor)
-    Ok(runtime.Runtime(root:, queues:, ..)) -> {
+    Ok(runtime.StopPlan(supervised: True, ..)) -> Error(OwnedBySupervisor)
+    Ok(runtime.StopPlan(root:, coordinators:, ..)) -> {
       let reply = process.new_subject()
-      list.each(queues, fn(entry) {
-        let #(plan, coordinator) = entry
+      list.each(coordinators, fn(entry) {
+        let #(coordinator, grace_ms) = entry
         process.spawn(fn() {
-          process.send(reply, consumer.drain(coordinator, plan.grace_ms))
+          process.send(reply, consumer.drain(coordinator, grace_ms))
         })
       })
       let active =
-        list.fold(queues, 0, fn(total, entry) {
-          let #(plan, _) = entry
-          case process.receive(reply, within: plan.grace_ms + 2000) {
+        list.fold(coordinators, 0, fn(total, entry) {
+          let #(_, grace_ms) = entry
+          case process.receive(reply, within: grace_ms + 2000) {
             Ok(consumer.DrainedWithActiveWork(active)) -> total + active
             _ -> total
           }

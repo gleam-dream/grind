@@ -377,7 +377,8 @@ pub fn quarantine_expired(
 
 /// Runs the declared settlements of up to `limit` (at most 10,000) due jobs
 /// of `queue`, one try each and each job at most once, on this node, and
-/// returns how many tries ran.
+/// returns how many tries ran. Each call copies the queue's registered
+/// workers, and only that queue's, into this process to run them.
 /// A consumer that polls on its own does this once per poll interval; call
 /// it where consumers are polled by hand or not at all (`without_consumers`,
 /// `testing.drain`). It first marks the jobs of `queue` a node of the
@@ -390,21 +391,15 @@ pub fn settle_due(
   queue queue: String,
   limit limit: Int,
 ) -> Result(Int, Error) {
-  use #(database, plan) <- result.try(
-    runtime.lookup(grind)
-    |> result.replace_error(NotRunning)
-    |> result.map(fn(running) {
-      #(
-        running.database,
-        list.find(running.plans, fn(plan) { plan.name == queue }),
-      )
-    }),
+  // Only this queue's workers are copied here, to run their settlements.
+  use runtime.QueueLookup(database:, plan:) <- result.try(
+    runtime.queue(grind, queue) |> result.replace_error(NotRunning),
   )
   case limit > 0 && limit <= postgres.list_limit_maximum, plan {
     False, _ ->
       Error(InvalidLimit(limit:, maximum: postgres.list_limit_maximum))
-    True, Error(Nil) -> Ok(0)
-    True, Ok(plan) -> {
+    True, None -> Ok(0)
+    True, Some(plan) -> {
       use _ <- result.try(
         settlement.recognise_unmarked(database, plan.workers)
         |> result.map_error(Unavailable),

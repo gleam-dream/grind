@@ -1,9 +1,14 @@
 //// A Grind runtime's registered state: the `Database` its consumers and the
 //// facade use, found by the runtime's name.
+////
+//// A reply is copied into the process that asks, so each request returns
+//// only what its caller needs. The queue plans hold every registered
+//// worker; they stay in this process, and only `queue` hands one plan out.
 
 import exception
 import gleam/erlang/process
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision
@@ -20,7 +25,24 @@ pub type Grind {
 }
 
 pub opaque type Message {
-  GetRuntime(reply: process.Subject(Runtime))
+  GetDatabase(reply: process.Subject(postgres.Database))
+  GetStopPlan(reply: process.Subject(StopPlan))
+  GetQueue(queue: String, reply: process.Subject(QueueLookup))
+}
+
+/// What `grind.stop` needs: the root supervisor and each consumed queue's
+/// coordinator with its grace, without the queue's workers.
+pub type StopPlan {
+  StopPlan(
+    root: process.Pid,
+    supervised: Bool,
+    coordinators: List(#(process.Name(consumer.Message), Int)),
+  )
+}
+
+/// The database with one queue's plan, when a node's worker uses that queue.
+pub type QueueLookup {
+  QueueLookup(database: postgres.Database, plan: Option(QueuePlan))
 }
 
 /// One queue a node runs: its registry and validated consumer policies.
@@ -125,8 +147,25 @@ pub fn child(
     |> actor.named(name)
     |> actor.on_message(fn(state, message) {
       case message {
-        GetRuntime(reply) -> {
-          process.send(reply, state)
+        GetDatabase(reply) -> {
+          process.send(reply, state.database)
+          actor.continue(state)
+        }
+        GetStopPlan(reply) -> {
+          let Runtime(root:, supervised:, queues:, ..) = state
+          let coordinators =
+            list.map(queues, fn(entry) {
+              let #(plan, coordinator) = entry
+              #(coordinator, plan.grace_ms)
+            })
+          process.send(reply, StopPlan(root:, supervised:, coordinators:))
+          actor.continue(state)
+        }
+        GetQueue(queue, reply) -> {
+          let plan =
+            list.find(state.plans, fn(plan) { plan.name == queue })
+            |> option.from_result
+          process.send(reply, QueueLookup(database: state.database, plan:))
           actor.continue(state)
         }
       }
@@ -179,9 +218,28 @@ pub fn describe_schema_behind(found: Option(Int), required: Int) -> String {
   <> "; configure grind.with_startup_migration, or run grind.migrate from a runtime without consumers (or apply priv/migrations) before starting this one"
 }
 
-/// The running runtime's state, or `Error(Nil)` when none is registered
+/// The running runtime's database, or `Error(Nil)` when none is registered
 /// under the handle's name.
-pub fn lookup(grind: Grind) -> Result(Runtime, Nil) {
+pub fn database(grind: Grind) -> Result(postgres.Database, Nil) {
+  request(grind, GetDatabase)
+}
+
+/// What stopping the runtime needs, without any queue's workers.
+pub fn stop_plan(grind: Grind) -> Result(StopPlan, Nil) {
+  request(grind, GetStopPlan)
+}
+
+/// The database and the plan of `queue`. The plan carries that queue's
+/// workers, which are copied into the caller; use it only where the caller
+/// runs them.
+pub fn queue(grind: Grind, queue: String) -> Result(QueueLookup, Nil) {
+  request(grind, GetQueue(queue, _))
+}
+
+fn request(
+  grind: Grind,
+  make: fn(process.Subject(reply)) -> Message,
+) -> Result(reply, Nil) {
   case process.named(grind.name) {
     Error(Nil) -> Error(Nil)
     Ok(pid) -> {
@@ -189,7 +247,7 @@ pub fn lookup(grind: Grind) -> Result(Runtime, Nil) {
       let reply = process.new_subject()
       let sent =
         exception.rescue(fn() {
-          process.send(process.named_subject(grind.name), GetRuntime(reply))
+          process.send(process.named_subject(grind.name), make(reply))
         })
       let result = case sent {
         Error(_) -> Error(Nil)
@@ -204,11 +262,6 @@ pub fn lookup(grind: Grind) -> Result(Runtime, Nil) {
       result
     }
   }
-}
-
-/// The running runtime's database.
-pub fn database(grind: Grind) -> Result(postgres.Database, Nil) {
-  lookup(grind) |> result.map(fn(runtime) { runtime.database })
 }
 
 @external(erlang, "grind_runtime_ffi", "put_pool")
