@@ -33,9 +33,9 @@
 //// loses internal sharing, so each costs the closure's flat size. Capture
 //// small references, such as an id or a process name, and keep static data
 //// in module constants, which Gleam inlines and the runtime does not copy.
-//// Calls such as `grind.submit` and `grind.state` copy no worker into the
-//// calling process; `admin.settle_due` and `testing.drain` copy the
-//// workers of the queue they run.
+//// Calls such as `grind.submit`, `grind.state` and `testing.drain` copy no
+//// worker into the calling process; `admin.settle_due` copies the
+//// settlements of its queue's workers, each a closure over its definition.
 //// Bound the worker value in a test with
 //// `erts_debug:flat_size(Worker) * erlang:system_info(wordsize)`. The README
 //// section "What each job copies" has an example; for codecs built with
