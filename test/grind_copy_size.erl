@@ -18,18 +18,23 @@ heap_bytes_after_gc(Pid) ->
 %% Runs `Fun` in a fresh process and returns its result with the flat bytes
 %% of every message that process received while it ran: what a call copies
 %% into its caller. The process is traced from before it starts the call
-%% until it finishes, and the trace is drained before the sum is taken.
+%% until it finishes, and the trace is drained before the sum is taken. A
+%% crash in `Fun` fails the caller with its reason.
 received_bytes(Fun) ->
     Parent = self(),
     Ref = make_ref(),
-    Pid = spawn(fun() ->
+    {Pid, Monitor} = spawn_monitor(fun() ->
         receive {Ref, go} -> ok end,
         Result = Fun(),
         Parent ! {Ref, done, Result}
     end),
     1 = erlang:trace(Pid, true, ['receive']),
     Pid ! {Ref, go},
-    Result = receive {Ref, done, R} -> R end,
+    Result = receive
+        {Ref, done, R} -> R;
+        {'DOWN', Monitor, process, Pid, Reason} -> erlang:error({call_crashed, Reason})
+    end,
+    erlang:demonitor(Monitor, [flush]),
     Delivered = erlang:trace_delivered(Pid),
     receive {trace_delivered, Pid, Delivered} -> ok end,
     {Result, collect(Pid, Ref, 0)}.

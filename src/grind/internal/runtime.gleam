@@ -3,7 +3,9 @@
 ////
 //// A reply is copied into the process that asks, so each request returns
 //// only what its caller needs. The queue plans hold every registered
-//// worker; they stay in this process, and only `queue` hands one plan out.
+//// worker; they stay in this process. Only `queue` hands one plan out, to
+//// the process that runs its workers, and `settling` hands out one queue's
+//// settlements.
 
 import exception
 import gleam/erlang/process
@@ -17,6 +19,7 @@ import gleam/string
 import grind/internal/consumer
 import grind/internal/postgres
 import grind/internal/registry
+import grind/internal/settlement/declared
 import pog
 
 /// A handle on a runtime, found by name.
@@ -27,7 +30,9 @@ pub type Grind {
 pub opaque type Message {
   GetDatabase(reply: process.Subject(postgres.Database))
   GetStopPlan(reply: process.Subject(StopPlan))
+  HasQueue(queue: String, reply: process.Subject(Bool))
   GetQueue(queue: String, reply: process.Subject(QueueLookup))
+  GetSettling(queue: String, reply: process.Subject(SettleLookup))
 }
 
 /// What `grind.stop` needs: the root supervisor and each consumed queue's
@@ -45,6 +50,22 @@ pub type QueueLookup {
   QueueLookup(database: postgres.Database, plan: Option(QueuePlan))
 }
 
+/// The database with what settling one queue needs, when a node's worker
+/// uses that queue.
+pub type SettleLookup {
+  SettleLookup(database: postgres.Database, plan: Option(SettlePlan))
+}
+
+/// The queue's settlements (`registry.settlements`), without the rest of
+/// any worker, and its lease.
+pub type SettlePlan {
+  SettlePlan(
+    queue: String,
+    settlements: List(#(String, String, declared.Settle)),
+    lease_ms: Int,
+  )
+}
+
 /// One queue a node runs: its registry and validated consumer policies.
 pub type QueuePlan {
   QueuePlan(
@@ -56,7 +77,7 @@ pub type QueuePlan {
   )
 }
 
-pub type Runtime {
+type Runtime {
   Runtime(
     database: postgres.Database,
     root: process.Pid,
@@ -161,11 +182,26 @@ pub fn child(
           process.send(reply, StopPlan(root:, supervised:, coordinators:))
           actor.continue(state)
         }
+        HasQueue(queue, reply) -> {
+          process.send(reply, option.is_some(find_plan(state, queue)))
+          actor.continue(state)
+        }
         GetQueue(queue, reply) -> {
-          let plan =
-            list.find(state.plans, fn(plan) { plan.name == queue })
-            |> option.from_result
+          let plan = find_plan(state, queue)
           process.send(reply, QueueLookup(database: state.database, plan:))
+          actor.continue(state)
+        }
+        GetSettling(queue, reply) -> {
+          let plan =
+            find_plan(state, queue)
+            |> option.map(fn(plan) {
+              SettlePlan(
+                queue:,
+                settlements: registry.settlements(plan.workers),
+                lease_ms: consumer.lease_duration_ms(plan.policy),
+              )
+            })
+          process.send(reply, SettleLookup(database: state.database, plan:))
           actor.continue(state)
         }
       }
@@ -173,6 +209,11 @@ pub fn child(
     |> actor.start
     |> result.map(fn(started) { actor.Started(started.pid, Nil) })
   })
+}
+
+fn find_plan(state: Runtime, queue: String) -> Option(QueuePlan) {
+  list.find(state.plans, fn(plan) { plan.name == queue })
+  |> option.from_result
 }
 
 fn settle_schema(
@@ -229,11 +270,23 @@ pub fn stop_plan(grind: Grind) -> Result(StopPlan, Nil) {
   request(grind, GetStopPlan)
 }
 
+/// Whether a worker of this node uses `queue`.
+pub fn has_queue(grind: Grind, queue: String) -> Result(Bool, Nil) {
+  request(grind, HasQueue(queue, _))
+}
+
 /// The database and the plan of `queue`. The plan carries that queue's
-/// workers, which are copied into the caller; use it only where the caller
+/// workers, which are copied into the caller; ask from the process that
 /// runs them.
 pub fn queue(grind: Grind, queue: String) -> Result(QueueLookup, Nil) {
   request(grind, GetQueue(queue, _))
+}
+
+/// The database and what settling `queue` needs. The plan carries the
+/// settlements of the queue's workers, each a closure over its worker's
+/// definition, which are copied into the caller.
+pub fn settling(grind: Grind, queue: String) -> Result(SettleLookup, Nil) {
+  request(grind, GetSettling(queue, _))
 }
 
 fn request(

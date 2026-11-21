@@ -26,11 +26,9 @@ import gleam/string
 import gleam/time/duration.{type Duration}
 import gleam/time/timestamp.{type Timestamp}
 import grind.{type Grind}
-import grind/internal/consumer
 import grind/internal/convert
 import grind/internal/job as stored_job
 import grind/internal/postgres
-import grind/internal/registry
 import grind/internal/runtime
 import grind/internal/settlement
 import grind/job.{type JobHandle, type State}
@@ -377,8 +375,9 @@ pub fn quarantine_expired(
 
 /// Runs the declared settlements of up to `limit` (at most 10,000) due jobs
 /// of `queue`, one try each and each job at most once, on this node, and
-/// returns how many tries ran. Each call copies the queue's registered
-/// workers, and only that queue's, into this process to run them.
+/// returns how many tries ran. Each call copies the queue's workers that
+/// declare a settlement into this process to run their settlements; it
+/// copies no other worker.
 /// A consumer that polls on its own does this once per poll interval; call
 /// it where consumers are polled by hand or not at all (`without_consumers`,
 /// `testing.drain`). It first marks the jobs of `queue` a node of the
@@ -391,9 +390,9 @@ pub fn settle_due(
   queue queue: String,
   limit limit: Int,
 ) -> Result(Int, Error) {
-  // Only this queue's workers are copied here, to run their settlements.
-  use runtime.QueueLookup(database:, plan:) <- result.try(
-    runtime.queue(grind, queue) |> result.replace_error(NotRunning),
+  // Only this queue's settling workers are copied here, to run them.
+  use runtime.SettleLookup(database:, plan:) <- result.try(
+    runtime.settling(grind, queue) |> result.replace_error(NotRunning),
   )
   case limit > 0 && limit <= postgres.list_limit_maximum, plan {
     False, _ ->
@@ -401,38 +400,38 @@ pub fn settle_due(
     True, None -> Ok(0)
     True, Some(plan) -> {
       use _ <- result.try(
-        settlement.recognise_unmarked(database, plan.workers)
+        settlement.recognise_unmarked_of(database, queue, plan.settlements)
         |> result.map_error(Unavailable),
       )
-      settle_tries(
-        database,
-        plan.workers,
-        consumer.lease_duration_ms(plan.policy),
-        limit,
-        [],
-      )
+      settle_tries(database, plan, limit, [])
     }
   }
 }
 
 fn settle_tries(
   database: postgres.Database,
-  workers: registry.Registry,
-  lease_ms: Int,
+  plan: runtime.SettlePlan,
   remaining: Int,
   already: List(Int),
 ) -> Result(Int, Error) {
   case remaining {
     0 -> Ok(list.length(already))
     _ ->
-      case settlement.settle_next_except(database, workers, lease_ms, already) {
+      case
+        settlement.settle_next_of(
+          database,
+          plan.queue,
+          plan.settlements,
+          plan.lease_ms,
+          already,
+        )
+      {
         Error(error) -> Error(Unavailable(error))
         Ok(settlement.NothingDue) -> Ok(list.length(already))
         Ok(outcome) ->
           settle_tries(
             database,
-            workers,
-            lease_ms,
+            plan,
             remaining - 1,
             list.append(
               option.values([settlement.outcome_job_id(outcome)]),

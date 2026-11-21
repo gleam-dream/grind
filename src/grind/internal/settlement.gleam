@@ -116,17 +116,28 @@ pub fn settle_next_except(
   lease_ms: Int,
   already: List(Int),
 ) -> Result(Outcome, pog.QueryError) {
-  let settling = registry.settlements(workers)
+  settle_next_of(
+    database,
+    registry.queue(workers),
+    registry.settlements(workers),
+    lease_ms,
+    already,
+  )
+}
+
+/// `settle_next_except` given only the queue and its workers' settlements
+/// (`registry.settlements`), so a caller that holds no registry can run it.
+pub fn settle_next_of(
+  database: Database,
+  queue: String,
+  settling: List(#(String, String, declared.Settle)),
+  lease_ms: Int,
+  already: List(Int),
+) -> Result(Outcome, pog.QueryError) {
   case settling {
     [] -> Ok(NothingDue)
     _ -> {
-      use taken <- result.map(take(
-        database,
-        registry.queue(workers),
-        settling,
-        lease_ms,
-        already,
-      ))
+      use taken <- result.map(take(database, queue, settling, lease_ms, already))
       case taken {
         None -> NothingDue
         Some(taken) -> {
@@ -150,14 +161,26 @@ pub fn recognise_unmarked(
   database: Database,
   workers: Registry,
 ) -> Result(Int, pog.QueryError) {
-  let settling = registry.settlements(workers)
+  recognise_unmarked_of(
+    database,
+    registry.queue(workers),
+    registry.settlements(workers),
+  )
+}
+
+/// `recognise_unmarked` given only the queue and its workers' settlements.
+pub fn recognise_unmarked_of(
+  database: Database,
+  queue: String,
+  settling: List(#(String, String, declared.Settle)),
+) -> Result(Int, pog.QueryError) {
   case settling {
     [] -> Ok(0)
     _ ->
       pog.query(
         "UPDATE grind_jobs AS job SET settle_attempt_id = job.attempt_id, settle_at = clock_timestamp(), settle_tries = 0 WHERE job.queue = $1 AND job.state = 'uncertain' AND job.attempt_id IS NOT NULL AND job.settle_attempt_id IS DISTINCT FROM job.attempt_id AND (job.worker_id, job.worker_version) IN (SELECT * FROM unnest($2::text[], $3::text[])) AND NOT EXISTS (SELECT 1 FROM grind_job_acknowledgements AS receipt WHERE receipt.job_id = job.id AND receipt.attempt_id = job.attempt_id AND receipt.attempt_epoch = job.attempt_epoch) RETURNING job.id",
       )
-      |> pog.parameter(pog.text(registry.queue(workers)))
+      |> pog.parameter(pog.text(queue))
       |> identities(settling)
       |> pog.returning(decode.field(0, decode.int, decode.success))
       |> store.execute_safely(on: postgres.connection(database))

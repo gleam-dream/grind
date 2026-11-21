@@ -25,7 +25,7 @@
 
 import gleam/erlang/process
 import gleam/int
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import gleam/time/duration.{type Duration}
@@ -180,29 +180,39 @@ type DrainMessage {
 
 /// Claims and runs up to `limit` due jobs from `queue`, one at a time, and
 /// returns how many ran. Stops early when no job is due. Fails with
-/// `DrainTimedOut` when `within` elapses first. Each call copies the
-/// queue's registered workers, and only that queue's, into this process.
+/// `DrainTimedOut` when `within` elapses first. The jobs run in a process
+/// the drain starts, which receives the queue's workers; the calling
+/// process receives none.
 pub fn drain(
   grind: Grind,
   queue queue: String,
   limit limit: Int,
   within within: Duration,
 ) -> Result(Int, DrainError) {
-  // Only this queue's workers are copied here; the drain runs them.
-  use runtime.QueueLookup(database:, plan:) <- result.try(
-    runtime.queue(grind, queue) |> result.replace_error(DrainNotRunning),
+  use known <- result.try(
+    runtime.has_queue(grind, queue) |> result.replace_error(DrainNotRunning),
   )
-  use plan <- result.try(plan |> option.to_result(UnknownQueue(queue)))
+  use Nil <- result.try(case known {
+    True -> Ok(Nil)
+    False -> Error(UnknownQueue(queue))
+  })
   let reply = process.new_subject()
+  // The runner, not the caller, fetches the queue's workers: it runs them.
   let runner =
     process.spawn_unlinked(fn() {
-      let outcome = case consumer.start(database, plan.workers, plan.manual) {
-        Error(error) -> Error(string.inspect(error))
-        Ok(started) -> {
-          let outcome = drain_loop(started, reply, limit)
-          let _ = consumer.stop(started)
-          outcome
-        }
+      let outcome = case runtime.queue(grind, queue) {
+        Ok(runtime.QueueLookup(database:, plan: Some(plan))) ->
+          case consumer.start(database, plan.workers, plan.manual) {
+            Error(error) -> Error(string.inspect(error))
+            Ok(started) -> {
+              let outcome = drain_loop(started, reply, limit)
+              let _ = consumer.stop(started)
+              outcome
+            }
+          }
+        // The runtime stopped or restarted after the check above.
+        Ok(runtime.QueueLookup(plan: None, ..)) | Error(Nil) ->
+          Error("grind: the runtime stopped before the drain started")
       }
       process.send(reply, Done(outcome))
     })
