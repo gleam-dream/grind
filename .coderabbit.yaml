@@ -5,18 +5,12 @@
 # of coderabbit-config itself, and `repository` marks a rule beyond the catalog.
 #
 # Catalogs read:
-#   practice catalog (not public)  879841a61c3f83cd809edca9229c4a6bb7f909f8
-#   gleam-agent-tools  6a9ea2f647e787a32d3c7fa88d9c58c5b81ae9d7
+#   practice catalog (not public)  a56636a4eed7a0d644b89f5bb7c7d7c9692e0887
+#   gleam-agent-tools  d7b541cb885b3edbf25563b06aee97b28b66074f
 #
 # Governing skills: coderabbit-config (policy), gleam, gleam-lib, gleam-ffi,
 # grind, gleam-sql, gleam-otp, sinal, testing, python, elixir, design,
 # tracker, gate, git.
-#
-# Governing dependency versions: grind 0.2.1 (this package, gleam.toml).
-# Locked in manifest.toml: gleam_otp 1.3.0, gleam_erlang 1.3.0, pog 4.1.0,
-# pgo 0.20.0, squirrel 4.7.0, cigogne 5.0.6, sinal 0.1.0, telemetry 1.4.2,
-# gleam_json 3.1.0, gleam_stdlib 1.0.5, gleeunit 1.11.0. The Oban oracle is
-# pinned to OSS 2.24.1 (docs/ORACLE.md, oracle/mix.lock).
 language: en-US
 tone_instructions: >-
   Literal and concise. Report only defects you can evidence from the diff, its
@@ -190,7 +184,7 @@ reviews:
 
     - path: "src/**/*.gleam"
       instructions: |
-        Grind runtime contracts (grind; rules for 0.2.1).
+        Grind runtime contracts (grind).
         - Flag a staged reply from `submit_in` or `admin.resolve_uncertain_in`
           returned, logged or documented as proof of the caller's commit
           (ADR-0004, ADR-0013).
@@ -209,6 +203,10 @@ reviews:
         - Flag a per-job message, spawn closure or start argument that carries
           the worker definition, registry or runtime environment where an id
           or the handler alone serves.
+        - Flag a change that copies worker definitions into a caller's
+          process anywhere but `admin.settle_due`, or into a job beyond the
+          three closures over the worker and the one its handler keeps while
+          it runs.
         - Flag a codec or worker-version change that leaves stored jobs of a
           deployed version unreadable.
         - Flag documentation or an API that promises cron, batch coordination
@@ -216,8 +214,7 @@ reviews:
 
     - path: "{consumer,examples,bench,resilience}/**/*.gleam"
       instructions: |
-        Grind consumers (grind; rules for 0.2.1). Apply to a module that
-        imports `grind`.
+        Grind consumers (grind). Apply to a module that imports `grind`.
         - Flag a new submission key after a timeout or `CommitUnknown`; retain
           the `PendingSubmission` and call `grind.reconcile_submission`.
         - Flag one submission key reused for a different command.
@@ -236,7 +233,12 @@ reviews:
         - Flag an effectful handler with no application idempotency key that
           the provider enforces.
         - Flag a worker handler closure that captures an environment,
-          catalogue, agent or other large value; capture ids.
+          catalogue, agent or other large value; capture ids. Each job copies
+          a closure over the whole worker definition three times, and its
+          handler keeps one while it runs.
+        - Flag `admin.settle_due` called where the copy of its queue's
+          settlement closures into the caller is not budgeted; no other call
+          copies workers.
         - Flag a script-owned `grind.start` with no matching `grind.stop`, and
           an application runtime not placed under its supervision tree with
           `grind.supervised`.
@@ -247,8 +249,7 @@ reviews:
 
     - path: "{src,consumer,examples,bench,resilience}/**/*.gleam"
       instructions: |
-        PostgreSQL access (gleam-sql; rules for pog 4.1.0, squirrel 4.7.0,
-        cigogne 5.0.6). Apply to a module that imports `pog`.
+        PostgreSQL access (gleam-sql). Apply to a module that imports `pog`.
         - Flag a query run on the pool inside a transaction callback instead
           of the callback's transaction connection.
         - Flag a caller-controlled identifier or value interpolated into SQL
@@ -269,7 +270,7 @@ reviews:
 
     - path: "src/grind/internal/sql/*.sql"
       instructions: |
-        Query files (gleam-sql; squirrel 4.7.0).
+        Query files (gleam-sql).
         - Flag a file that holds more than one statement.
 
     - path: "{priv/migrations/*.sql,src/grind/internal/migrations.gleam}"
@@ -290,8 +291,8 @@ reviews:
 
     - path: "{src,consumer,examples,bench,resilience}/**/*.gleam"
       instructions: |
-        Processes (gleam-otp; rules for gleam_otp 1.3.0, gleam_erlang 1.3.0).
-        Apply to a module that imports `gleam/otp` or `gleam/erlang/process`.
+        Processes (gleam-otp). Apply to a module that imports `gleam/otp` or
+        `gleam/erlang/process`.
         - Flag `process.call` whose timeout or callee exit is handled as a
           returned error or as proof the request had no effect, and a call
           timeout that triggers an unconditional retry of an effect.
@@ -313,8 +314,7 @@ reviews:
 
     - path: "{src,test,consumer,examples}/**/*.gleam"
       instructions: |
-        Telemetry (sinal; rules for sinal 0.1.0, telemetry 1.4.2). Apply to a
-        module that imports `sinal`.
+        Telemetry (sinal). Apply to a module that imports `sinal`.
         - Flag an event name, field key or route prefix built from runtime
           input; put unbounded values in metadata values.
         - Flag a custom getter or encoder that can fail or raise in the
