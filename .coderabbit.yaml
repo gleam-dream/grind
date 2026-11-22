@@ -173,12 +173,20 @@ reviews:
         - Flag an expected native failure not mapped to the declared failure
           value, and code that assumes Gleam catches an Erlang exception.
         - Flag a change to `grind_postgres_ffi.erl` or `grind_pool_ffi.erl`
-          that depends on another private pog or pgo shape, or a widened
-          pog/pgo range in gleam.toml, without the review the gleam.toml
-          comment asks for.
+          that depends on another private pog or pgo shape without the review
+          the gleam.toml comment asks for.
         - Flag a timeout or cancellation read as proof that the native effect
           did not happen.
         - Flag a foreign function with no remaining caller.
+
+    - path: "gleam.toml"
+      instructions: |
+        Driver pins (gleam-ffi; gleam.toml).
+        - Flag a widened `pog` or `pgo` range with no review of the private
+          driver contracts that `grind_postgres_ffi.erl` and
+          `grind_pool_ffi.erl` match, and of the startup and reconnect
+          regressions, as the comment above the pins asks;
+          `pog_connection_pool_shape_test` alone does not cover them.
 
     - path: "src/**/*.gleam"
       instructions: |
@@ -258,8 +266,11 @@ reviews:
           `grind/internal/postgres` or its collaborators; it belongs in its
           own `.sql` file under `src/grind/internal/sql` (AGENTS.md,
           ADR-0014). Dynamic SQL stays inline.
-        - Flag a `.sql` file under `src/grind/internal/sql` that holds more
-          than one statement.
+
+    - path: "src/grind/internal/sql/*.sql"
+      instructions: |
+        Query files (gleam-sql; squirrel 4.7.0).
+        - Flag a file that holds more than one statement.
 
     - path: "{priv/migrations/*.sql,src/grind/internal/migrations.gleam}"
       instructions: |
