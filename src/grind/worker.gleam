@@ -40,7 +40,7 @@
 //// `erts_debug:flat_size(Worker) * erlang:system_info(wordsize)`. The README
 //// section "What each job copies" has an example; for codecs built with
 //// json_blueprint, see its
-//// [codec guide](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+//// [codec guide](https://github.com/gleam-dream/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
 ////
 //// A handler built with `new` returns `Result(output, error)`. One built
 //// with `responding` receives the job's `Context` (job id, attempt, snooze

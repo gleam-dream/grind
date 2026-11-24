@@ -143,7 +143,7 @@ Keep the worker value small:
 
 - Capture small references, such as an id, a process name or a pool name, not an environment record that holds catalogues, agents, codecs or clients.
 - Keep static data in module constants or behind a handle such as a `persistent_term` key. Gleam inlines a constant where it is used, so a handler that refers to one captures nothing.
-- Build codecs as the [json_blueprint codec guide](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md) describes, on json_blueprint 2.1.1 or later.
+- Build codecs as the [json_blueprint codec guide](https://github.com/gleam-dream/json_blueprint/blob/main/docs/CODEC-PRACTICE.md) describes, on json_blueprint 2.1.1 or later.
 - Bound the worker value in a test. Add a one-function Erlang module, like [`grind_usage_copy_size.erl`](examples/usage/src/grind_usage_copy_size.erl), that returns `erts_debug:flat_size(Term) * erlang:system_info(wordsize)`, the bytes one copy takes:
 
 <!-- prettier-ignore-start -->
