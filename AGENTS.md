@@ -17,6 +17,13 @@
 - Benchmarks: `scripts/bench-smoke.sh` and `scripts/bench-matrix.sh`. Resilience: `scripts/test-resilience.sh`. Oracle faults: `oracle/run-faults.sh`. Their flags are in `docs/BENCHMARKS.md`, `resilience/README.md` and `docs/ORACLE.md`.
 - Run database gates, benchmarks and resilience runs serially in one checkout. Qualification rules are in the design, "Verification method".
 
+## Releasing
+
+- `nix run github:gleam-dream/.github#release -- <version>` opens the version-bump pull request from a clean, current `main`. It never tags and never publishes. Nix supplies every tool it calls.
+- After the merge, tag the merge commit `v<version>` and push the tag. The `Release` workflow uploads the package to Hex, where it stays staged.
+- Staged publishing is on for this package on hex.pm, so a release becomes public only when a Hex maintainer approves it there with a second factor. If that setting is ever turned off, a pushed tag publishes at once; never push a release tag while it is off. An agent stops after pushing the tag and reports whether the release waits for approval or is public.
+- Push a release tag only on an explicit request that names the version. The steps and the way to undo a release are in the [shared workflow's README](https://github.com/gleam-dream/.github#publishing-a-package-to-hex).
+
 ## References
 
 - Usage: compiled examples under `examples/usage`, one module per topic (`examples/usage/README.md`). Change an example when the API changes; the fast profile builds them and the database gate runs every topic.
