@@ -18,7 +18,7 @@ what it copies.
 - The README and `grind/worker` say what crosses per job and how many times,
   how to keep a worker value small, and how to bound it in a test.
 - Codec rules stay in the
-  [json_blueprint codec guide](https://github.com/lostbean/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
+  [json_blueprint codec guide](https://github.com/gleam-dream/json_blueprint/blob/main/docs/CODEC-PRACTICE.md).
 
 ## Decision: keep three copies per job
 
