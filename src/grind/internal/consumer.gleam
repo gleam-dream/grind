@@ -433,20 +433,12 @@ type ConsumerState {
     /// incarnation's own mailbox and has not yet been handled. `request_fill`
     /// is the sole sender and checks this before sending another, for the
     /// same single-outstanding-message reason `poll_scheduled` guards `Poll`.
-    /// Unlike `poll_scheduled` (a timer, armed only once idle), `request_fill`
-    /// sends `FillSlots` unconditionally after every successful automatic
-    /// claim — it never itself checks whether free capacity remains; that
-    /// check happens only once the message is actually handled, inside
-    /// `fill_automatic_slots` (`list.length(state.active) < maximum_concurrency`),
-    /// which simply does nothing more (`continue_if_idle`) if none is left.
-    /// Sending unconditionally rather than pre-checking capacity at the send
-    /// site is deliberate, not an oversight: it is what makes a burst that
-    /// fills many slots proceed one claim per message dispatch, returning to
-    /// the mailbox after each one — see `fill_automatic_slots`'s doc comment
-    /// for why this is what keeps `AttemptFinished`/`BeginShutdown`
-    /// from starving behind a whole burst of claims. A harmless extra
-    /// `FillSlots` dispatch once capacity is already full costs one mailbox
-    /// round-trip, never a wasted claim attempt.
+    /// `request_fill` sends `FillSlots` after every automatic attempt that
+    /// finished its job, without checking capacity: the check happens when the
+    /// message is handled, inside `fill_automatic_slots`. Sending a message
+    /// instead of claiming at once lets the completions, renewal statuses and
+    /// shutdown requests already in the mailbox run first, so one claim
+    /// statement fills every slot they freed.
     fill_pending: Bool,
     hooks: Hooks,
     shutting_down: Bool,
@@ -1291,6 +1283,7 @@ fn begin_shutdown(
   }
 }
 
+/// Claims one job for a manual request and starts its attempt.
 fn start_attempt(
   state: ConsumerState,
   completion: Completion,
@@ -1298,13 +1291,9 @@ fn start_attempt(
   let ConsumerState(
     database:,
     workers:,
-    worker_factory:,
     queue:,
     attempt_owner:,
-    incarnation_subject:,
     lease_duration_ms:,
-    renewal_interval_ms:,
-    hooks:,
     ..,
   ) = state
   case
@@ -1319,62 +1308,85 @@ fn start_attempt(
     Error(error) ->
       finish_without_claim(state, completion, Error(QueueProcessFailed(error)))
     Ok(None) -> finish_without_claim(state, completion, Ok(False))
-    Ok(Some(claimed)) -> {
-      let #(id, attempt_id, epoch) = attempt.claim_identity(claimed)
-      let request =
-        queue_worker.WorkerRequest(
-          queue_subject: incarnation_subject,
-          claimed:,
-          on_acknowledging: AttemptAcknowledging,
-          on_complete: AttemptFinished,
-          database:,
-          queue:,
-          owner: attempt_owner,
-          renewer: state.renewer,
-          retry_interval_ms: renewal_interval_ms,
-          automatic: case completion {
-            Automatic -> True
-            ManualCompletion(_) -> False
-          },
-        )
-      let start_result = case hooks.before_worker_start() {
-        Error(reason) -> Error(actor.InitFailed(reason))
-        Ok(Nil) -> factory_supervisor.start_child(worker_factory, request)
+    Ok(Some(claimed)) ->
+      case activate_claim(state, completion, claimed) {
+        #(state, Error(error)) ->
+          finish_without_claim(state, completion, Error(error))
+        #(state, Ok(Nil)) -> actor.continue(state)
       }
-      case start_result {
-        Error(error) ->
-          release_failed_worker_start(state, completion, claimed, error)
-        Ok(started) -> {
-          hooks.after_worker_start(started.pid)
-          let monitor = process.monitor(started.pid)
-          case process.is_alive(started.pid) {
-            False -> {
-              let _ = process.demonitor_process(monitor)
-              release_dead_worker_before_activation(state, completion, claimed)
-            }
-            True -> {
-              process.send(started.data, queue_worker.StartAttempt)
-              let active =
-                ActiveAttempt(
-                  id:,
-                  attempt_id:,
-                  epoch:,
-                  claimed:,
-                  worker_subject: started.data,
-                  monitor:,
-                  completion:,
-                  renewal_status: LeaseRenewalConfirmed,
-                  phase: telemetry.HandlerRunning,
-                )
-              let state =
-                ConsumerState(
-                  ..state,
-                  active: list.prepend(state.active, active),
-                )
-                |> emit_capacity
-              continue_after_start(state, completion)
-            }
-          }
+  }
+}
+
+/// Starts the attempt actor of one claimed job and records it as active. A
+/// claim whose actor does not start is released, so its job is due again and
+/// its attempt is refunded; the error says which of the two steps failed.
+fn activate_claim(
+  state: ConsumerState,
+  completion: Completion,
+  claimed: attempt.ClaimedJob,
+) -> #(ConsumerState, Result(Nil, ProcessError)) {
+  let ConsumerState(
+    database:,
+    worker_factory:,
+    queue:,
+    attempt_owner:,
+    incarnation_subject:,
+    renewal_interval_ms:,
+    hooks:,
+    ..,
+  ) = state
+  let #(id, attempt_id, epoch) = attempt.claim_identity(claimed)
+  let request =
+    queue_worker.WorkerRequest(
+      queue_subject: incarnation_subject,
+      claimed:,
+      on_acknowledging: AttemptAcknowledging,
+      on_complete: AttemptFinished,
+      database:,
+      queue:,
+      owner: attempt_owner,
+      renewer: state.renewer,
+      retry_interval_ms: renewal_interval_ms,
+      automatic: case completion {
+        Automatic -> True
+        ManualCompletion(_) -> False
+      },
+    )
+  let start_result = case hooks.before_worker_start() {
+    Error(reason) -> Error(actor.InitFailed(reason))
+    Ok(Nil) -> factory_supervisor.start_child(worker_factory, request)
+  }
+  case start_result {
+    Error(error) -> #(
+      state,
+      Error(release_failed_worker_start(state, claimed, error)),
+    )
+    Ok(started) -> {
+      hooks.after_worker_start(started.pid)
+      let monitor = process.monitor(started.pid)
+      case process.is_alive(started.pid) {
+        False -> {
+          let _ = process.demonitor_process(monitor)
+          #(state, Error(release_dead_worker_before_activation(state, claimed)))
+        }
+        True -> {
+          process.send(started.data, queue_worker.StartAttempt)
+          let active =
+            ActiveAttempt(
+              id:,
+              attempt_id:,
+              epoch:,
+              claimed:,
+              worker_subject: started.data,
+              monitor:,
+              completion:,
+              renewal_status: LeaseRenewalConfirmed,
+              phase: telemetry.HandlerRunning,
+            )
+          let state =
+            ConsumerState(..state, active: list.prepend(state.active, active))
+            |> emit_capacity
+          #(state, Ok(Nil))
         }
       }
     }
@@ -1383,9 +1395,8 @@ fn start_attempt(
 
 fn release_dead_worker_before_activation(
   state: ConsumerState,
-  completion: Completion,
   claimed: attempt.ClaimedJob,
-) -> actor.Next(ConsumerState, Message) {
+) -> ProcessError {
   case
     attempt.release_unstarted(
       state.database,
@@ -1394,24 +1405,9 @@ fn release_dead_worker_before_activation(
       claimed,
     )
   {
-    Ok(True) ->
-      finish_without_claim(
-        state,
-        completion,
-        Error(QueueWorkerExitedBeforeActivation),
-      )
-    Ok(False) ->
-      finish_without_claim(
-        state,
-        completion,
-        Error(QueueWorkerActivationClaimLost),
-      )
-    Error(error) ->
-      finish_without_claim(
-        state,
-        completion,
-        Error(QueueWorkerActivationReleaseFailed(error)),
-      )
+    Ok(True) -> QueueWorkerExitedBeforeActivation
+    Ok(False) -> QueueWorkerActivationClaimLost
+    Error(error) -> QueueWorkerActivationReleaseFailed(error)
   }
 }
 
@@ -1432,10 +1428,9 @@ pub fn wait_for_worker_exit(pid: process.Pid, checks_remaining: Int) -> Nil {
 
 fn release_failed_worker_start(
   state: ConsumerState,
-  completion: Completion,
   claimed: attempt.ClaimedJob,
   start_error: actor.StartError,
-) -> actor.Next(ConsumerState, Message) {
+) -> ProcessError {
   case
     attempt.release_unstarted(
       state.database,
@@ -1444,24 +1439,10 @@ fn release_failed_worker_start(
       claimed,
     )
   {
-    Ok(True) ->
-      finish_without_claim(
-        state,
-        completion,
-        Error(QueueWorkerStartFailed(start_error)),
-      )
-    Ok(False) ->
-      finish_without_claim(
-        state,
-        completion,
-        Error(QueueWorkerStartClaimLost(start_error)),
-      )
+    Ok(True) -> QueueWorkerStartFailed(start_error)
+    Ok(False) -> QueueWorkerStartClaimLost(start_error)
     Error(release_error) ->
-      finish_without_claim(
-        state,
-        completion,
-        Error(QueueWorkerStartReleaseFailed(start_error, release_error)),
-      )
+      QueueWorkerStartReleaseFailed(start_error, release_error)
   }
 }
 
@@ -1525,35 +1506,63 @@ fn finish_completion(
       continue_if_idle(state)
     }
     Automatic ->
-      case result {
-        Ok(True) -> fill_automatic_slots(state)
-        Ok(False) | Error(_) -> continue_if_idle(state)
+      case result, state.shutting_down {
+        // The refill is a message to this coordinator, not a call: the
+        // completions already waiting in the mailbox free their slots first,
+        // and one claim statement then fills all of them.
+        Ok(True), False -> request_fill(state)
+        Ok(True), True | Ok(False), _ | Error(_), _ -> continue_if_idle(state)
       }
   }
 }
 
-/// Claims into one free slot unless shutdown has started. Each successful
-/// automatic claim queues FillSlots at the back of this incarnation's mailbox,
-/// so completion, renewal status and shutdown messages can run between claims.
-/// Renewal storage work runs in an independent actor and reserved pool.
+/// Claims into every free slot with one claim statement, unless shutdown has
+/// started, and starts the claimed attempts in selection order. The claim and
+/// the starts run inside one mailbox message, so a shutdown request cannot
+/// fall between a claim and its start. Renewal storage work runs in an
+/// independent actor and reserved pool.
 ///
-/// Every claim performs its bounded quarantine scan. A successful claim consumes
-/// one free slot; an empty or failed claim waits for the polling interval.
+/// Every claim statement follows one bounded quarantine scan. A claimed row
+/// that cannot run here, or whose attempt actor does not start, is parked or
+/// released on its own and does not stop the other rows of its batch. After
+/// the batch the coordinator waits for the polling interval while a slot is
+/// free: fewer rows than free slots means the queue has no more due work.
 /// This avoids a hot loop while draining a backlog at available capacity.
 fn fill_automatic_slots(
   state: ConsumerState,
 ) -> actor.Next(ConsumerState, Message) {
   let ValidatedPolicy(maximum_concurrency:, ..) = state.policy
-  case !state.shutting_down && list.length(state.active) < maximum_concurrency {
-    True -> start_attempt(state, Automatic)
+  let free_slots = maximum_concurrency - list.length(state.active)
+  case !state.shutting_down && free_slots > 0 {
     False -> continue_if_idle(state)
+    True ->
+      case
+        attempt.claim_batch(
+          state.database,
+          state.queue,
+          state.workers,
+          state.attempt_owner,
+          state.lease_duration_ms,
+          free_slots,
+        )
+      {
+        Error(_) -> continue_if_idle(state)
+        Ok(rows) ->
+          list.fold(rows, state, fn(state, row) {
+            case row {
+              Error(_) -> state
+              Ok(claimed) -> activate_claim(state, Automatic, claimed).0
+            }
+          })
+          |> continue_if_idle
+      }
   }
 }
 
 /// Asks this coordinator's own incarnation to run `fill_automatic_slots`
 /// again, via a `FillSlots` message rather than a direct call, so any
-/// message already ahead of it in the mailbox (a lease renewal, a worker's
-/// completion, a shutdown request) is handled first. `fill_pending` is the
+/// message already ahead of it in the mailbox (another completion, a renewal
+/// status, a shutdown request) is handled first. `fill_pending` is the
 /// single-outstanding-message guard: a completion that arrives while a
 /// `FillSlots` is already queued does not send a second one, exactly like
 /// `continue_if_idle`'s `poll_scheduled` guard for `Poll`.
@@ -1564,16 +1573,6 @@ fn request_fill(state: ConsumerState) -> actor.Next(ConsumerState, Message) {
       process.send(state.incarnation_subject, FillSlots)
       actor.continue(ConsumerState(..state, fill_pending: True))
     }
-  }
-}
-
-fn continue_after_start(
-  state: ConsumerState,
-  completion: Completion,
-) -> actor.Next(ConsumerState, Message) {
-  case completion {
-    ManualCompletion(_) -> actor.continue(state)
-    Automatic -> request_fill(state)
   }
 }
 

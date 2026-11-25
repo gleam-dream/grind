@@ -57,6 +57,36 @@ pub fn claim_one(
   attempt_owner: String,
   lease_duration_ms: Int,
 ) -> Result(Option(ClaimedJob), postgres.QueueRunError) {
+  case
+    claim_batch(database, queue, workers, attempt_owner, lease_duration_ms, 1)
+  {
+    Error(error) -> Error(error)
+    Ok([]) -> Ok(None)
+    Ok([Ok(claimed)]) -> Ok(Some(claimed))
+    Ok([Error(error)]) -> Error(error)
+    Ok([_, _, ..]) -> Error(postgres.QueueStorageInvariantViolated)
+  }
+}
+
+/// Atomically claims up to `limit` due rows in one statement, after one
+/// quarantine scan, without running a handler in the caller. The rows come
+/// back in selection order (earliest `available_at`, then job ID), each with
+/// its own attempt fence and a lease that starts at the claim.
+///
+/// The outer error means no row was claimed. An inner error belongs to one
+/// claimed row that cannot run here, such as a codec contract mismatch that
+/// parked it; the other rows of the batch stay claimed.
+pub fn claim_batch(
+  database: Database,
+  queue: String,
+  workers: Registry,
+  attempt_owner: String,
+  lease_duration_ms: Int,
+  limit: Int,
+) -> Result(
+  List(Result(ClaimedJob, postgres.QueueRunError)),
+  postgres.QueueRunError,
+) {
   let fwd = postgres.forwarder(database)
   let reference = diagnostics.queue_ref(queue, attempt_owner)
   let measured =
@@ -85,13 +115,14 @@ pub fn claim_one(
       Error(postgres.QueueClaimFailed(error))
     }
     Ok(Nil) ->
-      claim_registered_job(
+      claim_registered_jobs(
         database,
         queue,
         workers,
         attempt_owner,
         registry.identities(workers),
         lease_duration_ms,
+        limit,
       )
   }
 }
@@ -621,19 +652,23 @@ fn acknowledge_once(
   }
 }
 
-fn claim_registered_job(
+fn claim_registered_jobs(
   database: Database,
   queue: String,
   workers: Registry,
   attempt_owner: String,
   identities: List(#(String, String)),
   lease_duration_ms: Int,
-) -> Result(Option(ClaimedJob), postgres.QueueRunError) {
+  limit: Int,
+) -> Result(
+  List(Result(ClaimedJob, postgres.QueueRunError)),
+  postgres.QueueRunError,
+) {
   let connection = postgres.connection(database)
   let forwarder = postgres.forwarder(database)
   let eligibility =
     list.index_map(identities, fn(_, index) {
-      let id_parameter = 4 + index * 2
+      let id_parameter = 5 + index * 2
       let version_parameter = id_parameter + 1
       "(worker_id = $"
       <> int.to_string(id_parameter)
@@ -662,15 +697,24 @@ fn claim_registered_job(
   // same row for a reason that was never actually incompatible with this
   // claim's own write. See the "Admission and uniqueness" design section
   // for the full contention picture across claim, cancel, and quarantine.
+  // The candidate lock skips rows another claim holds, so concurrent batches
+  // take disjoint rows. `UPDATE ... RETURNING` has no row order of its own:
+  // the outer `SELECT` restores the selection order, which is the order the
+  // coordinator starts the attempts in.
   let sql =
     "WITH candidate AS (SELECT id, state AS previous_state FROM grind_jobs WHERE queue = $1 AND "
     <> eligible_state
     <> " AND cancel_requested_at IS NULL AND ("
     <> eligibility
-    <> ") ORDER BY available_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $2, lease_expires_at = clock_timestamp() + ($3::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1, delivery_count = job.delivery_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version, job.attempt_count, job.max_attempts, job.snooze_count, job.delivery_count, candidate.previous_state, job.correlation"
+    <> ") ORDER BY available_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT $4), claimed AS (UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $2, lease_expires_at = clock_timestamp() + ($3::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1, delivery_count = job.delivery_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version, job.attempt_count, job.max_attempts, job.snooze_count, job.delivery_count, candidate.previous_state, job.correlation, job.available_at) SELECT id, attempt_id, attempt_epoch, input_version, input, worker_id, worker_version, output_version, error_version, attempt_count, max_attempts, snooze_count, delivery_count, previous_state, correlation FROM claimed ORDER BY available_at, id"
   let parameters =
     list.append(
-      [pog.text(queue), pog.text(attempt_owner), pog.int(lease_duration_ms)],
+      [
+        pog.text(queue),
+        pog.text(attempt_owner),
+        pog.int(lease_duration_ms),
+        pog.int(limit),
+      ],
       list.flat_map(identities, fn(identity) {
         let #(worker_id, worker_version) = identity
         [pog.text(worker_id), pog.text(worker_version)]
@@ -736,111 +780,110 @@ fn claim_registered_job(
       Error(postgres.QueueClaimFailed(error))
     }
     Ok(returned) ->
-      case returned.rows {
-        [] -> Ok(None)
-        [claim] -> {
-          let Claim(
-            id: claimed_id,
-            attempt_id:,
-            epoch:,
-            input_version:,
-            encoded_input:,
-            worker_id:,
-            worker_version:,
-            output_version:,
-            error_version:,
-            current_attempt:,
-            previous_state:,
-            ..,
-          ) = claim
-          case job.state_of_stored(previous_state) {
-            Error(Nil) -> Nil
-            Ok(previous_state) ->
-              emit_claimed(
-                forwarder,
-                events.correlation(claim.id, claim.correlation),
-                queue,
-                claimed_id,
-                worker_id,
-                worker_version,
-                attempt_id,
-                epoch,
-                current_attempt,
-                previous_state,
-              )
-          }
-          case registry.select(workers, queue, worker_id, worker_version) {
-            Error(_) -> Error(postgres.QueueStorageInvariantViolated)
-            Ok(registry.Selected(
-              input_version: registered_input,
-              output_version: registered_output,
-              error_version: registered_error,
-              run:,
-              timeout_ms:,
-              abandonment:,
-              ..,
-            )) ->
-              case
-                codec_contract_mismatch(
-                  input_version,
-                  registered_input,
-                  output_version,
-                  registered_output,
-                  error_version,
-                  registered_error,
-                )
-              {
-                Some(#(kind, expected, actual)) -> {
-                  case
-                    mark_contract_mismatch(
-                      database,
-                      queue,
-                      attempt_owner,
-                      claim,
-                      kind,
-                      expected,
-                      actual,
-                    )
-                  {
-                    Error(error) -> Error(error)
-                    Ok(True) ->
-                      case codec_kind_of_stored(kind) {
-                        Ok(kind) ->
-                          Error(postgres.QueueCodecMismatch(
-                            kind:,
-                            expected:,
-                            actual:,
-                          ))
-                        Error(Nil) ->
-                          Error(postgres.QueueStorageInvariantViolated)
-                      }
-                    Ok(False) -> Error(postgres.QueueStorageInvariantViolated)
-                  }
-                }
-                None -> {
-                  let max_payload_bytes = postgres.max_payload_bytes(database)
-                  Ok(
-                    Some(ClaimedJob(
-                      claim:,
-                      queue:,
-                      run: fn(context) {
-                        run(
-                          input_version,
-                          encoded_input,
-                          context,
-                          max_payload_bytes,
-                        )
-                      },
-                      timeout_ms:,
-                      abandonment:,
-                      connection: postgres.connection(database),
-                    )),
-                  )
-                }
+      Ok(
+        list.map(returned.rows, fn(claim) {
+          claimed_job(database, queue, workers, attempt_owner, claim)
+        }),
+      )
+  }
+}
+
+/// Binds one claimed row to its registered worker, or parks a row whose
+/// stored codec contract differs from the registered one.
+fn claimed_job(
+  database: Database,
+  queue: String,
+  workers: Registry,
+  attempt_owner: String,
+  claim: Claim,
+) -> Result(ClaimedJob, postgres.QueueRunError) {
+  let forwarder = postgres.forwarder(database)
+  let Claim(
+    id: claimed_id,
+    attempt_id:,
+    epoch:,
+    input_version:,
+    encoded_input:,
+    worker_id:,
+    worker_version:,
+    output_version:,
+    error_version:,
+    current_attempt:,
+    previous_state:,
+    ..,
+  ) = claim
+  case job.state_of_stored(previous_state) {
+    Error(Nil) -> Nil
+    Ok(previous_state) ->
+      emit_claimed(
+        forwarder,
+        events.correlation(claim.id, claim.correlation),
+        queue,
+        claimed_id,
+        worker_id,
+        worker_version,
+        attempt_id,
+        epoch,
+        current_attempt,
+        previous_state,
+      )
+  }
+  case registry.select(workers, queue, worker_id, worker_version) {
+    Error(_) -> Error(postgres.QueueStorageInvariantViolated)
+    Ok(registry.Selected(
+      input_version: registered_input,
+      output_version: registered_output,
+      error_version: registered_error,
+      run:,
+      timeout_ms:,
+      abandonment:,
+      ..,
+    )) ->
+      case
+        codec_contract_mismatch(
+          input_version,
+          registered_input,
+          output_version,
+          registered_output,
+          error_version,
+          registered_error,
+        )
+      {
+        Some(#(kind, expected, actual)) -> {
+          case
+            mark_contract_mismatch(
+              database,
+              queue,
+              attempt_owner,
+              claim,
+              kind,
+              expected,
+              actual,
+            )
+          {
+            Error(error) -> Error(error)
+            Ok(True) ->
+              case codec_kind_of_stored(kind) {
+                Ok(kind) ->
+                  Error(postgres.QueueCodecMismatch(kind:, expected:, actual:))
+                Error(Nil) -> Error(postgres.QueueStorageInvariantViolated)
               }
+            Ok(False) -> Error(postgres.QueueStorageInvariantViolated)
           }
         }
-        _ -> Error(postgres.QueueStorageInvariantViolated)
+        None -> {
+          let max_payload_bytes = postgres.max_payload_bytes(database)
+          Ok(ClaimedJob(
+            claim:,
+            queue:,
+            run: fn(context) {
+              run(input_version, encoded_input, context, max_payload_bytes)
+            },
+            timeout_ms:,
+            abandonment:,
+            connection: postgres.connection(database),
+          ))
+        }
       }
   }
 }

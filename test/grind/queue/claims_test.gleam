@@ -123,24 +123,18 @@ pub fn postgres_automatic_fill_yields_to_shutdown_between_claims_test() {
   }
 }
 
-/// Proves the actual fix, not just its absence-of-regression companion
-/// above: a `BeginShutdown` sent while one automatic claim is genuinely in
-/// flight is handled *before* this coordinator's own next `FillSlots`
-/// message, even though there is a whole backlog (`job_count`, well above
-/// `maximum_concurrency`) still waiting to be filled. The first claim's own
-/// `UPDATE ... SET state = 'executing'` is forced to block on a
-/// test-held `pg_advisory_xact_lock` (the same barrier shape
-/// `run_overlapping_claim_test` uses); while it is genuinely waiting
+/// A `BeginShutdown` sent while one automatic claim statement is in flight
+/// is handled before this coordinator starts another claim statement, even
+/// though a backlog (`job_count`, above `maximum_concurrency`) is still
+/// waiting. The claim statement's own `UPDATE ... SET state = 'executing'`
+/// is forced to block on a test-held `pg_advisory_xact_lock` (the same
+/// barrier shape `run_overlapping_claim_test` uses); while it is waiting
 /// (confirmed via `pg_stat_activity`, not a timing guess),
-/// `begin_shutdown_for_test` sends `BeginShutdown` — which can only land in
-/// this coordinator's mailbox, since the coordinator itself is fully
-/// occupied running the blocked claim. Releasing the lock lets that one
-/// claim complete; `continue_after_start` then asks for another fill via a
-/// `FillSlots` message sent *after* `BeginShutdown` was already sent, so
-/// FIFO delivery hands the coordinator `BeginShutdown` first. With the old,
-/// directly-recursive `fill_automatic_slots`, nothing would have stopped it
-/// from claiming straight through the rest of the backlog before ever
-/// looking at its mailbox again.
+/// `begin_shutdown_for_test` sends `BeginShutdown`, which can only land in
+/// this coordinator's mailbox, since the coordinator is occupied by the
+/// blocked claim. Releasing the lock lets that statement finish: the rows it
+/// claimed, one per free slot, run to completion, and the slots they free
+/// are not refilled because the shutdown was handled first.
 fn run_automatic_fill_yields_to_shutdown_between_claims_test(
   database_url: String,
 ) -> Nil {
@@ -211,9 +205,10 @@ fn run_automatic_fill_yields_to_shutdown_between_claims_test(
     Nil
   })
 
+  let slots = 4
   let assert Ok(policy) =
     queue.default_policy()
-    |> queue.with_maximum_concurrency(job_count)
+    |> queue.with_maximum_concurrency(slots)
     |> queue.validate_policy
   let assert Ok(consumer) = queue.start(database, workers, policy)
   use <- exception.defer(fn() {
@@ -234,11 +229,9 @@ fn run_automatic_fill_yields_to_shutdown_between_claims_test(
 
   let assert Ok(claimed) =
     count_non_queued_in_queue(connection, "fill-yield-shutdown")
-  // The whole point: fewer than the full backlog was claimed once shutdown
-  // landed, because `BeginShutdown` was handled ahead of the next
-  // `FillSlots` message instead of being starved behind a burst of claims.
-  should.be_true(claimed < job_count)
-  should.equal(claimed, 1)
+  // The statement in flight claimed one row per free slot. Shutdown was
+  // handled before any refill, so the rest of the backlog stays queued.
+  should.equal(claimed, slots)
   mark_database_test_executed("automatic-fill-yields-to-shutdown")
 }
 

@@ -3,6 +3,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/json
+import gleam/list
 import gleam/result
 import gleeunit/should
 import grind/internal/consumer as queue
@@ -12,7 +13,9 @@ import grind/internal/registry
 import grind/internal/worker
 import grind/support/concurrency.{ReleaseAttempt}
 import grind/support/diagnostics
-import grind/support/env.{mark_database_test_executed, queue_database_url}
+import grind/support/env.{
+  mark_database_test_executed, queue_database_url, unique_test_run_id,
+}
 import grind/support/job_state.{job_finished_at_ms, wait_for_job_state}
 import grind/support/observers.{detach}
 import grind/support/queue_signals.{CapacityWorkerStarted}
@@ -20,6 +23,7 @@ import grind/support/queue_timing.{database_time_ms}
 import grind/support/worker_failure.{AccountMissing}
 import grind/telemetry
 import pog
+import sinal
 
 pub fn postgres_consumer_enforces_configured_capacity_test() {
   case queue_database_url() {
@@ -688,4 +692,142 @@ fn run_automatic_fill_does_not_hot_loop_on_claim_error_test(
   should.be_true(attempts <= poll_count + 1)
   should.be_true(attempts >= 1)
   mark_database_test_executed("automatic-fill-no-hot-loop-on-claim-error")
+}
+
+type BatchClaimObservation {
+  ClaimStatementObserved
+  CapacityObserved(active: Int)
+}
+
+/// A consumer with eight free slots and eight due jobs fills every slot with
+/// one claim statement, in selection order, instead of one statement per
+/// slot. The forwarder delivers observations in emission order, so the claim
+/// statements counted before the capacity sample that reports eight active
+/// attempts are exactly the statements that filled those slots.
+pub fn postgres_automatic_consumer_claims_free_slots_in_one_statement_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(database_url) -> run_batch_claim_test(database_url)
+  }
+}
+
+fn run_batch_claim_test(database_url: String) -> Nil {
+  let queue_name =
+    "consumer-capacity-batch-" <> int.to_string(unique_test_run_id())
+  let slots = 8
+  let assert Ok(validated) =
+    postgres.settings(database_url) |> postgres.validate
+  let assert Ok(database) = postgres.start(validated)
+  use <- exception.defer(fn() { postgres.close(database) })
+  let assert Ok(Nil) = postgres.migrate(database)
+  let assert Ok(input_codec) =
+    worker.codec(
+      "batch-capacity-input-v1",
+      worker.infallible(json.int),
+      decode.int,
+    )
+  let assert Ok(output_codec) =
+    worker.codec(
+      "batch-capacity-output-v1",
+      worker.infallible(json.string),
+      decode.string,
+    )
+  let started = process.new_subject()
+  let assert Ok(definition) =
+    worker.define("batch.capacity", "v1", input_codec, output_codec, fn(value) {
+      let release = process.new_subject()
+      process.send(started, CapacityWorkerStarted(value, release))
+      case process.receive(release, within: 10_000) {
+        Ok(ReleaseAttempt) -> Ok("batch-capacity-" <> int.to_string(value))
+        Error(Nil) -> Error(AccountMissing(value))
+      }
+    })
+  let assert Ok(workers) = registry.new(queue_name)
+  let assert Ok(workers) = registry.register(workers, definition)
+  let inputs = ascending(1, slots + 1)
+  let handles =
+    list.map(inputs, fn(input) {
+      let assert Ok(handle) =
+        postgres.submit(database, queue_name, definition, input)
+      handle
+    })
+  let observed = process.new_subject()
+  let claim_statements =
+    sinal.observe(telemetry.checkout(), fn(_, meta) {
+      case
+        meta.queue.queue == queue_name
+        && meta.operation == telemetry.ClaimCandidate
+      {
+        True -> process.send(observed, ClaimStatementObserved)
+        False -> Nil
+      }
+    })
+  use <- exception.defer(fn() { detach(claim_statements) })
+  let capacity =
+    sinal.observe(telemetry.capacity(), fn(measurements, meta) {
+      case meta.queue.queue == queue_name {
+        True -> process.send(observed, CapacityObserved(measurements.active))
+        False -> Nil
+      }
+    })
+  use <- exception.defer(fn() { detach(capacity) })
+  let assert Ok(policy) =
+    queue.default_policy()
+    |> queue.with_poll_interval(60_000)
+    |> queue.with_maximum_concurrency(slots)
+    |> queue.validate_policy
+  let assert Ok(consumer) = queue.start(database, workers, policy)
+  use <- exception.defer(fn() { queue.stop(consumer) })
+
+  let releases =
+    list.map(ascending(1, slots), fn(_) {
+      let assert Ok(CapacityWorkerStarted(input, release)) =
+        process.receive(started, within: 5000)
+      #(input, release)
+    })
+  use <- exception.defer(fn() {
+    list.each(releases, fn(entry) { process.send(entry.1, ReleaseAttempt) })
+  })
+  // The eight earliest jobs fill the slots; the ninth stays queued.
+  releases
+  |> list.map(fn(entry) { entry.0 })
+  |> list.sort(int.compare)
+  |> should.equal(ascending(1, slots))
+  let assert Ok(last_handle) = list.last(handles)
+  postgres.state(database, last_handle) |> should.equal(Ok(job.Queued))
+  claim_statements_before_full(observed, slots, 0) |> should.equal(Ok(1))
+
+  // A freed slot is refilled with the remaining job.
+  let assert Ok(#(_, first_release)) = list.first(releases)
+  process.send(first_release, ReleaseAttempt)
+  let assert Ok(CapacityWorkerStarted(ninth, ninth_release)) =
+    process.receive(started, within: 5000)
+  ninth |> should.equal(slots + 1)
+  process.send(ninth_release, ReleaseAttempt)
+  list.each(releases, fn(entry) { process.send(entry.1, ReleaseAttempt) })
+  list.each(handles, fn(handle) {
+    wait_for_job_state(database, handle, job.Succeeded, 250)
+    |> should.equal(True)
+  })
+  mark_database_test_executed("automatic-consumer-batch-claim")
+}
+
+fn claim_statements_before_full(
+  observed: process.Subject(BatchClaimObservation),
+  slots: Int,
+  statements: Int,
+) -> Result(Int, Nil) {
+  case process.receive(observed, within: 5000) {
+    Error(Nil) -> Error(Nil)
+    Ok(ClaimStatementObserved) ->
+      claim_statements_before_full(observed, slots, statements + 1)
+    Ok(CapacityObserved(active:)) if active == slots -> Ok(statements)
+    Ok(CapacityObserved(..)) ->
+      claim_statements_before_full(observed, slots, statements)
+  }
+}
+
+/// The integers from `first` to `last`, both included, ascending.
+fn ascending(first: Int, last: Int) -> List(Int) {
+  int.range(from: last, to: first - 1, with: [], run: list.prepend)
 }
