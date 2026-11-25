@@ -47,6 +47,10 @@ const released_migration_sha256 = [
     "20261002000000-grind_v13.sql",
     "86717F6DA252F0BB149E053DC48AFD1E7C2BDF12A913D320FE843486BE36A994",
   ),
+  #(
+    "20261120000000-grind_v14.sql",
+    "7226EF0307EC8DDC17D15C5CED75D21269CC68FA8F29FD3545FECC15E8BC6D30",
+  ),
 ]
 
 /// Proves `grind/internal/migrations.migrations()` (what `postgres.migrate`
@@ -64,6 +68,9 @@ const released_migration_sha256 = [
 ///   marker statement records — which must itself be a
 ///   `INSERT INTO grind_schema_migrations` statement, not merely end with a
 ///   number that happens to parse.
+/// - Each concurrent index of a version is its own `disable_transaction`
+///   file (`<timestamp>-grind_v<N>_<index>.sql`) holding exactly the index
+///   statement, ordered before the file of its version.
 /// - Every file except the newest (highest) version has a pinned sha256 in
 ///   `released_migration_sha256` above, and it matches.
 /// - The frozen upgrade-harness fixture (`test/fixtures/schema/v11.sql`)
@@ -74,23 +81,45 @@ pub fn grind_migrations_conformance_test() {
   let assert Ok(files) = cigogne.read_migrations(config)
   let sorted = list.sort(files, migration.compare)
   let defined = migrations.migrations()
-  list.length(sorted) |> should.equal(list.length(defined))
+  // Each concurrent index is its own `disable_transaction` file, before the
+  // file of its version, since cigogne allows one statement in such a file.
+  let expected =
+    list.flat_map(defined, fn(step) {
+      list.append(
+        list.map(step.concurrent_indexes, fn(index) { #(step, Some(index)) }),
+        [#(step, None)],
+      )
+    })
+  list.length(sorted) |> should.equal(list.length(expected))
   let newest_version =
     list.fold(defined, 0, fn(highest, step) { int.max(highest, step.version) })
-  list.zip(sorted, defined)
+  list.zip(sorted, expected)
   |> list.each(fn(pair) {
-    let #(file, step) = pair
+    let #(file, #(step, concurrent)) = pair
     let file_version = version_from_migration_name(file.name)
     file_version |> should.equal(step.version)
     let up_statements =
       file.queries_up
       |> list.map(fn(statement) { drop_trailing_semicolon(statement) })
-    up_statements |> should.equal(step.statements)
-    let assert Ok(marker_statement) = list.last(up_statements)
-    string.starts_with(marker_statement, "INSERT INTO grind_schema_migrations")
-    |> should.be_true()
-    let assert Some(marker_version) = marker_insert_version(marker_statement)
-    marker_version |> should.equal(step.version)
+    case concurrent {
+      Some(index) -> {
+        file.options.disable_transaction |> should.be_true()
+        up_statements |> should.equal([index.statement])
+      }
+      None -> {
+        file.options.disable_transaction |> should.be_false()
+        up_statements |> should.equal(step.statements)
+        let assert Ok(marker_statement) = list.last(up_statements)
+        string.starts_with(
+          marker_statement,
+          "INSERT INTO grind_schema_migrations",
+        )
+        |> should.be_true()
+        let assert Some(marker_version) =
+          marker_insert_version(marker_statement)
+        marker_version |> should.equal(step.version)
+      }
+    }
     let pinned_sha256 =
       list.key_find(released_migration_sha256, filename_from_path(file.path))
     case step.version == newest_version {
@@ -134,8 +163,12 @@ fn filename_from_path(path: String) -> String {
 /// its filename after `<timestamp>-`), which this repository's naming
 /// convention (`grind_v<N>`) always encodes — see AGENTS.md.
 fn version_from_migration_name(name: String) -> Int {
-  let assert Ok(digits) = string.split_once(name, "grind_v")
-  let assert Ok(version) = int.parse(digits.1)
+  let assert Ok(#(_, rest)) = string.split_once(name, "grind_v")
+  let digits = case string.split_once(rest, "_") {
+    Ok(#(digits, _)) -> digits
+    Error(Nil) -> rest
+  }
+  let assert Ok(version) = int.parse(digits)
   version
 }
 
@@ -467,9 +500,10 @@ fn run_cigogne_concurrent_test(database_url: String) -> Nil {
 
   let engine_v12 = cigogne.create_engine(cigogne_config_for(connection))
   let assert Ok(engine_v12) = engine_v12
+  // v12, v13, v14, v15's concurrent index and v15.
   cigogne.get_unapplied_migrations(engine_v12)
   |> list.length
-  |> should.equal(3)
+  |> should.equal(5)
 
   let cigogne_result = process.new_subject()
   let migrate_result = process.new_subject()
@@ -513,6 +547,6 @@ fn run_cigogne_concurrent_test(database_url: String) -> Nil {
   process.receive(migrate_result, within: 10_000) |> should.equal(Ok(Ok(Nil)))
 
   let assert Ok(marker_count) = schema_marker_count(connection)
-  marker_count |> should.equal(4)
+  marker_count |> should.equal(5)
   mark_database_test_executed("cigogne-migrate-concurrent-serialize-passed")
 }

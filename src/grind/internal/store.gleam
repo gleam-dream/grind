@@ -97,3 +97,14 @@ pub fn transaction_or_checkout_failure(
   connection: pog.Connection,
   callback: fn(pog.Connection) -> Result(a, b),
 ) -> Result(Result(a, pog.TransactionError(b)), Nil)
+
+/// `postgres.migrate`'s wrapper for statements that must run outside a
+/// transaction, such as a concurrent index build: `run` receives one
+/// checked-out session, held under `deadline_ms`, and its statements commit
+/// one at a time.
+@external(erlang, "grind_postgres_ffi", "migration_call_safely")
+pub fn migration_call_safely(
+  connection: pog.Connection,
+  deadline_ms: Int,
+  run: fn(pog.Connection) -> Result(a, pog.QueryError),
+) -> Result(a, pog.QueryError)

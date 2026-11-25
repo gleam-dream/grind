@@ -16,6 +16,7 @@
 //// See AGENTS.md, "Adding a migration", for the steps to add a new version
 //// here.
 
+import gleam/list
 import grind/internal/terminal
 
 /// A relation kind as PostgreSQL's own `pg_class.relkind` distinguishes them
@@ -65,7 +66,22 @@ pub type Migration {
     /// own doc comment ("Dropping `storage_owner`") for the one case this
     /// exists for today, and AGENTS.md, "Adding a migration".
     forbidden_columns: List(#(String, String)),
+    /// Indexes this version builds with `CREATE INDEX CONCURRENTLY`, which
+    /// PostgreSQL refuses inside a transaction. `postgres.migrate_with`
+    /// builds them before the version's transaction, under the migration
+    /// lock held as a session lock, and rebuilds one a failed build left
+    /// invalid; the version's own `statements` then write its marker. Each
+    /// is also listed in `shape`, and the shape check of the version before
+    /// accepts it, since it exists before this version's marker commits.
+    concurrent_indexes: List(ConcurrentIndex),
   )
+}
+
+/// One index a version builds outside its transaction. `statement` is
+/// `CREATE INDEX CONCURRENTLY IF NOT EXISTS <name> ...`, so a repeated build
+/// of a valid index changes nothing.
+pub type ConcurrentIndex {
+  ConcurrentIndex(name: String, statement: String)
 }
 
 /// The advisory-lock statement every version's own `statements` list starts
@@ -75,8 +91,24 @@ pub type Migration {
 /// `postgres.migrate_with` still locks even if a future version's author
 /// forgets to keep this as their own first statement).
 pub fn advisory_lock_statement() -> String {
-  "SELECT true FROM (SELECT pg_advisory_xact_lock(hashtextextended('grind-migrate-v1:' || current_schema(), 0))) l"
+  "SELECT true FROM (SELECT pg_advisory_xact_lock(" <> lock_key_sql <> ")) l"
 }
+
+/// The same lock as `advisory_lock_statement`, held by a session instead of
+/// a transaction, for a version's concurrent index builds. It returns at
+/// once with whether the lock was taken: a session that waited for it inside
+/// a statement would hold a snapshot, and a concurrent index build waits for
+/// every older snapshot to end.
+pub fn session_lock_statement() -> String {
+  "SELECT pg_try_advisory_lock(" <> lock_key_sql <> ")"
+}
+
+pub fn session_unlock_statement() -> String {
+  "SELECT pg_advisory_unlock(" <> lock_key_sql <> ")"
+}
+
+const lock_key_sql =
+  "hashtextextended('grind-migrate-v1:' || current_schema(), 0)"
 
 /// One entry per released schema version, in the order `postgres.migrate`
 /// (`migrate_with(database, migrations())`) applies them.
@@ -85,13 +117,14 @@ pub fn advisory_lock_statement() -> String {
 /// never part of the public API.
 pub fn migrations() -> List(Migration) {
   [
-    Migration(11, v11_statements(), v11_shape(), [], []),
+    Migration(11, v11_statements(), v11_shape(), [], [], []),
     Migration(
       12,
       v12_statements(),
       v12_shape(),
       v12_foreign_keys(),
       v12_forbidden_columns(),
+      [],
     ),
     Migration(
       13,
@@ -99,6 +132,7 @@ pub fn migrations() -> List(Migration) {
       v13_shape(),
       v12_foreign_keys(),
       v12_forbidden_columns(),
+      [],
     ),
     Migration(
       14,
@@ -106,6 +140,15 @@ pub fn migrations() -> List(Migration) {
       v14_shape(),
       v12_foreign_keys(),
       v12_forbidden_columns(),
+      [],
+    ),
+    Migration(
+      15,
+      v15_statements(),
+      v15_shape(),
+      v12_foreign_keys(),
+      v12_forbidden_columns(),
+      v15_concurrent_indexes(),
     ),
   ]
 }
@@ -517,4 +560,31 @@ fn v14_shape() -> List(ExpectedRelation) {
     ExpectedRelation("grind_unique_submissions_pkey", Index, []),
     ExpectedRelation("grind_unique_submissions_job_idx", Index, []),
   ]
+}
+
+/// Version 15 indexes the settler's due jobs (ADR-0023): the uncertain jobs
+/// of a queue that carry a due time, in due order. Without it each settler
+/// poll reads every uncertain job of the installation. The index is built
+/// concurrently, so building it never blocks job writes; the version's
+/// transaction then only writes the marker.
+fn v15_concurrent_indexes() -> List(ConcurrentIndex) {
+  [
+    ConcurrentIndex(
+      "grind_jobs_settle_due_idx",
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS grind_jobs_settle_due_idx ON grind_jobs (queue, settle_at, id) WHERE state = 'uncertain' AND settle_at IS NOT NULL",
+    ),
+  ]
+}
+
+fn v15_statements() -> List(String) {
+  [
+    advisory_lock_statement(),
+    "INSERT INTO grind_schema_migrations (version) VALUES (15)",
+  ]
+}
+
+fn v15_shape() -> List(ExpectedRelation) {
+  list.append(v14_shape(), [
+    ExpectedRelation("grind_jobs_settle_due_idx", Index, []),
+  ])
 }

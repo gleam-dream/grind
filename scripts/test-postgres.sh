@@ -130,7 +130,7 @@ for migration_file in "$repo_root"/priv/migrations/*.sql; do
   # `tr -d '\r'` first: a CRLF-saved migration file would otherwise leave a
   # trailing `\r` on the guard lines below, silently matching nothing.
   tr -d '\r' <"$migration_file" |
-    sed -n '/^--- migration:up$/,/^--- migration:down$/p' |
+    sed -n '/^--- migration:up/,/^--- migration:down$/p' |
     sed '1d;$d' >>"$squirrel_check_up_sql"
 done
 if [[ ! -s "$squirrel_check_up_sql" ]]; then

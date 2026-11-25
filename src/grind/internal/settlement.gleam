@@ -203,6 +203,10 @@ fn identities(
   ))
 }
 
+/// Takes the earliest due job of a declared worker version. A job is due
+/// when its due time is at or before the statement's start: a stable time
+/// that `grind_jobs_settle_due_idx` can bound, unlike `clock_timestamp()`,
+/// so a poll reads only due jobs instead of every uncertain one.
 fn take(
   database: Database,
   queue: String,
@@ -211,7 +215,7 @@ fn take(
   already: List(Int),
 ) -> Result(Option(Taken), pog.QueryError) {
   pog.query(
-    "UPDATE grind_jobs AS job SET settle_at = clock_timestamp() + make_interval(secs => GREATEST(LEAST($4::float8 * power(2::float8, LEAST(job.settle_tries, 40)::float8), GREATEST($5::float8, $4::float8)), $4::float8) / 1000.0), settle_tries = job.settle_tries + 1 FROM (SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'uncertain' AND settle_at IS NOT NULL AND settle_attempt_id = attempt_id AND settle_at <= clock_timestamp() AND (worker_id, worker_version) IN (SELECT * FROM unnest($2::text[], $3::text[])) AND NOT (id = ANY($6::bigint[])) ORDER BY settle_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) AS candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.settle_attempt_id, job.settle_tries, job.correlation",
+    "UPDATE grind_jobs AS job SET settle_at = clock_timestamp() + make_interval(secs => GREATEST(LEAST($4::float8 * power(2::float8, LEAST(job.settle_tries, 40)::float8), GREATEST($5::float8, $4::float8)), $4::float8) / 1000.0), settle_tries = job.settle_tries + 1 FROM (SELECT id FROM grind_jobs WHERE queue = $1 AND state = 'uncertain' AND settle_at IS NOT NULL AND settle_attempt_id = attempt_id AND settle_at <= statement_timestamp() AND (worker_id, worker_version) IN (SELECT * FROM unnest($2::text[], $3::text[])) AND NOT (id = ANY($6::bigint[])) ORDER BY settle_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) AS candidate WHERE job.id = candidate.id RETURNING job.id, job.queue, job.worker_id, job.worker_version, job.settle_attempt_id, job.settle_tries, job.correlation",
   )
   |> pog.parameter(pog.text(queue))
   |> identities(settling)

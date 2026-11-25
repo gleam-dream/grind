@@ -44,6 +44,8 @@ The migration contract is in the design, "Storage and migrations", with rational
 3. After release, add the file sha256 (`shasum -a 256 <file> | awk '{print toupper($1)}'`) to `released_migration_sha256` in `test/grind/migrations/conformance_test.gleam`.
 4. Run `scripts/test-postgres.sh`, which applies every mirror `up` section with `psql` before Squirrel generation and check.
 
+An index on `grind_jobs` is built concurrently (ADR-0023): list it in the version's `concurrent_indexes` as `CREATE INDEX CONCURRENTLY IF NOT EXISTS`, add it to the shape, and mirror it as its own `<timestamp>-grind_v<N>_<index>.sql` file with `--- migration:up:disable_transaction`, timestamped before the version's file, whose transaction then holds only the lock statement and the marker.
+
 <!-- agent-skills:begin -->
 <!-- framework-commit: cab7c0590036edaa66d8430cc5016399a9fd2c71 origin: git@github.com:lostbean/skills.git -->
 

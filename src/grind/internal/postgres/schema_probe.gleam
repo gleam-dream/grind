@@ -98,11 +98,16 @@ fn relation_kind_code(kind: migrations.RelationKind) -> String {
   }
 }
 
+/// `accepted` names relations that may exist beyond `shape`: the next
+/// version's concurrent indexes, built before that version's marker.
 pub fn relation_shape_matches(
   connection: pog.Connection,
   shape: List(migrations.ExpectedRelation),
+  accepted: List(String),
 ) -> Result(Bool, ProbeError) {
   use actual <- result.try(read_grind_relations(connection))
+  let actual =
+    list.filter(actual, fn(relation) { !list.contains(accepted, relation.0) })
   let expected =
     shape
     |> list.map(fn(relation) {
@@ -225,5 +230,23 @@ pub fn forbidden_columns_absent(
           }
       }
     }
+  }
+}
+
+/// Whether the index `name` in the current schema is valid: `[]` when it
+/// does not exist, `[False]` when a failed concurrent build left it invalid.
+pub fn index_validity(
+  connection: pog.Connection,
+  name: String,
+) -> Result(List(Bool), ProbeError) {
+  let query =
+    pog.query(
+      "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname = $1",
+    )
+    |> pog.parameter(pog.text(name))
+    |> pog.returning(decode.at([0], decode.bool))
+  case store.execute_safely(query, on: connection) {
+    Error(error) -> Error(ProbeQueryFailed(error))
+    Ok(returned) -> Ok(returned.rows)
   }
 }

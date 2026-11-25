@@ -13,6 +13,7 @@
     transaction_measured/2,
     transaction_or_checkout_failure/2,
     migration_transaction_safely/3,
+    migration_call_safely/3,
     is_single_connection/1,
     application_search_path/0
 ]).
@@ -446,6 +447,23 @@ migration_transaction_safely(Connection, DeadlineMs, Callback) ->
             );
         SingleConnection = {single_connection, Conn} ->
             guarded_transaction(Conn, fun() -> pog:transaction(SingleConnection, Callback) end)
+    end.
+
+%% `migration_transaction_safely/3` without a transaction: `Fun` runs its
+%% statements on one checked-out session, each in its own implicit
+%% transaction, under the migration deadline. A concurrent index build needs
+%% this, since PostgreSQL refuses it inside a transaction block.
+migration_call_safely(Connection, DeadlineMs, Fun) ->
+    case Connection of
+        {pool, PoolName} ->
+            with_deadline_ms(
+                PoolName,
+                DeadlineMs,
+                fun(WrappedConn, RawConn) -> guarded_query(RawConn, fun() -> Fun(WrappedConn) end) end,
+                fun() -> {error, connection_unavailable} end
+            );
+        SingleConnection = {single_connection, Conn} ->
+            guarded_query(Conn, fun() -> Fun(SingleConnection) end)
     end.
 
 stop_consumer_supervisor(Pid) ->
