@@ -374,6 +374,20 @@ pub fn with_max_snoozes(
 
 /// What happens to an abandoned attempt; `HoldUncertain` by default. Panics
 /// on `ReplayAfterLeaseExpiry` with fewer than 1 replay.
+///
+/// A handler that crashes abandons its attempt, like a node that dies: a
+/// panic, a failed `let assert` or any other exit of the handler's process is
+/// not a failed attempt and is not retried under the retry policy, because
+/// the handler may already have had its effect. The job stays `Executing`
+/// until its lease expires and then follows this policy. Return `Error` from
+/// the handler for a failure that is safe to retry.
+///
+/// Grind stores a description of the crash on the job, where `admin.list`
+/// and `abandoned.description` read it: the kind of failure, its module,
+/// function and line, and the message of a `panic`, at most 500 characters.
+/// It never stores a value the failure carried, such as the value a
+/// `let assert` did not match. A job held `Uncertain` keeps the description;
+/// a replayed job replaces it.
 pub fn with_abandonment(
   worker: Worker(input, output, error),
   abandonment: Abandonment,
