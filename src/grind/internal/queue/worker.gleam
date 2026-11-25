@@ -8,7 +8,9 @@
 //// through lease expiry. A handler that exceeds its timeout is unlinked and
 //// killed. Under `HoldUncertain` the attempt acknowledges `uncertain`; under
 //// `ReplayAfterLeaseExpiry` it stops renewing and lets lease-expiry recovery
-//// decide.
+//// decide. A handler whose attempt lost its lease is stopped the same way:
+//// no write of that attempt can commit any more, and lease-expiry recovery
+//// may already have started another attempt of the same job.
 
 import gleam/erlang/process
 import gleam/int
@@ -33,6 +35,8 @@ pub type WorkerMessage {
   HandlerReady(cancel: process.Subject(Nil))
   HandlerFinished(worker.Execution)
   HandlerTimedOut
+  /// The renewer found no live fence for this attempt.
+  LeaseLost
 }
 
 pub type WorkerRequest(message) {
@@ -138,7 +142,28 @@ fn handle(
     HandlerTimedOut, Running(handler:, ..) -> {
       process.unlink(handler)
       process.kill(handler)
-      timed_out(state)
+      let timeout = case attempt.claim_timeout_ms(state.request.claimed) {
+        Some(ms) -> int.to_string(ms)
+        None -> "?"
+      }
+      abandon(
+        state,
+        "handler exceeded its timeout of "
+          <> timeout
+          <> " ms and was stopped; its effect is unknown",
+      )
+    }
+    // Only a running handler is stopped. Once the handler has returned, the
+    // acknowledgement decides: a renewal can also miss the fence because
+    // that acknowledgement has just committed.
+    LeaseLost, Running(handler:, timer:, ..) -> {
+      cancel_timer(timer)
+      process.unlink(handler)
+      process.kill(handler)
+      abandon(
+        state,
+        "attempt lost its lease while its handler was running; the handler was stopped and its effect is unknown",
+      )
     }
     RetryAcknowledgement, WaitingForAcknowledgement(execution) ->
       acknowledge(state, execution)
@@ -157,7 +182,8 @@ fn start_handler(
     renewer.Track(
       attempt.lease_fence(request.claimed, request.owner),
       process.self(),
-      fn() { process.send(self, CancelRequested) },
+      on_cancel: fn() { process.send(self, CancelRequested) },
+      on_lost: fn() { process.send(self, LeaseLost) },
     ),
   )
   let timeout_ms = attempt.claim_timeout_ms(request.claimed)
@@ -201,27 +227,20 @@ fn cancel_timer(timer: Option(process.Timer)) -> Nil {
   }
 }
 
-/// The handler outlived its timeout and was killed. `HoldUncertain`
-/// acknowledges `uncertain` now; `ReplayAfterLeaseExpiry` leaves the claim
-/// unacknowledged, so lease-expiry recovery replays it.
-fn timed_out(
+/// The handler was killed, at its timeout or because its attempt lost its
+/// lease. `HoldUncertain` proposes the abandonment now: with a live fence it
+/// commits `uncertain`, and without one it is rejected as stale and changes
+/// nothing, which leaves the job to whatever recovery already owns it.
+/// `ReplayAfterLeaseExpiry` leaves the claim unacknowledged, so lease-expiry
+/// recovery replays it.
+fn abandon(
   state: WorkerState(message),
+  description: String,
 ) -> actor.Next(WorkerState(message), WorkerMessage) {
   let request = state.request
-  let timeout = case attempt.claim_timeout_ms(request.claimed) {
-    Some(ms) -> int.to_string(ms)
-    None -> "?"
-  }
   case attempt.claim_abandonment(request.claimed) {
     worker.HoldUncertain ->
-      begin_acknowledgement(
-        state,
-        worker.ExecutedAbandoned(
-          "handler exceeded its timeout of "
-          <> timeout
-          <> " ms and was stopped; its effect is unknown",
-        ),
-      )
+      begin_acknowledgement(state, worker.ExecutedAbandoned(description))
     worker.ReplayAfterLeaseExpiry(_) -> {
       let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
       process.send(request.renewer, renewer.Untrack(attempt_id, epoch))

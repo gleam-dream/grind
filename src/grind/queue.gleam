@@ -19,8 +19,10 @@
 //// Concurrency is per node: each node that runs the queue claims up to this
 //// many jobs at once. A claimed attempt holds a lease in the database,
 //// renewed every third of its length by a reserved connection; an attempt
-//// whose lease expires is recovered by its worker's abandonment policy. The
-//// lease must be at least four times the statement deadline. On shutdown a
+//// whose lease expires is recovered by its worker's abandonment policy, and
+//// its handler, if it is still running on this node when a renewal finds
+//// the lease lost, is stopped at once like a handler that reached its
+//// timeout. The lease must be at least four times the statement deadline. On shutdown a
 //// queue stops claiming and waits up to its grace for running jobs.
 //// `grind.start` and `grind.supervised` check these values and report a
 //// `grind.InvalidQueue` error.
