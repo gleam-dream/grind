@@ -832,6 +832,11 @@ pub type SubmitError(input, output, error) {
   /// The admission may or may not have committed. Retry the same job, or
   /// pass the pending submission to `reconcile_submission`.
   CommitUnknown(PendingSubmission(input, output, error))
+  /// `submit_many` only: the batch may or may not have committed. It
+  /// commits all or nothing, so pass each pending submission, one per job in
+  /// order, to `reconcile_submission`, or retry the same batch when every
+  /// job has an id.
+  BatchCommitUnknown(pending: List(PendingSubmission(input, output, error)))
   /// `submit_in` was given a pool, not a transaction.
   NotInTransaction
   /// `submit_in`'s transaction is not `READ COMMITTED`.
@@ -857,6 +862,40 @@ pub fn submit(
   use spec <- result.try(spec_for(job))
   postgres.admit(database, spec)
   |> result.map(admission_of(_, postgres.installation(database), spec.worker))
+  |> result.map_error(submit_error)
+}
+
+/// Admits many jobs in one transaction, as `submit` admits one: all commit
+/// or none does, and the admissions come back in the order of `jobs`. Jobs
+/// without a uniqueness policy are written together, so a batch costs a few
+/// round trips instead of several per job. A job id is an idempotency key
+/// here too; one id twice in a batch is an `IdConflict`. A job with a
+/// uniqueness policy is admitted one at a time inside the same transaction,
+/// taking its lock in list order. The first job refused before storage
+/// (`InvalidInput`, `PayloadTooLarge`, `EmptyJobId`) refuses the batch, and
+/// nothing is written. Emits `[grind, job, admitted]` for each job once the
+/// commit is proven.
+///
+/// ```gleam
+/// grind.submit_many(jobs, list.map(order.lines, job.new(pick_line(), _)))
+/// ```
+pub fn submit_many(
+  grind: Grind,
+  jobs: List(job.Job(input, output, error)),
+) -> Result(
+  List(Admission(input, output, error)),
+  SubmitError(input, output, error),
+) {
+  use database <- result.try(
+    runtime.database(grind) |> result.replace_error(SubmitNotRunning),
+  )
+  use specs <- result.try(list.try_map(jobs, spec_for))
+  postgres.admit_many(database, specs)
+  |> result.map(
+    list.map2(_, specs, fn(admission, spec) {
+      admission_of(admission, postgres.installation(database), spec.worker)
+    }),
+  )
   |> result.map_error(submit_error)
 }
 
@@ -1015,6 +1054,7 @@ fn submit_error(
     submission.SubmissionConflict -> IdConflict
     submission.NotCommitted(reason) -> NotCommitted(reason)
     submission.CommitUnknown(pending) -> CommitUnknown(pending)
+    submission.BatchCommitUnknown(pending) -> BatchCommitUnknown(pending)
     submission.NotInTransaction -> NotInTransaction
     submission.TransactionIsolationUnsupported(isolation) ->
       TransactionIsolationUnsupported(isolation)
@@ -1352,7 +1392,7 @@ pub fn submit_error_kind(
     IdConflict | WrongDatabase -> Mismatch
     UniquenessContended -> Contended
     NotCommitted(_) | SubmitNotRunning -> Unreachable
-    CommitUnknown(_) -> Unknown
+    CommitUnknown(_) | BatchCommitUnknown(_) -> Unknown
   }
 }
 
@@ -1462,6 +1502,8 @@ pub fn describe_submit_error(
       "grind: the submit did not commit: " <> string.inspect(reason)
     CommitUnknown(_) ->
       "grind: the submit may have committed; reconcile it with reconcile_submission"
+    BatchCommitUnknown(_) ->
+      "grind: the batch may have committed; reconcile each job with reconcile_submission"
     NotInTransaction -> "grind: submit_in needs a transaction connection"
     TransactionIsolationUnsupported(isolation:) ->
       "grind: submit_in needs a READ COMMITTED transaction, not " <> isolation
