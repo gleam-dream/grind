@@ -48,7 +48,8 @@ pub fn main() -> Nil {
         |> grind.with_startup_migration,
       process.new_name("grind_bench_submit_many"),
     )
-  let batch = list.map(list.repeat(Nil, count), fn(_) { job.new(bench_worker, 1) })
+  let batch =
+    list.map(list.repeat(Nil, count), fn(_) { job.new(bench_worker, 1) })
   // One discarded warm-up of each arm.
   let _ = single(jobs, batch)
   let _ = bulk(jobs, batch)
