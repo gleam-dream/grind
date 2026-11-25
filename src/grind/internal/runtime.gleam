@@ -330,3 +330,25 @@ pub fn recorded_pool(
 
 @external(erlang, "grind_runtime_ffi", "parent_pid")
 fn parent_pid() -> process.Pid
+
+/// Why a new runtime cannot start under a name yet.
+pub type PreviousIncarnation {
+  /// A runtime is running under this name.
+  StillRunning
+  /// The previous runtime's root exited, but some of its processes were
+  /// still stopping when the wait ended.
+  DidNotStop
+}
+
+/// Records `root` as the runtime now running under `name`.
+@external(erlang, "grind_runtime_ffi", "record_incarnation")
+pub fn record_incarnation(name: process.Name(Message), root: process.Pid) -> Nil
+
+/// Waits up to `within_ms` for every process of the runtime last started
+/// under `name` to exit, so the next one registers its names only after the
+/// previous one released them.
+@external(erlang, "grind_runtime_ffi", "await_previous_incarnation")
+pub fn await_previous_incarnation(
+  name: process.Name(Message),
+  within_ms: Int,
+) -> Result(Nil, PreviousIncarnation)

@@ -509,15 +509,15 @@ pub fn start(
   use plans <- result.try(
     queue_plans(config) |> result.map_error(InvalidConfig),
   )
-  use Nil <- result.try(case process.named(name) {
-    Ok(_) -> Error(StartFailed("a runtime is already running under this name"))
-    Error(Nil) -> Ok(Nil)
-  })
+  use Nil <- result.try(
+    after_previous_incarnation(name, plans, config)
+    |> result.map_error(StartFailed),
+  )
   runtime.record_pool(name, postgres.pool_name(validated))
   let failures = process.new_subject()
   let root =
     root_supervisor(config, validated, plans, name, False, Some(failures))
-  case start_unlinked(fn() { static_supervisor.start(root) }) {
+  case start_unlinked(fn() { start_root(root, name) }) {
     Ok(_) -> Ok(runtime.Grind(name))
     Error(error) ->
       case process.receive(failures, within: 0) {
@@ -545,18 +545,59 @@ pub fn supervised(
     use validated <- result.try(settings(config))
     use plans <- result.try(queue_plans(config))
     runtime.record_pool(name, postgres.pool_name(validated))
-    Ok(root_supervisor(config, validated, plans, name, True, None))
+    Ok(#(root_supervisor(config, validated, plans, name, True, None), plans))
   }
   supervision.supervisor(fn() {
     case checked {
-      Ok(root) ->
-        static_supervisor.start(root)
-        |> result.map(fn(started) {
-          actor.Started(started.pid, runtime.Grind(name))
-        })
+      Ok(#(root, plans)) ->
+        case after_previous_incarnation(name, plans, config) {
+          Error(description) -> Error(actor.InitFailed(description))
+          Ok(Nil) ->
+            start_root(root, name)
+            |> result.map(fn(started) {
+              actor.Started(started.pid, runtime.Grind(name))
+            })
+        }
       Error(error) -> Error(actor.InitFailed(describe_config_error(error)))
     }
   })
+}
+
+/// Waits until no process of the runtime last started under `name` is
+/// alive. A killed or crashed root dies at once while its consumers drain
+/// and its pool waits for its callers, each still registered under a name
+/// the next runtime registers; starting only after they exit means a
+/// restart never meets one of them. The wait is bounded by the longest
+/// queue grace plus the connect timeout and five seconds, the budget the
+/// previous runtime had to stop and this one has to start.
+fn after_previous_incarnation(
+  name: process.Name(Message),
+  plans: List(runtime.QueuePlan),
+  config: Config,
+) -> Result(Nil, String) {
+  let longest_grace_ms =
+    list.fold(plans, 0, fn(longest, plan) { int.max(longest, plan.grace_ms) })
+  case
+    runtime.await_previous_incarnation(
+      name,
+      longest_grace_ms + config.connect_timeout_ms + 5000,
+    )
+  {
+    Ok(Nil) -> Ok(Nil)
+    Error(runtime.StillRunning) ->
+      Error("a runtime is already running under this name")
+    Error(runtime.DidNotStop) ->
+      Error("the previous runtime under this name did not stop in time")
+  }
+}
+
+fn start_root(
+  root: static_supervisor.Builder,
+  name: process.Name(Message),
+) -> Result(actor.Started(static_supervisor.Supervisor), actor.StartError) {
+  use started <- result.map(static_supervisor.start(root))
+  runtime.record_incarnation(name, started.pid)
+  started
 }
 
 fn start_failure(error: actor.StartError) -> String {

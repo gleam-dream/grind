@@ -65,6 +65,67 @@ pub fn facade_supervised_handle_survives_a_restart_test() {
   }
 }
 
+/// The application's supervisor restarts Grind as one child: everything the
+/// killed incarnation registered must be gone, so the new one starts.
+pub fn facade_supervisor_restarts_a_killed_runtime_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let echo_worker = echo_worker("root-restart")
+      let name = process.new_name("lifecycle_root_restart")
+      let jobs = grind.named(name)
+      let config =
+        grind.new(pool_config(url))
+        |> grind.with_worker(echo_worker)
+        |> grind.with_startup_migration
+      let assert Ok(started) =
+        supervisor.new(supervisor.OneForOne)
+        |> supervisor.add(grind.supervised(config, name))
+        |> supervisor.start
+      use <- exception.defer(fn() { stop_tree(started.pid) })
+      let assert Ok(grind.Inserted(first)) =
+        grind.submit(jobs, job.new(echo_worker, 1))
+      grind.await(jobs, first, within: duration.seconds(10))
+      |> should.equal(Ok(grind.Succeeded(1)))
+
+      // Kill Grind's own root, as a crash of the whole runtime would. The
+      // application's supervisor starts a new one at once.
+      let assert Ok(root) = only_child(started.pid)
+      kill_process(root)
+      wait_for_new_child(started.pid, root, 250)
+      // The application's supervisor survived the restart ...
+      process.is_alive(started.pid) |> should.be_true
+      // ... and the new runtime serves the same handle.
+      let assert Ok(grind.Inserted(second)) =
+        grind.submit(jobs, job.new(echo_worker, 2))
+      grind.await(jobs, second, within: duration.seconds(10))
+      |> should.equal(Ok(grind.Succeeded(2)))
+      mark_database_test_executed("facade-supervisor-root-restart-passed")
+    }
+  }
+}
+
+fn wait_for_new_child(
+  parent: process.Pid,
+  old: process.Pid,
+  attempts: Int,
+) -> Nil {
+  case only_child(parent), attempts {
+    Ok(pid), _ if pid != old -> Nil
+    _, 0 -> panic as "the application's supervisor did not restart Grind"
+    _, _ -> {
+      process.sleep(20)
+      wait_for_new_child(parent, old, attempts - 1)
+    }
+  }
+}
+
+@external(erlang, "grind_restart_probe", "only_child")
+fn only_child(supervisor: process.Pid) -> Result(process.Pid, Nil)
+
+@external(erlang, "grind_restart_probe", "kill")
+fn kill_process(pid: process.Pid) -> Nil
+
 fn wait_until_restarted(
   name: process.Name(grind.Message),
   old: process.Pid,
