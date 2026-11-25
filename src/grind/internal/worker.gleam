@@ -268,11 +268,6 @@ pub type AbandonmentCause {
 pub type Stopped {
   StoppedAtTimeout
   StoppedByCrash
-  /// A renewal found no live fence for the attempt while its handler ran, so
-  /// Grind stopped the handler. No write of the attempt can commit any more:
-  /// its acknowledgement is rejected as stale, and lease-expiry recovery
-  /// records the job's cause as `LeaseExpired`.
-  StoppedAtLeaseLoss
 }
 
 /// A declared settlement's decision. `grind/worker.Settlement` is the

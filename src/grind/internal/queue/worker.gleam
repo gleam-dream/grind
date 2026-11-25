@@ -12,8 +12,9 @@
 //// `uncertain` at once, with the cause and a bounded description; under
 //// `ReplayAfterLeaseExpiry` it stops renewing and lets lease-expiry
 //// recovery decide. A handler whose attempt lost its lease is unlinked and
-//// killed the same way: no write of that attempt can commit any more, and
-//// lease-expiry recovery may already have started another attempt of the
+//// killed too, and the attempt finishes here without acknowledging: no
+//// write of that attempt can commit any more, so lease-expiry recovery owns
+//// the job's outcome and may already have started another attempt of the
 //// same job. Because it is unlinked first, its stop is never read as a
 //// crash.
 
@@ -171,11 +172,7 @@ fn handle(
       cancel_timer(timer)
       process.unlink(handler)
       process.kill(handler)
-      abandon(
-        state,
-        worker.StoppedAtLeaseLoss,
-        "attempt lost its lease while its handler was running; the handler was stopped and its effect is unknown",
-      )
+      leave_to_lease_recovery(state)
     }
     RetryAcknowledgement, WaitingForAcknowledgement(execution) ->
       acknowledge(state, execution)
@@ -300,34 +297,38 @@ fn timed_out(
   )
 }
 
-/// The handler stopped without a result. `HoldUncertain` proposes the
-/// abandonment now, with the cause: with a live fence it commits
-/// `uncertain`, and without one (always so after a lost lease) it is
-/// rejected as stale and changes nothing, which leaves the job to whatever
-/// recovery already owns it. `ReplayAfterLeaseExpiry` leaves the claim
-/// unacknowledged, so lease-expiry recovery replays it.
+/// The handler stopped without a result, at its timeout or by crashing.
+/// `HoldUncertain` acknowledges `uncertain` now, with the cause;
+/// `ReplayAfterLeaseExpiry` leaves the claim unacknowledged, so lease-expiry
+/// recovery replays it.
 fn abandon(
   state: WorkerState(message),
   stopped: worker.Stopped,
   description: String,
 ) -> actor.Next(WorkerState(message), WorkerMessage) {
-  let request = state.request
-  case attempt.claim_abandonment(request.claimed) {
+  case attempt.claim_abandonment(state.request.claimed) {
     worker.HoldUncertain ->
       begin_acknowledgement(
         state,
         worker.ExecutedAbandoned(stopped, description),
       )
-    worker.ReplayAfterLeaseExpiry(_) -> {
-      let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
-      process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
-      process.send(
-        request.queue_subject,
-        request.on_complete(id, attempt_id, epoch, Ok(True)),
-      )
-      actor.continue(WorkerState(..state, phase: Finished))
-    }
+    worker.ReplayAfterLeaseExpiry(_) -> leave_to_lease_recovery(state)
   }
+}
+
+/// Finishes the attempt on this node without acknowledging: it stops
+/// renewing and frees its slot, and lease-expiry recovery decides the job.
+fn leave_to_lease_recovery(
+  state: WorkerState(message),
+) -> actor.Next(WorkerState(message), WorkerMessage) {
+  let request = state.request
+  let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
+  process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
+  process.send(
+    request.queue_subject,
+    request.on_complete(id, attempt_id, epoch, Ok(True)),
+  )
+  actor.continue(WorkerState(..state, phase: Finished))
 }
 
 fn begin_acknowledgement(
