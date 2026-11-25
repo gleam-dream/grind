@@ -8,8 +8,9 @@
 //// through lease expiry. A handler that exceeds its timeout is unlinked and
 //// killed. Under `HoldUncertain` the attempt acknowledges `uncertain`; under
 //// `ReplayAfterLeaseExpiry` it stops renewing and lets lease-expiry recovery
-//// decide. A handler whose attempt lost its lease is stopped the same way:
-//// no write of that attempt can commit any more, and lease-expiry recovery
+//// decide. A handler whose attempt lost its lease is stopped and the
+//// attempt finishes here without acknowledging: no write of that attempt
+//// can commit any more, so lease-expiry recovery owns the job's outcome and
 //// may already have started another attempt of the same job.
 
 import gleam/erlang/process
@@ -142,16 +143,7 @@ fn handle(
     HandlerTimedOut, Running(handler:, ..) -> {
       process.unlink(handler)
       process.kill(handler)
-      let timeout = case attempt.claim_timeout_ms(state.request.claimed) {
-        Some(ms) -> int.to_string(ms)
-        None -> "?"
-      }
-      abandon(
-        state,
-        "handler exceeded its timeout of "
-          <> timeout
-          <> " ms and was stopped; its effect is unknown",
-      )
+      timed_out(state)
     }
     // Only a running handler is stopped. Once the handler has returned, the
     // acknowledgement decides: a renewal can also miss the fence because
@@ -160,10 +152,7 @@ fn handle(
       cancel_timer(timer)
       process.unlink(handler)
       process.kill(handler)
-      abandon(
-        state,
-        "attempt lost its lease while its handler was running; the handler was stopped and its effect is unknown",
-      )
+      leave_to_lease_recovery(state)
     }
     RetryAcknowledgement, WaitingForAcknowledgement(execution) ->
       acknowledge(state, execution)
@@ -227,30 +216,44 @@ fn cancel_timer(timer: Option(process.Timer)) -> Nil {
   }
 }
 
-/// The handler was killed, at its timeout or because its attempt lost its
-/// lease. `HoldUncertain` proposes the abandonment now: with a live fence it
-/// commits `uncertain`, and without one it is rejected as stale and changes
-/// nothing, which leaves the job to whatever recovery already owns it.
-/// `ReplayAfterLeaseExpiry` leaves the claim unacknowledged, so lease-expiry
-/// recovery replays it.
-fn abandon(
+/// The handler outlived its timeout and was killed. `HoldUncertain`
+/// acknowledges `uncertain` now; `ReplayAfterLeaseExpiry` leaves the claim
+/// unacknowledged, so lease-expiry recovery replays it.
+fn timed_out(
   state: WorkerState(message),
-  description: String,
 ) -> actor.Next(WorkerState(message), WorkerMessage) {
   let request = state.request
+  let timeout = case attempt.claim_timeout_ms(request.claimed) {
+    Some(ms) -> int.to_string(ms)
+    None -> "?"
+  }
   case attempt.claim_abandonment(request.claimed) {
     worker.HoldUncertain ->
-      begin_acknowledgement(state, worker.ExecutedAbandoned(description))
-    worker.ReplayAfterLeaseExpiry(_) -> {
-      let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
-      process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
-      process.send(
-        request.queue_subject,
-        request.on_complete(id, attempt_id, epoch, Ok(True)),
+      begin_acknowledgement(
+        state,
+        worker.ExecutedAbandoned(
+          "handler exceeded its timeout of "
+          <> timeout
+          <> " ms and was stopped; its effect is unknown",
+        ),
       )
-      actor.continue(WorkerState(..state, phase: Finished))
-    }
+    worker.ReplayAfterLeaseExpiry(_) -> leave_to_lease_recovery(state)
   }
+}
+
+/// Finishes the attempt on this node without acknowledging: it stops
+/// renewing and frees its slot, and lease-expiry recovery decides the job.
+fn leave_to_lease_recovery(
+  state: WorkerState(message),
+) -> actor.Next(WorkerState(message), WorkerMessage) {
+  let request = state.request
+  let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
+  process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
+  process.send(
+    request.queue_subject,
+    request.on_complete(id, attempt_id, epoch, Ok(True)),
+  )
+  actor.continue(WorkerState(..state, phase: Finished))
 }
 
 fn begin_acknowledgement(

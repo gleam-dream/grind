@@ -176,6 +176,11 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
+  let #(acknowledgements, acknowledgement_attachment) =
+    diagnostics.capture(telemetry.acknowledgement(), fn(meta) {
+      meta.context.ref.job_id == job.id_value(handle)
+    })
+  use <- exception.defer(fn() { detach(acknowledgement_attachment) })
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_lease_duration(4008)
@@ -209,10 +214,10 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
     |> process.select_specific_monitor(handler_down, fn(down) { down })
     |> process.selector_receive(within: 5000)
   let assert Ok(process.ProcessDown(reason: process.Killed, ..)) = stopped
-  let assert Ok(Error(queue.QueueProcessFailed(postgres.QueueAckStale(
-    worker.ExecutedAbandoned(_),
-    postgres.AckLeaseExpired(..),
-  )))) = process.receive(reply, within: 5000)
+  // The attempt finishes on this node without proposing anything: no
+  // acknowledgement statement runs, so none is reported.
+  process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
+  process.receive(acknowledgements, within: 0) |> should.equal(Error(Nil))
   postgres.state(database, handle) |> should.equal(Ok(job.Executing))
   // The slot is free again, and the next claim's scan holds the job.
   queue.process_one(consumer) |> should.equal(Ok(False))
