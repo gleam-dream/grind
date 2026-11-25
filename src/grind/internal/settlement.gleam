@@ -359,7 +359,7 @@ type Locked {
     input_version: String,
     encoded_input: String,
     attempt: Int,
-    timed_out: Bool,
+    cause: worker.AbandonmentCause,
     replays: Int,
     authorized_replays: Int,
     try_number: Int,
@@ -411,10 +411,7 @@ fn try_once(
           encoded_input: locked.encoded_input,
           attempt_id:,
           attempt: locked.attempt,
-          cause: case locked.timed_out {
-            True -> worker.TimedOut
-            False -> worker.LeaseExpired
-          },
+          cause: locked.cause,
           replays: locked.replays,
           authorized_replays: locked.authorized_replays,
           try_number: locked.try_number,
@@ -521,15 +518,17 @@ fn decline(
 
 /// Locks the job without waiting and reads it, only while it is still due
 /// under the mark the take counted. An attempt Grind acknowledged as
-/// abandoned at its timeout has an acknowledgement receipt; one whose lease
-/// expired has none.
+/// abandoned, at its timeout or after its handler crashed, has an
+/// acknowledgement receipt and the job's `failure_cause` names which; one
+/// whose lease expired has no receipt. A timeout held before the cause was
+/// stored has a receipt and no cause.
 fn lock(
   transaction: pog.Connection,
   job_id: Int,
   attempt_id: Int,
 ) -> Result(Locked, Abort) {
   pog.query(
-    "SELECT pg_current_xact_id()::text, job.queue, job.input_version, job.input::text, job.attempt_count, EXISTS (SELECT 1 FROM grind_job_acknowledgements AS receipt WHERE receipt.job_id = job.id AND receipt.attempt_id = job.attempt_id AND receipt.attempt_epoch = job.attempt_epoch), job.replay_count, (SELECT count(*) FROM grind_job_resolutions AS resolution WHERE resolution.job_id = job.id AND resolution.decision = 'authorize_replay')::bigint, job.settle_tries, job.cancel_requested_at IS NOT NULL, (extract(epoch FROM COALESCE(job.uncertain_at, clock_timestamp())) * 1000000)::bigint, COALESCE(job.failure_description, ''), job.correlation FROM grind_jobs AS job WHERE job.id = $1 AND job.state = 'uncertain' AND job.settle_at IS NOT NULL AND job.settle_attempt_id = job.attempt_id AND job.attempt_id = $2 FOR NO KEY UPDATE OF job SKIP LOCKED",
+    "SELECT pg_current_xact_id()::text, job.queue, job.input_version, job.input::text, job.attempt_count, CASE WHEN NOT EXISTS (SELECT 1 FROM grind_job_acknowledgements AS receipt WHERE receipt.job_id = job.id AND receipt.attempt_id = job.attempt_id AND receipt.attempt_epoch = job.attempt_epoch) THEN 'lease_expired' WHEN job.failure_cause = 'handler_crashed' THEN 'handler_crashed' ELSE 'timed_out' END, job.replay_count, (SELECT count(*) FROM grind_job_resolutions AS resolution WHERE resolution.job_id = job.id AND resolution.decision = 'authorize_replay')::bigint, job.settle_tries, job.cancel_requested_at IS NOT NULL, (extract(epoch FROM COALESCE(job.uncertain_at, clock_timestamp())) * 1000000)::bigint, COALESCE(job.failure_description, ''), job.correlation FROM grind_jobs AS job WHERE job.id = $1 AND job.state = 'uncertain' AND job.settle_at IS NOT NULL AND job.settle_attempt_id = job.attempt_id AND job.attempt_id = $2 FOR NO KEY UPDATE OF job SKIP LOCKED",
   )
   |> pog.parameter(pog.int(job_id))
   |> pog.parameter(pog.int(attempt_id))
@@ -539,7 +538,7 @@ fn lock(
     use input_version <- decode.field(2, decode.string)
     use encoded_input <- decode.field(3, decode.string)
     use attempt <- decode.field(4, decode.int)
-    use timed_out <- decode.field(5, decode.bool)
+    use cause <- decode.field(5, decode.string)
     use replays <- decode.field(6, decode.int)
     use authorized_replays <- decode.field(7, decode.int)
     use try_number <- decode.field(8, decode.int)
@@ -553,7 +552,11 @@ fn lock(
       input_version:,
       encoded_input:,
       attempt:,
-      timed_out:,
+      cause: case cause {
+        "lease_expired" -> worker.LeaseExpired
+        "handler_crashed" -> worker.HandlerCrashed
+        _ -> worker.TimedOut
+      },
       replays:,
       authorized_replays:,
       try_number:,

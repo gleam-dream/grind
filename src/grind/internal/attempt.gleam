@@ -458,39 +458,6 @@ pub fn release_unstarted(
   }
 }
 
-/// Stores why this attempt's handler process exited, on the job the attempt
-/// still owns. The write changes nothing but the description: the job stays
-/// `executing`, because a handler that crashed may already have had its
-/// effect, and lease-expiry recovery decides what happens next. `True` means
-/// the fenced row was written; a lost fence or an expired lease writes
-/// nothing.
-pub fn record_handler_exit(
-  database: Database,
-  queue: String,
-  attempt_owner: String,
-  claimed: ClaimedJob,
-  description: String,
-) -> Result(Bool, pog.QueryError) {
-  let ClaimedJob(claim: Claim(id:, attempt_id:, epoch:, ..), ..) = claimed
-  let query =
-    pog.query(
-      "UPDATE grind_jobs SET failure_description = $1 WHERE id = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
-      <> lease.live_lease_predicate("clock_timestamp()")
-      <> " RETURNING id",
-    )
-    |> pog.parameter(pog.text(description))
-    |> pog.parameter(pog.int(id))
-    |> pog.parameter(pog.text(queue))
-    |> pog.parameter(pog.int(attempt_id))
-    |> pog.parameter(pog.int(epoch))
-    |> pog.parameter(pog.text(attempt_owner))
-    |> pog.returning(decode.at([0], decode.int))
-  case store.execute_safely(query, on: postgres.connection(database)) {
-    Error(error) -> Error(error)
-    Ok(returned) -> Ok(returned.rows != [])
-  }
-}
-
 /// Builds and forwards `[grind, job, released]` for a claim refunded before
 /// its worker ever ran. Called only after the release's own fenced
 /// `UPDATE ... RETURNING` already returned that row. `epoch` is the
@@ -642,7 +609,7 @@ fn acknowledge_once(
     | worker.ExecutedDiscarded(_)
     | worker.ExecutedCancelled(_)
     | worker.ExecutedUncertain(_)
-    | worker.ExecutedAbandoned(_) ->
+    | worker.ExecutedAbandoned(_, _) ->
       run_acknowledgement(
         database,
         queue,
@@ -1204,9 +1171,12 @@ fn run_acknowledgement(
         error: None,
         failure_description: Some(reason),
       )
-    worker.ExecutedAbandoned(reason) ->
+    worker.ExecutedAbandoned(stopped, reason) ->
       AckProposal(
-        proposed_state: "abandoned",
+        proposed_state: case stopped {
+          worker.StoppedAtTimeout -> "abandoned"
+          worker.StoppedByCrash -> "crashed"
+        },
         failure_cause: None,
         requested_delay_ms: None,
         output_version: None,
@@ -1379,7 +1349,7 @@ fn proposed_of_execution(execution: worker.Execution) -> telemetry.Proposed {
     worker.ExecutedSnoozeLimitReached(_, _) -> telemetry.ProposedBusinessFailure
     worker.ExecutedDiscarded(_) -> telemetry.ProposedDiscarded
     worker.ExecutedCancelled(_) -> telemetry.ProposedCancelled
-    worker.ExecutedUncertain(_) | worker.ExecutedAbandoned(_) ->
+    worker.ExecutedUncertain(_) | worker.ExecutedAbandoned(_, _) ->
       telemetry.ProposedUncertain
   }
 }

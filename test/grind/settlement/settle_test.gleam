@@ -288,7 +288,10 @@ pub fn postgres_function_sees_why_the_attempt_was_abandoned_test() {
       name,
       "gone-node",
       claimed,
-      definition.ExecutedAbandoned("handler exceeded its timeout"),
+      definition.ExecutedAbandoned(
+        definition.StoppedAtTimeout,
+        "handler exceeded its timeout",
+      ),
     )
   let assert Ok(settlement.Settled(_, _)) =
     settlement.settle_next(database, registry_of(name, agent), lease_ms)

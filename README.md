@@ -210,7 +210,7 @@ The [runnable transaction example](examples/usage/src/grind_usage/transactions.g
 
 ## When a job is left uncertain
 
-An attempt is abandoned when its node dies, its handler crashes or its handler exceeds its timeout. A crash is a panic, a failed `let assert` or any other exit of the handler's process; it is not retried as a failed attempt, and Grind keeps a description of it on the job (the kind of failure and where it happened, never a value it carried). Grind cannot know whether its effect happened, so once `with_abandonment` allows no further replay it holds the job `uncertain` and never decides on its own. Declare on the worker how such a job is settled, and the queue's consumer hands it to that function, inside a transaction that also records the decision:
+An attempt is abandoned when its node dies, its handler crashes or its handler exceeds its timeout. A crash is a panic, a failed `let assert` or any other exit of the handler's process; it is not retried as a failed attempt. Under the default policy Grind holds a crashed or timed-out job `uncertain` at once, with its cause and a description (for a crash, the kind of failure and where it happened, never a value it carried). Grind cannot know whether its effect happened, so once `with_abandonment` allows no further replay it holds the job `uncertain` and never decides on its own. Declare on the worker how such a job is settled, and the queue's consumer hands it to that function, inside a transaction that also records the decision:
 
 <!-- prettier-ignore-start -->
 
