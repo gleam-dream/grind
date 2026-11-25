@@ -7,7 +7,7 @@ description = "Benchmark/load harness for Grind. Not published; depends on grind
 
 [dependencies]
 grind = { path = ".." }
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "29ea7a90bf820b3c91eb3f76e824abe0d034d78f" }
+sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "02d386e070c6a99900225c613e8d273f3bebe3c2" }
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
