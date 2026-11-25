@@ -266,7 +266,8 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   // DDL, through cigogne's own public engine, not Grind's `migrate`.
   let cigogne_config = cigogne_config_for(connection)
   let assert Ok(engine) = cigogne.create_engine(cigogne_config)
-  cigogne.get_unapplied_migrations(engine) |> list.length |> should.equal(4)
+  // v11 to v15, and v15's concurrent index in its own file.
+  cigogne.get_unapplied_migrations(engine) |> list.length |> should.equal(6)
   let assert Ok(Nil) = cigogne.apply_all(engine)
 
   // 2. Grind accepts the result: `read_schema_generation` (exercised via
@@ -275,10 +276,10 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   // `UnsupportedSchemaVersion` — and running `migrate` against it is a
   // genuine no-op: no new marker rows, `Ok(Nil)` with zero steps run.
   let assert Ok(marker_count_before) = schema_marker_count(connection)
-  marker_count_before |> should.equal(4)
+  marker_count_before |> should.equal(5)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(marker_count_after) = schema_marker_count(connection)
-  marker_count_after |> should.equal(4)
+  marker_count_after |> should.equal(5)
 
   // 3. Fully functional for ordinary API traffic: submit, claim, and run a
   // job to completion against the cigogne-applied schema.
@@ -349,14 +350,14 @@ fn run_cigogne_e2e_test(e2e_url: String, fresh_url: String) -> Nil {
   let assert Ok(engine_at_v12) = cigogne.create_engine(cigogne_config)
   let assert Ok(Nil) = cigogne.rollback(engine_at_v12)
   let assert Ok(marker_after_rollback) = schema_marker_count(connection)
-  marker_after_rollback |> should.equal(3)
+  marker_after_rollback |> should.equal(4)
   let assert Ok(engine_at_v11) = cigogne.create_engine(cigogne_config)
   let assert Ok(Nil) = cigogne.apply(engine_at_v11)
   let assert Ok(marker_after_reapply) = schema_marker_count(connection)
-  marker_after_reapply |> should.equal(4)
+  marker_after_reapply |> should.equal(5)
   let assert Ok(Nil) = postgres.migrate(database)
   let assert Ok(marker_after_migrate_noop) = schema_marker_count(connection)
-  marker_after_migrate_noop |> should.equal(4)
+  marker_after_migrate_noop |> should.equal(5)
   postgres.outcome(database, handle)
   |> should.equal(Ok(job.SucceededWith("cigogne-9")))
 
