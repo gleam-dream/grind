@@ -2,6 +2,7 @@
 //// physical schema generation. The public StorageError remains in postgres.
 
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/result
@@ -160,6 +161,12 @@ fn run_migration_step(
   steps: List(migrations.Migration),
   step: migrations.Migration,
 ) -> Result(Nil, RunnerError) {
+  use Nil <- result.try(build_concurrent_indexes(
+    connection,
+    migration_deadline_ms,
+    steps,
+    step,
+  ))
   case
     store.migration_transaction_safely(
       connection,
@@ -186,6 +193,130 @@ fn run_migration_step(
   }
 }
 
+/// Builds `step`'s concurrent indexes before its transaction, on one session
+/// that holds the migration lock as a session lock, so no other migrator
+/// builds or drops them meanwhile. An index a failed build left invalid is
+/// dropped and built again. A version already applied builds nothing.
+fn build_concurrent_indexes(
+  connection: pog.Connection,
+  migration_deadline_ms: Int,
+  steps: List(migrations.Migration),
+  step: migrations.Migration,
+) -> Result(Nil, RunnerError) {
+  case step.concurrent_indexes {
+    [] -> Ok(Nil)
+    indexes -> {
+      let give_up_at = monotonic_ms() + migration_deadline_ms
+      let built =
+        store.migration_call_safely(
+          connection,
+          migration_deadline_ms,
+          fn(session) {
+            Ok(case take_session_lock(session, give_up_at) {
+              Error(error) -> Error(error)
+              Ok(False) -> Error(MigrationLockUnavailable(step.version))
+              Ok(True) -> {
+                let built = build_under_lock(session, steps, step, indexes)
+                case release_session_lock(session), built {
+                  _, Error(error) -> Error(error)
+                  Error(error), Ok(Nil) -> Error(error)
+                  Ok(Nil), Ok(Nil) -> Ok(Nil)
+                }
+              }
+            })
+          },
+        )
+      case built {
+        Ok(outcome) -> outcome
+        Error(error) -> Error(MigrationQueryFailed(error))
+      }
+    }
+  }
+}
+
+/// Tries the session lock until `give_up_at`. Each try is its own short
+/// statement, so a waiting migrator never holds the snapshot that the
+/// running build waits on.
+fn take_session_lock(
+  session: pog.Connection,
+  give_up_at: Int,
+) -> Result(Bool, RunnerError) {
+  let query =
+    pog.query(migrations.session_lock_statement())
+    |> pog.returning(decode.at([0], decode.bool))
+  case store.execute_safely(query, on: session) {
+    Error(error) -> Error(MigrationQueryFailed(error))
+    Ok(pog.Returned(rows: [True], ..)) -> Ok(True)
+    Ok(_) ->
+      case monotonic_ms() >= give_up_at {
+        True -> Ok(False)
+        False -> {
+          process.sleep(session_lock_retry_ms)
+          take_session_lock(session, give_up_at)
+        }
+      }
+  }
+}
+
+const session_lock_retry_ms = 50
+
+fn release_session_lock(session: pog.Connection) -> Result(Nil, RunnerError) {
+  case
+    store.execute_safely(
+      pog.query(migrations.session_unlock_statement()),
+      on: session,
+    )
+  {
+    Error(error) -> Error(MigrationQueryFailed(error))
+    Ok(_) -> Ok(Nil)
+  }
+}
+
+fn build_under_lock(
+  session: pog.Connection,
+  steps: List(migrations.Migration),
+  step: migrations.Migration,
+  indexes: List(migrations.ConcurrentIndex),
+) -> Result(Nil, RunnerError) {
+  use generation <- result.try(read_schema_generation(session, steps))
+  case generation_at_least(generation, step.version) {
+    True -> Ok(Nil)
+    False ->
+      list.try_each(indexes, fn(index) {
+        use valid <- result.try(
+          postgres_schema_probe.index_validity(session, index.name)
+          |> result.map_error(probe_error),
+        )
+        use Nil <- result.try(case valid {
+          [False] ->
+            execute_step_statement(
+              session,
+              step.version,
+              "DROP INDEX CONCURRENTLY IF EXISTS " <> index.name,
+            )
+          _ -> Ok(Nil)
+        })
+        execute_step_statement(session, step.version, index.statement)
+      })
+  }
+}
+
+fn execute_step_statement(
+  connection: pog.Connection,
+  version: Int,
+  statement: String,
+) -> Result(Nil, RunnerError) {
+  case store.execute_safely(pog.query(statement), on: connection) {
+    Ok(_) -> Ok(Nil)
+    Error(pog.PostgresqlError("55P03", _, _)) ->
+      Error(MigrationLockUnavailable(version))
+    Error(query_error) -> Error(MigrationStepFailed(version, query_error))
+  }
+}
+
+@external(erlang, "grind_queue_ffi", "monotonic_ms")
+fn monotonic_ms() -> Int
+
 fn run_migration_step_transaction(
   connection: pog.Connection,
   lock_timeout_ms: Int,
@@ -201,13 +332,7 @@ fn run_migration_step_transaction(
     False -> {
       use _ <- result.try(
         list.try_each(step.statements, fn(statement) {
-          case store.execute_safely(pog.query(statement), on: connection) {
-            Ok(_) -> Ok(Nil)
-            Error(pog.PostgresqlError("55P03", _, _)) ->
-              Error(MigrationLockUnavailable(step.version))
-            Error(query_error) ->
-              Error(MigrationStepFailed(step.version, query_error))
-          }
+          execute_step_statement(connection, step.version, statement)
         }),
       )
       use applied <- result.try(read_schema_generation(connection, steps))
@@ -412,10 +537,25 @@ fn validate_expected_shape(
   case list.find(steps, fn(step) { step.version == version }) {
     Error(Nil) -> Error(IncompatibleSchema)
     Ok(step) -> {
+      // The next version's concurrent indexes exist before its marker
+      // commits, so this version's shape accepts them.
+      let ahead =
+        steps
+        |> list.filter(fn(next) { next.version == version + 1 })
+        |> list.flat_map(fn(next) { next.concurrent_indexes })
+        |> list.map(fn(index) { index.name })
       use shape_ok <- result.try(
-        postgres_schema_probe.relation_shape_matches(connection, step.shape)
+        postgres_schema_probe.relation_shape_matches(
+          connection,
+          step.shape,
+          ahead,
+        )
         |> result.map_error(probe_error),
       )
+      use shape_ok <- result.try(case shape_ok {
+        False -> Ok(False)
+        True -> shape_indexes_valid(connection, step)
+      })
       case shape_ok {
         False -> Error(IncompatibleSchema)
         True ->
@@ -444,4 +584,22 @@ fn validate_expected_shape(
       }
     }
   }
+}
+
+/// An index of the shape that a failed concurrent build left invalid does
+/// not count as installed.
+fn shape_indexes_valid(
+  connection: pog.Connection,
+  step: migrations.Migration,
+) -> Result(Bool, RunnerError) {
+  step.concurrent_indexes
+  |> list.try_fold(True, fn(valid, index) {
+    case valid {
+      False -> Ok(False)
+      True ->
+        postgres_schema_probe.index_validity(connection, index.name)
+        |> result.map(fn(found) { found == [True] })
+        |> result.map_error(probe_error)
+    }
+  })
 }
