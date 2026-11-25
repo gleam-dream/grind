@@ -314,6 +314,7 @@ pub fn with_cause(
   let cause = case cause {
     abandoned.LeaseExpired -> definition.LeaseExpired
     abandoned.TimedOut -> definition.TimedOut
+    abandoned.HandlerCrashed -> definition.HandlerCrashed
   }
   with_abandoned(held, fn(inner) { definition.Abandoned(..inner, cause:) })
 }

@@ -511,7 +511,16 @@ fn run_temporary_worker_death_test(database_url: String) -> Nil {
       meta.queue.queue == "worker-death"
     })
   use <- exception.defer(fn() { detach(attachment) })
-  let assert Ok(consumer) = queue.start(database, workers, manual_policy())
+  // The attempt process dies, as on a node that stops: a crash of the
+  // handler alone is an abandonment the attempt process acknowledges.
+  let attempts = process.new_subject()
+  let hooks =
+    consumer_hooks.Hooks(
+      before_worker_start: fn() { Ok(Nil) },
+      after_worker_start: fn(pid) { process.send(attempts, pid) },
+    )
+  let assert Ok(consumer) =
+    queue.start_with_hooks(database, workers, manual_policy(), hooks)
   use <- exception.defer(fn() { queue.stop(consumer) })
 
   let reply = process.new_subject()
@@ -519,8 +528,9 @@ fn run_temporary_worker_death_test(database_url: String) -> Nil {
     process.spawn_unlinked(fn() {
       process.send(reply, queue.process_one(consumer))
     })
-  let assert Ok(WorkerDeathStarted(worker_pid, release)) =
+  let assert Ok(WorkerDeathStarted(_handler, release)) =
     process.receive(started, within: 5000)
+  let assert Ok(worker_pid) = process.receive(attempts, within: 1000)
   use <- exception.defer(fn() {
     process.send(release, ReleaseAttempt)
     Nil

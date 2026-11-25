@@ -640,7 +640,7 @@ fn acknowledge_once(
     | worker.ExecutedDiscarded(_)
     | worker.ExecutedCancelled(_)
     | worker.ExecutedUncertain(_)
-    | worker.ExecutedAbandoned(_) ->
+    | worker.ExecutedAbandoned(_, _) ->
       run_acknowledgement(
         database,
         queue,
@@ -1214,9 +1214,12 @@ fn run_acknowledgement(
         error: None,
         failure_description: Some(reason),
       )
-    worker.ExecutedAbandoned(reason) ->
+    worker.ExecutedAbandoned(stopped, reason) ->
       AckProposal(
-        proposed_state: "abandoned",
+        proposed_state: case stopped {
+          worker.StoppedAtTimeout -> "abandoned"
+          worker.StoppedByCrash -> "crashed"
+        },
         failure_cause: None,
         requested_delay_ms: None,
         output_version: None,
@@ -1389,7 +1392,7 @@ fn proposed_of_execution(execution: worker.Execution) -> telemetry.Proposed {
     worker.ExecutedSnoozeLimitReached(_, _) -> telemetry.ProposedBusinessFailure
     worker.ExecutedDiscarded(_) -> telemetry.ProposedDiscarded
     worker.ExecutedCancelled(_) -> telemetry.ProposedCancelled
-    worker.ExecutedUncertain(_) | worker.ExecutedAbandoned(_) ->
+    worker.ExecutedUncertain(_) | worker.ExecutedAbandoned(_, _) ->
       telemetry.ProposedUncertain
   }
 }

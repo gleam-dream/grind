@@ -185,7 +185,7 @@ pub fn update_resolution_query(
   // contract.
   let update =
     pog.query(
-      "UPDATE grind_jobs SET state = $1, output = $2::jsonb, error = $3::jsonb, failure_description = $4, attempt_id = CASE WHEN $1 = 'queued' THEN NULL ELSE attempt_id END, attempt_owner = NULL, lease_expires_at = NULL, available_at = CASE WHEN $1 = 'queued' THEN clock_timestamp() ELSE available_at END, finished_at = CASE WHEN $1 IN ("
+      "UPDATE grind_jobs SET state = $1, output = $2::jsonb, error = $3::jsonb, failure_description = $4, failure_cause = NULL, attempt_id = CASE WHEN $1 = 'queued' THEN NULL ELSE attempt_id END, attempt_owner = NULL, lease_expires_at = NULL, available_at = CASE WHEN $1 = 'queued' THEN clock_timestamp() ELSE available_at END, finished_at = CASE WHEN $1 IN ("
       <> terminal.states_sql()
       <> ") THEN clock_timestamp() ELSE NULL END WHERE id = $5 AND queue = $6 AND worker_id = $7 AND worker_version = $8 AND state = 'uncertain' AND attempt_id = $9 AND attempt_epoch = $10 AND attempt_owner = $11 RETURNING state",
     )

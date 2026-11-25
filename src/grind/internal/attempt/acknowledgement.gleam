@@ -35,6 +35,13 @@ pub type Claim {
   )
 }
 
+/// The job's `failure_cause` while an attempt Grind acknowledged as
+/// abandoned holds it `uncertain`; a declared settlement reads the cause
+/// from it. A lease-expiry hold has no acknowledgement receipt instead.
+pub const abandoned_at_timeout = "timed_out"
+
+pub const abandoned_by_crash = "handler_crashed"
+
 pub type AckProposal {
   AckProposal(
     proposed_state: String,
@@ -281,12 +288,13 @@ pub fn acknowledge_transaction(
             pog.text(attempt_owner),
           ],
         )
-        // Grind's own timeout stop under `HoldUncertain`: committed exactly
-        // as an uncertain proposal, plus the settlement mark naming this
-        // attempt (docs/design/design.typ, "Declared settlement of
-        // abandoned jobs").
-        "abandoned" -> #(
-          "UPDATE grind_jobs SET state = 'uncertain', failure_description = $1, uncertain_at = clock_timestamp(), finished_at = NULL, settle_attempt_id = attempt_id, settle_at = clock_timestamp(), settle_tries = 0 WHERE id = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
+        // Grind's own timeout stop, or a handler crash, under
+        // `HoldUncertain`: committed exactly as an uncertain proposal, plus
+        // the settlement mark naming this attempt and the job's
+        // `failure_cause` naming how it was abandoned (docs/design/design.typ,
+        // "Declared settlement of abandoned jobs").
+        "abandoned" | "crashed" -> #(
+          "UPDATE grind_jobs SET state = 'uncertain', failure_description = $1, failure_cause = $7, uncertain_at = clock_timestamp(), finished_at = NULL, settle_attempt_id = attempt_id, settle_at = clock_timestamp(), settle_tries = 0 WHERE id = $2 AND queue = $3 AND state = 'executing' AND attempt_id = $4 AND attempt_epoch = $5 AND attempt_owner = $6 AND "
             <> lease.live_lease_predicate("clock_timestamp()")
             <> " RETURNING id, state, failure_description, (extract(epoch FROM available_at) * 1000)::bigint",
           [
@@ -296,6 +304,10 @@ pub fn acknowledge_transaction(
             pog.int(attempt_id),
             pog.int(epoch),
             pog.text(attempt_owner),
+            pog.text(case proposed_state {
+              "crashed" -> abandoned_by_crash
+              _ -> abandoned_at_timeout
+            }),
           ],
         )
         "runtime_failed" -> #(
