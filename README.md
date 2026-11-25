@@ -185,6 +185,10 @@ pub fn worker_stays_small() -> Nil {
 
 `erts_debug:flat_size` also counts a module constant captured through a variable, which the runtime does not copy. Refer to the constant inside the handler, as above, and the measurement matches the copy.
 
+## Enqueue many jobs
+
+`grind.submit_many(jobs, list)` admits a list of jobs in one transaction: all commit or none does, and the admissions come back in list order. Jobs without a uniqueness policy are written together, so a batch costs a few round trips instead of several per job.
+
 ## Enqueue with an application write
 
 `grind.submit_in` stages admission in the caller's open `READ COMMITTED` transaction on the same database. The job commits or rolls back with the application write. Its reply is staged admission, not proof that the outer transaction committed.

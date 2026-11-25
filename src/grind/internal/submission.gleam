@@ -227,6 +227,10 @@ pub type SubmitError(input, output, error) {
   /// admission transaction's own receipt lookup, not candidate selection,
   /// resolves a genuinely committed prior attempt once it becomes visible).
   CommitUnknown(PendingSubmission(input, output, error))
+  /// `submit_many` only: the batch transaction reached the database and its
+  /// outcome could not be established. The batch commits all or nothing, so
+  /// every pending submission settles the same way; reconcile each.
+  BatchCommitUnknown(List(PendingSubmission(input, output, error)))
   /// The encoded input is larger than the payload limit
   /// (`postgres.with_max_payload_bytes`, default 1 MiB). Checked before any
   /// storage call; nothing was written.
