@@ -11,7 +11,11 @@
 //// handler had no effect: under `HoldUncertain` the attempt acknowledges
 //// `uncertain` at once, with the cause and a bounded description; under
 //// `ReplayAfterLeaseExpiry` it stops renewing and lets lease-expiry
-//// recovery decide.
+//// recovery decide. A handler whose attempt lost its lease is unlinked and
+//// killed the same way: no write of that attempt can commit any more, and
+//// lease-expiry recovery may already have started another attempt of the
+//// same job. Because it is unlinked first, its stop is never read as a
+//// crash.
 
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process
@@ -40,6 +44,8 @@ pub type WorkerMessage {
   /// A process linked to this attempt process exited: its handler, or the
   /// supervisor that is stopping it.
   LinkedExited(process.ExitMessage)
+  /// The renewer found no live fence for this attempt.
+  LeaseLost
 }
 
 pub type WorkerRequest(message) {
@@ -158,6 +164,19 @@ fn handle(
       process.kill(handler)
       timed_out(state)
     }
+    // Only a running handler is stopped. Once the handler has returned, the
+    // acknowledgement decides: a renewal can also miss the fence because
+    // that acknowledgement has just committed.
+    LeaseLost, Running(handler:, timer:, ..) -> {
+      cancel_timer(timer)
+      process.unlink(handler)
+      process.kill(handler)
+      abandon(
+        state,
+        worker.StoppedAtLeaseLoss,
+        "attempt lost its lease while its handler was running; the handler was stopped and its effect is unknown",
+      )
+    }
     RetryAcknowledgement, WaitingForAcknowledgement(execution) ->
       acknowledge(state, execution)
     LinkedExited(process.ExitMessage(pid:, reason:)),
@@ -190,7 +209,8 @@ fn start_handler(
     renewer.Track(
       attempt.lease_fence(request.claimed, request.owner),
       process.self(),
-      fn() { process.send(self, CancelRequested) },
+      on_cancel: fn() { process.send(self, CancelRequested) },
+      on_lost: fn() { process.send(self, LeaseLost) },
     ),
   )
   let timeout_ms = attempt.claim_timeout_ms(request.claimed)
@@ -280,8 +300,11 @@ fn timed_out(
   )
 }
 
-/// The handler stopped without a result. `HoldUncertain` acknowledges
-/// `uncertain` now, with the cause; `ReplayAfterLeaseExpiry` leaves the claim
+/// The handler stopped without a result. `HoldUncertain` proposes the
+/// abandonment now, with the cause: with a live fence it commits
+/// `uncertain`, and without one (always so after a lost lease) it is
+/// rejected as stale and changes nothing, which leaves the job to whatever
+/// recovery already owns it. `ReplayAfterLeaseExpiry` leaves the claim
 /// unacknowledged, so lease-expiry recovery replays it.
 fn abandon(
   state: WorkerState(message),

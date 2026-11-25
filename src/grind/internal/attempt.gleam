@@ -1219,6 +1219,9 @@ fn run_acknowledgement(
         proposed_state: case stopped {
           worker.StoppedAtTimeout -> "abandoned"
           worker.StoppedByCrash -> "crashed"
+          // No acknowledgement statement writes this state: the attempt's
+          // fence is already gone, so the proposal is rejected as stale.
+          worker.StoppedAtLeaseLoss -> "lease_lost"
         },
         failure_cause: None,
         requested_delay_ms: None,

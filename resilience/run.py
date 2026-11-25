@@ -350,8 +350,9 @@ class Runner:
                          duration_ms=self.lease_ms + 2 * self.deadline_ms + 5000)
         isolated.proxy.configure()
         release.touch()
-        wait_for(lambda: any(json.loads(line)["event"] == "handler_finished"
-                            for line in isolated.effects.read_text().splitlines()), "old handler returned")
+        # The old handler either returns now or was already stopped when its
+        # consumer saw the lease lost. The drain below settles both: it is
+        # clean only once the stale attempt has completed.
         with concurrent.futures.ThreadPoolExecutor(1) as executor:
             pending_stop = executor.submit(isolated.command, "stop",
                                            timeout=(self.lease_ms + 2 * self.deadline_ms) / 1000 + 10)
@@ -362,6 +363,9 @@ class Runner:
                 time.sleep(0.5)
             stopped = pending_stop.result()
         assert stopped["outcome"] == "clean", "old pending acknowledgement did not settle"
+        self.record("old_handler", returned=any(
+            json.loads(line)["event"] == "handler_finished"
+            for line in isolated.effects.read_text().splitlines()))
         assert self.state(identity) == "uncertain", "stale owner acknowledged after healing"
         assert len(self.effects("partitioned-effect")) == 1
         assert all(row["job_id"] != identity for row in self.receipts()), "stale receipt accepted"

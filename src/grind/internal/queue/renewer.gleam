@@ -21,7 +21,14 @@ pub type Message {
   /// Starts renewing a claim's lease. `on_cancel` runs once, from the
   /// renewer, when a renewal sees that a cancellation of this attempt has
   /// committed. The fence carries no worker, so tracking copies none.
-  Track(attempt.LeaseFence, process.Pid, on_cancel: fn() -> Nil)
+  /// `on_lost` runs once, from the renewer, when a renewal finds no live
+  /// fence for this attempt: the attempt can no longer commit anything.
+  Track(
+    attempt.LeaseFence,
+    process.Pid,
+    on_cancel: fn() -> Nil,
+    on_lost: fn() -> Nil,
+  )
   AwaitAcknowledgement(attempt_id: Int, epoch: Int)
   Untrack(attempt_id: Int, epoch: Int)
   Tick
@@ -44,6 +51,7 @@ type Entry {
     phase: Phase,
     on_cancel: fn() -> Nil,
     cancel_delivered: Bool,
+    on_lost: fn() -> Nil,
   )
 }
 
@@ -145,7 +153,7 @@ fn start_with_forwarder(
 
 fn handle(state: State, message: Message) -> actor.Next(State, Message) {
   case message {
-    Track(fence, pid, on_cancel) -> {
+    Track(fence, pid, on_cancel, on_lost) -> {
       let #(_, attempt_id, epoch) = attempt.fence_identity(fence)
       let entry =
         Entry(
@@ -156,6 +164,7 @@ fn handle(state: State, message: Message) -> actor.Next(State, Message) {
           phase: Running,
           on_cancel:,
           cancel_delivered: False,
+          on_lost:,
         )
       actor.continue(State(..state, entries: [entry, ..state.entries]))
     }
@@ -305,6 +314,9 @@ fn renew(state: State) -> State {
                     }
                     attempt.BatchLeaseLost -> {
                       state.on_status(entry.attempt_id, entry.epoch, Lost)
+                      // The entry leaves the renewed set here, so this runs
+                      // once per attempt.
+                      entry.on_lost()
                       Entry(..entry, phase: OwnershipLost)
                     }
                   }
