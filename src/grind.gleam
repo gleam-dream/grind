@@ -923,8 +923,9 @@ pub fn submit(
 /// returns for that job, and nothing is written. When PostgreSQL rolls the
 /// batch back because a concurrent admission of the same job took one of
 /// its ids, the batch returns `UniquenessContended`; retry it.
-/// `BatchCommitUnknown` is returned only when the commit reply was lost. Emits `[grind, job, admitted]` for each job once the
-/// commit is proven.
+/// `BatchCommitUnknown` is returned only when the commit reply was lost.
+///
+/// Emits `[grind, job, admitted]` for each job once the commit is proven.
 ///
 /// ```gleam
 /// grind.submit_many(jobs, list.map(order.lines, job.new(pick_line(), _)))

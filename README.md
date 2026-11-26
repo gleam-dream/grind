@@ -196,7 +196,7 @@ pub fn worker_stays_small() -> Nil {
 
 ## Enqueue many jobs
 
-`grind.submit_many(jobs, list)` admits a list of jobs in one transaction: all commit or none does, and the admissions come back in list order. Jobs without a uniqueness policy are written together, so a batch costs a few round trips instead of several per job.
+`grind.submit_many(jobs, list)` admits a list of jobs in one transaction: all commit or none does, and the admissions come back in list order. Jobs without a uniqueness policy are written together, so a batch costs a few round trips instead of several per job. A refused job refuses the whole batch with `BatchRefused(position, reason)`, where `reason` is the error `grind.submit` returns for that job; after `BatchCommitUnknown`, the commit reply was lost, so pass each pending submission to `grind.reconcile_submission`, as the [migration guide](https://github.com/gleam-dream/grind/blob/main/docs/MIGRATION.md#submiterror-has-batchrefused-and-batchcommitunknown-variants) describes.
 
 ## Enqueue with an application write
 
