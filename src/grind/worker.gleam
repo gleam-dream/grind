@@ -121,8 +121,9 @@ pub type Timeout {
   Infinity
 }
 
-/// What happens to an attempt whose node died, whose handler exceeded its
-/// timeout, or whose lease otherwise expired before an acknowledgement.
+/// What happens to an attempt whose node died, whose handler crashed or
+/// exceeded its timeout, or whose lease otherwise expired before an
+/// acknowledgement.
 pub type Abandonment {
   /// Hold the job `uncertain` until an operator resolves it. The default:
   /// a handler that may have acted is never run twice without a decision.

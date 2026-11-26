@@ -43,8 +43,9 @@ pub fn to_definition(
 /// Why the attempt was abandoned.
 pub type Cause {
   /// Its lease expired without an acknowledgement: its node died or lost the
-  /// database, or its handler ran past a replay-safe timeout and the lease
-  /// ran out.
+  /// database, a renewal found the lease lost while its handler ran (Grind
+  /// then stops the handler and leaves the job to lease-expiry recovery), or
+  /// its handler ran past a replay-safe timeout and the lease ran out.
   LeaseExpired
   /// Grind stopped its handler at the worker's timeout under `HoldUncertain`.
   TimedOut
