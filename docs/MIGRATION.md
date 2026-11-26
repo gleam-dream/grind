@@ -40,7 +40,7 @@ New in 0.3.0 and not breaking: `grind.submit_many`, which admits a list of jobs 
 
 ## A handler crash has its own cause
 
-**What changed.** `grind/abandoned.Cause` has a third variant, `HandlerCrashed`, and `grind/testing.with_cause` accepts it. A handler crash is a panic, a failed `let assert`, or any other exit of the handler's process without a return. Under `HoldUncertain`, the default, Grind now holds the crashed job `uncertain` at once, with the cause `HandlerCrashed` and a description of at most 500 characters: the kind of failure, its module, function and line, and the message of a `panic`. The description never holds a value the failure carried. In 0.2 the job stayed `executing` until its lease expired (30 seconds by default) and was then held `uncertain` with the cause `LeaseExpired` and the text `expired attempt requires outcome reconciliation`, as if its node had died. Under `ReplayAfterLeaseExpiry` a crashed job is still replayed once its lease expires.
+**What changed.** `grind/abandoned.Cause` has a third variant, `HandlerCrashed`, and `grind/testing.with_cause` accepts it. A handler crash is a panic, a failed `let assert`, or any other exit of the handler's process without a return. Under `HoldUncertain`, the default, Grind now holds the crashed job `uncertain` at once, with the cause `HandlerCrashed` and a description of at most 500 characters and 2000 bytes: the kind of failure, its module, function and line, and the message the developer wrote for a `panic`, `let assert ... as`, `assert ... as` or `todo as`. The description never holds a value the failure carried. In 0.2 the job stayed `executing` until its lease expired (30 seconds by default) and was then held `uncertain` with the cause `LeaseExpired` and the text `expired attempt requires outcome reconciliation`, as if its node had died. Under `ReplayAfterLeaseExpiry` a crashed job is still left to lease-expiry recovery, which replays it while replays remain and no cancellation is pending, and otherwise holds it `uncertain` with the cause `LeaseExpired`.
 
 **Why.** A settlement and an operator could not tell a bug in the handler from a lost node, and the job waited a whole lease before anything could decide it.
 
@@ -61,7 +61,7 @@ case abandoned.cause(job) {
 }
 ```
 
-Code that waited for lease expiry after a crash now sees the job decided earlier. Jobs that a crash held `uncertain` before the upgrade keep the cause `LeaseExpired`. A message written with `panic as` is stored as written, so do not interpolate job data into it.
+Code that waited for lease expiry after a crash now sees the job decided earlier. Jobs that a crash held `uncertain` before the upgrade keep the cause `LeaseExpired`. A message written with `panic as`, `let assert ... as`, `assert ... as` or `todo as` is stored as written, so do not interpolate job data into it.
 
 ## A lost lease stops the handler
 

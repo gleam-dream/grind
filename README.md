@@ -4,7 +4,7 @@
 >
 > - Schema version 15 builds an index with `CREATE INDEX CONCURRENTLY`, outside a transaction: never wrap Grind migrations in one transaction, and budget the build for a large jobs table.
 > - Grind depends on `sinal >= 0.2.0 and < 0.3.0`.
-> - A crashed handler's job is held `uncertain` at once with the new cause `abandoned.HandlerCrashed`.
+> - Under the default `HoldUncertain` policy, a crashed handler's job is held `uncertain` at once with the new cause `abandoned.HandlerCrashed`; under `ReplayAfterLeaseExpiry` it is left to lease-expiry recovery.
 > - A lost lease stops the handler; lease-expiry recovery records the job as `LeaseExpired`.
 > - `grind.SubmitError` has a new variant, `BatchCommitUnknown`, returned by the new `grind.submit_many`.
 > - Depend on `grind >= 0.3.0 and < 0.4.0`.

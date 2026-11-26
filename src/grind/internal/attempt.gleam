@@ -73,7 +73,9 @@ pub fn claim_one(
 /// back in selection order (earliest `available_at`, then job ID), each with
 /// its own attempt fence and a lease that starts at the claim.
 ///
-/// The outer error means no row was claimed. An inner error belongs to one
+/// The outer error means no claim was returned to the caller, not that none
+/// committed: a lost reply after the claim statement committed leaves its
+/// rows executing until lease-expiry recovery. An inner error belongs to one
 /// claimed row that cannot run here, such as a codec contract mismatch that
 /// parked it; the other rows of the batch stay claimed.
 pub fn claim_batch(

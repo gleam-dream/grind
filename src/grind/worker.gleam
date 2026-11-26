@@ -382,14 +382,18 @@ pub fn with_max_snoozes(
 /// the handler may already have had its effect. It follows this policy as a
 /// timeout does: under `HoldUncertain` the job is held `Uncertain` at once,
 /// with the cause `abandoned.HandlerCrashed` for its settlement; under
-/// `ReplayAfterLeaseExpiry` it is replayed once its lease expires. Return
+/// `ReplayAfterLeaseExpiry` it is left to lease-expiry recovery, which
+/// replays it while replays remain and no cancellation is pending. Return
 /// `Error` from the handler for a failure that is safe to retry.
 ///
 /// A job held `Uncertain` after a crash carries a description of it, which
 /// `admin.list` and `abandoned.description` read: the kind of failure, its
-/// module, function and line, and the message of a `panic`, at most 500
-/// characters. It never holds a value the failure carried, such as the
-/// value a `let assert` did not match.
+/// module, function and line, and its message, at most 500 characters and
+/// 2000 bytes. The message is Gleam's own text, or the text the developer
+/// wrote with `panic as`, `let assert ... as`, `assert ... as` or `todo as`,
+/// stored as written: keep job data out of those messages. It never holds a
+/// value the failure carried, such as the value a `let assert` did not
+/// match.
 pub fn with_abandonment(
   worker: Worker(input, output, error),
   abandonment: Abandonment,

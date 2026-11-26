@@ -912,9 +912,11 @@ pub fn submit(
 /// round trips instead of several per job. A job id is an idempotency key
 /// here too; one id twice in a batch is an `IdConflict`. A job with a
 /// uniqueness policy is admitted one at a time inside the same transaction,
-/// taking its lock in list order. The first job refused before storage
+/// taking its lock in list order. A job refused before storage
 /// (`InvalidInput`, `PayloadTooLarge`, `EmptyJobId`) refuses the batch, and
-/// nothing is written. Emits `[grind, job, admitted]` for each job once the
+/// nothing is written. The error is that of one refused job, not
+/// necessarily the first in the list: job ids are checked for every job
+/// before any payload size. Emits `[grind, job, admitted]` for each job once the
 /// commit is proven.
 ///
 /// ```gleam

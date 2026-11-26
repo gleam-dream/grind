@@ -5,7 +5,7 @@
 ## Decision
 
 - A handler crash is a third abandonment cause, `HandlerCrashed`, next to `LeaseExpired` and `TimedOut` in the closed cause a declared settlement reads. This amends ADR-0021, whose cause had two variants.
-- The attempt actor traps its handler's exit. A crash takes the same path as a timeout: under HoldUncertain the attempt acknowledges the job uncertain at once as an abandonment, which writes the settlement mark, with a bounded description of the crash; under ReplayAfterLeaseExpiry it stops renewing and lease expiry replays the job.
+- The attempt actor traps its handler's exit. A crash takes the same path as a timeout: under HoldUncertain the attempt acknowledges the job uncertain at once as an abandonment, which writes the settlement mark, with a bounded description of the crash; under ReplayAfterLeaseExpiry it stops renewing and leaves the job to lease-expiry recovery, which replays it while replays remain and no cancellation is pending, and otherwise holds it uncertain as a lease expiry.
 - The abandonment acknowledgement stores its cause in the job's `failure_cause` (`timed_out` or `handler_crashed`). A resolution clears it. A job with no acknowledgement receipt for its retained attempt is `LeaseExpired`; a receipt without a stored cause, written by a timeout before this decision, is `TimedOut`. No migration is needed.
 - HoldUncertain stays the default policy.
 
