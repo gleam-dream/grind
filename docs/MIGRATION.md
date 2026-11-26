@@ -16,12 +16,20 @@ New in 0.3.0 and not breaking: `grind.submit_many`, which admits a list of jobs 
 
 **What changed.** Version 15 adds the index `grind_jobs_settle_due_idx` on `grind_jobs (queue, settle_at, id)` for uncertain jobs with a due time. PostgreSQL builds it with `CREATE INDEX CONCURRENTLY`, which cannot run inside a transaction. The version's marker row is then written in its own transaction, as every earlier version's is. A Grind 0.3 runtime that runs consumers refuses a schema below version 15 with `SchemaNotMigrated`.
 
-**Why.** Every consumer whose workers declare a settlement polls for due uncertain jobs. Without the index each poll read every uncertain job of the installation: about 20 ms per poll at 200,000 uncertain jobs, against about 0.1 ms with it. A plain `CREATE INDEX` would block every write to the jobs table for the whole build. ADR-0023 records the decision.
+**Why.** Every consumer whose workers declare a settlement polls for due uncertain jobs. Without the index each poll read every uncertain job of the installation: about 23 ms per poll at 200,000 uncertain jobs, against about 0.1 ms with it. A plain `CREATE INDEX` would block every write to the jobs table for the whole build. [ADR-0023](https://github.com/gleam-dream/grind/blob/main/docs/adr/0023-build-indexes-concurrently-outside-the-version-transaction.md) records the decision.
 
 **What to do.** Apply version 15 before you start 0.3 nodes that run consumers, the way you already apply migrations:
 
 - **With `grind.migrate` or `grind.with_startup_migration`.** Nothing changes in your code. `grind.migrate` builds the index on one connection before the version's transaction and holds Grind's migration lock as a session lock while it builds. That connection must keep its PostgreSQL session for the whole build: connect `grind.migrate` directly to PostgreSQL or through a pooler in session mode, never through a pooler in transaction mode.
 - **With the cigogne mirror files.** Copy both new files from `priv/migrations`: `20261125000000-grind_v15_settle_due_idx.sql`, which builds the index and is marked `disable_transaction`, and `20261125000001-grind_v15.sql`, which writes the marker. Apply them in that order. Do not wrap the run in a transaction, for example with `psql --single-transaction` or a migration runner that puts every file in one `BEGIN`: PostgreSQL refuses `CREATE INDEX CONCURRENTLY` there. Cigogne takes no lock for the index file, so run one migrator at a time on a schema, and never mix cigogne and `grind.migrate` on one schema.
+
+**Rolling upgrade.** Grind 0.2.2 nodes keep running against a version 15 schema unless they migrate it. A 0.2.2 runtime that runs consumers accepts any schema at version 14 or newer, so it starts, claims and acknowledges jobs as before. A 0.2.2 `grind.migrate`, and a 0.2.2 node started with `grind.with_startup_migration`, refuse version 15 with `UnsupportedSchemaVersion(15)`; such a node fails to start. This was checked by running Grind 0.2.2 against a schema built from the 0.3.0 migration files: a job ran to `Succeeded`, `grind.migrate` returned `Error(UnsupportedSchemaVersion(15))`, and `grind.start` with startup migration returned `Error(StartupMigrationFailed(UnsupportedSchemaVersion(15)))`. Upgrade in this order:
+
+1. Remove `grind.with_startup_migration` from the 0.2 nodes, or plan for their restarts to fail until they run 0.3.
+2. Apply version 15 once, from a deployment step: `grind.migrate` from a 0.3 runtime without consumers, or the cigogne files. The 0.2 nodes keep working meanwhile.
+3. Replace the 0.2 nodes with 0.3 nodes. A 0.3 node with consumers refuses a schema below 15, so it must not start before step 2.
+
+While both versions run, a 0.2 consumer reads the cause of a job that a 0.3 node held for a crash as `TimedOut`, because 0.2 knows no `HandlerCrashed`, and 0.2 nodes still treat a crash as a lease expiry.
 
 **What to expect while it runs.**
 
