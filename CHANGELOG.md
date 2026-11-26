@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 This release breaks the public API and adds schema version 15. Read the [migration guide](https://github.com/gleam-dream/grind/blob/main/docs/MIGRATION.md) before upgrading from 0.2.
 
