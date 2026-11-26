@@ -1,5 +1,7 @@
 //// Bulk admission: many jobs in one transaction, as `submit` admits one.
 
+import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/string
@@ -12,6 +14,7 @@ import grind/job
 import grind/support/env.{mark_database_test_executed, queue_database_url}
 import grind/unique
 import grind/worker
+import pog
 
 pub fn facade_submit_many_admits_every_job_in_order_test() {
   case queue_database_url() {
@@ -72,7 +75,12 @@ pub fn facade_submit_many_writes_nothing_when_one_job_is_refused_test() {
         job.new(echo_worker, "short"),
         job.new(echo_worker, string.repeat("x", 64)),
       ])
-      |> should.equal(Error(grind.PayloadTooLarge(bytes: 66, limit: 16)))
+      |> should.equal(
+        Error(grind.BatchRefused(
+          position: 1,
+          reason: grind.PayloadTooLarge(bytes: 66, limit: 16),
+        )),
+      )
       count(jobs, queue) |> should.equal(0)
       mark_database_test_executed("facade-submit-many-refused")
     }
@@ -112,7 +120,9 @@ pub fn facade_submit_many_job_ids_are_idempotency_keys_test() {
         job.new(echo_worker, 4) |> job.with_id(id <> "-4"),
         job.new(echo_worker, 9) |> job.with_id(id <> "-1"),
       ])
-      |> should.equal(Error(grind.IdConflict))
+      |> should.equal(
+        Error(grind.BatchRefused(position: 1, reason: grind.IdConflict)),
+      )
       count(jobs, queue) |> should.equal(3)
 
       // A refusal after the batch wrote a job rolls that job back: the plain
@@ -127,7 +137,9 @@ pub fn facade_submit_many_job_ids_are_idempotency_keys_test() {
         job.new(echo_worker, 5) |> job.with_id(id <> "-5"),
         job.new(echo_worker, 9) |> job.with_id(id <> "-1") |> job.unique(policy),
       ])
-      |> should.equal(Error(grind.IdConflict))
+      |> should.equal(
+        Error(grind.BatchRefused(position: 1, reason: grind.IdConflict)),
+      )
       count(jobs, queue) |> should.equal(3)
       mark_database_test_executed("facade-submit-many-ids")
     }
@@ -172,6 +184,118 @@ pub fn facade_submit_many_applies_uniqueness_in_order_test() {
       count(jobs, queue) |> should.equal(2)
       mark_database_test_executed("facade-submit-many-unique")
     }
+  }
+}
+
+/// A batch that PostgreSQL rolled back because a concurrent admission took
+/// one of its ids did not commit, and the reply says so: the outcome is
+/// definite, not `BatchCommitUnknown`. Here the concurrent admission is the
+/// same job, so the batch is contended and retrying it converges.
+pub fn facade_submit_many_reports_a_known_rollback_definitely_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let queue = unique("facade-many-race")
+      let echo_worker =
+        worker.new(
+          unique("facade.many.race"),
+          input: int_codec(),
+          output: int_codec(),
+          perform: fn(n) { Ok(n) },
+        )
+        |> worker.with_queue(queue)
+      use jobs <- with_runtime(url, fn(config) {
+        config |> grind.with_worker(echo_worker) |> grind.without_consumers
+      })
+      let db = grind.connection(jobs)
+      let id = unique("race")
+      let first = job.new(echo_worker, 1) |> job.with_id(id <> "-a")
+      let second = job.new(echo_worker, 2) |> job.with_id(id <> "-b")
+      let replies = process.new_subject()
+      let assert Ok(Nil) =
+        pog.transaction(db, fn(tx) {
+          let assert Ok(grind.Inserted(_)) = grind.submit_in(jobs, tx, second)
+          process.spawn(fn() {
+            process.send(replies, grind.submit_many(jobs, [first, second]))
+          })
+          // The batch's receipt insert now waits for this transaction.
+          await_lock_waiter(db, 250) |> should.equal(True)
+          Ok(Nil)
+        })
+      let assert Ok(reply) = process.receive(replies, within: 10_000)
+      reply |> should.equal(Error(grind.UniquenessContended))
+      count(jobs, queue) |> should.equal(1)
+
+      let assert Ok([_, _]) = grind.submit_many(jobs, [first, second])
+      count(jobs, queue) |> should.equal(2)
+      mark_database_test_executed("facade-submit-many-known-rollback")
+    }
+  }
+}
+
+/// A different job under one of the batch's ids makes the rollback a
+/// refusal of that job, reported with its position in the list.
+pub fn facade_submit_many_names_the_refused_job_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let queue = unique("facade-many-refused")
+      let echo_worker =
+        worker.new(
+          unique("facade.many.refused"),
+          input: int_codec(),
+          output: int_codec(),
+          perform: fn(n) { Ok(n) },
+        )
+        |> worker.with_queue(queue)
+      use jobs <- with_runtime(url, fn(config) {
+        config |> grind.with_worker(echo_worker) |> grind.without_consumers
+      })
+      let db = grind.connection(jobs)
+      let id = unique("race")
+      let first = job.new(echo_worker, 1) |> job.with_id(id <> "-a")
+      let second = job.new(echo_worker, 2) |> job.with_id(id <> "-b")
+      let replies = process.new_subject()
+      let assert Ok(Nil) =
+        pog.transaction(db, fn(tx) {
+          let assert Ok(grind.Inserted(_)) =
+            grind.submit_in(
+              jobs,
+              tx,
+              job.new(echo_worker, 9) |> job.with_id(id <> "-b"),
+            )
+          process.spawn(fn() {
+            process.send(replies, grind.submit_many(jobs, [first, second]))
+          })
+          await_lock_waiter(db, 250) |> should.equal(True)
+          Ok(Nil)
+        })
+      let assert Ok(reply) = process.receive(replies, within: 10_000)
+      reply
+      |> should.equal(
+        Error(grind.BatchRefused(position: 1, reason: grind.IdConflict)),
+      )
+      count(jobs, queue) |> should.equal(1)
+      mark_database_test_executed("facade-submit-many-refused-position")
+    }
+  }
+}
+
+/// Polls until another session of this database waits on a lock.
+fn await_lock_waiter(db: pog.Connection, remaining: Int) -> Bool {
+  let assert Ok(pog.Returned(rows: [waiting], ..)) =
+    pog.query(
+      "SELECT count(*)::int FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    |> pog.returning(decode.at([0], decode.int))
+    |> pog.execute(db)
+  case waiting > 0, remaining > 0 {
+    True, _ -> True
+    False, True -> {
+      process.sleep(20)
+      await_lock_waiter(db, remaining - 1)
+    }
+    False, False -> False
   }
 }
 

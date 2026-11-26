@@ -6,7 +6,7 @@
 > - Grind depends on `sinal >= 0.2.0 and < 0.3.0`.
 > - Under the default `HoldUncertain` policy, a crashed handler's job is held `uncertain` at once with the new cause `abandoned.HandlerCrashed`; under `ReplayAfterLeaseExpiry` it is left to lease-expiry recovery.
 > - A lost lease stops the handler; lease-expiry recovery records the job as `LeaseExpired`.
-> - `grind.SubmitError` has a new variant, `BatchCommitUnknown`, returned by the new `grind.submit_many`.
+> - `grind.SubmitError` has two new variants, `BatchRefused` and `BatchCommitUnknown`, returned by the new `grind.submit_many`.
 > - Depend on `grind >= 0.3.0 and < 0.4.0`.
 
 [![CI](https://github.com/gleam-dream/grind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/grind/actions/workflows/ci.yml)

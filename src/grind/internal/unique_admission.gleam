@@ -11,6 +11,7 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/set
 import grind/internal/job
 import grind/internal/sql
 import grind/internal/store
@@ -191,17 +192,45 @@ pub fn admit_many(
   submission.SubmitError(input, output, error),
 ) {
   use requests <- result.try(
-    list.try_map(specs, request_for(installation, max_payload_bytes, _)),
+    try_index_map(specs, fn(spec, position) {
+      request_for(installation, max_payload_bytes, spec)
+      |> result.map_error(submission.BatchRefused(position, _))
+    }),
   )
   let ids =
     list.map(requests, fn(request) {
       submission.submission_id_value(request.submission_id)
     })
-  case requests, list.length(list.unique(ids)) == list.length(ids) {
+  case requests, repeated_position(ids, 0, set.new()) {
     [], _ -> Ok([])
     // One id for two jobs of a batch is the reuse `submit` reports.
-    _, False -> Error(submission.SubmissionConflict)
-    _, True -> run_many(connection, requests, lock_wait_ms)
+    _, Some(position) ->
+      Error(submission.BatchRefused(position, submission.SubmissionConflict))
+    _, None -> run_many(connection, requests, lock_wait_ms)
+  }
+}
+
+fn try_index_map(
+  items: List(a),
+  run: fn(a, Int) -> Result(b, e),
+) -> Result(List(b), e) {
+  list.index_map(items, fn(item, index) { #(item, index) })
+  |> list.try_map(fn(entry) { run(entry.0, entry.1) })
+}
+
+/// The position of the first id that an earlier id of the list repeats.
+fn repeated_position(
+  ids: List(String),
+  position: Int,
+  seen: set.Set(String),
+) -> Option(Int) {
+  case ids {
+    [] -> None
+    [id, ..rest] ->
+      case set.contains(seen, id) {
+        True -> Some(position)
+        False -> repeated_position(rest, position + 1, set.insert(seen, id))
+      }
   }
 }
 
@@ -222,11 +251,57 @@ fn run_many(
   {
     Error(Nil) -> Error(submission.NotCommitted(pog.ConnectionUnavailable))
     Ok(Ok(commits)) -> Ok(commits)
-    // As for one job: re-reading the receipts resolves the outcome.
-    Ok(Error(pog.TransactionRolledBack(submission.SubmissionConflict)))
-    | Ok(Error(pog.TransactionQueryError(_))) ->
+    // PostgreSQL confirmed the rollback, so the batch did not commit; the
+    // receipts only say which job was refused.
+    Ok(Error(pog.TransactionRolledBack(submission.SubmissionConflict))) ->
+      Error(refusal_after_rollback(connection, requests))
+    // The outcome was not observed: re-reading the receipts resolves it.
+    Ok(Error(pog.TransactionQueryError(_))) ->
       reconcile_many(connection, requests)
     Ok(Error(pog.TransactionRolledBack(error))) -> Error(error)
+  }
+}
+
+/// Why a batch that PostgreSQL rolled back on an id conflict was refused. A
+/// job whose id now holds another request's receipt is refused as
+/// `submit` refuses it. Otherwise a concurrent admission of the same job
+/// took one of the ids; the batch is contended, and retrying it finds that
+/// admission.
+fn refusal_after_rollback(
+  connection: pog.Connection,
+  requests: List(Request(input, output, error)),
+) -> submission.SubmitError(input, output, error) {
+  let ids =
+    list.map(requests, fn(request) {
+      submission.submission_id_value(request.submission_id)
+    })
+  case find_receipts(connection, ids) {
+    Error(_) -> submission.AdmissionContended
+    Ok(receipts) -> {
+      let receipts = dict.from_list(receipts)
+      let refused =
+        list.index_map(requests, fn(request, position) { #(request, position) })
+        |> list.find(fn(entry) {
+          let #(request, _) = entry
+          case
+            dict.get(
+              receipts,
+              submission.submission_id_value(request.submission_id),
+            )
+          {
+            Error(Nil) -> False
+            Ok(row) ->
+              row.request_sha256 != request.request_sha256
+              || outcome_of_receipt(request.installation, request.worker, row)
+              == Error(Nil)
+          }
+        })
+      case refused {
+        Ok(#(_, position)) ->
+          submission.BatchRefused(position, submission.SubmissionConflict)
+        Error(Nil) -> submission.AdmissionContended
+      }
+    }
   }
 }
 
@@ -256,23 +331,25 @@ fn reconcile_many(
   // A receipt of another request under one of the batch's ids proves the
   // batch did not commit, since a committed batch wrote every receipt.
   let conflicted =
-    list.any(results, fn(result) {
-      case result {
+    list.index_map(results, fn(result, position) { #(result, position) })
+    |> list.find(fn(entry) {
+      case entry.0 {
         Error(submission.SubmissionConflict) -> True
         _ -> False
       }
     })
   case conflicted, result.all(results) {
-    True, _ -> Error(submission.SubmissionConflict)
-    False, Ok(commits) -> Ok(commits)
-    False, Error(submission.CommitUnknown(_)) ->
+    Ok(#(_, position)), _ ->
+      Error(submission.BatchRefused(position, submission.SubmissionConflict))
+    Error(Nil), Ok(commits) -> Ok(commits)
+    Error(Nil), Error(submission.CommitUnknown(_)) ->
       Error(
         submission.BatchCommitUnknown(list.map(
           requests,
           unique_admission_request.pending_submission,
         )),
       )
-    False, Error(error) -> Error(error)
+    Error(Nil), Error(error) -> Error(error)
   }
 }
 
@@ -666,6 +743,7 @@ fn reconcile_from_receipt(
     | Error(submission.InvalidInput(_))
     | Error(submission.CommitUnknown(_))
     | Error(submission.BatchCommitUnknown(_))
+    | Error(submission.BatchRefused(..))
     | Error(submission.PayloadTooLarge(_, _))
     | Error(submission.NotInTransaction)
     | Error(submission.TransactionIsolationUnsupported(_)) ->

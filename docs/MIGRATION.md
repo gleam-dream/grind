@@ -2,13 +2,13 @@
 
 Grind 0.3.0 is a breaking release. Change the dependency to `grind >= 0.3.0 and < 0.4.0` in `gleam.toml`, then work through the sections below in order. The first one affects every installation.
 
-| Change                                                                                            | Who must act                                                                    |
-| ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| [Schema version 15 builds an index concurrently](#schema-version-15-builds-an-index-concurrently) | Every installation: whoever runs migrations, with `grind.migrate` or cigogne    |
-| [Grind depends on Sinal 0.2](#grind-depends-on-sinal-02)                                          | Applications that attach Sinal handlers to Grind events, or depend on Sinal 0.1 |
-| [A handler crash has its own cause](#a-handler-crash-has-its-own-cause)                           | Workers with a declared settlement, and operators who read uncertain jobs       |
-| [A lost lease stops the handler](#a-lost-lease-stops-the-handler)                                 | Operators who read uncertain jobs, and handlers with external effects           |
-| [`SubmitError` has a `BatchCommitUnknown` variant](#submiterror-has-a-batchcommitunknown-variant) | Code that matches `grind.SubmitError` exhaustively                              |
+| Change                                                                                                                              | Who must act                                                                    |
+| ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| [Schema version 15 builds an index concurrently](#schema-version-15-builds-an-index-concurrently)                                   | Every installation: whoever runs migrations, with `grind.migrate` or cigogne    |
+| [Grind depends on Sinal 0.2](#grind-depends-on-sinal-02)                                                                            | Applications that attach Sinal handlers to Grind events, or depend on Sinal 0.1 |
+| [A handler crash has its own cause](#a-handler-crash-has-its-own-cause)                                                             | Workers with a declared settlement, and operators who read uncertain jobs       |
+| [A lost lease stops the handler](#a-lost-lease-stops-the-handler)                                                                   | Operators who read uncertain jobs, and handlers with external effects           |
+| [`SubmitError` has `BatchRefused` and `BatchCommitUnknown` variants](#submiterror-has-batchrefused-and-batchcommitunknown-variants) | Code that matches `grind.SubmitError` exhaustively                              |
 
 New in 0.3.0 and not breaking: `grind.submit_many`, which admits a list of jobs in one transaction. Two behaviour changes need no action and are listed under [Other changes](#other-changes).
 
@@ -73,16 +73,21 @@ A lost lease and a crash are therefore reported differently. A crash is acknowle
 
 **What to do.** Nothing in your code. `grind/testing.drain` now counts an attempt that lost its lease as processed, as it counts a replay-safe timeout, instead of failing after the handler returned; read the job's durable state for its outcome. A handler can be stopped in the middle of its work after a lost lease, so give its external effects an idempotency key, as for any abandoned attempt. Grind notices a lost lease at the next renewal, up to a third of the lease after the loss.
 
-## `SubmitError` has a `BatchCommitUnknown` variant
+## `SubmitError` has `BatchRefused` and `BatchCommitUnknown` variants
 
-**What changed.** `grind.SubmitError` has a new variant, `BatchCommitUnknown(pending: List(PendingSubmission))`. Only `grind.submit_many` returns it, when the batch may or may not have committed. `grind.submit_error_kind` classifies it `Unknown`.
+**What changed.** `grind.SubmitError` has two new variants. Only `grind.submit_many` returns them.
 
-**What to do.** Add a branch to every exhaustive match on `SubmitError`. Treat it like `CommitUnknown`: pass each pending submission, one per job in list order, to `grind.reconcile_submission`, or retry the same batch when every job has an id.
+- `BatchRefused(position: Int, reason: SubmitError)`: the job at `position` in the list, counted from 0, was refused with `reason`, the error `grind.submit` returns for that job, and nothing of the batch was written. `grind.submit_error_kind` classifies it as its `reason`.
+- `BatchCommitUnknown(pending: List(PendingSubmission))`: the commit reply was lost, so the batch may or may not have committed. `grind.submit_error_kind` classifies it `Unknown`.
+
+A batch that PostgreSQL rolled back is never reported as unknown. When a concurrent admission of the same job took one of the batch's ids, `submit_many` returns `UniquenessContended`; retrying the same batch then finds that admission.
+
+**What to do.** Add both branches to every exhaustive match on `SubmitError`. Treat `BatchRefused` as a refusal of the job it names. Treat `BatchCommitUnknown` like `CommitUnknown`: pass each pending submission, one per job in list order, to `grind.reconcile_submission`, or retry the same batch when every job has an id.
 
 ```gleam
 case grind.submit_many(jobs, batch) {
   Ok(admissions) -> handle(admissions)
-  Error(grind.CommitUnknown(pending)) -> reconcile([pending])
+  Error(grind.BatchRefused(position:, reason:)) -> reject(position, reason)
   Error(grind.BatchCommitUnknown(pending:)) -> reconcile(pending)
   Error(other) -> report(other)
 }
