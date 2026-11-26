@@ -247,17 +247,24 @@ fn handler_crashed(
   state: WorkerState(message),
   reason: process.ExitReason,
 ) -> actor.Next(WorkerState(message), WorkerMessage) {
-  abandon(
-    state,
-    worker.StoppedByCrash,
+  abandon(state, worker.StoppedByCrash, crash_description(reason))
+}
+
+/// The description stored on a crashed handler's job, prefix included, cut
+/// to at most 500 characters and 2000 bytes.
+pub fn crash_description(reason: process.ExitReason) -> String {
+  bounded(
     "handler exited: "
-      <> case reason {
+    <> case reason {
       process.Normal -> "normal"
       process.Killed -> "killed"
       process.Abnormal(reason) -> describe_exit(reason)
     },
   )
 }
+
+@external(erlang, "grind_queue_ffi", "bounded")
+fn bounded(text: String) -> String
 
 @external(erlang, "grind_queue_ffi", "describe_exit")
 fn describe_exit(reason: Dynamic) -> String
