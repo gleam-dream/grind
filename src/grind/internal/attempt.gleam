@@ -47,6 +47,21 @@ pub opaque type ClaimedJob {
   )
 }
 
+/// One row of a batch claim: runnable here, holding a codec contract that no
+/// longer matches its registered worker (it must be parked), or unable to run
+/// for another reason.
+pub type ClaimedRow {
+  Runnable(ClaimedJob)
+  Mismatched(Mismatch)
+  Unrunnable(postgres.QueueRunError)
+}
+
+/// A claimed row whose stored codec version differs from the registered one.
+/// Nothing is written for it until `park` runs.
+pub opaque type Mismatch {
+  Mismatch(claim: Claim, kind: String, expected: String, actual: String)
+}
+
 /// Atomically claims one due row without running its handler in the caller.
 /// The attempt process owns acknowledgement; its consumer's independent
 /// renewer extends the live lease after this boundary.
@@ -62,8 +77,10 @@ pub fn claim_one(
   {
     Error(error) -> Error(error)
     Ok([]) -> Ok(None)
-    Ok([Ok(claimed)]) -> Ok(Some(claimed))
-    Ok([Error(error)]) -> Error(error)
+    Ok([Runnable(claimed)]) -> Ok(Some(claimed))
+    Ok([Mismatched(mismatch)]) ->
+      Error(park(database, queue, attempt_owner, mismatch))
+    Ok([Unrunnable(error)]) -> Error(error)
     Ok([_, _, ..]) -> Error(postgres.QueueStorageInvariantViolated)
   }
 }
@@ -75,9 +92,11 @@ pub fn claim_one(
 ///
 /// The outer error means no claim was returned to the caller, not that none
 /// committed: a lost reply after the claim statement committed leaves its
-/// rows executing until lease-expiry recovery. An inner error belongs to one
-/// claimed row that cannot run here, such as a codec contract mismatch that
-/// parked it; the other rows of the batch stay claimed.
+/// rows executing until lease-expiry recovery. A `Mismatched` row is not
+/// written here: the caller starts the batch's runnable rows first and then
+/// passes each mismatch to `park`, so no parking write ever runs between a
+/// runnable row's claim and its start. The other rows of the batch stay
+/// claimed whatever happens to one row.
 pub fn claim_batch(
   database: Database,
   queue: String,
@@ -85,10 +104,7 @@ pub fn claim_batch(
   attempt_owner: String,
   lease_duration_ms: Int,
   limit: Int,
-) -> Result(
-  List(Result(ClaimedJob, postgres.QueueRunError)),
-  postgres.QueueRunError,
-) {
+) -> Result(List(ClaimedRow), postgres.QueueRunError) {
   let fwd = postgres.forwarder(database)
   let reference = diagnostics.queue_ref(queue, attempt_owner)
   let measured =
@@ -662,10 +678,7 @@ fn claim_registered_jobs(
   identities: List(#(String, String)),
   lease_duration_ms: Int,
   limit: Int,
-) -> Result(
-  List(Result(ClaimedJob, postgres.QueueRunError)),
-  postgres.QueueRunError,
-) {
+) -> Result(List(ClaimedRow), postgres.QueueRunError) {
   let connection = postgres.connection(database)
   let forwarder = postgres.forwarder(database)
   let eligibility =
@@ -784,21 +797,20 @@ fn claim_registered_jobs(
     Ok(returned) ->
       Ok(
         list.map(returned.rows, fn(claim) {
-          claimed_job(database, queue, workers, attempt_owner, claim)
+          claimed_job(database, queue, workers, claim)
         }),
       )
   }
 }
 
-/// Binds one claimed row to its registered worker, or parks a row whose
-/// stored codec contract differs from the registered one.
+/// Binds one claimed row to its registered worker, or reports a row whose
+/// stored codec contract differs from the registered one, without writing.
 fn claimed_job(
   database: Database,
   queue: String,
   workers: Registry,
-  attempt_owner: String,
   claim: Claim,
-) -> Result(ClaimedJob, postgres.QueueRunError) {
+) -> ClaimedRow {
   let forwarder = postgres.forwarder(database)
   let Claim(
     id: claimed_id,
@@ -831,7 +843,7 @@ fn claimed_job(
       )
   }
   case registry.select(workers, queue, worker_id, worker_version) {
-    Error(_) -> Error(postgres.QueueStorageInvariantViolated)
+    Error(_) -> Unrunnable(postgres.QueueStorageInvariantViolated)
     Ok(registry.Selected(
       input_version: registered_input,
       output_version: registered_output,
@@ -851,31 +863,11 @@ fn claimed_job(
           registered_error,
         )
       {
-        Some(#(kind, expected, actual)) -> {
-          case
-            mark_contract_mismatch(
-              database,
-              queue,
-              attempt_owner,
-              claim,
-              kind,
-              expected,
-              actual,
-            )
-          {
-            Error(error) -> Error(error)
-            Ok(True) ->
-              case codec_kind_of_stored(kind) {
-                Ok(kind) ->
-                  Error(postgres.QueueCodecMismatch(kind:, expected:, actual:))
-                Error(Nil) -> Error(postgres.QueueStorageInvariantViolated)
-              }
-            Ok(False) -> Error(postgres.QueueStorageInvariantViolated)
-          }
-        }
+        Some(#(kind, expected, actual)) ->
+          Mismatched(Mismatch(claim:, kind:, expected:, actual:))
         None -> {
           let max_payload_bytes = postgres.max_payload_bytes(database)
-          Ok(ClaimedJob(
+          Runnable(ClaimedJob(
             claim:,
             queue:,
             run: fn(context) {
@@ -887,6 +879,37 @@ fn claimed_job(
           ))
         }
       }
+  }
+}
+
+/// Parks a mismatched claimed row as `contract_mismatch` under its attempt
+/// fence and live lease, and returns why the row could not run: the codec
+/// mismatch once it is recorded, or the storage error that prevented it.
+pub fn park(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  mismatch: Mismatch,
+) -> postgres.QueueRunError {
+  let Mismatch(claim:, kind:, expected:, actual:) = mismatch
+  case
+    mark_contract_mismatch(
+      database,
+      queue,
+      attempt_owner,
+      claim,
+      kind,
+      expected,
+      actual,
+    )
+  {
+    Error(error) -> error
+    Ok(True) ->
+      case codec_kind_of_stored(kind) {
+        Ok(kind) -> postgres.QueueCodecMismatch(kind:, expected:, actual:)
+        Error(Nil) -> postgres.QueueStorageInvariantViolated
+      }
+    Ok(False) -> postgres.QueueStorageInvariantViolated
   }
 }
 

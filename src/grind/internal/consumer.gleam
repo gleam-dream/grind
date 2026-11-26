@@ -1517,9 +1517,10 @@ fn finish_completion(
 }
 
 /// Claims into every free slot with one claim statement, unless shutdown has
-/// started, and starts the claimed attempts in selection order. The claim and
-/// the starts run inside one mailbox message, so a shutdown request cannot
-/// fall between a claim and its start. Renewal storage work runs in an
+/// started, and starts the claimed attempts in selection order, then parks
+/// the rows whose codec contract no longer matches. The claim and the starts
+/// run inside one mailbox message, so a shutdown request cannot fall between
+/// a claim and its start. Renewal storage work runs in an
 /// independent actor and reserved pool.
 ///
 /// Every claim statement follows one bounded quarantine scan. A claimed row
@@ -1547,14 +1548,34 @@ fn fill_automatic_slots(
         )
       {
         Error(_) -> continue_if_idle(state)
-        Ok(rows) ->
-          list.fold(rows, state, fn(state, row) {
+        Ok(rows) -> {
+          // Start every runnable row before any parking write, so parking
+          // time never sits between a runnable row's claim and its start.
+          let state =
+            list.fold(rows, state, fn(state, row) {
+              case row {
+                attempt.Runnable(claimed) ->
+                  activate_claim(state, Automatic, claimed).0
+                attempt.Mismatched(_) | attempt.Unrunnable(_) -> state
+              }
+            })
+          list.each(rows, fn(row) {
             case row {
-              Error(_) -> state
-              Ok(claimed) -> activate_claim(state, Automatic, claimed).0
+              attempt.Mismatched(mismatch) -> {
+                let _ =
+                  attempt.park(
+                    state.database,
+                    state.queue,
+                    state.attempt_owner,
+                    mismatch,
+                  )
+                Nil
+              }
+              attempt.Runnable(_) | attempt.Unrunnable(_) -> Nil
             }
           })
-          |> continue_if_idle
+          continue_if_idle(state)
+        }
       }
   }
 }
