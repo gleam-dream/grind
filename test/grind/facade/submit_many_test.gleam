@@ -114,6 +114,21 @@ pub fn facade_submit_many_job_ids_are_idempotency_keys_test() {
       ])
       |> should.equal(Error(grind.IdConflict))
       count(jobs, queue) |> should.equal(3)
+
+      // A refusal after the batch wrote a job rolls that job back: the plain
+      // job is inserted before the job with a uniqueness policy finds its id
+      // taken by another request.
+      let policy =
+        unique.policy(
+          unique.full_input(),
+          unique.within(duration.hours(1), from: unique.FromInsertion),
+        )
+      grind.submit_many(jobs, [
+        job.new(echo_worker, 5) |> job.with_id(id <> "-5"),
+        job.new(echo_worker, 9) |> job.with_id(id <> "-1") |> job.unique(policy),
+      ])
+      |> should.equal(Error(grind.IdConflict))
+      count(jobs, queue) |> should.equal(3)
       mark_database_test_executed("facade-submit-many-ids")
     }
   }
