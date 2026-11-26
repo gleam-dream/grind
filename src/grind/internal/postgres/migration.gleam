@@ -208,28 +208,35 @@ fn build_concurrent_indexes(
     indexes -> {
       let give_up_at = monotonic_ms() + migration_deadline_ms
       let built =
-        store.migration_call_safely(
+        store.migration_session_safely(
           connection,
           migration_deadline_ms,
           fn(session) {
-            Ok(case take_session_lock(session, give_up_at) {
+            case take_session_lock(session, give_up_at) {
               // The server may have granted the lock before it reported the
-              // error, and this session goes back to the shared pool: release
-              // it here, or a later migrator finds it held.
-              Error(error) -> {
-                let _ = release_session_lock(session)
-                Error(error)
-              }
-              Ok(False) -> Error(MigrationLockUnavailable(step.version))
+              // error: the session is retired, which drops it.
+              Error(error) -> #(store.RetireSession, Ok(Error(error)))
+              Ok(False) -> #(
+                store.ReturnSession,
+                Ok(Error(MigrationLockUnavailable(step.version))),
+              )
               Ok(True) -> {
                 let built = build_under_lock(session, steps, step, indexes)
-                case release_until_released(session, 2), built {
-                  _, Error(error) -> Error(error)
-                  Error(error), Ok(Nil) -> Error(error)
-                  Ok(Nil), Ok(Nil) -> Ok(Nil)
+                // Only a confirmed unlock lets the session return to the
+                // pool; otherwise it is retired with the lock.
+                case release_session_lock(session), built {
+                  Ok(Nil), built -> #(store.ReturnSession, Ok(built))
+                  Error(_), Error(error) -> #(
+                    store.RetireSession,
+                    Ok(Error(error)),
+                  )
+                  Error(error), Ok(Nil) -> #(
+                    store.RetireSession,
+                    Ok(Error(error)),
+                  )
                 }
               }
-            })
+            }
           },
         )
       case built {
@@ -265,20 +272,6 @@ fn take_session_lock(
 }
 
 const session_lock_retry_ms = 50
-
-/// Releases the session lock, trying again on the same session when the
-/// server reports an error, so a session returned to the pool does not keep
-/// the lock after a passing failure.
-fn release_until_released(
-  session: pog.Connection,
-  tries: Int,
-) -> Result(Nil, RunnerError) {
-  case release_session_lock(session) {
-    Ok(Nil) -> Ok(Nil)
-    Error(error) if tries <= 1 -> Error(error)
-    Error(_) -> release_until_released(session, tries - 1)
-  }
-}
 
 fn release_session_lock(session: pog.Connection) -> Result(Nil, RunnerError) {
   case

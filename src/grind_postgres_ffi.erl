@@ -13,7 +13,7 @@
     transaction_measured/2,
     transaction_or_checkout_failure/2,
     migration_transaction_safely/3,
-    migration_call_safely/3,
+    migration_session_safely/3,
     is_single_connection/1,
     application_search_path/0
 ]).
@@ -84,6 +84,14 @@ with_deadline_ms(PoolName, Deadline, Fun, OnCheckoutFailure) ->
     Value.
 
 with_deadline_ms_timing(PoolName, Deadline, Fun, OnCheckoutFailure) ->
+    with_deadline_ms_ending(PoolName, Deadline, Fun, OnCheckoutFailure,
+                            fun(Value) -> {Value, return} end).
+
+%% `Ending` turns the callback's result into the value to return and what
+%% happens to the session: `return` checks it back in (when it is still
+%% usable and its search_path was restored), `retire` disconnects it, so the
+%% server ends the session and drops every lock it held.
+with_deadline_ms_ending(PoolName, Deadline, Fun, OnCheckoutFailure, Ending) ->
     case grind_pool_ffi:acquire(PoolName) of
         {ok, Owner, Token, ConfiguredDeadlineMs, SearchPath} ->
             DeadlineMs = case Deadline of
@@ -91,7 +99,7 @@ with_deadline_ms_timing(PoolName, Deadline, Fun, OnCheckoutFailure) ->
                 ExplicitDeadlineMs -> ExplicitDeadlineMs
             end,
             ExpiresAt = erlang:monotonic_time(millisecond) + DeadlineMs,
-            try checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, 0, 0)
+            try checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Ending, 0, 0)
             after grind_pool_ffi:release(Owner, Token)
             end;
         {error, closed} -> checkout_unavailable(OnCheckoutFailure, 0, 0)
@@ -101,13 +109,13 @@ with_deadline_ms_timing(PoolName, Deadline, Fun, OnCheckoutFailure) ->
 %% Checking it back in recycles that dead socket forever. Retire unusable
 %% candidates before sending any SQL, sharing one absolute deadline across
 %% all candidates. This retries admission only: Fun is never retried here.
-checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
+checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Ending, WaitUs, Candidates) ->
     case erlang:monotonic_time(millisecond) < ExpiresAt of
         false -> checkout_unavailable(OnCheckoutFailure, WaitUs, Candidates);
-        true -> checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates)
+        true -> checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Ending, WaitUs, Candidates)
     end.
 
-checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, WaitUs, Candidates) ->
+checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Ending, WaitUs, Candidates) ->
     %% Time only the real checkout call. Probes, stale-holder retirement,
     %% callback execution and cleanup do not masquerade as pool waiting.
     %% Pinned pgo has no receive timeout while queued: this interval may exceed
@@ -124,27 +132,38 @@ checkout_candidate(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Wait
             case Entered of
                 {ok, Restore} ->
                     Previous = put(?APPLICATION_SEARCH_PATH, Restore),
-                    Value = try Fun({single_connection, Conn}, Conn)
-                    after
-                        restore_application_search_path(Previous),
-                        %% Cleanup cannot change a result or prove whether an
-                        %% earlier command committed. Ambiguity stays ambiguous.
-                        %% A connection whose search_path could not be
-                        %% restored never returns to the shared pool.
-                        case try leave_search_path(Conn, Restore)
-                             catch
-                                 throw:Thrown -> Thrown;
-                                 exit:Reason -> {'EXIT', Reason};
-                                 error:Reason:Stack -> {'EXIT', {Reason, Stack}}
-                             end of
-                            ok -> try return_connection(Ref, Conn, ExpiresAt) catch _:_ -> ok end;
-                            _ -> retire_connection(Ref, Conn)
-                        end
+                    Outcome = try {ok, Ending(Fun({single_connection, Conn}, Conn))}
+                              catch Class:Raised:Stack -> {raised, Class, Raised, Stack}
+                              end,
+                    restore_application_search_path(Previous),
+                    %% Cleanup cannot change a result or prove whether an
+                    %% earlier command committed. Ambiguity stays ambiguous.
+                    %% A connection whose search_path could not be restored,
+                    %% or whose callback asked to retire it, never returns to
+                    %% the shared pool.
+                    Disposition = case Outcome of
+                        {ok, {_, Asked}} -> Asked;
+                        {raised, _, _, _} -> return
+                    end,
+                    Left = try leave_search_path(Conn, Restore)
+                           catch
+                               throw:Thrown -> Thrown;
+                               exit:LeaveReason -> {'EXIT', LeaveReason};
+                               error:LeaveReason:LeaveStack -> {'EXIT', {LeaveReason, LeaveStack}}
+                           end,
+                    case {Left, Disposition} of
+                        {ok, return} -> try return_connection(Ref, Conn, ExpiresAt) catch _:_ -> ok end;
+                        _ -> retire_connection(Ref, Conn)
+                    end,
+                    Value = case Outcome of
+                        {ok, {Returned, _}} -> Returned;
+                        {raised, RaisedClass, RaisedReason, RaisedStack} ->
+                            erlang:raise(RaisedClass, RaisedReason, RaisedStack)
                     end,
                     {Value, {checkout_timing, CheckedOutWaitUs, Candidates + 1, checked_out}};
                 error ->
                     retire_connection(Ref, Conn),
-                    checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure,
+                    checkout_before(PoolName, SearchPath, ExpiresAt, Fun, OnCheckoutFailure, Ending,
                                     CheckedOutWaitUs, Candidates + 1)
             end;
         {error, _Reason} ->
@@ -452,19 +471,33 @@ migration_transaction_safely(Connection, DeadlineMs, Callback) ->
 %% `migration_transaction_safely/3` without a transaction: `Fun` runs its
 %% statements on one checked-out session, each in its own implicit
 %% transaction, under the migration deadline. A concurrent index build needs
-%% this, since PostgreSQL refuses it inside a transaction block.
-migration_call_safely(Connection, DeadlineMs, Fun) ->
+%% this, since PostgreSQL refuses it inside a transaction block. `Fun`
+%% returns `{return_session, Result}` only when the session holds no lock it
+%% took; anything else, a crash included, retires the session instead of
+%% returning it to the pool. A single connection belongs to its caller and is
+%% never retired here.
+migration_session_safely(Connection, DeadlineMs, Fun) ->
     case Connection of
         {pool, PoolName} ->
-            with_deadline_ms(
+            {Value, _Timing} = with_deadline_ms_ending(
                 PoolName,
                 DeadlineMs,
                 fun(WrappedConn, RawConn) -> guarded_query(RawConn, fun() -> Fun(WrappedConn) end) end,
-                fun() -> {error, connection_unavailable} end
-            );
+                fun() -> {error, connection_unavailable} end,
+                fun session_ending/1
+            ),
+            Value;
         SingleConnection = {single_connection, Conn} ->
-            guarded_query(Conn, fun() -> Fun(SingleConnection) end)
+            case guarded_query(Conn, fun() -> Fun(SingleConnection) end) of
+                {return_session, Result} -> Result;
+                {retire_session, Result} -> Result;
+                Other -> Other
+            end
     end.
+
+session_ending({return_session, Result}) -> {Result, return};
+session_ending({retire_session, Result}) -> {Result, retire};
+session_ending(Other) -> {Other, retire}.
 
 stop_consumer_supervisor(Pid) ->
     case erlang:is_process_alive(Pid) of

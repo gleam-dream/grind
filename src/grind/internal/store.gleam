@@ -102,9 +102,17 @@ pub fn transaction_or_checkout_failure(
 /// transaction, such as a concurrent index build: `run` receives one
 /// checked-out session, held under `deadline_ms`, and its statements commit
 /// one at a time.
-@external(erlang, "grind_postgres_ffi", "migration_call_safely")
-pub fn migration_call_safely(
+@external(erlang, "grind_postgres_ffi", "migration_session_safely")
+pub fn migration_session_safely(
   connection: pog.Connection,
   deadline_ms: Int,
-  run: fn(pog.Connection) -> Result(a, pog.QueryError),
+  run: fn(pog.Connection) -> #(SessionEnd, Result(a, pog.QueryError)),
 ) -> Result(a, pog.QueryError)
+
+/// How a migration session ends. `ReturnSession` checks it back into the
+/// pool and is only for a session that holds no lock it took; every other
+/// ending, a crash included, disconnects it so the server drops its locks.
+pub type SessionEnd {
+  ReturnSession
+  RetireSession
+}
