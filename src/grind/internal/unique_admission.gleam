@@ -425,6 +425,15 @@ fn batch_body(
       let #(index, request) = entry
       transaction_body(connection, request)
       |> result.map(fn(commit) { #(index, commit) })
+      // A lock wait that expired belongs to this job. An id conflict stays
+      // unwrapped: the rollback it causes is classified from the receipts.
+      |> result.map_error(fn(error) {
+        case error {
+          submission.AdmissionContended ->
+            submission.BatchRefused(index, submission.AdmissionContended)
+          other -> other
+        }
+      })
     }),
   )
   list.flatten([found, inserted, admitted])

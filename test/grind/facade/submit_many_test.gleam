@@ -281,6 +281,61 @@ pub fn facade_submit_many_names_the_refused_job_test() {
   }
 }
 
+/// A job whose uniqueness lock wait expires inside a batch refuses the batch
+/// with its position, as for any other refusal of one job.
+pub fn facade_submit_many_names_a_contended_job_test() {
+  case queue_database_url() {
+    Error(Nil) -> Nil
+    Ok(url) -> {
+      let queue = unique("facade-many-contended")
+      let echo_worker =
+        worker.new(
+          unique("facade.many.contended"),
+          input: int_codec(),
+          output: int_codec(),
+          perform: fn(n) { Ok(n) },
+        )
+        |> worker.with_queue(queue)
+      use jobs <- with_runtime(url, fn(config) {
+        config
+        |> grind.with_worker(echo_worker)
+        |> grind.with_unique_lock_wait(duration.milliseconds(200))
+        |> grind.without_consumers
+      })
+      let policy =
+        unique.policy(
+          unique.full_input(),
+          unique.within(duration.hours(1), from: unique.FromInsertion),
+        )
+      let db = grind.connection(jobs)
+      let held: Result(Nil, pog.TransactionError(String)) =
+        pog.transaction(db, fn(tx) {
+          // This transaction holds the uniqueness lock of the key.
+          let assert Ok(grind.Inserted(_)) =
+            grind.submit_in(
+              jobs,
+              tx,
+              job.new(echo_worker, 3) |> job.unique(policy),
+            )
+          grind.submit_many(jobs, [
+            job.new(echo_worker, 1),
+            job.new(echo_worker, 3) |> job.unique(policy),
+          ])
+          |> should.equal(
+            Error(grind.BatchRefused(
+              position: 1,
+              reason: grind.UniquenessContended,
+            )),
+          )
+          Error("release the lock")
+        })
+      let assert Error(pog.TransactionRolledBack("release the lock")) = held
+      count(jobs, queue) |> should.equal(0)
+      mark_database_test_executed("facade-submit-many-contended-position")
+    }
+  }
+}
+
 /// Polls until another session of this database waits on a lock.
 fn await_lock_waiter(db: pog.Connection, remaining: Int) -> Bool {
   let assert Ok(pog.Returned(rows: [waiting], ..)) =
