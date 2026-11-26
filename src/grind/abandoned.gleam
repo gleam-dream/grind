@@ -6,6 +6,7 @@
 //// worker.with_settlement(agent, fn(_transaction, job) {
 ////   case abandoned.cause(job), abandoned.try_number(job) {
 ////     abandoned.TimedOut, _ -> Ok(worker.ConfirmFailure("timed out"))
+////     abandoned.HandlerCrashed, _ -> Ok(worker.LeaveUncertain("a bug"))
 ////     abandoned.LeaseExpired, try if try < 5 -> Error("ask again later")
 ////     abandoned.LeaseExpired, _ -> Ok(worker.LeaveUncertain("needs a person"))
 ////   }
@@ -42,11 +43,16 @@ pub fn to_definition(
 /// Why the attempt was abandoned.
 pub type Cause {
   /// Its lease expired without an acknowledgement: its node died or lost the
-  /// database, or its handler ran past a replay-safe timeout and the lease
-  /// ran out.
+  /// database, a renewal found the lease lost while its handler ran (Grind
+  /// then stops the handler and leaves the job to lease-expiry recovery), or
+  /// its handler ran past a replay-safe timeout and the lease ran out.
   LeaseExpired
   /// Grind stopped its handler at the worker's timeout under `HoldUncertain`.
   TimedOut
+  /// Its handler crashed under `HoldUncertain`: it panicked, failed a
+  /// `let assert`, or its process exited in any other way without returning.
+  /// `description` names the kind of failure and where it happened.
+  HandlerCrashed
 }
 
 /// The job's id.
@@ -74,6 +80,7 @@ pub fn cause(abandoned: Abandoned(input)) -> Cause {
   case to_definition(abandoned).cause {
     definition.LeaseExpired -> LeaseExpired
     definition.TimedOut -> TimedOut
+    definition.HandlerCrashed -> HandlerCrashed
   }
 }
 

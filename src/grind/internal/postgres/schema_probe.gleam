@@ -7,6 +7,7 @@ import gleam/list
 import gleam/result
 import gleam/string
 import grind/internal/migrations
+import grind/internal/sql
 import grind/internal/store
 import pog
 
@@ -98,11 +99,16 @@ fn relation_kind_code(kind: migrations.RelationKind) -> String {
   }
 }
 
+/// `accepted` names relations that may exist beyond `shape`: the next
+/// version's concurrent indexes, built before that version's marker.
 pub fn relation_shape_matches(
   connection: pog.Connection,
   shape: List(migrations.ExpectedRelation),
+  accepted: List(String),
 ) -> Result(Bool, ProbeError) {
   use actual <- result.try(read_grind_relations(connection))
+  let actual =
+    list.filter(actual, fn(relation) { !list.contains(accepted, relation.0) })
   let expected =
     shape
     |> list.map(fn(relation) {
@@ -225,5 +231,21 @@ pub fn forbidden_columns_absent(
           }
       }
     }
+  }
+}
+
+/// Whether the index `name` in the current schema is valid: `[]` when it
+/// does not exist, `[False]` when a failed concurrent build left it invalid.
+pub fn index_validity(
+  connection: pog.Connection,
+  name: String,
+) -> Result(List(Bool), ProbeError) {
+  case
+    store.call_safely(connection, fn(connection) {
+      sql.index_validity(connection, name)
+    })
+  {
+    Error(error) -> Error(ProbeQueryFailed(error))
+    Ok(returned) -> Ok(list.map(returned.rows, fn(row) { row.indisvalid }))
   }
 }

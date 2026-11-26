@@ -509,15 +509,15 @@ pub fn start(
   use plans <- result.try(
     queue_plans(config) |> result.map_error(InvalidConfig),
   )
-  use Nil <- result.try(case process.named(name) {
-    Ok(_) -> Error(StartFailed("a runtime is already running under this name"))
-    Error(Nil) -> Ok(Nil)
-  })
+  use Nil <- result.try(
+    after_previous_incarnation(name, plans, config)
+    |> result.map_error(StartFailed),
+  )
   runtime.record_pool(name, postgres.pool_name(validated))
   let failures = process.new_subject()
   let root =
     root_supervisor(config, validated, plans, name, False, Some(failures))
-  case start_unlinked(fn() { static_supervisor.start(root) }) {
+  case start_unlinked(fn() { start_root(root, name) }) {
     Ok(_) -> Ok(runtime.Grind(name))
     Error(error) ->
       case process.receive(failures, within: 0) {
@@ -545,18 +545,59 @@ pub fn supervised(
     use validated <- result.try(settings(config))
     use plans <- result.try(queue_plans(config))
     runtime.record_pool(name, postgres.pool_name(validated))
-    Ok(root_supervisor(config, validated, plans, name, True, None))
+    Ok(#(root_supervisor(config, validated, plans, name, True, None), plans))
   }
   supervision.supervisor(fn() {
     case checked {
-      Ok(root) ->
-        static_supervisor.start(root)
-        |> result.map(fn(started) {
-          actor.Started(started.pid, runtime.Grind(name))
-        })
+      Ok(#(root, plans)) ->
+        case after_previous_incarnation(name, plans, config) {
+          Error(description) -> Error(actor.InitFailed(description))
+          Ok(Nil) ->
+            start_root(root, name)
+            |> result.map(fn(started) {
+              actor.Started(started.pid, runtime.Grind(name))
+            })
+        }
       Error(error) -> Error(actor.InitFailed(describe_config_error(error)))
     }
   })
+}
+
+/// Waits until no process of the runtime last started under `name` is
+/// alive. A killed or crashed root dies at once while its consumers drain
+/// and its pool waits for its callers, each still registered under a name
+/// the next runtime registers; starting only after they exit means a
+/// restart never meets one of them. The wait is bounded by the longest
+/// queue grace plus the connect timeout and five seconds, the budget the
+/// previous runtime had to stop and this one has to start.
+fn after_previous_incarnation(
+  name: process.Name(Message),
+  plans: List(runtime.QueuePlan),
+  config: Config,
+) -> Result(Nil, String) {
+  let longest_grace_ms =
+    list.fold(plans, 0, fn(longest, plan) { int.max(longest, plan.grace_ms) })
+  case
+    runtime.await_previous_incarnation(
+      name,
+      longest_grace_ms + config.connect_timeout_ms + 5000,
+    )
+  {
+    Ok(Nil) -> Ok(Nil)
+    Error(runtime.StillRunning) ->
+      Error("a runtime is already running under this name")
+    Error(runtime.DidNotStop) ->
+      Error("the previous runtime under this name did not stop in time")
+  }
+}
+
+fn start_root(
+  root: static_supervisor.Builder,
+  name: process.Name(Message),
+) -> Result(actor.Started(static_supervisor.Supervisor), actor.StartError) {
+  use started <- result.map(static_supervisor.start(root))
+  runtime.record_incarnation(name, started.pid)
+  started
 }
 
 fn start_failure(error: actor.StartError) -> String {
@@ -824,7 +865,9 @@ pub type SubmitError(input, output, error) {
   EmptyJobId
   /// The job's id was already used for a different job.
   IdConflict
-  /// The uniqueness lock wait expired. Nothing was written; retry.
+  /// The uniqueness lock wait expired, or, from `submit_many`, a concurrent
+  /// admission of the same job took one of the batch's ids. Nothing was
+  /// written; retry.
   UniquenessContended
   /// The admission did not commit. Retry, under the same id when it has
   /// one.
@@ -832,6 +875,15 @@ pub type SubmitError(input, output, error) {
   /// The admission may or may not have committed. Retry the same job, or
   /// pass the pending submission to `reconcile_submission`.
   CommitUnknown(PendingSubmission(input, output, error))
+  /// `submit_many` only: the batch may or may not have committed. It
+  /// commits all or nothing, so pass each pending submission, one per job in
+  /// order, to `reconcile_submission`, or retry the same batch when every
+  /// job has an id.
+  BatchCommitUnknown(pending: List(PendingSubmission(input, output, error)))
+  /// `submit_many` only: the job at `position` in the list, counted from 0,
+  /// was refused with `reason`, the error `submit` returns for that job, and
+  /// nothing of the batch was written.
+  BatchRefused(position: Int, reason: SubmitError(input, output, error))
   /// `submit_in` was given a pool, not a transaction.
   NotInTransaction
   /// `submit_in`'s transaction is not `READ COMMITTED`.
@@ -857,6 +909,50 @@ pub fn submit(
   use spec <- result.try(spec_for(job))
   postgres.admit(database, spec)
   |> result.map(admission_of(_, postgres.installation(database), spec.worker))
+  |> result.map_error(submit_error)
+}
+
+/// Admits many jobs in one transaction, as `submit` admits one: all commit
+/// or none does, and the admissions come back in the order of `jobs`. Jobs
+/// without a uniqueness policy are written together, so a batch costs a few
+/// round trips instead of several per job. A job id is an idempotency key
+/// here too; one id twice in a batch is an `IdConflict`. A job with a
+/// uniqueness policy is admitted one at a time inside the same transaction,
+/// taking its lock in list order. A refused job refuses the whole batch with
+/// `BatchRefused(position, reason)`, where `reason` is the error `submit`
+/// returns for that job, and nothing is written. When PostgreSQL rolls the
+/// batch back because a concurrent admission of the same job took one of
+/// its ids, the batch returns `UniquenessContended`; retry it.
+/// `BatchCommitUnknown` is returned only when the commit reply was lost.
+///
+/// Emits `[grind, job, admitted]` for each job once the commit is proven.
+///
+/// ```gleam
+/// grind.submit_many(jobs, list.map(order.lines, job.new(pick_line(), _)))
+/// ```
+pub fn submit_many(
+  grind: Grind,
+  jobs: List(job.Job(input, output, error)),
+) -> Result(
+  List(Admission(input, output, error)),
+  SubmitError(input, output, error),
+) {
+  use database <- result.try(
+    runtime.database(grind) |> result.replace_error(SubmitNotRunning),
+  )
+  use specs <- result.try(
+    list.index_map(jobs, fn(job, position) { #(job, position) })
+    |> list.try_map(fn(entry) {
+      spec_for(entry.0)
+      |> result.map_error(BatchRefused(entry.1, _))
+    }),
+  )
+  postgres.admit_many(database, specs)
+  |> result.map(
+    list.map2(_, specs, fn(admission, spec) {
+      admission_of(admission, postgres.installation(database), spec.worker)
+    }),
+  )
   |> result.map_error(submit_error)
 }
 
@@ -1015,6 +1111,9 @@ fn submit_error(
     submission.SubmissionConflict -> IdConflict
     submission.NotCommitted(reason) -> NotCommitted(reason)
     submission.CommitUnknown(pending) -> CommitUnknown(pending)
+    submission.BatchCommitUnknown(pending) -> BatchCommitUnknown(pending)
+    submission.BatchRefused(position, reason) ->
+      BatchRefused(position, submit_error(reason))
     submission.NotInTransaction -> NotInTransaction
     submission.TransactionIsolationUnsupported(isolation) ->
       TransactionIsolationUnsupported(isolation)
@@ -1352,7 +1451,8 @@ pub fn submit_error_kind(
     IdConflict | WrongDatabase -> Mismatch
     UniquenessContended -> Contended
     NotCommitted(_) | SubmitNotRunning -> Unreachable
-    CommitUnknown(_) -> Unknown
+    CommitUnknown(_) | BatchCommitUnknown(_) -> Unknown
+    BatchRefused(reason:, ..) -> submit_error_kind(reason)
   }
 }
 
@@ -1462,6 +1562,13 @@ pub fn describe_submit_error(
       "grind: the submit did not commit: " <> string.inspect(reason)
     CommitUnknown(_) ->
       "grind: the submit may have committed; reconcile it with reconcile_submission"
+    BatchCommitUnknown(_) ->
+      "grind: the batch may have committed; reconcile each job with reconcile_submission"
+    BatchRefused(position:, reason:) ->
+      "grind: job "
+      <> int.to_string(position)
+      <> " of the batch was refused and nothing was written: "
+      <> describe_submit_error(reason)
     NotInTransaction -> "grind: submit_in needs a transaction connection"
     TransactionIsolationUnsupported(isolation:) ->
       "grind: submit_in needs a READ COMMITTED transaction, not " <> isolation

@@ -30,7 +30,10 @@ pub fn postgres_queue_renews_running_attempt_before_ack_test() {
   }
 }
 
-pub fn postgres_expired_renewal_keeps_worker_fenced_and_returns_proposal_test() {
+/// A handler whose attempt lost its lease is stopped: nothing it does from
+/// then on can be acknowledged, and another attempt may already be running
+/// the same job.
+pub fn postgres_lost_lease_stops_the_handler_and_frees_its_slot_test() {
   case queue_database_url() {
     Error(Nil) -> Nil
     Ok(database_url) -> run_lease_renewal_loss_test(database_url)
@@ -173,6 +176,11 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
       meta.context.ref.job_id == job.id_value(handle)
     })
   use <- exception.defer(fn() { detach(attachment) })
+  let #(acknowledgements, acknowledgement_attachment) =
+    diagnostics.capture(telemetry.acknowledgement(), fn(meta) {
+      meta.context.ref.job_id == job.id_value(handle)
+    })
+  use <- exception.defer(fn() { detach(acknowledgement_attachment) })
   let assert Ok(policy) =
     queue.default_policy()
     |> queue.with_lease_duration(4008)
@@ -185,10 +193,11 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
     process.spawn(fn() { process.send(reply, queue.process_one(consumer)) })
   let assert Ok(FirstAttemptStarted(release)) =
     process.receive(started, within: 5000)
+  let assert Ok(handler) = process.subject_owner(release)
+  let handler_down = process.monitor(handler)
   let connection = postgres.connection(database)
   force_lease_expired(connection, job.id_value(handle))
   |> should.equal(Ok(Nil))
-  await_renewal_lost(consumer, 200) |> should.equal(True)
   let assert Ok(#(measurement, metadata)) =
     diagnostics.await(
       renewals,
@@ -198,19 +207,19 @@ fn run_lease_renewal_loss_test(database_url: String) -> Nil {
   metadata.phase |> should.equal(telemetry.HandlerRunning)
   let assert Some(headroom) = measurement.remaining_lease_ms
   { headroom < 0 } |> should.be_true()
-  queue.process_one(consumer) |> should.equal(Error(queue.QueueBusy))
 
-  process.send(release, ReleaseAttempt)
-  let assert Ok(Error(queue.QueueProcessFailed(postgres.QueueAckStale(
-    proposed,
-    postgres.AckLeaseExpired(..),
-  )))) = process.receive(reply, within: 5000)
-  proposed
-  |> should.equal(worker.ExecutedSuccess(
-    "renewal-loss-output-v1",
-    "\"lost-lease-7\"",
-  ))
+  // The handler is never released: losing the lease stops it.
+  let stopped =
+    process.new_selector()
+    |> process.select_specific_monitor(handler_down, fn(down) { down })
+    |> process.selector_receive(within: 5000)
+  let assert Ok(process.ProcessDown(reason: process.Killed, ..)) = stopped
+  // The attempt finishes on this node without proposing anything: no
+  // acknowledgement statement runs, so none is reported.
+  process.receive(reply, within: 5000) |> should.equal(Ok(Ok(True)))
+  process.receive(acknowledgements, within: 0) |> should.equal(Error(Nil))
   postgres.state(database, handle) |> should.equal(Ok(job.Executing))
+  // The slot is free again, and the next claim's scan holds the job.
   queue.process_one(consumer) |> should.equal(Ok(False))
   postgres.state(database, handle) |> should.equal(Ok(job.Uncertain))
   mark_database_test_executed("lease-renewal-loss-fenced-passed")
@@ -423,20 +432,6 @@ fn run_closed_pool_renewal_test(database_url: String) -> Nil {
   postgres.state(reopened_database, handle)
   |> should.equal(Ok(job.Succeeded))
   mark_database_test_executed("closed-pool-renewal-recovered-passed")
-}
-
-fn await_renewal_lost(consumer: queue.Consumer, checks_remaining: Int) -> Bool {
-  case queue.renewal_status(consumer) {
-    Ok(Some(queue.LeaseRenewalLost)) -> True
-    _ ->
-      case checks_remaining > 0 {
-        False -> False
-        True -> {
-          process.sleep(10)
-          await_renewal_lost(consumer, checks_remaining - 1)
-        }
-      }
-  }
 }
 
 fn force_lease_expired(

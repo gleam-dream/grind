@@ -3,13 +3,22 @@
 ////
 //// The handler runs in its own linked process, so that the attempt process
 //// can bound it with the worker's timeout and deliver a committed
-//// cancellation to it. A handler that crashes takes the attempt process
-//// with it, exactly as an inline handler would: the claim is then recovered
-//// through lease expiry. A handler that exceeds its timeout is unlinked and
-//// killed. Under `HoldUncertain` the attempt acknowledges `uncertain`; under
-//// `ReplayAfterLeaseExpiry` it stops renewing and lets lease-expiry recovery
-//// decide.
+//// cancellation to it. The attempt process traps exits, so a handler crash
+//// arrives as a message. When any other linked process exits, which is its
+//// supervisor stopping it, it exits with `shutdown` and its handler ends
+//// with it. A handler that exceeds its timeout is unlinked and killed.
+//// Either way the attempt is abandoned, because neither proves that the
+//// handler had no effect: under `HoldUncertain` the attempt acknowledges
+//// `uncertain` at once, with the cause and a bounded description; under
+//// `ReplayAfterLeaseExpiry` it stops renewing and lets lease-expiry
+//// recovery decide. A handler whose attempt lost its lease is unlinked and
+//// killed too, and the attempt finishes here without acknowledging: no
+//// write of that attempt can commit any more, so lease-expiry recovery owns
+//// the job's outcome and may already have started another attempt of the
+//// same job. Because it is unlinked first, its stop is never read as a
+//// crash.
 
+import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process
 import gleam/int
 import gleam/option.{type Option, None, Some}
@@ -33,6 +42,11 @@ pub type WorkerMessage {
   HandlerReady(cancel: process.Subject(Nil))
   HandlerFinished(worker.Execution)
   HandlerTimedOut
+  /// A process linked to this attempt process exited: its handler, or the
+  /// supervisor that is stopping it.
+  LinkedExited(process.ExitMessage)
+  /// The renewer found no live fence for this attempt.
+  LeaseLost
 }
 
 pub type WorkerRequest(message) {
@@ -67,6 +81,8 @@ pub opaque type WorkerState(message) {
   WorkerState(
     request: WorkerRequest(message),
     subject: process.Subject(WorkerMessage),
+    /// The supervisor that started this attempt process.
+    parent: process.Pid,
     phase: Phase,
     pending_since_us: Option(Int),
     retries: Int,
@@ -81,14 +97,23 @@ pub fn worker_actor(
   process.Subject(WorkerMessage),
 ) {
   actor.new_with_initialiser(1000, fn(subject) {
+    // A handler crash arrives as a message instead of ending this process,
+    // so the reason can be stored before the attempt ends.
+    process.trap_exits(True)
+    let selector =
+      process.new_selector()
+      |> process.select(subject)
+      |> process.select_trapped_exits(LinkedExited)
     Ok(
       actor.initialised(WorkerState(
         request:,
         subject:,
+        parent: parent_pid(),
         phase: Ready,
         pending_since_us: None,
         retries: 0,
       ))
+      |> actor.selecting(selector)
       |> actor.returning(subject),
     )
   })
@@ -140,8 +165,32 @@ fn handle(
       process.kill(handler)
       timed_out(state)
     }
+    // Only a running handler is stopped. Once the handler has returned, the
+    // acknowledgement decides: a renewal can also miss the fence because
+    // that acknowledgement has just committed.
+    LeaseLost, Running(handler:, timer:, ..) -> {
+      cancel_timer(timer)
+      process.unlink(handler)
+      process.kill(handler)
+      leave_to_lease_recovery(state)
+    }
     RetryAcknowledgement, WaitingForAcknowledgement(execution) ->
       acknowledge(state, execution)
+    LinkedExited(process.ExitMessage(pid:, reason:)),
+      Running(handler:, timer:, ..)
+      if pid == handler
+    -> {
+      // A handler that returns sends `HandlerFinished` before it exits, and
+      // that message leaves this phase. An exit seen here is a crash.
+      cancel_timer(timer)
+      handler_crashed(state, reason)
+    }
+    // The supervisor is stopping this attempt. Any other exit is one this
+    // process no longer acts on: a handler that returned and ended, or one
+    // that crashed in the instant its timeout was handled.
+    LinkedExited(process.ExitMessage(pid:, ..)), _ if pid == state.parent ->
+      exit_shutdown()
+    LinkedExited(_), _ -> actor.continue(state)
     StopWorker, _ -> actor.stop()
     _, _ -> actor.continue(state)
   }
@@ -157,7 +206,8 @@ fn start_handler(
     renewer.Track(
       attempt.lease_fence(request.claimed, request.owner),
       process.self(),
-      fn() { process.send(self, CancelRequested) },
+      on_cancel: fn() { process.send(self, CancelRequested) },
+      on_lost: fn() { process.send(self, LeaseLost) },
     ),
   )
   let timeout_ms = attempt.claim_timeout_ms(request.claimed)
@@ -191,6 +241,42 @@ fn start_handler(
   )
 }
 
+/// The handler process exited without returning: an abandonment, with a
+/// bounded description of its exit reason.
+fn handler_crashed(
+  state: WorkerState(message),
+  reason: process.ExitReason,
+) -> actor.Next(WorkerState(message), WorkerMessage) {
+  abandon(state, worker.StoppedByCrash, crash_description(reason))
+}
+
+/// The description stored on a crashed handler's job, prefix included, cut
+/// to at most 500 characters and 2000 bytes.
+pub fn crash_description(reason: process.ExitReason) -> String {
+  bounded(
+    "handler exited: "
+    <> case reason {
+      process.Normal -> "normal"
+      process.Killed -> "killed"
+      process.Abnormal(reason) -> describe_exit(reason)
+    },
+  )
+}
+
+@external(erlang, "grind_queue_ffi", "bounded")
+fn bounded(text: String) -> String
+
+@external(erlang, "grind_queue_ffi", "describe_exit")
+fn describe_exit(reason: Dynamic) -> String
+
+@external(erlang, "grind_runtime_ffi", "parent_pid")
+fn parent_pid() -> process.Pid
+
+/// Ends this process with reason `shutdown`, the reason a supervisor expects
+/// from a child it is stopping. The linked handler ends with it.
+@external(erlang, "grind_runtime_ffi", "exit_shutdown")
+fn exit_shutdown() -> a
+
 fn cancel_timer(timer: Option(process.Timer)) -> Nil {
   case timer {
     Some(timer) -> {
@@ -201,37 +287,55 @@ fn cancel_timer(timer: Option(process.Timer)) -> Nil {
   }
 }
 
-/// The handler outlived its timeout and was killed. `HoldUncertain`
-/// acknowledges `uncertain` now; `ReplayAfterLeaseExpiry` leaves the claim
-/// unacknowledged, so lease-expiry recovery replays it.
+/// The handler outlived its timeout and was killed.
 fn timed_out(
   state: WorkerState(message),
 ) -> actor.Next(WorkerState(message), WorkerMessage) {
-  let request = state.request
-  let timeout = case attempt.claim_timeout_ms(request.claimed) {
+  let timeout = case attempt.claim_timeout_ms(state.request.claimed) {
     Some(ms) -> int.to_string(ms)
     None -> "?"
   }
-  case attempt.claim_abandonment(request.claimed) {
+  abandon(
+    state,
+    worker.StoppedAtTimeout,
+    "handler exceeded its timeout of "
+      <> timeout
+      <> " ms and was stopped; its effect is unknown",
+  )
+}
+
+/// The handler stopped without a result, at its timeout or by crashing.
+/// `HoldUncertain` acknowledges `uncertain` now, with the cause;
+/// `ReplayAfterLeaseExpiry` leaves the claim unacknowledged, so lease-expiry
+/// recovery replays it.
+fn abandon(
+  state: WorkerState(message),
+  stopped: worker.Stopped,
+  description: String,
+) -> actor.Next(WorkerState(message), WorkerMessage) {
+  case attempt.claim_abandonment(state.request.claimed) {
     worker.HoldUncertain ->
       begin_acknowledgement(
         state,
-        worker.ExecutedAbandoned(
-          "handler exceeded its timeout of "
-          <> timeout
-          <> " ms and was stopped; its effect is unknown",
-        ),
+        worker.ExecutedAbandoned(stopped, description),
       )
-    worker.ReplayAfterLeaseExpiry(_) -> {
-      let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
-      process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
-      process.send(
-        request.queue_subject,
-        request.on_complete(id, attempt_id, epoch, Ok(True)),
-      )
-      actor.continue(WorkerState(..state, phase: Finished))
-    }
+    worker.ReplayAfterLeaseExpiry(_) -> leave_to_lease_recovery(state)
   }
+}
+
+/// Finishes the attempt on this node without acknowledging: it stops
+/// renewing and frees its slot, and lease-expiry recovery decides the job.
+fn leave_to_lease_recovery(
+  state: WorkerState(message),
+) -> actor.Next(WorkerState(message), WorkerMessage) {
+  let request = state.request
+  let #(id, attempt_id, epoch) = attempt.claim_identity(request.claimed)
+  process.send(request.renewer, renewer.Untrack(attempt_id, epoch))
+  process.send(
+    request.queue_subject,
+    request.on_complete(id, attempt_id, epoch, Ok(True)),
+  )
+  actor.continue(WorkerState(..state, phase: Finished))
 }
 
 fn begin_acknowledgement(

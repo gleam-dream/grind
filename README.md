@@ -1,5 +1,14 @@
 # Grind
 
+> **Grind 0.3.0 is a breaking release.** Read the [migration guide](https://github.com/gleam-dream/grind/blob/main/docs/MIGRATION.md) before you upgrade from 0.2.
+>
+> - Schema version 15 builds an index with `CREATE INDEX CONCURRENTLY`, outside a transaction: never wrap Grind migrations in one transaction, and budget the build for a large jobs table.
+> - Grind depends on `sinal >= 0.2.0 and < 0.3.0`.
+> - Under the default `HoldUncertain` policy, a crashed handler's job is held `uncertain` at once with the new cause `abandoned.HandlerCrashed`; under `ReplayAfterLeaseExpiry` it is left to lease-expiry recovery.
+> - A lost lease stops the handler; lease-expiry recovery records the job as `LeaseExpired`.
+> - `grind.SubmitError` has two new variants, `BatchRefused` and `BatchCommitUnknown`, returned by the new `grind.submit_many`.
+> - Depend on `grind >= 0.3.0 and < 0.4.0`.
+
 [![CI](https://github.com/gleam-dream/grind/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/gleam-dream/grind/actions/workflows/ci.yml)
 [![grind on Hex](https://img.shields.io/hexpm/v/grind?label=Hex%3A%20grind)](https://hex.pm/packages/grind)
 [![Gleam](https://img.shields.io/badge/Gleam-FFAFF3?logo=gleam&logoColor=000000)](https://gleam.run/)
@@ -34,7 +43,7 @@ The example below uses these direct dependencies. Commit `gleam.toml` and
 
 ```toml
 [dependencies]
-grind = ">= 0.1.0 and < 0.2.0"
+grind = ">= 0.3.0 and < 0.4.0"
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
@@ -110,7 +119,7 @@ pub fn send(name: process.Name(grind.Message), email: Email) {
 
 <!-- prettier-ignore-end -->
 
-The example opts into startup migration. In production, give DDL permission to the runtime only when that is your migration plan; otherwise call `grind.migrate` in a deployment step or use your migration tool. Choose one migration owner per schema.
+The example opts into startup migration. Version 15 builds an index with `CREATE INDEX CONCURRENTLY`, which PostgreSQL refuses inside a transaction; the [migration guide](https://github.com/gleam-dream/grind/blob/main/docs/MIGRATION.md#schema-version-15-builds-an-index-concurrently) lists what operators must do. In production, give DDL permission to the runtime only when that is your migration plan; otherwise call `grind.migrate` in a deployment step or use your migration tool. Choose one migration owner per schema.
 
 ## How the runtime fits together
 
@@ -185,6 +194,10 @@ pub fn worker_stays_small() -> Nil {
 
 `erts_debug:flat_size` also counts a module constant captured through a variable, which the runtime does not copy. Refer to the constant inside the handler, as above, and the measurement matches the copy.
 
+## Enqueue many jobs
+
+`grind.submit_many(jobs, list)` admits a list of jobs in one transaction: all commit or none does, and the admissions come back in list order. Jobs without a uniqueness policy are written together, so a batch costs a few round trips instead of several per job. A refused job refuses the whole batch with `BatchRefused(position, reason)`, where `reason` is the error `grind.submit` returns for that job; after `BatchCommitUnknown`, the commit reply was lost, so pass each pending submission to `grind.reconcile_submission`, as the [migration guide](https://github.com/gleam-dream/grind/blob/main/docs/MIGRATION.md#submiterror-has-batchrefused-and-batchcommitunknown-variants) describes.
+
 ## Enqueue with an application write
 
 `grind.submit_in` stages admission in the caller's open `READ COMMITTED` transaction on the same database. The job commits or rolls back with the application write. Its reply is staged admission, not proof that the outer transaction committed.
@@ -210,7 +223,7 @@ The [runnable transaction example](examples/usage/src/grind_usage/transactions.g
 
 ## When a job is left uncertain
 
-An attempt is abandoned when its node dies or its handler exceeds its timeout. Grind cannot know whether its effect happened, so once `with_abandonment` allows no further replay it holds the job `uncertain` and never decides on its own. Declare on the worker how such a job is settled, and the queue's consumer hands it to that function, inside a transaction that also records the decision:
+An attempt is abandoned when its node dies, its handler crashes or its handler exceeds its timeout. A crash is a panic, a failed `let assert` or any other exit of the handler's process; it is not retried as a failed attempt. Under the default policy Grind holds a crashed or timed-out job `uncertain` at once, with its cause and a description (for a crash, the kind of failure and where it happened, never a value it carried). An attempt whose lease a renewal finds lost while its handler runs is abandoned too: Grind stops the handler and sends no acknowledgement, and lease-expiry recovery holds the job with the cause `LeaseExpired`, as for a node that died. Grind cannot know whether its effect happened, so once `with_abandonment` allows no further replay it holds the job `uncertain` and never decides on its own. Declare on the worker how such a job is settled, and the queue's consumer hands it to that function, inside a transaction that also records the decision:
 
 <!-- prettier-ignore-start -->
 
@@ -255,4 +268,5 @@ A periodic sweep of `admin.list(... |> admin.in_state(job.Uncertain))` is still 
 - [Compiled usage examples](examples/usage/README.md) cover workers, jobs, transactions, handlers, runtime configuration, uniqueness, recovery, retention, and migrations.
 - [Public consumer guide](consumer/README.md) exercises the API from a separate package.
 - [Design and operating contracts](docs/design/design-layer.pdf) document defaults and the detailed boundaries.
+- [Migration guide](https://github.com/gleam-dream/grind/blob/main/docs/MIGRATION.md) lists what to change when upgrading from 0.2.
 - [Benchmark method and retained results](docs/BENCHMARKS.md) include historical measurements and their limits.

@@ -5,11 +5,13 @@
 //// `grind/internal/unique_admission` submodules. See
 //// the "Admission and uniqueness" design section for the full contract.
 
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/set
 import grind/internal/job
 import grind/internal/sql
 import grind/internal/store
@@ -173,6 +175,422 @@ pub fn admit_in_transaction(
   }
 }
 
+/// Admits every job of `specs` in one transaction, in order: all commit or
+/// none does. Jobs without a uniqueness policy are written together, with
+/// one receipt lookup and one statement for their rows and receipts; a job
+/// with a policy runs the single-job admission inside the same
+/// transaction, so the uniqueness locks of one batch are taken in list
+/// order. A refused input refuses the batch before any storage call.
+pub fn admit_many(
+  connection: pog.Connection,
+  installation: job.Installation,
+  lock_wait_ms: Int,
+  max_payload_bytes: Int,
+  specs: List(Spec(input, output, error)),
+) -> Result(
+  List(Commit(input, output, error)),
+  submission.SubmitError(input, output, error),
+) {
+  use requests <- result.try(
+    try_index_map(specs, fn(spec, position) {
+      request_for(installation, max_payload_bytes, spec)
+      |> result.map_error(submission.BatchRefused(position, _))
+    }),
+  )
+  let ids =
+    list.map(requests, fn(request) {
+      submission.submission_id_value(request.submission_id)
+    })
+  case requests, repeated_position(ids, 0, set.new()) {
+    [], _ -> Ok([])
+    // One id for two jobs of a batch is the reuse `submit` reports.
+    _, Some(position) ->
+      Error(submission.BatchRefused(position, submission.SubmissionConflict))
+    _, None -> run_many(connection, requests, lock_wait_ms)
+  }
+}
+
+fn try_index_map(
+  items: List(a),
+  run: fn(a, Int) -> Result(b, e),
+) -> Result(List(b), e) {
+  list.index_map(items, fn(item, index) { #(item, index) })
+  |> list.try_map(fn(entry) { run(entry.0, entry.1) })
+}
+
+/// The position of the first id that an earlier id of the list repeats.
+fn repeated_position(
+  ids: List(String),
+  position: Int,
+  seen: set.Set(String),
+) -> Option(Int) {
+  case ids {
+    [] -> None
+    [id, ..rest] ->
+      case set.contains(seen, id) {
+        True -> Some(position)
+        False -> repeated_position(rest, position + 1, set.insert(seen, id))
+      }
+  }
+}
+
+fn run_many(
+  connection: pog.Connection,
+  requests: List(Request(input, output, error)),
+  lock_wait_ms: Int,
+) -> Result(
+  List(Commit(input, output, error)),
+  submission.SubmitError(input, output, error),
+) {
+  case
+    store.transaction_or_checkout_failure(connection, fn(transaction) {
+      use _ <- result.try(pin_read_committed(transaction))
+      use _ <- result.try(set_lock_timeout(transaction, lock_wait_ms))
+      batch_body(transaction, requests)
+    })
+  {
+    Error(Nil) -> Error(submission.NotCommitted(pog.ConnectionUnavailable))
+    Ok(Ok(commits)) -> Ok(commits)
+    // PostgreSQL confirmed the rollback, so the batch did not commit; the
+    // receipts only say which job was refused.
+    Ok(Error(pog.TransactionRolledBack(submission.SubmissionConflict))) ->
+      Error(refusal_after_rollback(connection, requests))
+    // The outcome was not observed: re-reading the receipts resolves it.
+    Ok(Error(pog.TransactionQueryError(_))) ->
+      reconcile_many(connection, requests)
+    Ok(Error(pog.TransactionRolledBack(error))) -> Error(error)
+  }
+}
+
+/// Why a batch that PostgreSQL rolled back on an id conflict was refused. A
+/// job whose id now holds another request's receipt is refused as
+/// `submit` refuses it. Otherwise a concurrent admission of the same job
+/// took one of the ids; the batch is contended, and retrying it finds that
+/// admission.
+fn refusal_after_rollback(
+  connection: pog.Connection,
+  requests: List(Request(input, output, error)),
+) -> submission.SubmitError(input, output, error) {
+  let ids =
+    list.map(requests, fn(request) {
+      submission.submission_id_value(request.submission_id)
+    })
+  case find_receipts(connection, ids) {
+    Error(_) -> submission.AdmissionContended
+    Ok(receipts) -> {
+      let receipts = dict.from_list(receipts)
+      let refused =
+        list.index_map(requests, fn(request, position) { #(request, position) })
+        |> list.find(fn(entry) {
+          let #(request, _) = entry
+          case
+            dict.get(
+              receipts,
+              submission.submission_id_value(request.submission_id),
+            )
+          {
+            Error(Nil) -> False
+            Ok(row) ->
+              row.request_sha256 != request.request_sha256
+              || outcome_of_receipt(request.installation, request.worker, row)
+              == Error(Nil)
+          }
+        })
+      case refused {
+        Ok(#(_, position)) ->
+          submission.BatchRefused(position, submission.SubmissionConflict)
+        Error(Nil) -> submission.AdmissionContended
+      }
+    }
+  }
+}
+
+fn reconcile_many(
+  connection: pog.Connection,
+  requests: List(Request(input, output, error)),
+) -> Result(
+  List(Commit(input, output, error)),
+  submission.SubmitError(input, output, error),
+) {
+  let results =
+    list.map(requests, fn(request) {
+      reconcile_from_receipt(
+        connection,
+        unique_admission_request.pending_submission(request),
+      )
+      |> result.map(fn(found) {
+        let #(outcome, committed_state) = found
+        Commit(
+          outcome:,
+          committed_state:,
+          available_at_unix_ms: None,
+          via_receipt_match: True,
+        )
+      })
+    })
+  // A receipt of another request under one of the batch's ids proves the
+  // batch did not commit, since a committed batch wrote every receipt.
+  let conflicted =
+    list.index_map(results, fn(result, position) { #(result, position) })
+    |> list.find(fn(entry) {
+      case entry.0 {
+        Error(submission.SubmissionConflict) -> True
+        _ -> False
+      }
+    })
+  case conflicted, result.all(results) {
+    Ok(#(_, position)), _ ->
+      Error(submission.BatchRefused(position, submission.SubmissionConflict))
+    Error(Nil), Ok(commits) -> Ok(commits)
+    Error(Nil), Error(submission.CommitUnknown(_)) ->
+      Error(
+        submission.BatchCommitUnknown(list.map(
+          requests,
+          unique_admission_request.pending_submission,
+        )),
+      )
+    Error(Nil), Error(error) -> Error(error)
+  }
+}
+
+fn batch_body(
+  connection: pog.Connection,
+  requests: List(Request(input, output, error)),
+) -> Result(
+  List(Commit(input, output, error)),
+  submission.SubmitError(input, output, error),
+) {
+  let indexed =
+    list.index_map(requests, fn(request, index) { #(index, request) })
+  let #(plain, keyed) =
+    list.partition(indexed, fn(entry) { option.is_none({ entry.1 }.policy) })
+  use receipts <- result.try(find_receipts(
+    connection,
+    list.map(plain, fn(entry) {
+      submission.submission_id_value({ entry.1 }.submission_id)
+    }),
+  ))
+  // Indexed once, so an exact retry of a large batch does not scan the
+  // receipts once per job.
+  let receipts = dict.from_list(receipts)
+  use #(found, fresh) <- result.try(
+    list.try_fold(plain, #([], []), fn(acc, entry) {
+      let #(found, fresh) = acc
+      let #(index, request) = entry
+      case
+        dict.get(
+          receipts,
+          submission.submission_id_value(request.submission_id),
+        )
+      {
+        Error(Nil) -> Ok(#(found, [entry, ..fresh]))
+        Ok(row) ->
+          case row.request_sha256 == request.request_sha256 {
+            False -> Error(submission.SubmissionConflict)
+            True ->
+              case
+                outcome_of_receipt(request.installation, request.worker, row)
+              {
+                Error(Nil) -> Error(submission.SubmissionConflict)
+                Ok(#(outcome, committed_state)) ->
+                  Ok(#(
+                    [
+                      #(
+                        index,
+                        Commit(
+                          outcome:,
+                          committed_state:,
+                          available_at_unix_ms: None,
+                          via_receipt_match: True,
+                        ),
+                      ),
+                      ..found
+                    ],
+                    fresh,
+                  ))
+              }
+          }
+      }
+    }),
+  )
+  use inserted <- result.try(case fresh {
+    [] -> Ok([])
+    _ -> {
+      use now_us <- result.try(sample_now(connection))
+      insert_jobs(connection, list.reverse(fresh), now_us)
+    }
+  })
+  use admitted <- result.try(
+    list.try_map(keyed, fn(entry) {
+      let #(index, request) = entry
+      transaction_body(connection, request)
+      |> result.map(fn(commit) { #(index, commit) })
+      // A lock wait that expired belongs to this job. An id conflict stays
+      // unwrapped: the rollback it causes is classified from the receipts.
+      |> result.map_error(fn(error) {
+        case error {
+          submission.AdmissionContended ->
+            submission.BatchRefused(index, submission.AdmissionContended)
+          other -> other
+        }
+      })
+    }),
+  )
+  list.flatten([found, inserted, admitted])
+  |> list.sort(fn(a, b) { int.compare(a.0, b.0) })
+  |> list.map(fn(entry) { entry.1 })
+  |> Ok
+}
+
+fn find_receipts(
+  connection: pog.Connection,
+  submission_ids: List(String),
+) -> Result(
+  List(#(String, sql.FindReceiptRow)),
+  submission.SubmitError(input, output, error),
+) {
+  case submission_ids {
+    [] -> Ok([])
+    _ -> {
+      use returned <- result.try(
+        store.call_safely(connection, fn(connection) {
+          sql.find_receipts(connection, submission_ids)
+        })
+        |> result.map_error(classify_query_error),
+      )
+      Ok(
+        list.map(returned.rows, fn(row) {
+          let sql.FindReceiptsRow(
+            submission_id:,
+            decision:,
+            job_id:,
+            job_queue:,
+            observed_state:,
+            worker_id:,
+            worker_version:,
+            request_sha256:,
+          ) = row
+          #(
+            submission_id,
+            sql.FindReceiptRow(
+              decision:,
+              job_id:,
+              job_queue:,
+              observed_state:,
+              worker_id:,
+              worker_version:,
+              request_sha256:,
+            ),
+          )
+        }),
+      )
+    }
+  }
+}
+
+/// Inserts the jobs of `entries` and their receipts in one statement. Each
+/// row takes its id from the sequence alongside its position, so the
+/// returned ids pair with the entries whatever order PostgreSQL writes
+/// them in.
+fn insert_jobs(
+  connection: pog.Connection,
+  entries: List(#(Int, Request(input, output, error))),
+  now_us: Int,
+) -> Result(
+  List(#(Int, Commit(input, output, error))),
+  submission.SubmitError(input, output, error),
+) {
+  let now_ms = now_us / 1000
+  let rows =
+    list.map(entries, fn(entry) {
+      let #(index, request) = entry
+      #(index, request, initial_state(request.availability, now_ms))
+    })
+  let texts = fn(field: fn(Request(input, output, error)) -> String) {
+    pog.array(pog.text, list.map(rows, fn(row) { field(row.1) }))
+  }
+  let query =
+    pog.query(
+      "WITH input AS MATERIALIZED (SELECT nextval('grind_jobs_id_seq') AS id, u.* FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::bigint[], $9::text[], $10::bigint[], $11::text[], $12::bigint[], $13::bytea[], $14::text[]) WITH ORDINALITY AS u(submission_id, queue, worker_id, worker_version, input_version, input, output_version, max_attempts, error_version, available_at_ms, correlation, max_replays, request_sha256, state, position)), "
+      <> "jobs AS (INSERT INTO grind_jobs (id, queue, worker_id, worker_version, input_version, input, output_version, error_version, max_attempts, state, available_at, inserted_at, correlation, max_replays) SELECT id, queue, worker_id, worker_version, input_version, input::jsonb, output_version, error_version, max_attempts, state, to_timestamp(available_at_ms / 1000.0), "
+      <> unique_admission_query.to_timestamptz_sql(15, "1000000.0")
+      <> ", correlation, max_replays FROM input), "
+      <> "receipts AS (INSERT INTO grind_unique_submissions (submission_id, queue, worker_id, worker_version, request_sha256, decision, job_id, job_queue, observed_state) SELECT submission_id, queue, worker_id, worker_version, request_sha256, 'inserted', id, queue, state FROM input) "
+      <> "SELECT position, id FROM input ORDER BY position",
+    )
+    |> pog.parameter(
+      texts(fn(request) {
+        submission.submission_id_value(request.submission_id)
+      }),
+    )
+    |> pog.parameter(texts(fn(request) { request.queue }))
+    |> pog.parameter(texts(fn(request) { request.worker_id }))
+    |> pog.parameter(texts(fn(request) { request.worker_version }))
+    |> pog.parameter(texts(fn(request) { request.input_version }))
+    |> pog.parameter(texts(fn(request) { request.encoded_input }))
+    |> pog.parameter(texts(fn(request) { request.output_version }))
+    |> pog.parameter(pog.array(
+      pog.int,
+      list.map(rows, fn(row) { { row.1 }.max_attempts }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.nullable(pog.text, _),
+      list.map(rows, fn(row) { { row.1 }.error_version }),
+    ))
+    |> pog.parameter(pog.array(pog.int, list.map(rows, fn(row) { row.2.1 })))
+    |> pog.parameter(pog.array(
+      pog.nullable(pog.text, _),
+      list.map(rows, fn(row) { { row.1 }.correlation }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.nullable(pog.int, _),
+      list.map(rows, fn(row) { { row.1 }.max_replays }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.bytea,
+      list.map(rows, fn(row) { { row.1 }.request_sha256 }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.text,
+      list.map(rows, fn(row) { job.state_to_stored(row.2.0) }),
+    ))
+    |> pog.parameter(pog.int(now_us))
+    |> pog.returning({
+      use position <- decode.field(0, decode.int)
+      use id <- decode.field(1, decode.int)
+      decode.success(#(position, id))
+    })
+  use returned <- result.try(case store.execute_safely(query, on: connection) {
+    Ok(returned) -> Ok(returned)
+    Error(pog.ConstraintViolated(_, "grind_unique_submissions_pkey", _)) ->
+      Error(submission.SubmissionConflict)
+    Error(other) -> Error(classify_query_error(other))
+  })
+  case list.length(returned.rows) == list.length(rows) {
+    False -> Error(submission.NotCommitted(pog.UnexpectedResultType([])))
+    True ->
+      list.zip(rows, returned.rows)
+      |> list.map(fn(pair) {
+        let #(#(index, request, #(state, available_at_ms)), #(_, id)) = pair
+        #(
+          index,
+          Commit(
+            outcome: submission.Inserted(job.new_handle(
+              id,
+              request.installation,
+              request.queue,
+              request.worker,
+            )),
+            committed_state: state,
+            available_at_unix_ms: admitted_available_at(state, available_at_ms),
+            via_receipt_match: False,
+          ),
+        )
+      })
+      |> Ok
+  }
+}
+
 @external(erlang, "grind_postgres_ffi", "is_single_connection")
 fn is_single_connection(connection: pog.Connection) -> Bool
 
@@ -333,6 +751,8 @@ fn reconcile_from_receipt(
     | Error(submission.EmptyQueueName)
     | Error(submission.InvalidInput(_))
     | Error(submission.CommitUnknown(_))
+    | Error(submission.BatchCommitUnknown(_))
+    | Error(submission.BatchRefused(..))
     | Error(submission.PayloadTooLarge(_, _))
     | Error(submission.NotInTransaction)
     | Error(submission.TransactionIsolationUnsupported(_)) ->

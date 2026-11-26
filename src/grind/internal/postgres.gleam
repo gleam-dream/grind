@@ -1321,6 +1321,62 @@ pub fn admit(
   }
 }
 
+/// Admits the jobs of `specs` in one transaction (see
+/// `unique_admission.admit_many`) and emits one admitted event per job once
+/// the commit is proven.
+pub fn admit_many(
+  database: Database,
+  specs: List(unique_admission.Spec(input, output, error)),
+) -> Result(
+  List(submission.Admission(input, output, error)),
+  submission.SubmitError(input, output, error),
+) {
+  let Database(
+    connection:,
+    unique_lock_wait_ms:,
+    forwarder:,
+    installation:,
+    max_payload_bytes:,
+    ..,
+  ) = database
+  use commits <- result.try(unique_admission.admit_many(
+    connection,
+    installation,
+    unique_lock_wait_ms,
+    max_payload_bytes,
+    specs,
+  ))
+  list.map2(commits, specs, fn(commit, spec) {
+    let unique_admission.Commit(
+      outcome:,
+      committed_state:,
+      available_at_unix_ms:,
+      via_receipt_match:,
+    ) = commit
+    let confirmation = case via_receipt_match {
+      True -> telemetry.Reconciled
+      False -> telemetry.Replied
+    }
+    let worker.Metadata(id: worker_id, worker_version:, ..) =
+      worker.metadata(spec.worker)
+    let job_id = admission_job_id(outcome)
+    emit_admitted(
+      forwarder,
+      events.correlation(job_id, spec.correlation),
+      spec.queue,
+      job_id,
+      worker_id,
+      worker_version,
+      committed_state,
+      available_at_unix_ms,
+      Some(submission.submission_id_value(spec.submission_id)),
+      confirmation,
+    )
+    outcome
+  })
+  |> Ok
+}
+
 /// Admits one job inside the caller's open transaction `tx`. Emits nothing:
 /// the caller's own commit decides whether the job exists.
 pub fn admit_in(

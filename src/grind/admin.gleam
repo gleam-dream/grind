@@ -11,12 +11,12 @@
 //// ```
 ////
 //// An uncertain job's attempt may or may not have had its effect: its node
-//// died, its handler exceeded its timeout, or it reported `Uncertain`. Grind
-//// never runs it again on its own unless its worker opted into
-//// `worker.ReplayAfterLeaseExpiry`. An operator resolves it with
-//// `resolve_uncertain`: confirm the success or failure that happened, or
-//// authorize a replay. Every resolution is recorded with its author and is
-//// idempotent under its id.
+//// died or lost its lease, its handler crashed or exceeded its timeout, or it
+//// reported `Uncertain`. Grind never runs it again on its own unless its
+//// worker opted into `worker.ReplayAfterLeaseExpiry`. An operator resolves
+//// it with `resolve_uncertain`: confirm the success or failure that
+//// happened, or authorize a replay. Every resolution is recorded with its
+//// author and is idempotent under its id.
 
 import gleam/int
 import gleam/list

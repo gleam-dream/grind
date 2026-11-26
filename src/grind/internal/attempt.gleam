@@ -47,6 +47,21 @@ pub opaque type ClaimedJob {
   )
 }
 
+/// One row of a batch claim: runnable here, holding a codec contract that no
+/// longer matches its registered worker (it must be parked), or unable to run
+/// for another reason.
+pub type ClaimedRow {
+  Runnable(ClaimedJob)
+  Mismatched(Mismatch)
+  Unrunnable(postgres.QueueRunError)
+}
+
+/// A claimed row whose stored codec version differs from the registered one.
+/// Nothing is written for it until `park` runs.
+pub opaque type Mismatch {
+  Mismatch(claim: Claim, kind: String, expected: String, actual: String)
+}
+
 /// Atomically claims one due row without running its handler in the caller.
 /// The attempt process owns acknowledgement; its consumer's independent
 /// renewer extends the live lease after this boundary.
@@ -57,6 +72,42 @@ pub fn claim_one(
   attempt_owner: String,
   lease_duration_ms: Int,
 ) -> Result(Option(ClaimedJob), postgres.QueueRunError) {
+  case
+    claim_batch(database, queue, workers, attempt_owner, lease_duration_ms, 1)
+  {
+    Error(error) -> Error(error)
+    Ok([]) -> Ok(None)
+    Ok([Runnable(claimed)]) -> Ok(Some(claimed))
+    Ok([Mismatched(mismatch)]) ->
+      case park(database, queue, attempt_owner, [mismatch]) {
+        Ok(Nil) -> Error(mismatch_error(mismatch))
+        Error(error) -> Error(error)
+      }
+    Ok([Unrunnable(error)]) -> Error(error)
+    Ok([_, _, ..]) -> Error(postgres.QueueStorageInvariantViolated)
+  }
+}
+
+/// Atomically claims up to `limit` due rows in one statement, after one
+/// quarantine scan, without running a handler in the caller. The rows come
+/// back in selection order (earliest `available_at`, then job ID), each with
+/// its own attempt fence and a lease that starts at the claim.
+///
+/// The outer error means no claim was returned to the caller, not that none
+/// committed: a lost reply after the claim statement committed leaves its
+/// rows executing until lease-expiry recovery. A `Mismatched` row is not
+/// written here: the caller starts the batch's runnable rows first and then
+/// passes each mismatch to `park`, so no parking write ever runs between a
+/// runnable row's claim and its start. The other rows of the batch stay
+/// claimed whatever happens to one row.
+pub fn claim_batch(
+  database: Database,
+  queue: String,
+  workers: Registry,
+  attempt_owner: String,
+  lease_duration_ms: Int,
+  limit: Int,
+) -> Result(List(ClaimedRow), postgres.QueueRunError) {
   let fwd = postgres.forwarder(database)
   let reference = diagnostics.queue_ref(queue, attempt_owner)
   let measured =
@@ -85,13 +136,14 @@ pub fn claim_one(
       Error(postgres.QueueClaimFailed(error))
     }
     Ok(Nil) ->
-      claim_registered_job(
+      claim_registered_jobs(
         database,
         queue,
         workers,
         attempt_owner,
         registry.identities(workers),
         lease_duration_ms,
+        limit,
       )
   }
 }
@@ -609,7 +661,7 @@ fn acknowledge_once(
     | worker.ExecutedDiscarded(_)
     | worker.ExecutedCancelled(_)
     | worker.ExecutedUncertain(_)
-    | worker.ExecutedAbandoned(_) ->
+    | worker.ExecutedAbandoned(_, _) ->
       run_acknowledgement(
         database,
         queue,
@@ -621,19 +673,20 @@ fn acknowledge_once(
   }
 }
 
-fn claim_registered_job(
+fn claim_registered_jobs(
   database: Database,
   queue: String,
   workers: Registry,
   attempt_owner: String,
   identities: List(#(String, String)),
   lease_duration_ms: Int,
-) -> Result(Option(ClaimedJob), postgres.QueueRunError) {
+  limit: Int,
+) -> Result(List(ClaimedRow), postgres.QueueRunError) {
   let connection = postgres.connection(database)
   let forwarder = postgres.forwarder(database)
   let eligibility =
     list.index_map(identities, fn(_, index) {
-      let id_parameter = 4 + index * 2
+      let id_parameter = 5 + index * 2
       let version_parameter = id_parameter + 1
       "(worker_id = $"
       <> int.to_string(id_parameter)
@@ -662,15 +715,24 @@ fn claim_registered_job(
   // same row for a reason that was never actually incompatible with this
   // claim's own write. See the "Admission and uniqueness" design section
   // for the full contention picture across claim, cancel, and quarantine.
+  // The candidate lock skips rows another claim holds, so concurrent batches
+  // take disjoint rows. `UPDATE ... RETURNING` has no row order of its own:
+  // the outer `SELECT` restores the selection order, which is the order the
+  // coordinator starts the attempts in.
   let sql =
     "WITH candidate AS (SELECT id, state AS previous_state FROM grind_jobs WHERE queue = $1 AND "
     <> eligible_state
     <> " AND cancel_requested_at IS NULL AND ("
     <> eligibility
-    <> ") ORDER BY available_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT 1) UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $2, lease_expires_at = clock_timestamp() + ($3::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1, delivery_count = job.delivery_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version, job.attempt_count, job.max_attempts, job.snooze_count, job.delivery_count, candidate.previous_state, job.correlation"
+    <> ") ORDER BY available_at, id FOR NO KEY UPDATE SKIP LOCKED LIMIT $4), claimed AS (UPDATE grind_jobs AS job SET state = 'executing', attempt_id = nextval('grind_attempts_id_seq'), attempt_epoch = job.attempt_epoch + 1, attempt_owner = $2, lease_expires_at = clock_timestamp() + ($3::double precision * interval '1 millisecond'), attempt_count = job.attempt_count + 1, delivery_count = job.delivery_count + 1 FROM candidate WHERE job.id = candidate.id RETURNING job.id, job.attempt_id, job.attempt_epoch, job.input_version, job.input::text, job.worker_id, job.worker_version, job.output_version, job.error_version, job.attempt_count, job.max_attempts, job.snooze_count, job.delivery_count, candidate.previous_state, job.correlation, job.available_at) SELECT id, attempt_id, attempt_epoch, input_version, input, worker_id, worker_version, output_version, error_version, attempt_count, max_attempts, snooze_count, delivery_count, previous_state, correlation FROM claimed ORDER BY available_at, id"
   let parameters =
     list.append(
-      [pog.text(queue), pog.text(attempt_owner), pog.int(lease_duration_ms)],
+      [
+        pog.text(queue),
+        pog.text(attempt_owner),
+        pog.int(lease_duration_ms),
+        pog.int(limit),
+      ],
       list.flat_map(identities, fn(identity) {
         let #(worker_id, worker_version) = identity
         [pog.text(worker_id), pog.text(worker_version)]
@@ -736,112 +798,116 @@ fn claim_registered_job(
       Error(postgres.QueueClaimFailed(error))
     }
     Ok(returned) ->
-      case returned.rows {
-        [] -> Ok(None)
-        [claim] -> {
-          let Claim(
-            id: claimed_id,
-            attempt_id:,
-            epoch:,
-            input_version:,
-            encoded_input:,
-            worker_id:,
-            worker_version:,
-            output_version:,
-            error_version:,
-            current_attempt:,
-            previous_state:,
-            ..,
-          ) = claim
-          case job.state_of_stored(previous_state) {
-            Error(Nil) -> Nil
-            Ok(previous_state) ->
-              emit_claimed(
-                forwarder,
-                events.correlation(claim.id, claim.correlation),
-                queue,
-                claimed_id,
-                worker_id,
-                worker_version,
-                attempt_id,
-                epoch,
-                current_attempt,
-                previous_state,
-              )
-          }
-          case registry.select(workers, queue, worker_id, worker_version) {
-            Error(_) -> Error(postgres.QueueStorageInvariantViolated)
-            Ok(registry.Selected(
-              input_version: registered_input,
-              output_version: registered_output,
-              error_version: registered_error,
-              run:,
-              timeout_ms:,
-              abandonment:,
-              ..,
-            )) ->
-              case
-                codec_contract_mismatch(
-                  input_version,
-                  registered_input,
-                  output_version,
-                  registered_output,
-                  error_version,
-                  registered_error,
-                )
-              {
-                Some(#(kind, expected, actual)) -> {
-                  case
-                    mark_contract_mismatch(
-                      database,
-                      queue,
-                      attempt_owner,
-                      claim,
-                      kind,
-                      expected,
-                      actual,
-                    )
-                  {
-                    Error(error) -> Error(error)
-                    Ok(True) ->
-                      case codec_kind_of_stored(kind) {
-                        Ok(kind) ->
-                          Error(postgres.QueueCodecMismatch(
-                            kind:,
-                            expected:,
-                            actual:,
-                          ))
-                        Error(Nil) ->
-                          Error(postgres.QueueStorageInvariantViolated)
-                      }
-                    Ok(False) -> Error(postgres.QueueStorageInvariantViolated)
-                  }
-                }
-                None -> {
-                  let max_payload_bytes = postgres.max_payload_bytes(database)
-                  Ok(
-                    Some(ClaimedJob(
-                      claim:,
-                      queue:,
-                      run: fn(context) {
-                        run(
-                          input_version,
-                          encoded_input,
-                          context,
-                          max_payload_bytes,
-                        )
-                      },
-                      timeout_ms:,
-                      abandonment:,
-                      connection: postgres.connection(database),
-                    )),
-                  )
-                }
-              }
-          }
+      Ok(
+        list.map(returned.rows, fn(claim) {
+          claimed_job(database, queue, workers, claim)
+        }),
+      )
+  }
+}
+
+/// Binds one claimed row to its registered worker, or reports a row whose
+/// stored codec contract differs from the registered one, without writing.
+fn claimed_job(
+  database: Database,
+  queue: String,
+  workers: Registry,
+  claim: Claim,
+) -> ClaimedRow {
+  let forwarder = postgres.forwarder(database)
+  let Claim(
+    id: claimed_id,
+    attempt_id:,
+    epoch:,
+    input_version:,
+    encoded_input:,
+    worker_id:,
+    worker_version:,
+    output_version:,
+    error_version:,
+    current_attempt:,
+    previous_state:,
+    ..,
+  ) = claim
+  case job.state_of_stored(previous_state) {
+    Error(Nil) -> Nil
+    Ok(previous_state) ->
+      emit_claimed(
+        forwarder,
+        events.correlation(claim.id, claim.correlation),
+        queue,
+        claimed_id,
+        worker_id,
+        worker_version,
+        attempt_id,
+        epoch,
+        current_attempt,
+        previous_state,
+      )
+  }
+  case registry.select(workers, queue, worker_id, worker_version) {
+    Error(_) -> Unrunnable(postgres.QueueStorageInvariantViolated)
+    Ok(registry.Selected(
+      input_version: registered_input,
+      output_version: registered_output,
+      error_version: registered_error,
+      run:,
+      timeout_ms:,
+      abandonment:,
+      ..,
+    )) ->
+      case
+        codec_contract_mismatch(
+          input_version,
+          registered_input,
+          output_version,
+          registered_output,
+          error_version,
+          registered_error,
+        )
+      {
+        Some(#(kind, expected, actual)) ->
+          Mismatched(Mismatch(claim:, kind:, expected:, actual:))
+        None -> {
+          let max_payload_bytes = postgres.max_payload_bytes(database)
+          Runnable(ClaimedJob(
+            claim:,
+            queue:,
+            run: fn(context) {
+              run(input_version, encoded_input, context, max_payload_bytes)
+            },
+            timeout_ms:,
+            abandonment:,
+            connection: postgres.connection(database),
+          ))
         }
-        _ -> Error(postgres.QueueStorageInvariantViolated)
       }
+  }
+}
+
+/// Parks mismatched claimed rows as `contract_mismatch` in one statement,
+/// each under its claim token (attempt id, epoch and owner) and with no
+/// lease condition: the row never ran, so parking is right however late it
+/// comes. A row whose token no longer holds was already taken by lease-expiry
+/// recovery and is left to it.
+pub fn park(
+  database: Database,
+  queue: String,
+  attempt_owner: String,
+  mismatches: List(Mismatch),
+) -> Result(Nil, postgres.QueueRunError) {
+  case mismatches {
+    [] -> Ok(Nil)
+    _ -> mark_contract_mismatches(database, queue, attempt_owner, mismatches)
+  }
+}
+
+/// Why a mismatched row could not run.
+pub fn mismatch_error(mismatch: Mismatch) -> postgres.QueueRunError {
+  let Mismatch(kind:, expected:, actual:, ..) = mismatch
+  case codec_kind_of_stored(kind) {
+    Ok(kind) -> postgres.QueueCodecMismatch(kind:, expected:, actual:)
+    Error(Nil) -> postgres.QueueStorageInvariantViolated
   }
 }
 
@@ -917,76 +983,74 @@ fn option_version(version: Option(String)) -> String {
   }
 }
 
-fn mark_contract_mismatch(
+fn mark_contract_mismatches(
   database: Database,
   queue: String,
   attempt_owner: String,
-  claim: Claim,
-  kind: String,
-  expected: String,
-  actual: String,
-) -> Result(Bool, postgres.QueueRunError) {
+  mismatches: List(Mismatch),
+) -> Result(Nil, postgres.QueueRunError) {
   let connection = postgres.connection(database)
   let forwarder = postgres.forwarder(database)
-  let Claim(
-    id:,
-    attempt_id:,
-    epoch:,
-    worker_id:,
-    worker_version:,
-    current_attempt:,
-    ..,
-  ) = claim
+  let claims = list.map(mismatches, fn(mismatch) { mismatch.claim })
   let query =
     pog.query(
-      "UPDATE grind_jobs SET state = 'contract_mismatch', failure_description = $6, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0), finished_at = clock_timestamp() WHERE id = $1 AND queue = $2 AND state = 'executing' AND attempt_id = $3 AND attempt_epoch = $4 AND attempt_owner = $5 AND "
-      <> lease.live_lease_predicate("clock_timestamp()")
-      <> " RETURNING id",
+      "UPDATE grind_jobs AS job SET state = 'contract_mismatch', failure_description = parked.description, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(job.attempt_count - 1, 0), finished_at = clock_timestamp() FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::text[]) AS parked(id, attempt_id, epoch, description) WHERE job.id = parked.id AND job.queue = $5 AND job.state = 'executing' AND job.attempt_id = parked.attempt_id AND job.attempt_epoch = parked.epoch AND job.attempt_owner = $6 RETURNING job.id",
     )
-    |> pog.parameter(pog.int(id))
-    |> pog.parameter(pog.text(queue))
-    |> pog.parameter(pog.int(attempt_id))
-    |> pog.parameter(pog.int(epoch))
-    |> pog.parameter(pog.text(attempt_owner))
-    |> pog.parameter(pog.text(
-      "stored "
-      <> kind
-      <> " codec version "
-      <> expected
-      <> " does not match registered version "
-      <> actual,
+    |> pog.parameter(pog.array(
+      pog.int,
+      list.map(claims, fn(claim) { claim.id }),
     ))
-    |> pog.returning({
-      use id <- decode.field(0, decode.int)
-      decode.success(id)
-    })
+    |> pog.parameter(pog.array(
+      pog.int,
+      list.map(claims, fn(claim) { claim.attempt_id }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.int,
+      list.map(claims, fn(claim) { claim.epoch }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.text,
+      list.map(mismatches, fn(mismatch) {
+        "stored "
+        <> mismatch.kind
+        <> " codec version "
+        <> mismatch.expected
+        <> " does not match registered version "
+        <> mismatch.actual
+      }),
+    ))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.text(attempt_owner))
+    |> pog.returning(decode.at([0], decode.int))
   case store.execute_safely(query, on: connection) {
     Error(error) -> Error(postgres.QueueAckFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [_] -> {
-          case codec_kind_of_stored(kind) {
-            Error(Nil) -> Nil
-            Ok(kind) ->
-              emit_contract_mismatch(
-                forwarder,
-                events.correlation(claim.id, claim.correlation),
-                queue,
-                id,
-                worker_id,
-                worker_version,
-                attempt_id,
-                epoch,
-                current_attempt,
-                kind,
-                expected,
-                actual,
-              )
-          }
-          Ok(True)
+    Ok(returned) -> {
+      list.each(mismatches, fn(mismatch) {
+        let Mismatch(claim:, kind:, expected:, actual:) = mismatch
+        case
+          list.contains(returned.rows, claim.id),
+          codec_kind_of_stored(kind)
+        {
+          True, Ok(kind) ->
+            emit_contract_mismatch(
+              forwarder,
+              events.correlation(claim.id, claim.correlation),
+              queue,
+              claim.id,
+              claim.worker_id,
+              claim.worker_version,
+              claim.attempt_id,
+              claim.epoch,
+              claim.current_attempt,
+              kind,
+              expected,
+              actual,
+            )
+          _, _ -> Nil
         }
-        _ -> Error(postgres.QueueStorageInvariantViolated)
-      }
+      })
+      Ok(Nil)
+    }
   }
 }
 
@@ -1171,9 +1235,12 @@ fn run_acknowledgement(
         error: None,
         failure_description: Some(reason),
       )
-    worker.ExecutedAbandoned(reason) ->
+    worker.ExecutedAbandoned(stopped, reason) ->
       AckProposal(
-        proposed_state: "abandoned",
+        proposed_state: case stopped {
+          worker.StoppedAtTimeout -> "abandoned"
+          worker.StoppedByCrash -> "crashed"
+        },
         failure_cause: None,
         requested_delay_ms: None,
         output_version: None,
@@ -1346,7 +1413,7 @@ fn proposed_of_execution(execution: worker.Execution) -> telemetry.Proposed {
     worker.ExecutedSnoozeLimitReached(_, _) -> telemetry.ProposedBusinessFailure
     worker.ExecutedDiscarded(_) -> telemetry.ProposedDiscarded
     worker.ExecutedCancelled(_) -> telemetry.ProposedCancelled
-    worker.ExecutedUncertain(_) | worker.ExecutedAbandoned(_) ->
+    worker.ExecutedUncertain(_) | worker.ExecutedAbandoned(_, _) ->
       telemetry.ProposedUncertain
   }
 }

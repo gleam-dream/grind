@@ -43,17 +43,18 @@ import pog
 /// exercises for real, rather than only against a synthetic stand-in.
 fn synthetic_v15_alter_migration() -> migrations.Migration {
   migrations.Migration(
-    15,
+    16,
     [
       "ALTER TABLE grind_jobs ADD COLUMN grind_test_note text",
       "CREATE INDEX grind_test_note_idx ON grind_jobs (grind_test_note)",
-      "INSERT INTO grind_schema_migrations (version) VALUES (15)",
+      "INSERT INTO grind_schema_migrations (version) VALUES (16)",
     ],
     list.append(latest_migration().shape, [
       migrations.ExpectedRelation("grind_test_note_idx", migrations.Index, []),
     ]),
     latest_migration().foreign_keys,
     latest_migration().forbidden_columns,
+    [],
   )
 }
 

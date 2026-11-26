@@ -258,6 +258,16 @@ pub type AbandonmentCause {
   LeaseExpired
   /// Grind stopped its handler at the worker's timeout under `HoldUncertain`.
   TimedOut
+  /// Its handler crashed under `HoldUncertain`: it panicked, failed a
+  /// `let assert`, or its process exited in any other way without returning.
+  HandlerCrashed
+}
+
+/// How Grind abandoned an attempt whose handler it saw stop. A timeout and a
+/// crash are acknowledged at once, unlike a lease that expires.
+pub type Stopped {
+  StoppedAtTimeout
+  StoppedByCrash
 }
 
 /// A declared settlement's decision. `grind/worker.Settlement` is the
@@ -591,10 +601,11 @@ pub type Execution {
   ExecutedDiscarded(String)
   ExecutedCancelled(String)
   ExecutedUncertain(String)
-  /// Grind stopped the handler at its timeout under `HoldUncertain`: an
-  /// abandoned attempt, committed as `uncertain` with a settlement mark
-  /// naming the attempt, unlike the handler's own `ExecutedUncertain`.
-  ExecutedAbandoned(String)
+  /// Grind stopped the handler at its timeout, or saw it crash, under
+  /// `HoldUncertain`: an abandoned attempt, committed as `uncertain` with a
+  /// settlement mark naming the attempt and the cause, unlike the handler's
+  /// own `ExecutedUncertain`.
+  ExecutedAbandoned(stopped: Stopped, reason: String)
   ExecutedInvalidInput(String)
   /// The handler ran, and its output codec (`OutputCodec`) or error codec
   /// (`ErrorCodec`) rejected the value it returned, the encoded value was
@@ -766,7 +777,7 @@ pub fn refused_by_storage(execution: Execution, sqlstate: String) -> Execution {
     ExecutedDiscarded(_) -> ExecutedDiscarded(reason)
     ExecutedCancelled(_) -> ExecutedCancelled(reason)
     ExecutedUncertain(_) -> ExecutedUncertain(reason)
-    ExecutedAbandoned(_) -> ExecutedAbandoned(reason)
+    ExecutedAbandoned(stopped, _) -> ExecutedAbandoned(stopped, reason)
   }
 }
 

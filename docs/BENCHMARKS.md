@@ -54,6 +54,10 @@ Point definitions live in [bench-matrix.sh](../scripts/bench-matrix.sh) and the 
 | L6 / T2 | Healthy siblings during slow acknowledgements: D = 4 s, L = 16, 24 or 30 s, acknowledgement delay 0.8D or 1.2D. The default 26 profiles cover K = 0 and 3 to 8 at L = 16 s and K = 0, 5 and 8 at L = 24 and 30 s. |
 | L7 / T3 | Coordinator throughput at 1×C50, 5×C10 and 10×C5, with 1 ms handlers; mailbox and function sampling explain the shape.                                                                                            |
 
+## Settlement poll
+
+`bench/sql/settlement-take.sh <database-url> [rows] [runs] [polls]` times the settler's take statement (`bench/sql/settlement-take.sql`, kept equal to `take` in `src/grind/internal/settlement.gleam`) with pgbench against a queue holding `rows` uncertain jobs whose tries are backing off, so none is due. It needs a database with Grind's schema and prints the mean latency of each run. It answers how a poll scales with the uncertain backlog; it is not part of the matrix.
+
 ## Harness pools
 
 Bookkeeping queries use the harness database path and not Grind, and the completion observer has its own pool. Bookkeeping uses a sixty-second timeout and retries `noproc` for up to five seconds. A nonzero `harness_pool_restart_retries` count requires repeating the run before its measurements are used. [ADR-0009](adr/0009-separate-observations-from-qualification-evidence.md) records the failure that motivated this isolation.
