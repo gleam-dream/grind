@@ -1559,21 +1559,21 @@ fn fill_automatic_slots(
                 attempt.Mismatched(_) | attempt.Unrunnable(_) -> state
               }
             })
-          list.each(rows, fn(row) {
-            case row {
-              attempt.Mismatched(mismatch) -> {
-                let _ =
-                  attempt.park(
-                    state.database,
-                    state.queue,
-                    state.attempt_owner,
-                    mismatch,
-                  )
-                Nil
+          // Then park every mismatched row of the batch in one statement.
+          let mismatches =
+            list.filter_map(rows, fn(row) {
+              case row {
+                attempt.Mismatched(mismatch) -> Ok(mismatch)
+                attempt.Runnable(_) | attempt.Unrunnable(_) -> Error(Nil)
               }
-              attempt.Runnable(_) | attempt.Unrunnable(_) -> Nil
-            }
-          })
+            })
+          let _ =
+            attempt.park(
+              state.database,
+              state.queue,
+              state.attempt_owner,
+              mismatches,
+            )
           continue_if_idle(state)
         }
       }

@@ -79,7 +79,10 @@ pub fn claim_one(
     Ok([]) -> Ok(None)
     Ok([Runnable(claimed)]) -> Ok(Some(claimed))
     Ok([Mismatched(mismatch)]) ->
-      Error(park(database, queue, attempt_owner, mismatch))
+      case park(database, queue, attempt_owner, [mismatch]) {
+        Ok(Nil) -> Error(mismatch_error(mismatch))
+        Error(error) -> Error(error)
+      }
     Ok([Unrunnable(error)]) -> Error(error)
     Ok([_, _, ..]) -> Error(postgres.QueueStorageInvariantViolated)
   }
@@ -882,34 +885,29 @@ fn claimed_job(
   }
 }
 
-/// Parks a mismatched claimed row as `contract_mismatch` under its attempt
-/// fence and live lease, and returns why the row could not run: the codec
-/// mismatch once it is recorded, or the storage error that prevented it.
+/// Parks mismatched claimed rows as `contract_mismatch` in one statement,
+/// each under its claim token (attempt id, epoch and owner) and with no
+/// lease condition: the row never ran, so parking is right however late it
+/// comes. A row whose token no longer holds was already taken by lease-expiry
+/// recovery and is left to it.
 pub fn park(
   database: Database,
   queue: String,
   attempt_owner: String,
-  mismatch: Mismatch,
-) -> postgres.QueueRunError {
-  let Mismatch(claim:, kind:, expected:, actual:) = mismatch
-  case
-    mark_contract_mismatch(
-      database,
-      queue,
-      attempt_owner,
-      claim,
-      kind,
-      expected,
-      actual,
-    )
-  {
-    Error(error) -> error
-    Ok(True) ->
-      case codec_kind_of_stored(kind) {
-        Ok(kind) -> postgres.QueueCodecMismatch(kind:, expected:, actual:)
-        Error(Nil) -> postgres.QueueStorageInvariantViolated
-      }
-    Ok(False) -> postgres.QueueStorageInvariantViolated
+  mismatches: List(Mismatch),
+) -> Result(Nil, postgres.QueueRunError) {
+  case mismatches {
+    [] -> Ok(Nil)
+    _ -> mark_contract_mismatches(database, queue, attempt_owner, mismatches)
+  }
+}
+
+/// Why a mismatched row could not run.
+pub fn mismatch_error(mismatch: Mismatch) -> postgres.QueueRunError {
+  let Mismatch(kind:, expected:, actual:, ..) = mismatch
+  case codec_kind_of_stored(kind) {
+    Ok(kind) -> postgres.QueueCodecMismatch(kind:, expected:, actual:)
+    Error(Nil) -> postgres.QueueStorageInvariantViolated
   }
 }
 
@@ -985,76 +983,74 @@ fn option_version(version: Option(String)) -> String {
   }
 }
 
-fn mark_contract_mismatch(
+fn mark_contract_mismatches(
   database: Database,
   queue: String,
   attempt_owner: String,
-  claim: Claim,
-  kind: String,
-  expected: String,
-  actual: String,
-) -> Result(Bool, postgres.QueueRunError) {
+  mismatches: List(Mismatch),
+) -> Result(Nil, postgres.QueueRunError) {
   let connection = postgres.connection(database)
   let forwarder = postgres.forwarder(database)
-  let Claim(
-    id:,
-    attempt_id:,
-    epoch:,
-    worker_id:,
-    worker_version:,
-    current_attempt:,
-    ..,
-  ) = claim
+  let claims = list.map(mismatches, fn(mismatch) { mismatch.claim })
   let query =
     pog.query(
-      "UPDATE grind_jobs SET state = 'contract_mismatch', failure_description = $6, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(attempt_count - 1, 0), finished_at = clock_timestamp() WHERE id = $1 AND queue = $2 AND state = 'executing' AND attempt_id = $3 AND attempt_epoch = $4 AND attempt_owner = $5 AND "
-      <> lease.live_lease_predicate("clock_timestamp()")
-      <> " RETURNING id",
+      "UPDATE grind_jobs AS job SET state = 'contract_mismatch', failure_description = parked.description, attempt_id = NULL, attempt_owner = NULL, lease_expires_at = NULL, attempt_count = GREATEST(job.attempt_count - 1, 0), finished_at = clock_timestamp() FROM unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::text[]) AS parked(id, attempt_id, epoch, description) WHERE job.id = parked.id AND job.queue = $5 AND job.state = 'executing' AND job.attempt_id = parked.attempt_id AND job.attempt_epoch = parked.epoch AND job.attempt_owner = $6 RETURNING job.id",
     )
-    |> pog.parameter(pog.int(id))
-    |> pog.parameter(pog.text(queue))
-    |> pog.parameter(pog.int(attempt_id))
-    |> pog.parameter(pog.int(epoch))
-    |> pog.parameter(pog.text(attempt_owner))
-    |> pog.parameter(pog.text(
-      "stored "
-      <> kind
-      <> " codec version "
-      <> expected
-      <> " does not match registered version "
-      <> actual,
+    |> pog.parameter(pog.array(
+      pog.int,
+      list.map(claims, fn(claim) { claim.id }),
     ))
-    |> pog.returning({
-      use id <- decode.field(0, decode.int)
-      decode.success(id)
-    })
+    |> pog.parameter(pog.array(
+      pog.int,
+      list.map(claims, fn(claim) { claim.attempt_id }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.int,
+      list.map(claims, fn(claim) { claim.epoch }),
+    ))
+    |> pog.parameter(pog.array(
+      pog.text,
+      list.map(mismatches, fn(mismatch) {
+        "stored "
+        <> mismatch.kind
+        <> " codec version "
+        <> mismatch.expected
+        <> " does not match registered version "
+        <> mismatch.actual
+      }),
+    ))
+    |> pog.parameter(pog.text(queue))
+    |> pog.parameter(pog.text(attempt_owner))
+    |> pog.returning(decode.at([0], decode.int))
   case store.execute_safely(query, on: connection) {
     Error(error) -> Error(postgres.QueueAckFailed(error))
-    Ok(returned) ->
-      case returned.rows {
-        [_] -> {
-          case codec_kind_of_stored(kind) {
-            Error(Nil) -> Nil
-            Ok(kind) ->
-              emit_contract_mismatch(
-                forwarder,
-                events.correlation(claim.id, claim.correlation),
-                queue,
-                id,
-                worker_id,
-                worker_version,
-                attempt_id,
-                epoch,
-                current_attempt,
-                kind,
-                expected,
-                actual,
-              )
-          }
-          Ok(True)
+    Ok(returned) -> {
+      list.each(mismatches, fn(mismatch) {
+        let Mismatch(claim:, kind:, expected:, actual:) = mismatch
+        case
+          list.contains(returned.rows, claim.id),
+          codec_kind_of_stored(kind)
+        {
+          True, Ok(kind) ->
+            emit_contract_mismatch(
+              forwarder,
+              events.correlation(claim.id, claim.correlation),
+              queue,
+              claim.id,
+              claim.worker_id,
+              claim.worker_version,
+              claim.attempt_id,
+              claim.epoch,
+              claim.current_attempt,
+              kind,
+              expected,
+              actual,
+            )
+          _, _ -> Nil
         }
-        _ -> Error(postgres.QueueStorageInvariantViolated)
-      }
+      })
+      Ok(Nil)
+    }
   }
 }
 
