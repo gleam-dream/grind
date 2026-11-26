@@ -45,6 +45,7 @@ pub fn main() -> Nil {
       grind.new(config)
         |> grind.with_worker(bench_worker)
         |> grind.without_consumers
+        |> grind.without_pruner
         |> grind.with_startup_migration,
       process.new_name("grind_bench_submit_many"),
     )
