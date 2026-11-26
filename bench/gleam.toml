@@ -3,11 +3,11 @@ version = "0.1.0"
 target = "erlang"
 gleam = ">= 1.18.0"
 licenses = ["Apache-2.0"]
-description = "Benchmark/load harness for Grind. Not published; depends on grind and sinal by path, like consumer/."
+description = "Benchmark/load harness for Grind. Not published; depends on grind by path, like consumer/."
 
 [dependencies]
 grind = { path = ".." }
-sinal = { git = "https://github.com/gleam-dream/sinal.git", ref = "02d386e070c6a99900225c613e8d273f3bebe3c2" }
+sinal = ">= 0.2.0 and < 0.3.0"
 gleam_stdlib = ">= 0.70.0 and < 2.0.0"
 gleam_erlang = ">= 1.0.0 and < 2.0.0"
 gleam_otp = ">= 1.0.0 and < 2.0.0"
