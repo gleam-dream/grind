@@ -285,6 +285,97 @@ pub fn find_receipt(
   |> pog.execute(db)
 }
 
+/// A row you get from running the `find_receipts` query
+/// defined in `./src/grind/internal/sql/find_receipts.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type FindReceiptsRow {
+  FindReceiptsRow(
+    submission_id: String,
+    decision: String,
+    job_id: Int,
+    job_queue: String,
+    observed_state: String,
+    worker_id: String,
+    worker_version: String,
+    request_sha256: BitArray,
+  )
+}
+
+/// Runs the `find_receipts` query
+/// defined in `./src/grind/internal/sql/find_receipts.sql`.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn find_receipts(
+  db: pog.Connection,
+  arg_1: List(String),
+) -> Result(pog.Returned(FindReceiptsRow), pog.QueryError) {
+  let decoder = {
+    use submission_id <- decode.field(0, decode.string)
+    use decision <- decode.field(1, decode.string)
+    use job_id <- decode.field(2, decode.int)
+    use job_queue <- decode.field(3, decode.string)
+    use observed_state <- decode.field(4, decode.string)
+    use worker_id <- decode.field(5, decode.string)
+    use worker_version <- decode.field(6, decode.string)
+    use request_sha256 <- decode.field(7, decode.bit_array)
+    decode.success(FindReceiptsRow(
+      submission_id:,
+      decision:,
+      job_id:,
+      job_queue:,
+      observed_state:,
+      worker_id:,
+      worker_version:,
+      request_sha256:,
+    ))
+  }
+
+  "SELECT submission_id, decision, job_id, job_queue, observed_state, worker_id, worker_version, request_sha256 FROM grind_unique_submissions WHERE submission_id = ANY($1)
+"
+  |> pog.query
+  |> pog.parameter(pog.array(fn(value) { pog.text(value) }, arg_1))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
+/// A row you get from running the `index_validity` query
+/// defined in `./src/grind/internal/sql/index_validity.sql`.
+///
+/// > 🐿️ This type definition was generated automatically using v4.7.0 of the
+/// > [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub type IndexValidityRow {
+  IndexValidityRow(indisvalid: Bool)
+}
+
+/// Runs the `index_validity` query
+/// defined in `./src/grind/internal/sql/index_validity.sql`.
+///
+/// > 🐿️ This function was generated automatically using v4.7.0 of
+/// > the [squirrel package](https://github.com/giacomocavalieri/squirrel).
+///
+pub fn index_validity(
+  db: pog.Connection,
+  c_relname: String,
+) -> Result(pog.Returned(IndexValidityRow), pog.QueryError) {
+  let decoder = {
+    use indisvalid <- decode.field(0, decode.bool)
+    decode.success(IndexValidityRow(indisvalid:))
+  }
+
+  "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname = $1
+"
+  |> pog.query
+  |> pog.parameter(pog.text(c_relname))
+  |> pog.returning(decoder)
+  |> pog.execute(db)
+}
+
 /// A row you get from running the `outcome` query
 /// defined in `./src/grind/internal/sql/outcome.sql`.
 ///

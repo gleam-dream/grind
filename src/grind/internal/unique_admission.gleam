@@ -5,6 +5,7 @@
 //// `grind/internal/unique_admission` submodules. See
 //// the "Admission and uniqueness" design section for the full contract.
 
+import gleam/dict
 import gleam/dynamic/decode
 import gleam/int
 import gleam/list
@@ -292,12 +293,15 @@ fn batch_body(
       submission.submission_id_value({ entry.1 }.submission_id)
     }),
   ))
+  // Indexed once, so an exact retry of a large batch does not scan the
+  // receipts once per job.
+  let receipts = dict.from_list(receipts)
   use #(found, fresh) <- result.try(
     list.try_fold(plain, #([], []), fn(acc, entry) {
       let #(found, fresh) = acc
       let #(index, request) = entry
       case
-        list.key_find(
+        dict.get(
           receipts,
           submission.submission_id_value(request.submission_id),
         )
@@ -362,21 +366,25 @@ fn find_receipts(
   case submission_ids {
     [] -> Ok([])
     _ -> {
-      let query =
-        pog.query(
-          "SELECT submission_id, decision, job_id, job_queue, observed_state, worker_id, worker_version, request_sha256 FROM grind_unique_submissions WHERE submission_id = ANY($1)",
-        )
-        |> pog.parameter(pog.array(pog.text, submission_ids))
-        |> pog.returning({
-          use submission_id <- decode.field(0, decode.string)
-          use decision <- decode.field(1, decode.string)
-          use job_id <- decode.field(2, decode.int)
-          use job_queue <- decode.field(3, decode.string)
-          use observed_state <- decode.field(4, decode.string)
-          use worker_id <- decode.field(5, decode.string)
-          use worker_version <- decode.field(6, decode.string)
-          use request_sha256 <- decode.field(7, decode.bit_array)
-          decode.success(#(
+      use returned <- result.try(
+        store.call_safely(connection, fn(connection) {
+          sql.find_receipts(connection, submission_ids)
+        })
+        |> result.map_error(classify_query_error),
+      )
+      Ok(
+        list.map(returned.rows, fn(row) {
+          let sql.FindReceiptsRow(
+            submission_id:,
+            decision:,
+            job_id:,
+            job_queue:,
+            observed_state:,
+            worker_id:,
+            worker_version:,
+            request_sha256:,
+          ) = row
+          #(
             submission_id,
             sql.FindReceiptRow(
               decision:,
@@ -387,10 +395,9 @@ fn find_receipts(
               worker_version:,
               request_sha256:,
             ),
-          ))
-        })
-      use returned <- result.try(unique_execute(query, connection))
-      Ok(returned.rows)
+          )
+        }),
+      )
     }
   }
 }

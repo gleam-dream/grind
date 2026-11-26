@@ -7,6 +7,7 @@ import gleam/list
 import gleam/result
 import gleam/string
 import grind/internal/migrations
+import grind/internal/sql
 import grind/internal/store
 import pog
 
@@ -239,14 +240,12 @@ pub fn index_validity(
   connection: pog.Connection,
   name: String,
 ) -> Result(List(Bool), ProbeError) {
-  let query =
-    pog.query(
-      "SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = current_schema() AND c.relname = $1",
-    )
-    |> pog.parameter(pog.text(name))
-    |> pog.returning(decode.at([0], decode.bool))
-  case store.execute_safely(query, on: connection) {
+  case
+    store.call_safely(connection, fn(connection) {
+      sql.index_validity(connection, name)
+    })
+  {
     Error(error) -> Error(ProbeQueryFailed(error))
-    Ok(returned) -> Ok(returned.rows)
+    Ok(returned) -> Ok(list.map(returned.rows, fn(row) { row.indisvalid }))
   }
 }
