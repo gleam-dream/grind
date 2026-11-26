@@ -27,13 +27,25 @@ describe_exit(Reason) when is_tuple(Reason), tuple_size(Reason) > 0,
 describe_exit(_) ->
     <<"abnormal exit">>.
 
-%% At most 500 characters of valid UTF-8, without a NUL, which PostgreSQL
-%% text cannot hold.
+%% At most 500 characters and 2000 bytes of valid UTF-8, without a NUL,
+%% which PostgreSQL text cannot hold. The byte limit matters because one
+%% character (grapheme) can carry any number of combining code points.
 bounded(Text) ->
     case unicode:characters_to_binary(Text, utf8, utf8) of
         Valid when is_binary(Valid) ->
             Clean = binary:replace(Valid, <<0>>, <<>>, [global]),
-            unicode:characters_to_binary(string:slice(Clean, 0, 500));
+            Sliced = unicode:characters_to_binary(string:slice(Clean, 0, 500)),
+            within_bytes(Sliced, 2000, <<>>);
         _ ->
             <<"abnormal exit">>
+    end.
+
+%% The longest prefix of whole code points that fits in `Budget` bytes.
+within_bytes(<<>>, _Budget, Kept) ->
+    Kept;
+within_bytes(<<Point/utf8, Rest/binary>>, Budget, Kept) ->
+    Size = byte_size(<<Point/utf8>>),
+    case Size =< Budget of
+        true -> within_bytes(Rest, Budget - Size, <<Kept/binary, Point/utf8>>);
+        false -> Kept
     end.
